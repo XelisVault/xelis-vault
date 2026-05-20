@@ -1,6 +1,5 @@
 const FLASH_LOAN_FEE_BPS: u64 = 9
-const MAX_FLASH_AMOUNT: u64 = 1_000_000_000_000
-const CALLBACK_GAS: u64 = 200_000
+const MAX_FLASH_AMOUNT: u64 = 1_000_000_000_000_000
 
 struct FlashLoanRequest {
     borrower: Address,
@@ -8,7 +7,6 @@ struct FlashLoanRequest {
     amount: u64,
     target_contract: Hash,
     target_chunk: u16,
-    callback_data: u8[],
     executed: bool,
     repaid: bool,
     topoheight: u64
@@ -17,24 +15,24 @@ struct FlashLoanRequest {
 const VAULT_CONTRACT_KEY: string = "vault_contract"
 const LOAN_PREFIX: string = "flash_loan_"
 const LOAN_COUNTER_KEY: string = "loan_counter"
+const ADMIN_KEY: string = "admin"
 
 hook constructor() -> u64 {
     let storage: Storage = Storage::new();
     storage.store(LOAN_COUNTER_KEY, 0);
+    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
     return 0;
+}
+
+fn only_admin() {
+    let storage: Storage = Storage::new();
+    let caller: Address = get_caller().expect("no caller");
+    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
+    require(caller == admin, "not authorized");
 }
 
 fn get_loan_key(id: u64) -> string {
     return LOAN_PREFIX + id.to_string();
-}
-
-fn require_vault() {
-    let storage: Storage = Storage::new();
-    let vault_hash: optional<Hash> = storage.load(VAULT_CONTRACT_KEY);
-    if vault_hash.is_some() {
-        let caller_hash: Hash = get_contract_hash();
-        require(caller_hash == vault_hash.unwrap(), "only vault can call");
-    }
 }
 
 entry flash_loan(asset: Hash, amount: u64, target: Hash, chunk_id: u16, data: u8[]) -> u64 {
@@ -59,7 +57,6 @@ entry flash_loan(asset: Hash, amount: u64, target: Hash, chunk_id: u16, data: u8
         amount: amount,
         target_contract: target,
         target_chunk: chunk_id,
-        callback_data: data,
         executed: false,
         repaid: false,
         topoheight: get_current_topoheight()
@@ -77,8 +74,7 @@ entry flash_loan(asset: Hash, amount: u64, target: Hash, chunk_id: u16, data: u8
 
     let fee: u64 = amount * FLASH_LOAN_FEE_BPS / 10000;
 
-    fire_rpc_event(30, [caller, amount, fee, "flash_loan"]);
-
+    fire_rpc_event(30, [caller, amount, fee, loan_id, "flash_loan"]);
     return loan_id;
 }
 
@@ -96,7 +92,7 @@ entry repay_flash_loan(loan_id: u64) -> u64 {
     req.repaid = true;
     storage.store(loan_key, req);
 
-    fire_rpc_event(31, [loan_id, total, "flash_loan_repaid"]);
+    fire_rpc_event(31, [loan_id, req.borrower, total, "flash_loan_repaid"]);
     return total;
 }
 
@@ -111,10 +107,8 @@ entry get_max_flash_amount(asset: Hash) -> u64 {
 }
 
 entry set_vault_contract(vault_hash: Hash) -> u64 {
+    only_admin();
     let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let owner: Address = Address::from_string("admin");
-    require(caller == owner, "not authorized");
     storage.store(VAULT_CONTRACT_KEY, vault_hash);
     return 0;
 }
@@ -123,4 +117,12 @@ entry get_loan(loan_id: u64) -> optional<FlashLoanRequest> {
     let storage: Storage = Storage::new();
     let loan_key: string = get_loan_key(loan_id);
     return storage.load(loan_key);
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    require(new_admin != Address::from_string(""), "invalid address");
+    let storage: Storage = Storage::new();
+    storage.store(ADMIN_KEY, new_admin);
+    return 0;
 }

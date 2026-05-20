@@ -3,7 +3,9 @@ const XUSD_TICKER: string = "xUSD"
 const MAX_SUPPLY: u64 = 0
 const SAVINGS_RATE_KEY: string = "savings_rate"
 const VAULT_CONTRACT_KEY: string = "vault_contract"
-const SAVINGS_BALANCES_KEY: string = "savings_balances"
+const SAVINGS_PREFIX: string = "savings_"
+const ASSET_HASH_KEY: string = "asset_hash"
+const ADMIN_KEY: string = "admin"
 
 struct SavingsBalance {
     amount: u64,
@@ -14,74 +16,93 @@ struct SavingsBalance {
 hook constructor() -> u64 {
     let storage: Storage = Storage::new();
     storage.store(SAVINGS_RATE_KEY, 500);
+    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
+
+    let asset_hash: Hash = Asset::create(XUSD_NAME, XUSD_TICKER, MAX_SUPPLY);
+    storage.store(ASSET_HASH_KEY, asset_hash);
     return 0;
 }
 
-fn require_vault() {
+fn only_admin() {
     let storage: Storage = Storage::new();
-    let vault_hash: Hash = storage.load(VAULT_CONTRACT_KEY).expect("vault not set");
-    let caller_hash: Hash = get_contract_hash();
-    require(caller_hash == vault_hash, "only vault can call");
+    let caller: Address = get_caller().expect("no caller");
+    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
+    require(caller == admin, "not authorized");
 }
 
-entry init(asset_hash: Hash) -> u64 {
+fn only_vault() {
     let storage: Storage = Storage::new();
-    storage.store(VAULT_CONTRACT_KEY, asset_hash);
+    let vault_hash: Hash = storage.load(VAULT_CONTRACT_KEY).expect("vault not set");
+    let caller_contract: optional<Hash> = get_contract_caller();
+    require(caller_contract.is_some(), "not called by contract");
+    require(caller_contract.unwrap() == vault_hash, "only vault can call");
+}
+
+fn get_asset() -> Asset {
+    let storage: Storage = Storage::new();
+    let asset_hash: Hash = storage.load(ASSET_HASH_KEY).expect("asset not created");
+    return Asset::get_by_hash(asset_hash);
+}
+
+entry init(vault_hash: Hash) -> u64 {
+    only_admin();
+    let storage: Storage = Storage::new();
+    storage.store(VAULT_CONTRACT_KEY, vault_hash);
     return 0;
 }
 
 entry mint(to: Address, amount: u64) -> u64 {
-    require_vault();
+    only_vault();
     require(amount > 0, "amount must be > 0");
-    let asset: Asset = Asset::get_by_hash(get_contract_hash());
+    let asset: Asset = get_asset();
     asset.mint(to, amount);
     return 0;
 }
 
-entry burn(from: Address, amount: u64) -> u64 {
-    require_vault();
-    require(amount > 0, "amount must be > 0");
-    let ok: bool = burn(amount, get_contract_hash());
-    require(ok, "burn failed");
-    return 0;
-}
-
 entry set_savings_rate(rate_bps: u64) -> u64 {
+    only_admin();
+    require(rate_bps <= 5000, "rate too high");
     let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let owner: Address = Address::from_string("admin");
-    require(caller == owner, "not authorized");
     storage.store(SAVINGS_RATE_KEY, rate_bps);
     return 0;
 }
 
-fn accrue_savings(user: Address) -> SavingsBalance {
-    let storage: Storage = Storage::new();
-    let savings_key: string = SAVINGS_BALANCES_KEY + user.to_string();
-    let balance: optional<SavingsBalance> = storage.load(savings_key);
-    let sb: SavingsBalance;
-    if balance.is_some() {
-        sb = balance.unwrap();
-    } else {
-        sb = SavingsBalance { amount: 0, last_update_topo: get_current_topoheight(), accumulated: 0 };
+fn get_savings_key(user: Address) -> string {
+    return SAVINGS_PREFIX + user.to_string();
+}
+
+fn load_savings(storage: Storage, user: Address) -> SavingsBalance {
+    let key: string = get_savings_key(user);
+    let existing: optional<SavingsBalance> = storage.load(key);
+    if existing.is_some() {
+        return existing.unwrap();
     }
-    return sb;
+    return SavingsBalance {
+        amount: 0,
+        last_update_topo: get_current_topoheight(),
+        accumulated: 0
+    };
+}
+
+fn save_savings(storage: Storage, user: Address, sb: SavingsBalance) {
+    let key: string = get_savings_key(user);
+    storage.store(key, sb);
 }
 
 entry deposit_savings(amount: u64) -> u64 {
     require(amount > 0, "amount must be > 0");
     let caller: Address = get_caller().expect("no caller");
-    let deposit: optional<u64> = get_deposit_for_asset(get_contract_hash());
+    let asset: Asset = get_asset();
+    let deposit: optional<u64> = get_deposit_for_asset(asset.get_hash());
     require(deposit.is_some() && deposit.unwrap() >= amount, "insufficient deposit");
 
     let storage: Storage = Storage::new();
-    let savings_key: string = SAVINGS_BALANCES_KEY + caller.to_string();
-    let sb: SavingsBalance = accrue_savings(caller);
+    let sb: SavingsBalance = load_savings(storage, caller);
     sb.amount += amount;
     sb.last_update_topo = get_current_topoheight();
-    storage.store(savings_key, sb);
+    save_savings(storage, caller, sb);
 
-    fire_rpc_event(10, [caller, amount, "savings_deposit"]);
+    fire_rpc_event(10, [caller, amount, sb.amount, "savings_deposit"]);
     return sb.amount;
 }
 
@@ -90,34 +111,40 @@ entry withdraw_savings(amount: u64) -> u64 {
     let caller: Address = get_caller().expect("no caller");
 
     let storage: Storage = Storage::new();
-    let savings_key: string = SAVINGS_BALANCES_KEY + caller.to_string();
-    let sb: SavingsBalance = accrue_savings(caller);
+    let sb: SavingsBalance = load_savings(storage, caller);
     require(sb.amount >= amount, "insufficient savings balance");
 
+    let asset: Asset = get_asset();
     sb.amount -= amount;
     sb.last_update_topo = get_current_topoheight();
-    storage.store(savings_key, sb);
+    save_savings(storage, caller, sb);
 
-    let total_earned: u64 = sb.accumulated * amount / (sb.amount + amount + 1);
-
-    let transfer_ok: bool = transfer(caller, amount + total_earned, get_contract_hash());
+    let transfer_ok: bool = transfer(caller, amount, asset.get_hash());
     require(transfer_ok, "transfer failed");
 
-    fire_rpc_event(11, [caller, amount, "savings_withdraw"]);
+    fire_rpc_event(11, [caller, amount, sb.amount, "savings_withdraw"]);
     return sb.amount;
 }
 
 entry get_savings_info(user: Address) -> SavingsBalance {
     let storage: Storage = Storage::new();
-    let savings_key: string = SAVINGS_BALANCES_KEY + user.to_string();
-    let sb: optional<SavingsBalance> = storage.load(savings_key);
-    if sb.is_some() {
-        return sb.unwrap();
-    }
-    return SavingsBalance { amount: 0, last_update_topo: get_current_topoheight(), accumulated: 0 };
+    return load_savings(storage, user);
 }
 
 entry get_savings_rate() -> u64 {
     let storage: Storage = Storage::new();
     return storage.load(SAVINGS_RATE_KEY).unwrap_or(0);
+}
+
+entry get_asset_hash() -> Hash {
+    let storage: Storage = Storage::new();
+    return storage.load(ASSET_HASH_KEY).expect("asset not created");
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    require(new_admin != Address::from_string(""), "invalid address");
+    let storage: Storage = Storage::new();
+    storage.store(ADMIN_KEY, new_admin);
+    return 0;
 }
