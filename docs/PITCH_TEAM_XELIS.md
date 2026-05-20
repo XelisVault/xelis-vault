@@ -4,7 +4,7 @@
 
 ---
 
-## Bonjour XELIS Team 👋
+## Hello XELIS Team 👋
 
 We are building **XELIS Vault**, the world's first private overcollateralized lending protocol — native on XELIS.
 
