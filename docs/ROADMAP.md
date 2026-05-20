@@ -4,76 +4,76 @@
 
 ---
 
-## Phase 0: Foundation (Week 1)
+## Phase 0: Foundation 
 
-| Task | Status | Who |
-|------|--------|-----|
-| GitHub repo setup | 🔲 | You |
-| Devnet environment | 🔲 | You |
-| Whitepaper v1 | ✅ | AI |
-| Architecture docs | ✅ | AI |
-| Smart contract skeletons | ✅ | AI |
+| Task | Status |
+|------|--------|
+| GitHub repo setup | 🔲 | 
+| Devnet environment | 🔲 | 
+| Whitepaper v1 | ✅ | 
+| Architecture docs | ✅ |
+| Smart contract skeletons | ✅ |
 
-## Phase 1: Core Vault (Weeks 2-4)
+## Phase 1: Core Vault 
 
-| Task | Status | Who |
-|------|--------|-----|
-| VaultEngine.slx — deposit/borrow/repay/withdraw | ✅ | AI |
-| xUSD Confidential Asset | ✅ | AI |
-| InterestRateModel.slx | ✅ | AI |
-| PriceOracle.slx | ✅ | AI |
-| Deploy & test on devnet | 🔲 | You |
-| Debug & iterate | 🔲 | Both |
+| Task | Status | 
+|------|--------|
+| VaultEngine.slx — deposit/borrow/repay/withdraw | ✅ |
+| xUSD Confidential Asset | ✅ |
+| InterestRateModel.slx | ✅ |
+| PriceOracle.slx | ✅ |
+| Deploy & test on devnet | 🔲 | 
+| Debug & iterate | 🔲 |
 
 **Milestone**: Single-asset lending working on devnet
 
-## Phase 2: Yield & Automation (Weeks 5-7)
+## Phase 2: Yield & Automation 
 
-| Task | Status | Who |
-|------|--------|-----|
-| xUSD Savings Rate | 🔲 | AI |
-| Auto-Remining Loans | 🔲 | AI |
-| LiquidationBot (keeper) | ✅ | AI (skeleton) |
-| SDK TypeScript | ✅ | AI (skeleton) |
-| Dashboard React | ✅ | AI (skeleton) |
-| Testnet deployment | 🔲 | You |
+| Task | Status |
+|------|--------|
+| xUSD Savings Rate | 🔲 | 
+| Auto-Remining Loans | 🔲 | 
+| LiquidationBot (keeper) | ✅ | 
+| SDK TypeScript | ✅ |
+| Dashboard React | ✅ | 
+| Testnet deployment | 🔲 | 
 
 **Milestone**: Full lending + savings + bot working on testnet
 
-## Phase 3: Launch (Weeks 8-10)
+## Phase 3: Launch 
 
-| Task | Status | Who |
-|------|--------|-----|
-| Security audit (internal) | 🔲 | Both |
-| Bug bounties | 🔲 | Community |
-| Mainnet deployment | 🔲 | You |
-| Dashboard live | 🔲 | AI |
-| Community announcement | 🔲 | You |
-| Forge DEX xUSD/XEL pool | 🔲 | Community |
+| Task | Status |
+|------|--------|
+| Security audit (internal) | 🔲 |
+| Bug bounties | 🔲 | 
+| Mainnet deployment | 🔲 |
+| Dashboard live | 🔲 | 
+| Community announcement | 🔲 |
+| Forge DEX xUSD/XEL pool | 🔲 | 
 
 **Milestone**: Live on mainnet with real TVL
 
-## Phase 4: Expansion (Weeks 11-16)
+## Phase 4: Expansion 
 
-| Task | Status | Who |
-|------|--------|-----|
-| InsurancePool.slx | ✅ | AI |
-| FlashLoan.slx | ✅ | AI |
-| Multi-collateral support | 🔲 | AI |
-| Governance VLT token | 🔲 | AI |
-| DeFi composability (Forge DEX) | 🔲 | Both |
+| Task | Status | 
+|------|--------|
+| InsurancePool.slx | ✅ |
+| FlashLoan.slx | ✅ | 
+| Multi-collateral support | 🔲 |
+| Governance VLT token | 🔲 | 
+| DeFi composability (Forge DEX) | 🔲 |
 
 **Milestone**: Multi-asset lending with insurance + flash loans
 
-## Phase 5: Dominance (Q3-Q4 2026)
+## Phase 5: Dominance 
 
-| Task | Status | Who |
-|------|--------|-----|
-| Cross-chain xUSD (Trocador) | 🔲 | AI |
-| Position NFTs | 🔲 | AI |
-| Credit scores | 🔲 | AI |
-| Full DAO governance | 🔲 | AI |
-| Institutional API | 🔲 | AI |
+| Task | Status | 
+|------|--------|
+| Cross-chain xUSD (Trocador) | 🔲 |
+| Position NFTs | 🔲 | 
+| Credit scores | 🔲 |
+| Full DAO governance | 🔲 | 
+| Institutional API | 🔲 |
 
 **Milestone**: Dominant privacy lending protocol
 
