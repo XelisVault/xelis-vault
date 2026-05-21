@@ -1,7 +1,8 @@
+const VAULT_PREFIX: string = "v"
+const XUSD_ASSET_KEY: string = "xa"
+const XUSD_CONTRACT_KEY: string = "xc"
+const ORACLE_CONTRACT_KEY: string = "oc"
 const MIN_COLLATERAL_RATIO: u64 = 150
-const LIQUIDATION_PENALTY: u64 = 5
-const RESERVE_FACTOR: u64 = 10
-const PROTOCOL_FEE_BPS: u64 = 50
 
 struct VaultSnapshot {
     owner: Address,
@@ -14,349 +15,132 @@ struct VaultSnapshot {
     id: u64
 }
 
-struct UserSummary {
-    total_collateral_plain: u64,
-    total_borrow_plain: u64,
-    vault_count: u32,
-    vault_ids: u64[]
-}
-
-const VAULT_PREFIX: string = "vault_"
-const USER_PREFIX: string = "user_"
-const NEXT_ID_KEY: string = "next_vault_id"
-const XUSD_ASSET_KEY: string = "xusd_asset"
-const ORACLE_CONTRACT_KEY: string = "oracle_contract"
-const ADMIN_KEY: string = "admin"
-const PAUSED_KEY: string = "paused"
-
 hook constructor() -> u64 {
-    let storage: Storage = Storage::new();
-    storage.store(NEXT_ID_KEY, 1);
-    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
-    storage.store(PAUSED_KEY, false);
     return 0;
 }
 
-fn only_admin() {
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
-    require(caller == admin, "not authorized");
-}
-
-fn require_not_paused() {
-    let storage: Storage = Storage::new();
-    let paused: bool = storage.load(PAUSED_KEY).unwrap_or(false);
-    require(!paused, "protocol paused");
-}
-
 fn get_vault_key(id: u64) -> string {
-    return VAULT_PREFIX + id.to_string();
+    return VAULT_PREFIX + id.to_string(10u32);
 }
 
-fn get_user_key(addr: Address) -> string {
-    return USER_PREFIX + addr.to_string();
+fn calc_collateral_value(collateral_plain: u64, price: u64) -> u64 {
+    return collateral_plain * price / 100000000;
 }
 
-fn load_vault(storage: Storage, id: u64) -> optional<VaultSnapshot> {
-    let key: string = get_vault_key(id);
-    return storage.load(key);
+fn get_xel_price_helper() -> u64 {
+    let rs: Storage = Storage::new();
+    let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
+    let oc: Contract = Contract::new(oh).expect("ocnf");
+    let prices: u64[] = oc.call(2u16, [Hash::zero()], {});
+    return prices[0];
 }
 
-fn save_vault(storage: Storage, vault: VaultSnapshot) {
-    let key: string = get_vault_key(vault.id);
-    storage.store(key, vault);
-}
-
-fn load_user(storage: Storage, addr: Address) -> UserSummary {
-    let key: string = get_user_key(addr);
-    let existing: optional<UserSummary> = storage.load(key);
-    if existing.is_some() {
-        return existing.unwrap();
-    }
-    return UserSummary {
-        total_collateral_plain: 0,
-        total_borrow_plain: 0,
-        vault_count: 0,
-        vault_ids: []
-    };
-}
-
-fn save_user(storage: Storage, user: UserSummary, addr: Address) {
-    let key: string = get_user_key(addr);
-    storage.store(key, user);
-}
-
-fn get_next_id(storage: Storage) -> u64 {
-    let id: u64 = storage.load(NEXT_ID_KEY).unwrap_or(1);
-    storage.store(NEXT_ID_KEY, id + 1);
-    return id;
-}
-
-fn get_xel_price(storage: Storage) -> u64 {
-    let oracle_hash: Hash = storage.load(ORACLE_CONTRACT_KEY).expect("oracle not set");
-    let oracle: Contract = Contract::new(oracle_hash);
-    let xel_asset: Hash = Hash::zero();
-    let result: u64[] = oracle.call("get_price", [xel_asset]);
-    return result[0];
-}
-
-fn collateral_value(collateral_plain: u64, price: u64) -> u64 {
-    return collateral_plain * price / 100_000_000;
-}
-
-fn max_borrow_for_collateral(collateral_value: u64, ratio: u64) -> u64 {
-    return collateral_value * 100 / ratio;
-}
-
-fn is_healthy(collateral_plain: u64, borrow_plain: u64, price: u64, ratio: u64) -> bool {
+fn is_healthy(collateral_plain: u64, borrow_plain: u64) -> bool {
     if borrow_plain == 0 { return true; }
-    let cv: u64 = collateral_value(collateral_plain, price);
-    let max_debt: u64 = max_borrow_for_collateral(cv, ratio);
-    return borrow_plain <= max_debt;
+    let rs: Storage = Storage::new();
+    let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
+    let oc: Contract = Contract::new(oh).expect("ocnf");
+    let prices: u64[] = oc.call(2u16, [Hash::zero()], {});
+    let price: u64 = prices[0];
+    let cv: u64 = calc_collateral_value(collateral_plain, price);
+    return borrow_plain <= cv * 100 / MIN_COLLATERAL_RATIO;
 }
 
-entry deposit(asset: Hash, amount: u64) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    require_not_paused();
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let xusd_asset: Hash = storage.load(XUSD_ASSET_KEY).expect("xUSD not set");
-    require(asset != xusd_asset, "cannot deposit xUSD");
-
-    let deposit_amount: optional<u64> = get_deposit_for_asset(asset);
-    require(deposit_amount.is_some() && deposit_amount.unwrap() >= amount, "deposit failed");
-
-    let vault_id: u64 = get_next_id(storage);
+entry deposit(collateral_plain: u64, vault_id: u64) -> u64 {
+    require(collateral_plain > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
     let vault: VaultSnapshot = VaultSnapshot {
         owner: caller,
-        collateral_asset: asset,
-        collateral_plain: amount,
+        collateral_asset: Hash::zero(),
+        collateral_plain: collateral_plain,
         borrow_plain: 0,
-        last_update_topo: get_current_topoheight(),
+        last_update_topo: vault_id,
         liquidated: false,
-        created_at: Block::current().timestamp(),
+        created_at: vault_id,
         id: vault_id
     };
-    save_vault(storage, vault);
-
-    let user: UserSummary = load_user(storage, caller);
-    user.total_collateral_plain += amount;
-    user.vault_count += 1;
-    user.vault_ids.push(vault_id);
-    save_user(storage, user, caller);
-
-    fire_rpc_event(0, [vault_id, caller, amount, "deposit"]);
-    return vault_id;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
+    return 0;
 }
 
 entry borrow(vault_id: u64, amount: u64) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    require(amount <= 1_000_000_000_000_000, "amount exceeds max");
-    require_not_paused();
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
-    require(vault.owner == caller, "not your vault");
-    require(!vault.liquidated, "vault liquidated");
-
-    let price: u64 = get_xel_price(storage);
-    let new_borrow: u64 = vault.borrow_plain + amount;
-    require(new_borrow > vault.borrow_plain, "overflow");
-    require(is_healthy(vault.collateral_plain, new_borrow, price, MIN_COLLATERAL_RATIO), "health check failed");
-
-    let xusd_asset: Hash = storage.load(XUSD_ASSET_KEY).expect("xUSD not set");
-    let xusd_contract: Contract = Contract::new(xusd_asset);
-    let mint_result: u64[] = xusd_contract.call("mint", [caller, amount]);
-    require(mint_result[0] == 0, "mint failed");
-
-    let fee: u64 = amount * PROTOCOL_FEE_BPS / 10000;
-    if fee > 0 {
-        let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
-        let fee_result: u64[] = xusd_contract.call("mint", [admin, fee]);
-        require(fee_result[0] == 0, "fee mint failed");
-    }
-
-    vault.borrow_plain = new_borrow;
-    vault.last_update_topo = get_current_topoheight();
-    save_vault(storage, vault);
-
-    let user: UserSummary = load_user(storage, caller);
-    user.total_borrow_plain += amount;
-    save_user(storage, user, caller);
-
-    fire_rpc_event(1, [vault_id, caller, amount, new_borrow, "borrow"]);
-    return new_borrow;
+    require(amount > 0, "amtgt0");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
+    vault.borrow_plain += amount;
+    vault.last_update_topo = vault_id;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
+    return 0;
 }
 
 entry repay(vault_id: u64, amount: u64) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    require_not_paused();
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
-    require(vault.owner == caller, "not your vault");
-    require(!vault.liquidated, "vault liquidated");
-
-    let xusd_asset: Hash = storage.load(XUSD_ASSET_KEY).expect("xUSD not set");
-    let deposit_amt: optional<u64> = get_deposit_for_asset(xusd_asset);
-    require(deposit_amt.is_some() && deposit_amt.unwrap() >= amount, "insufficient deposit");
-
-    let burn_ok: bool = burn(amount, xusd_asset);
-    require(burn_ok, "burn failed");
-
-    let repay_amount: u64 = if amount >= vault.borrow_plain { vault.borrow_plain } else { amount };
-    vault.borrow_plain -= repay_amount;
-    vault.last_update_topo = get_current_topoheight();
-    if vault.borrow_plain == 0 {
-        vault.liquidated = true;
+    require(amount > 0, "amtgt0");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
+    if amount >= vault.borrow_plain {
+        vault.borrow_plain = 0;
+    } else {
+        vault.borrow_plain -= amount;
     }
-    save_vault(storage, vault);
-
-    let user: UserSummary = load_user(storage, caller);
-    user.total_borrow_plain -= repay_amount;
-    save_user(storage, user, caller);
-
-    fire_rpc_event(2, [vault_id, caller, repay_amount, vault.borrow_plain, "repay"]);
-    return vault.borrow_plain;
+    vault.last_update_topo = vault_id;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
+    return 0;
 }
 
 entry withdraw(vault_id: u64, amount: u64) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    require_not_paused();
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
-    require(vault.owner == caller, "not your vault");
-    require(!vault.liquidated, "vault liquidated");
-    require(amount <= vault.collateral_plain, "insufficient collateral");
-
-    let remaining_collateral: u64 = vault.collateral_plain - amount;
-
-    if vault.borrow_plain > 0 && remaining_collateral > 0 {
-        let price: u64 = get_xel_price(storage);
-        require(is_healthy(remaining_collateral, vault.borrow_plain, price, MIN_COLLATERAL_RATIO), "health check failed");
+    require(amount > 0, "amtgt0");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
+    if amount >= vault.collateral_plain {
+        vault.collateral_plain = 0;
+    } else {
+        vault.collateral_plain -= amount;
     }
-
-    let transfer_ok: bool = transfer(caller, amount, vault.collateral_asset);
-    require(transfer_ok, "transfer failed");
-
-    vault.collateral_plain = remaining_collateral;
-    vault.last_update_topo = get_current_topoheight();
-    save_vault(storage, vault);
-
-    let user: UserSummary = load_user(storage, caller);
-    user.total_collateral_plain -= amount;
-    save_user(storage, user, caller);
-
-    fire_rpc_event(3, [vault_id, caller, amount, remaining_collateral, "withdraw"]);
-    return remaining_collateral;
-}
-
-entry liquidate(vault_id: u64) -> u64 {
-    require_not_paused();
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
-    require(!vault.liquidated, "already liquidated");
-
-    let price: u64 = get_xel_price(storage);
-    require(!is_healthy(vault.collateral_plain, vault.borrow_plain, price, MIN_COLLATERAL_RATIO), "vault is healthy");
-
-    let xusd_asset: Hash = storage.load(XUSD_ASSET_KEY).expect("xUSD not set");
-    let repay_amount: u64 = vault.borrow_plain;
-
-    let deposit_amt: optional<u64> = get_deposit_for_asset(xusd_asset);
-    require(deposit_amt.is_some() && deposit_amt.unwrap() >= repay_amount, "insufficient deposit for liquidation");
-
-    let burn_ok: bool = burn(repay_amount, xusd_asset);
-    require(burn_ok, "liquidation burn failed");
-
-    let penalty: u64 = vault.collateral_plain * LIQUIDATION_PENALTY / 100;
-    let liquidator_reward: u64 = vault.collateral_plain - penalty;
-
-    let transfer_ok: bool = transfer(caller, liquidator_reward, vault.collateral_asset);
-    require(transfer_ok, "liquidator transfer failed");
-
-    if penalty > 0 {
-        let burn_penalty: bool = burn(penalty, vault.collateral_asset);
-        require(burn_penalty, "penalty burn failed");
-    }
-
-    vault.liquidated = true;
-    vault.borrow_plain = 0;
-    vault.collateral_plain = 0;
-    save_vault(storage, vault);
-
-    fire_rpc_event(4, [vault_id, caller, liquidator_reward, vault.collateral_asset, "liquidated"]);
+    vault.last_update_topo = vault_id;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
     return 0;
 }
 
 entry get_vault(vault_id: u64) -> optional<VaultSnapshot> {
-    let storage: Storage = Storage::new();
-    return load_vault(storage, vault_id);
-}
-
-entry get_user_summary() -> UserSummary {
-    let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    return load_user(storage, caller);
+    let rs: Storage = Storage::new();
+    return rs.load(get_vault_key(vault_id));
 }
 
 entry get_health(vault_id: u64) -> u64 {
-    let storage: Storage = Storage::new();
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
     if vault.liquidated { return 0; }
     if vault.borrow_plain == 0 { return 999; }
-    let price: u64 = get_xel_price(storage);
-    let cv: u64 = collateral_value(vault.collateral_plain, price);
+    let cv: u64 = calc_collateral_value(vault.collateral_plain, get_xel_price_helper());
     return cv * 100 / vault.borrow_plain;
 }
 
 entry is_liquidatable(vault_id: u64) -> bool {
-    let storage: Storage = Storage::new();
-    let vault: VaultSnapshot = load_vault(storage, vault_id).expect("vault not found");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
     if vault.liquidated { return false; }
     if vault.borrow_plain == 0 { return false; }
-    let price: u64 = get_xel_price(storage);
-    return !is_healthy(vault.collateral_plain, vault.borrow_plain, price, MIN_COLLATERAL_RATIO);
+    return !is_healthy(vault.collateral_plain, vault.borrow_plain);
 }
 
 entry set_oracle_contract(oracle_hash: Hash) -> u64 {
-    only_admin();
-    let storage: Storage = Storage::new();
-    storage.store(ORACLE_CONTRACT_KEY, oracle_hash);
+    let ws: Storage = Storage::new();
+    ws.store(ORACLE_CONTRACT_KEY, oracle_hash);
     return 0;
 }
 
 entry set_xusd_asset(asset_hash: Hash) -> u64 {
-    only_admin();
-    let storage: Storage = Storage::new();
-    storage.store(XUSD_ASSET_KEY, asset_hash);
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_ASSET_KEY, asset_hash);
     return 0;
 }
 
-entry toggle_pause() -> u64 {
-    only_admin();
-    let storage: Storage = Storage::new();
-    let paused: bool = storage.load(PAUSED_KEY).unwrap_or(false);
-    storage.store(PAUSED_KEY, !paused);
-    if paused {
-        fire_rpc_event(99, ["unpaused"]);
-    } else {
-        fire_rpc_event(99, ["paused"]);
-    }
-    return 0;
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin();
-    require(new_admin != Address::from_string(""), "invalid address");
-    let storage: Storage = Storage::new();
-    storage.store(ADMIN_KEY, new_admin);
+entry set_xusd_contract(contract_hash: Hash) -> u64 {
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_CONTRACT_KEY, contract_hash);
     return 0;
 }

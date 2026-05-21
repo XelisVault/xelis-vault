@@ -1,5 +1,5 @@
 const FLASH_LOAN_FEE_BPS: u64 = 9
-const MAX_FLASH_AMOUNT: u64 = 1_000_000_000_000_000
+const MAX_FLASH_AMOUNT: u64 = 1000000000000000
 
 struct FlashLoanRequest {
     borrower: Address,
@@ -12,44 +12,44 @@ struct FlashLoanRequest {
     topoheight: u64
 }
 
-const VAULT_CONTRACT_KEY: string = "vault_contract"
-const LOAN_PREFIX: string = "flash_loan_"
-const LOAN_COUNTER_KEY: string = "loan_counter"
-const ADMIN_KEY: string = "admin"
+const VAULT_CONTRACT_KEY: string = "vc"
+const LOAN_PREFIX: string = "l"
+const LOAN_COUNTER_KEY: string = "lc"
+const ADMIN_KEY: string = "a"
 
 hook constructor() -> u64 {
     let storage: Storage = Storage::new();
     storage.store(LOAN_COUNTER_KEY, 0);
-    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
+    storage.store(ADMIN_KEY, get_caller().expect("nocalle"));
     return 0;
 }
 
 fn only_admin() {
     let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
-    require(caller == admin, "not authorized");
+    let caller: Address = get_caller().expect("nocalle");
+    let admin: Address = storage.load(ADMIN_KEY).expect("anotset");
+    require(caller == admin, "notauth");
 }
 
 fn get_loan_key(id: u64) -> string {
-    return LOAN_PREFIX + id.to_string();
+    return LOAN_PREFIX + id.to_string(10u32);
 }
 
 entry flash_loan(asset: Hash, amount: u64, target: Hash, chunk_id: u16, data: u8[]) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    require(amount <= MAX_FLASH_AMOUNT, "amount exceeds max");
+    require(amount > 0, "amtgt0");
+    require(amount <= MAX_FLASH_AMOUNT, "amtmax");
 
-    let caller: Address = get_caller().expect("no caller");
+    let caller: Address = get_caller().expect("nocalle");
     let storage: Storage = Storage::new();
     let counter: u64 = storage.load(LOAN_COUNTER_KEY).unwrap_or(0);
     let loan_id: u64 = counter + 1;
     storage.store(LOAN_COUNTER_KEY, loan_id);
 
     let balance: optional<u64> = get_balance_for_asset(asset);
-    require(balance.is_some() && balance.unwrap() >= amount, "insufficient contract balance");
+    require(balance.is_some() && balance.unwrap() >= amount, "nobalance");
 
     let ok: bool = transfer(caller, amount, asset);
-    require(ok, "initial transfer failed");
+    require(ok, "txfail");
 
     let request: FlashLoanRequest = FlashLoanRequest {
         borrower: caller,
@@ -65,34 +65,33 @@ entry flash_loan(asset: Hash, amount: u64, target: Hash, chunk_id: u16, data: u8
     let loan_key: string = get_loan_key(loan_id);
     storage.store(loan_key, request);
 
-    let target_contract: Contract = Contract::new(target);
+    let target_contract: Contract = Contract::new(target).expect("tnotfound");
     let callback_args: any[] = [caller, amount, asset, loan_id];
-    target_contract.call_by_chunk(chunk_id, callback_args);
+    target_contract.call(chunk_id, callback_args, {});
 
-    let updated_req: FlashLoanRequest = storage.load(loan_key).expect("loan not found");
-    require(updated_req.repaid, "flash loan not repaid");
+    let updated_req: FlashLoanRequest = storage.load(loan_key).expect("lnotfound");
+    require(updated_req.repaid, "notrepaid");
 
     let fee: u64 = amount * FLASH_LOAN_FEE_BPS / 10000;
-
-    fire_rpc_event(30, [caller, amount, fee, loan_id, "flash_loan"]);
+    fire_rpc_event(30, [loan_id, fee]);
     return loan_id;
 }
 
 entry repay_flash_loan(loan_id: u64) -> u64 {
     let storage: Storage = Storage::new();
     let loan_key: string = get_loan_key(loan_id);
-    let req: FlashLoanRequest = storage.load(loan_key).expect("loan not found");
-    require(!req.repaid, "already repaid");
+    let req: FlashLoanRequest = storage.load(loan_key).expect("lnotfound");
+    require(!req.repaid, "done");
 
     let fee: u64 = req.amount * FLASH_LOAN_FEE_BPS / 10000;
     let total: u64 = req.amount + fee;
     let deposit: optional<u64> = get_deposit_for_asset(req.asset);
-    require(deposit.is_some() && deposit.unwrap() >= total, "insufficient repay");
+    require(deposit.is_some() && deposit.unwrap() >= total, "nodep");
 
     req.repaid = true;
     storage.store(loan_key, req);
 
-    fire_rpc_event(31, [loan_id, req.borrower, total, "flash_loan_repaid"]);
+    fire_rpc_event(31, [loan_id, total]);
     return total;
 }
 
@@ -121,7 +120,7 @@ entry get_loan(loan_id: u64) -> optional<FlashLoanRequest> {
 
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
-    require(new_admin != Address::from_string(""), "invalid address");
+    require(new_admin != Address::from_string(""), "invaddr");
     let storage: Storage = Storage::new();
     storage.store(ADMIN_KEY, new_admin);
     return 0;

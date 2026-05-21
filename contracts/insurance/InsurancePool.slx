@@ -20,43 +20,46 @@ struct Claim {
     executed: bool
 }
 
-const POSITION_PREFIX: string = "pos_"
-const TOTAL_STAKED_KEY: string = "total_staked"
-const VAULT_KEY: string = "vault_contract"
-const ADMIN_KEY: string = "admin"
+const POS_PREFIX: string = "p"
+const CLAIM_PREFIX: string = "c"
+const TOTAL_STAKED_KEY: string = "ts"
+const POS_COUNTER_KEY: string = "pc"
+const VAULT_KEY: string = "vc"
+const ADMIN_KEY: string = "a"
 
 hook constructor() -> u64 {
     let storage: Storage = Storage::new();
     storage.store(TOTAL_STAKED_KEY, 0);
-    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
+    storage.store(POS_COUNTER_KEY, 0);
+    storage.store(ADMIN_KEY, get_caller().expect("nocalle"));
     return 0;
 }
 
 fn only_admin() {
     let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
-    require(caller == admin, "not authorized");
+    let caller: Address = get_caller().expect("nocalle");
+    let admin: Address = storage.load(ADMIN_KEY).expect("anotset");
+    require(caller == admin, "notauth");
 }
 
-fn get_pos_key(addr: Address) -> string {
-    return POSITION_PREFIX + addr.to_string();
+fn get_pos_key(id: u64) -> string {
+    return POS_PREFIX + id.to_string(10u32);
 }
 
 fn get_claim_key(vault_id: u64) -> string {
-    return "claim_" + vault_id.to_string();
+    return CLAIM_PREFIX + vault_id.to_string(10u32);
 }
 
 entry stake(amount: u64, asset: Hash) -> u64 {
-    require(amount >= MIN_STAKE, "minimum stake not met");
-    let caller: Address = get_caller().expect("no caller");
+    require(amount >= MIN_STAKE, "minstk");
+    let caller: Address = get_caller().expect("nocalle");
     let deposit: optional<u64> = get_deposit_for_asset(asset);
-    require(deposit.is_some() && deposit.unwrap() >= amount, "insufficient deposit");
+    require(deposit.is_some() && deposit.unwrap() >= amount, "nodep");
 
     let storage: Storage = Storage::new();
-    let pos_key: string = get_pos_key(caller);
-    let existing: optional<InsurancePosition> = storage.load(pos_key);
-    require(existing.is_none() || !existing.unwrap().active, "already have active position");
+    let counter: u64 = storage.load(POS_COUNTER_KEY).unwrap_or(0);
+    let pos_id: u64 = counter + 1;
+    storage.store(POS_COUNTER_KEY, pos_id);
 
     let pos: InsurancePosition = InsurancePosition {
         staker: caller,
@@ -65,47 +68,48 @@ entry stake(amount: u64, asset: Hash) -> u64 {
         start_topo: get_current_topoheight(),
         active: true
     };
-    storage.store(pos_key, pos);
+    storage.store(get_pos_key(pos_id), pos);
 
     let total: u64 = storage.load(TOTAL_STAKED_KEY).unwrap_or(0);
-    storage.store(TOTAL_STAKED_KEY, total + amount);
+    let new_total: u64 = total + amount;
+    storage.store(TOTAL_STAKED_KEY, new_total);
 
-    fire_rpc_event(20, [caller, amount, total + amount, "insurance_stake"]);
-    return amount;
+    fire_rpc_event(20, [pos_id, amount, new_total]);
+    return pos_id;
 }
 
-entry unstake() -> u64 {
-    let caller: Address = get_caller().expect("no caller");
+entry unstake(pos_id: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocalle");
     let storage: Storage = Storage::new();
-    let pos_key: string = get_pos_key(caller);
-    let pos: InsurancePosition = storage.load(pos_key).expect("no position");
-    require(pos.active, "position not active");
+    let pos: InsurancePosition = storage.load(get_pos_key(pos_id)).expect("nopos");
+    require(pos.staker == caller, "notyours");
+    require(pos.active, "inactive");
 
     pos.active = false;
-    storage.store(pos_key, pos);
+    storage.store(get_pos_key(pos_id), pos);
 
     let total: u64 = storage.load(TOTAL_STAKED_KEY).unwrap_or(0);
     let new_total: u64 = total.saturating_sub(pos.staked_amount);
     storage.store(TOTAL_STAKED_KEY, new_total);
 
     let ok: bool = transfer(caller, pos.staked_amount, pos.asset);
-    require(ok, "unstake transfer failed");
+    require(ok, "unstkfail");
 
-    fire_rpc_event(21, [caller, pos.staked_amount, new_total, "insurance_unstake"]);
+    fire_rpc_event(21, [pos_id, pos.staked_amount, new_total]);
     return pos.staked_amount;
 }
 
 entry submit_claim(vault_id: u64, amount: u64, reason: string) -> u64 {
-    require(amount > 0, "amount must be > 0");
-    let caller: Address = get_caller().expect("no caller");
+    require(amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocalle");
 
     let storage: Storage = Storage::new();
     let claim_key: string = get_claim_key(vault_id);
     let existing_claim: optional<Claim> = storage.load(claim_key);
-    require(existing_claim.is_none(), "claim already exists");
+    require(existing_claim.is_none(), "exists");
 
     let total_staked: u64 = storage.load(TOTAL_STAKED_KEY).unwrap_or(0);
-    require(total_staked >= amount, "insufficient pool");
+    require(total_staked >= amount, "nofunds");
 
     let max_cover: u64 = amount * MAX_COVERAGE_PCT / 100;
     let claim: Claim = Claim {
@@ -119,7 +123,7 @@ entry submit_claim(vault_id: u64, amount: u64, reason: string) -> u64 {
     };
     storage.store(claim_key, claim);
 
-    fire_rpc_event(22, [vault_id, caller, max_cover, "claim_submitted"]);
+    fire_rpc_event(22, [vault_id, max_cover]);
     return max_cover;
 }
 
@@ -127,35 +131,36 @@ entry approve_claim(vault_id: u64) -> u64 {
     only_admin();
     let storage: Storage = Storage::new();
     let claim_key: string = get_claim_key(vault_id);
-    let claim: Claim = storage.load(claim_key).expect("claim not found");
-    require(!claim.approved, "already approved");
-    require(!claim.executed, "already executed");
+    let claim: Claim = storage.load(claim_key).expect("notfound");
+    require(!claim.approved, "approved");
+    require(!claim.executed, "executed");
 
     claim.approved = true;
     storage.store(claim_key, claim);
 
-    fire_rpc_event(23, [vault_id, "claim_approved"]);
+    fire_rpc_event(23, [vault_id]);
     return 0;
 }
 
 entry execute_claim(vault_id: u64) -> u64 {
     let storage: Storage = Storage::new();
     let claim_key: string = get_claim_key(vault_id);
-    let claim: Claim = storage.load(claim_key).expect("claim not found");
-    require(claim.approved, "not approved");
-    require(!claim.executed, "already executed");
+    let claim: Claim = storage.load(claim_key).expect("notfound");
+    require(claim.approved, "notapp");
+    require(!claim.executed, "done");
 
     let total_staked: u64 = storage.load(TOTAL_STAKED_KEY).unwrap_or(0);
-    require(total_staked >= claim.amount, "insufficient pool");
+    require(total_staked >= claim.amount, "nofunds");
 
     let ok: bool = transfer(claim.claimant, claim.amount, get_contract_hash());
-    require(ok, "claim payout failed");
+    require(ok, "payoutfail");
 
     claim.executed = true;
     storage.store(claim_key, claim);
-    storage.store(TOTAL_STAKED_KEY, total_staked.saturating_sub(claim.amount));
+    let new_total: u64 = total_staked.saturating_sub(claim.amount);
+    storage.store(TOTAL_STAKED_KEY, new_total);
 
-    fire_rpc_event(24, [vault_id, claim.claimant, claim.amount, "claim_paid"]);
+    fire_rpc_event(24, [vault_id, claim.amount]);
     return claim.amount;
 }
 
@@ -171,10 +176,9 @@ entry get_total_staked() -> u64 {
     return storage.load(TOTAL_STAKED_KEY).unwrap_or(0);
 }
 
-entry get_position(staker: Address) -> optional<InsurancePosition> {
+entry get_position(pos_id: u64) -> optional<InsurancePosition> {
     let storage: Storage = Storage::new();
-    let pos_key: string = get_pos_key(staker);
-    return storage.load(pos_key);
+    return storage.load(get_pos_key(pos_id));
 }
 
 entry get_claim(vault_id: u64) -> optional<Claim> {
@@ -185,7 +189,7 @@ entry get_claim(vault_id: u64) -> optional<Claim> {
 
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
-    require(new_admin != Address::from_string(""), "invalid address");
+    require(new_admin != Address::from_string(""), "invaddr");
     let storage: Storage = Storage::new();
     storage.store(ADMIN_KEY, new_admin);
     return 0;

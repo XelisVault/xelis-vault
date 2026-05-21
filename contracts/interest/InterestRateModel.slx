@@ -26,20 +26,20 @@ hook constructor() -> u64 {
         reserve_factor: DEFAULT_RESERVE_FACTOR
     };
     storage.store(PARAMS_KEY, params);
-    storage.store(ADMIN_KEY, get_caller().expect("no caller"));
+    storage.store(ADMIN_KEY, get_caller().expect("nocalle"));
     return 0;
 }
 
 fn only_admin() {
     let storage: Storage = Storage::new();
-    let caller: Address = get_caller().expect("no caller");
-    let admin: Address = storage.load(ADMIN_KEY).expect("admin not set");
-    require(caller == admin, "not authorized");
+    let caller: Address = get_caller().expect("nocalle");
+    let admin: Address = storage.load(ADMIN_KEY).expect("adminnotset");
+    require(caller == admin, "notauth");
 }
 
 fn get_params() -> InterestParams {
     let storage: Storage = Storage::new();
-    return storage.load(PARAMS_KEY).expect("params not set");
+    return storage.load(PARAMS_KEY).expect("paramsnotset");
 }
 
 fn calc_utilization(total_borrows: u64, total_supply: u64) -> u64 {
@@ -47,7 +47,7 @@ fn calc_utilization(total_borrows: u64, total_supply: u64) -> u64 {
     return total_borrows * ONE_HUNDRED / total_supply;
 }
 
-entry get_borrow_rate(total_borrows: u64, total_supply: u64) -> u64 {
+fn get_borrow_rate(total_borrows: u64, total_supply: u64) -> u64 {
     let util: u64 = calc_utilization(total_borrows, total_supply);
     let params: InterestParams = get_params();
     if util <= params.kink {
@@ -74,8 +74,8 @@ entry get_current_params() -> InterestParams {
 
 entry set_params(params: InterestParams) -> u64 {
     only_admin();
-    require(params.kink <= 100, "kink must be <= 100");
-    require(params.reserve_factor <= 50, "reserve factor must be <= 50");
+    require(params.kink <= 100, "kinkmustbe100");
+    require(params.reserve_factor <= 50, "reservefactormustbe50");
     let storage: Storage = Storage::new();
     storage.store(PARAMS_KEY, params);
     return 0;
@@ -83,7 +83,7 @@ entry set_params(params: InterestParams) -> u64 {
 
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
-    require(new_admin != Address::from_string(""), "invalid address");
+    require(new_admin != Address::from_string(""), "invalidaddress");
     let storage: Storage = Storage::new();
     storage.store(ADMIN_KEY, new_admin);
     return 0;
