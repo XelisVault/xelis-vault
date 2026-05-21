@@ -1,0 +1,141 @@
+const ADMIN_KEY: string = "a"
+const POOL_PREFIX: string = "pl"
+const COUNTER_KEY: string = "n"
+
+struct LendingPool {
+    asset_hash: Hash,
+    total_liquidity: u64,
+    total_borrows: u64,
+    interest_rate_bps: u64,
+    min_collateral_bps: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(COUNTER_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_pool_key(id: u64) -> string {
+    return POOL_PREFIX + id.to_string(10u32);
+}
+
+entry create_pool(asset: Hash, rate_bps: u64, min_col_bps: u64) -> u64 {
+    only_admin();
+    require(rate_bps > 0, "rategt0");
+    require(min_col_bps >= 100, "min100");
+    let rs: Storage = Storage::new();
+    let id: u64 = rs.load(COUNTER_KEY).expect("idns");
+    let pool: LendingPool = LendingPool {
+        asset_hash: asset,
+        total_liquidity: 0,
+        total_borrows: 0,
+        interest_rate_bps: rate_bps,
+        min_collateral_bps: min_col_bps,
+        active: true
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(id), pool);
+    ws.store(COUNTER_KEY, id + 1);
+    return id;
+}
+
+entry supply(pool_id: u64) -> u64 {
+    let rs: Storage = Storage::new();
+    let pool: LendingPool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    let dep: optional<u64> = get_deposit_for_asset(pool.asset_hash);
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
+    let amount: u64 = dep.unwrap();
+    pool.total_liquidity += amount;
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
+    let rs: Storage = Storage::new();
+    let pool: LendingPool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    require(pool.total_borrows < pool.total_liquidity, "noliquid");
+    let col_dep: optional<u64> = get_deposit_for_asset(collateral_asset);
+    require(col_dep.is_some() && col_dep.unwrap() > 0, "nocol");
+    let col_val: u64 = col_dep.unwrap();
+    let max_borrow: u64 = col_val * 10000 / pool.min_collateral_bps;
+    let available: u64 = pool.total_liquidity - pool.total_borrows;
+    let borrow_amount: u64 = max_borrow;
+    if borrow_amount > available { borrow_amount = available; }
+    require(borrow_amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
+    let ok: bool = transfer(caller, borrow_amount, pool.asset_hash);
+    require(ok, "txfail");
+    pool.total_borrows += borrow_amount;
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry repay(pool_id: u64) -> u64 {
+    let rs: Storage = Storage::new();
+    let pool: LendingPool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    let dep: optional<u64> = get_deposit_for_asset(pool.asset_hash);
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
+    let amount: u64 = dep.unwrap();
+    if amount > pool.total_borrows {
+        pool.total_liquidity -= pool.total_borrows;
+        pool.total_borrows = 0;
+    } else {
+        pool.total_liquidity -= amount;
+        pool.total_borrows -= amount;
+    }
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry withdraw_liquidity(pool_id: u64, amount: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let pool: LendingPool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    let available: u64 = pool.total_liquidity - pool.total_borrows;
+    require(amount <= available, "lwavl");
+    pool.total_liquidity -= amount;
+    let ok: bool = transfer(caller, amount, pool.asset_hash);
+    require(ok, "txfail");
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry deactivate_pool(pool_id: u64) -> u64 {
+    only_admin();
+    let rs: Storage = Storage::new();
+    let pool: LendingPool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    pool.active = false;
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry get_pool(pool_id: u64) -> optional<LendingPool> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_pool_key(pool_id));
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

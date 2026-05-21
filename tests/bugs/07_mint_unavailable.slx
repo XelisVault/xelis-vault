@@ -1,0 +1,12 @@
+// Tests if mint() built-in is available
+// Expected: fails to compile with "unknown function" error
+entry test() -> u64 {
+    let ok: bool = mint(1000u64, Hash::zero());
+    return 0;
+}
+
+// Tests if burn() built-in works (it should — this is how native XEL burn works)
+entry test_burn() -> u64 {
+    let ok: bool = burn(100u64, Hash::zero());
+    return 0;
+}

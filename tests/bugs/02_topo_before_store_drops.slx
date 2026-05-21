@@ -1,0 +1,18 @@
+const KEY_A: string = "a"
+
+entry bug() -> u64 {
+    let topo: u64 = get_current_topoheight();  // FIRST operation — breaks subsequent store
+    let s: Storage = Storage::new();
+    s.store(KEY_A, 42u64);        // DROPPED because topoheight was called first
+    let a: u64 = s.load(KEY_A).unwrap_or(0);
+    return a;  // returns 0 instead of 42
+}
+
+entry expected() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(KEY_A, 0u64);         // DUMMY store first
+    let topo: u64 = get_current_topoheight();  // now safe
+    s.store(KEY_A, 42u64);        // persists correctly
+    let a: u64 = s.load(KEY_A).unwrap_or(0);
+    return a;  // returns 42
+}

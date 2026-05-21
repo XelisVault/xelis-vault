@@ -1,0 +1,13 @@
+// Tests cross-contract call return value indexing
+// Deploy this, then call call_test() to see if array indexing works
+
+entry dummy() -> u64 {
+    return 42u64;
+}
+
+entry call_test(called_contract: Hash) -> u64 {
+    let c: Contract = Contract::new(called_contract).expect("cnf");
+    let result: u64[] = c.call(1u16, [], {});
+    let val: u64 = result[0];  // may fail with "invalid array call"
+    return 0;  // (return bug workaround)
+}

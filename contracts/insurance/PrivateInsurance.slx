@@ -1,0 +1,101 @@
+const ADMIN_KEY: string = "a"
+const POOL_PREFIX: string = "pi"
+const COUNTER_KEY: string = "n"
+
+struct InsurancePool {
+    name_string: string,
+    premium_asset: Hash,
+    premium_amount: u64,
+    coverage_asset: Hash,
+    coverage_amount: u64,
+    total_premiums: u64,
+    total_payouts: u64,
+    max_members: u64,
+    member_count: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(COUNTER_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_pool_key(id: u64) -> string {
+    return POOL_PREFIX + id.to_string(10u32);
+}
+
+entry create_pool(name: string, premium_asset: Hash, premium_amount: u64, coverage_asset: Hash, coverage_amount: u64, max_members: u64) -> u64 {
+    only_admin();
+    require(premium_amount > 0, "premgt0");
+    require(coverage_amount > 0, "covgt0");
+    require(max_members > 0, "maxgt0");
+    let rs: Storage = Storage::new();
+    let id: u64 = rs.load(COUNTER_KEY).expect("idns");
+    let pool: InsurancePool = InsurancePool {
+        name_string: name,
+        premium_asset: premium_asset,
+        premium_amount: premium_amount,
+        coverage_asset: coverage_asset,
+        coverage_amount: coverage_amount,
+        total_premiums: 0,
+        total_payouts: 0,
+        max_members: max_members,
+        member_count: 0,
+        active: true
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(id), pool);
+    ws.store(COUNTER_KEY, id + 1);
+    return id;
+}
+
+entry join_pool(pool_id: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let pool: InsurancePool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    require(pool.member_count < pool.max_members, "full");
+    let dep: optional<u64> = get_deposit_for_asset(pool.premium_asset);
+    require(dep.is_some() && dep.unwrap() >= pool.premium_amount, "nodep");
+    pool.total_premiums += pool.premium_amount;
+    pool.member_count += 1;
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry claim_payout(pool_id: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let pool: InsurancePool = rs.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.active, "inactive");
+    require(pool.total_premiums >= pool.coverage_amount, "lowfunds");
+    pool.total_premiums -= pool.coverage_amount;
+    pool.total_payouts += pool.coverage_amount;
+    let ok: bool = transfer(caller, pool.coverage_amount, pool.coverage_asset);
+    require(ok, "txfail");
+    let ws: Storage = Storage::new();
+    ws.store(get_pool_key(pool_id), pool);
+    return pool.coverage_amount;
+}
+
+entry get_pool(pool_id: u64) -> optional<InsurancePool> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_pool_key(pool_id));
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

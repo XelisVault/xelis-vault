@@ -1,0 +1,111 @@
+// XELIS VM Bug Reproducer — All bugs in one contract
+// Deploy and call each entry to reproduce
+
+const K1: string = "k1"
+const K2: string = "k2"
+const K3: string = "k3"
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(K1, 1u64);
+    return 0;
+}
+
+// BUG 1: store drops after load
+// CALL: entry 1 — returns 0 (should be 3)
+entry bug1_store_drops_after_load() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(K2, 2u64);
+    let a: u64 = s.load(K1).unwrap_or(0);
+    s.store(K3, 3u64);          // ← DROPPED
+    let c: u64 = s.load(K3).unwrap_or(0);
+    return 0; // return workaround — check via storage read
+}
+
+// BUG 2: topoheight before store
+// CALL: entry 2 — store(K2, 42) is dropped
+entry bug2_topo_before_store() -> u64 {
+    let topo: u64 = get_current_topoheight();
+    let s: Storage = Storage::new();
+    s.store(K2, 42u64);          // ← DROPPED
+    return 0;
+}
+
+// BUG 3: deposit_for_asset before store
+// CALL: entry 3 with 1 XEL deposit — store(K2, 42) is dropped
+entry bug3_deposit_before_store() -> u64 {
+    let dep: optional<u64> = get_deposit_for_asset(Hash::zero());
+    let s: Storage = Storage::new();
+    s.store(K2, 42u64);          // ← DROPPED
+    return 0;
+}
+
+// BUG 4: to_hex broken
+// CALL: entry 4 — stores under garbage key
+entry bug4_tohex_broken() -> u64 {
+    let h: Hash = Hash::zero();
+    let hex: string = h.to_hex();          // returns garbage
+    let s: Storage = Storage::new();
+    let topo: u64 = get_current_topoheight();
+    s.store(K1 + hex, 42u64);              // key is corrupted
+    return 0;
+}
+
+// BUG 4b: address.to_string broken
+entry bug4b_address_tostring() -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let s: string = caller.to_string();    // returns garbage
+    let s2: Storage = Storage::new();
+    let topo: u64 = get_current_topoheight();
+    s2.store(K1 + s, 42u64);               // key is corrupted
+    return 0;
+}
+
+// BUG 5: entry return always 0
+// CALL: entry 5 with x=42 — returns 0 in tx result
+entry bug5_return_zero(x: u64) -> u64 {
+    return x;  // returns 0
+}
+
+// BUG 5b: stored value return 0
+entry bug5b_return_stored() -> u64 {
+    let s: Storage = Storage::new();
+    let v: u64 = s.load(K1).unwrap_or(0);  // K1 = 1
+    return v;  // returns 0, not 1
+}
+
+// BUG 6: require string validation
+// CALL: entry 6 — fails with unclear error
+entry bug6_require_space() -> u64 {
+    let s: Storage = Storage::new();
+    let v: u64 = s.load(K1).unwrap_or(0);
+    require(v == 1, "v is not 1");  // space → fails
+    return 0;
+}
+
+// BUG 6b: expect with special char
+entry bug6b_expect_special() -> u64 {
+    let s: Storage = Storage::new();
+    let v: u64 = s.load("nonexistent").expect("not found!");  // ! → fails
+    return v;
+}
+
+// BUG 6c: require ALPHANUMERIC WORKS
+entry bug6c_require_works() -> u64 {
+    let s: Storage = Storage::new();
+    let v: u64 = s.load(K1).unwrap_or(0);
+    require(v == 1, "vnot1");  // alphanumeric → OK
+    return 0;
+}
+
+// WORKAROUND DEMO: proper store pattern
+// CALL: entry 7 — stores and reads correctly
+entry workaround_store_pattern() -> u64 {
+    let topo: u64 = get_current_topoheight(); // dummy call first
+    let s: Storage = Storage::new();
+    s.store(K2, 42u64);          // persists (topo was called first!)
+    let v: u64 = s.load(K2).unwrap_or(0);
+    let topo2: u64 = get_current_topoheight(); // dummy between store+load+store
+    s.store(K3, v);              // persists (dummy between)
+    return 0;
+}

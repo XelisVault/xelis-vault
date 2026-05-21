@@ -19,15 +19,15 @@ entry create_asset() -> u64 {
     only_admin();
     let bal: optional<u64> = get_balance_for_asset(Hash::zero());
     require(bal.is_some() && bal.unwrap() >= 100000000, "lowbal");
-    let asset: Asset = Asset::create(0u64, "XELIS USD", "xUSD", 8u8, null).expect("crefail");
+    let asset: Asset = Asset::create(1u64, "XELIS Vault Token", "VLT", 8u8, null).expect("crefail");
     let hash: Hash = asset.get_hash();
     let ws: Storage = Storage::new();
     ws.store(ASSET_HASH_KEY, hash);
-    ws.store(ASSET_ID_KEY, 0u64);
+    ws.store(ASSET_ID_KEY, 1u64);
     return 0;
 }
 
-entry mint_tokens(to: Address, amount: u64) -> u64 {
+entry mint(to: Address, amount: u64) -> u64 {
     only_admin();
     require(amount > 0, "amtgt0");
     let rs: Storage = Storage::new();
@@ -35,15 +35,14 @@ entry mint_tokens(to: Address, amount: u64) -> u64 {
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
     require(ok, "mintfail");
-    let caller: Address = get_caller().expect("nocaller");
-    if to != caller {
+    if to != get_caller().expect("nocaller") {
         let ok2: bool = transfer(to, amount, hash);
         require(ok2, "txfail");
     }
     return 0;
 }
 
-entry burn_tokens(amount: u64) -> u64 {
+entry burn(amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
     let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
     let ok: bool = burn(amount, hash);
@@ -51,7 +50,7 @@ entry burn_tokens(amount: u64) -> u64 {
     return 0;
 }
 
-entry transfer_tokens(to: Address, amount: u64) -> u64 {
+entry transfer_token(to: Address, amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
     let caller: Address = get_caller().expect("nocaller");
     let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
@@ -65,11 +64,11 @@ entry get_asset_hash() -> Hash {
     return rs.load(ASSET_HASH_KEY).expect("anset");
 }
 
-entry get_asset_info() -> (string, string, u64) {
+entry get_supply() -> u64 {
     let rs: Storage = Storage::new();
     let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
-    return (asset.get_name(), asset.get_ticker(), asset.get_supply());
+    return asset.get_supply();
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

@@ -1,0 +1,106 @@
+const ADMIN_KEY: string = "a"
+const STATUS_PREFIX: string = "cs"
+const COUNTER_KEY: string = "n"
+
+enum KYCStatus {
+    None,
+    Pending,
+    Approved,
+    Rejected
+}
+
+struct ComplianceRecord {
+    address_val: Address,
+    kyc_status: u64,
+    accredited: bool,
+    jurisdiction: u64,
+    expiry_topo: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(COUNTER_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_status_key(index: u64) -> string {
+    return STATUS_PREFIX + index.to_string(10u32);
+}
+
+entry register_user() -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let id: u64 = rs.load(COUNTER_KEY).expect("idns");
+    let record: ComplianceRecord = ComplianceRecord {
+        address_val: caller,
+        kyc_status: 1,
+        accredited: false,
+        jurisdiction: 0,
+        expiry_topo: 0
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_status_key(id), record);
+    ws.store(COUNTER_KEY, id + 1);
+    return id;
+}
+
+entry approve_kyc(record_id: u64, accredited: bool, jurisdiction: u64, duration_blocks: u64) -> u64 {
+    only_admin();
+    let rs: Storage = Storage::new();
+    let record: ComplianceRecord = rs.load(get_status_key(record_id)).expect("rnf");
+    let topo: u64 = get_current_topoheight();
+    record.kyc_status = 2;
+    record.accredited = accredited;
+    record.jurisdiction = jurisdiction;
+    record.expiry_topo = topo + duration_blocks;
+    let ws: Storage = Storage::new();
+    ws.store(get_status_key(record_id), record);
+    return 0;
+}
+
+entry reject_kyc(record_id: u64) -> u64 {
+    only_admin();
+    let rs: Storage = Storage::new();
+    let record: ComplianceRecord = rs.load(get_status_key(record_id)).expect("rnf");
+    record.kyc_status = 3;
+    let ws: Storage = Storage::new();
+    ws.store(get_status_key(record_id), record);
+    return 0;
+}
+
+entry check_kyc(record_id: u64) -> bool {
+    let rs: Storage = Storage::new();
+    let record: ComplianceRecord = rs.load(get_status_key(record_id)).expect("rnf");
+    if record.kyc_status != 2 { return false; }
+    if record.expiry_topo > 0 {
+        let topo: u64 = get_current_topoheight();
+        if topo > record.expiry_topo { return false; }
+    }
+    return true;
+}
+
+entry is_accredited(record_id: u64) -> bool {
+    let rs: Storage = Storage::new();
+    let record: ComplianceRecord = rs.load(get_status_key(record_id)).expect("rnf");
+    return record.accredited && check_kyc(record_id);
+}
+
+entry get_record(record_id: u64) -> optional<ComplianceRecord> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_status_key(record_id));
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

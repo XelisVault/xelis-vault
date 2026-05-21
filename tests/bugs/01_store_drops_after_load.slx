@@ -1,0 +1,27 @@
+const KEY_A: string = "a"
+const KEY_B: string = "b"
+const KEY_C: string = "c"
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(KEY_A, 1u64);
+    return 0;
+}
+
+entry bug() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(KEY_B, 2u64);        // store B = 2
+    let a: u64 = s.load(KEY_A).unwrap_or(0);  // load A (exists, returns 1)
+    s.store(KEY_C, 3u64);        // store C = 3 ← THIS IS DROPPED
+    let c: u64 = s.load(KEY_C).unwrap_or(0);  // SHOULD be 3, actual: 0
+    return c;
+}
+
+entry expected() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(KEY_B, 2u64);
+    let topo: u64 = get_current_topoheight();  // DUMMY: prevents drop
+    s.store(KEY_C, 3u64);        // now persists correctly
+    let c: u64 = s.load(KEY_C).unwrap_or(0);
+    return c;
+}

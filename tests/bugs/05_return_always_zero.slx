@@ -1,0 +1,22 @@
+const KEY: string = "k"
+
+entry bug_param(x: u64) -> u64 {
+    return x;  // returns 0 regardless of x
+}
+
+entry bug_stored() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(KEY, 42u64);
+    let topo: u64 = get_current_topoheight();
+    let v: u64 = s.load(KEY).unwrap_or(0);  // reads 42 correctly
+    return v;  // returns 0 despite v = 42
+}
+
+entry bug_computed() -> u64 {
+    let v: u64 = 21u64 + 21u64;
+    return v;  // returns 0 despite v = 42
+}
+
+entry works_constant() -> u64 {
+    return 42u64;  // returns 42 correctly (literal constant only)
+}

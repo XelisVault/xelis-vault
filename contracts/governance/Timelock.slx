@@ -1,0 +1,114 @@
+const ADMIN_KEY: string = "a"
+const PROPOSAL_PREFIX: string = "p"
+const COUNTER_KEY: string = "n"
+const MIN_DELAY_KEY: string = "md"
+const MAX_DELAY_KEY: string = "xd"
+
+struct Proposal {
+    target_contract: Hash,
+    entry_id: u16,
+    params: u8[],
+    value: u64,
+    submitted_at: u64,
+    delay: u64,
+    executed: bool,
+    cancelled: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(COUNTER_KEY, 0u64);
+    s.store(MIN_DELAY_KEY, 720u64);
+    s.store(MAX_DELAY_KEY, 259200u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_proposal_key(id: u64) -> string {
+    return PROPOSAL_PREFIX + id.to_string(10u32);
+}
+
+entry submit_proposal(target: Hash, entry: u16, params: u8[], delay: u64) -> u64 {
+    only_admin();
+    require(delay >= Storage::new().load(MIN_DELAY_KEY).unwrap_or(720), "min");
+    let max_delay: u64 = Storage::new().load(MAX_DELAY_KEY).unwrap_or(259200);
+    require(delay <= max_delay, "max");
+    let rs: Storage = Storage::new();
+    let id: u64 = rs.load(COUNTER_KEY).expect("idns");
+    let topo: u64 = get_current_topoheight();
+    let prop: Proposal = Proposal {
+        target_contract: target,
+        entry_id: entry,
+        params: params,
+        value: 0,
+        submitted_at: topo,
+        delay: delay,
+        executed: false,
+        cancelled: false
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_proposal_key(id), prop);
+    ws.store(COUNTER_KEY, id + 1);
+    return id;
+}
+
+entry execute_proposal(proposal_id: u64) -> u64 {
+    let rs: Storage = Storage::new();
+    let prop: Proposal = rs.load(get_proposal_key(proposal_id)).expect("pnf");
+    require(!prop.executed, "done");
+    require(!prop.cancelled, "canc");
+    let topo: u64 = get_current_topoheight();
+    require(topo >= prop.submitted_at + prop.delay, "early");
+    let target: Contract = Contract::new(prop.target_contract).expect("tcnf");
+    let empty_deposits: {} = {};
+    target.call(prop.entry_id, [], empty_deposits);
+    prop.executed = true;
+    let ws: Storage = Storage::new();
+    ws.store(get_proposal_key(proposal_id), prop);
+    return 0;
+}
+
+entry cancel_proposal(proposal_id: u64) -> u64 {
+    only_admin();
+    let rs: Storage = Storage::new();
+    let prop: Proposal = rs.load(get_proposal_key(proposal_id)).expect("pnf");
+    require(!prop.executed, "done");
+    prop.cancelled = true;
+    let ws: Storage = Storage::new();
+    ws.store(get_proposal_key(proposal_id), prop);
+    return 0;
+}
+
+entry set_min_delay(delay: u64) -> u64 {
+    only_admin();
+    require(delay >= 1, "min1");
+    let ws: Storage = Storage::new();
+    ws.store(MIN_DELAY_KEY, delay);
+    return 0;
+}
+
+entry set_max_delay(delay: u64) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(MAX_DELAY_KEY, delay);
+    return 0;
+}
+
+entry get_proposal(proposal_id: u64) -> optional<Proposal> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_proposal_key(proposal_id));
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

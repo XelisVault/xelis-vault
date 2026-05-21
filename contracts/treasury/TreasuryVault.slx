@@ -1,0 +1,107 @@
+const ADMIN_KEY: string = "a"
+const BALANCE_KEY: string = "tb"
+const LOCKED_KEY: string = "tl"
+const ALLOC_KEY: string = "ta"
+const ALLOC_COUNT_KEY: string = "tac"
+
+struct Allocation {
+    recipient: Address,
+    share_bps: u64,
+    asset_hash: Hash,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(BALANCE_KEY, 0u64);
+    s.store(ALLOC_COUNT_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_alloc_key(index: u64) -> string {
+    return ALLOC_KEY + index.to_string(10u32);
+}
+
+entry deposit() -> u64 {
+    let dep: optional<u64> = get_deposit_for_asset(Hash::zero());
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
+    let amount: u64 = dep.unwrap();
+    let rs: Storage = Storage::new();
+    let bal: u64 = rs.load(BALANCE_KEY).unwrap_or(0);
+    let ws: Storage = Storage::new();
+    ws.store(BALANCE_KEY, bal + amount);
+    return 0;
+}
+
+entry set_allocation(recipient: Address, share_bps: u64, asset: Hash) -> u64 {
+    only_admin();
+    require(share_bps <= 10000, "max100pct");
+    let rs: Storage = Storage::new();
+    let count: u64 = rs.load(ALLOC_COUNT_KEY).unwrap_or(0);
+    let alloc: Allocation = Allocation {
+        recipient: recipient,
+        share_bps: share_bps,
+        asset_hash: asset,
+        active: true
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_alloc_key(count), alloc);
+    ws.store(ALLOC_COUNT_KEY, count + 1);
+    return count;
+}
+
+entry remove_allocation(index: u64) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.delete(get_alloc_key(index));
+    return 0;
+}
+
+entry distribute() -> u64 {
+    only_admin();
+    let rs: Storage = Storage::new();
+    let bal: u64 = rs.load(BALANCE_KEY).unwrap_or(0);
+    require(bal > 0, "nofunds");
+    let count: u64 = rs.load(ALLOC_COUNT_KEY).unwrap_or(0);
+    require(count > 0, "noalloc");
+    let mut i: u64 = 0;
+    let mut total_distributed: u64 = 0;
+    while i < count {
+        let alloc_opt: optional<Allocation> = rs.load(get_alloc_key(i));
+        if alloc_opt.is_none() { i += 1; continue; }
+        let alloc: Allocation = alloc_opt.unwrap();
+        if !alloc.active { i += 1; continue; }
+        let amount: u64 = bal * alloc.share_bps / 10000;
+        if amount > 0 {
+            let ok: bool = transfer(alloc.recipient, amount, alloc.asset_hash);
+            require(ok, "txfail");
+            total_distributed += amount;
+        }
+        i += 1;
+    }
+    if total_distributed > 0 {
+        let ws: Storage = Storage::new();
+        ws.store(BALANCE_KEY, bal - total_distributed);
+    }
+    return total_distributed;
+}
+
+entry get_balance() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(BALANCE_KEY).unwrap_or(0);
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

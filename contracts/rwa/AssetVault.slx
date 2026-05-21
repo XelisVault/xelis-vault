@@ -1,0 +1,102 @@
+const ADMIN_KEY: string = "a"
+const VAULT_PREFIX: string = "av"
+const ASSET_PREFIX: string = "aa"
+const COUNTER_KEY: string = "n"
+
+struct AssetVault {
+    owner: Address,
+    name_string: string,
+    description_string: string,
+    asset_hash: Hash,
+    total_shares: u64,
+    valuation: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(COUNTER_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_vault_key(id: u64) -> string {
+    return VAULT_PREFIX + id.to_string(10u32);
+}
+
+entry create_vault(name: string, desc: string, valuation: u64, decimals: u8) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    require(valuation > 0, "valgt0");
+    let bal: optional<u64> = get_balance_for_asset(Hash::zero());
+    require(bal.is_some() && bal.unwrap() >= 100000000, "lowbal");
+    let rs: Storage = Storage::new();
+    let id: u64 = rs.load(COUNTER_KEY).expect("idns");
+    let share_asset: Asset = Asset::create(id + 100, "RWA " + id.to_string(10u32), "RWA" + id.to_string(10u32), decimals, null).expect("crefail");
+    let share_hash: Hash = share_asset.get_hash();
+    let vault: AssetVault = AssetVault {
+        owner: caller,
+        name_string: name,
+        description_string: desc,
+        asset_hash: share_hash,
+        total_shares: 0,
+        valuation: valuation,
+        active: true
+    };
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(id), vault);
+    ws.store(COUNTER_KEY, id + 1);
+    return id;
+}
+
+entry mint_shares(vault_id: u64, amount: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let vault: AssetVault = rs.load(get_vault_key(vault_id)).expect("vnf");
+    require(vault.owner == caller, "ny");
+    require(vault.active, "inactive");
+    require(amount > 0, "amtgt0");
+    let asset: Asset = Asset::get_by_hash(vault.asset_hash).expect("anf");
+    let ok: bool = asset.mint(amount);
+    require(ok, "mintfail");
+    vault.total_shares += amount;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
+    return 0;
+}
+
+entry buy_shares(vault_id: u64, xel_amount: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let vault: AssetVault = rs.load(get_vault_key(vault_id)).expect("vnf");
+    require(vault.active, "inactive");
+    require(xel_amount > 0, "amtgt0");
+    let dep: optional<u64> = get_deposit_for_asset(Hash::zero());
+    require(dep.is_some() && dep.unwrap() >= xel_amount, "nodep");
+    let share_price: u64 = vault.valuation / vault.total_shares;
+    let shares: u64 = xel_amount * vault.total_shares / vault.valuation;
+    require(shares > 0, "lowamt");
+    let ok: bool = transfer(vault.owner, xel_amount, Hash::zero());
+    require(ok, "txfail");
+    let ok2: bool = transfer(caller, shares, vault.asset_hash);
+    require(ok2, "txfail");
+    return shares;
+}
+
+entry get_vault(vault_id: u64) -> optional<AssetVault> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_vault_key(vault_id));
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}
