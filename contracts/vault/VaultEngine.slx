@@ -2,7 +2,10 @@ const VAULT_PREFIX: string = "v"
 const XUSD_ASSET_KEY: string = "xa"
 const XUSD_CONTRACT_KEY: string = "xc"
 const ORACLE_CONTRACT_KEY: string = "oc"
+const ADMIN_KEY: string = "a"
 const MIN_COLLATERAL_RATIO: u64 = 150
+const LIQUIDATION_PENALTY: u64 = 5
+const PROTOCOL_FEE_BPS: u64 = 50
 
 struct VaultSnapshot {
     owner: Address,
@@ -16,18 +19,27 @@ struct VaultSnapshot {
 }
 
 hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
 }
 
 fn get_vault_key(id: u64) -> string {
     return VAULT_PREFIX + id.to_string(10u32);
 }
 
-fn calc_collateral_value(collateral_plain: u64, price: u64) -> u64 {
-    return collateral_plain * price / 100000000;
+fn calc_collateral_value(cp: u64, price: u64) -> u64 {
+    return cp * price / 100000000;
 }
 
-fn get_xel_price_helper() -> u64 {
+fn get_xel_price() -> u64 {
     let rs: Storage = Storage::new();
     let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
     let oc: Contract = Contract::new(oh).expect("ocnf");
@@ -35,24 +47,20 @@ fn get_xel_price_helper() -> u64 {
     return prices[0];
 }
 
-fn is_healthy(collateral_plain: u64, borrow_plain: u64) -> bool {
-    if borrow_plain == 0 { return true; }
-    let rs: Storage = Storage::new();
-    let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
-    let oc: Contract = Contract::new(oh).expect("ocnf");
-    let prices: u64[] = oc.call(2u16, [Hash::zero()], {});
-    let price: u64 = prices[0];
-    let cv: u64 = calc_collateral_value(collateral_plain, price);
-    return borrow_plain <= cv * 100 / MIN_COLLATERAL_RATIO;
+fn require_healthy(cp: u64, bp: u64) {
+    let price: u64 = get_xel_price();
+    let cv: u64 = calc_collateral_value(cp, price);
+    require(bp <= cv * 100 / MIN_COLLATERAL_RATIO, "unhlth");
 }
 
-entry deposit(collateral_plain: u64, vault_id: u64) -> u64 {
-    require(collateral_plain > 0, "amtgt0");
+entry deposit(collateral_asset: Hash, vault_id: u64) -> u64 {
+    let dep: optional<u64> = get_deposit_for_asset(collateral_asset);
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
     let caller: Address = get_caller().expect("nocaller");
     let vault: VaultSnapshot = VaultSnapshot {
         owner: caller,
-        collateral_asset: Hash::zero(),
-        collateral_plain: collateral_plain,
+        collateral_asset: collateral_asset,
+        collateral_plain: dep.unwrap(),
         borrow_plain: 0,
         last_update_topo: vault_id,
         liquidated: false,
@@ -61,47 +69,106 @@ entry deposit(collateral_plain: u64, vault_id: u64) -> u64 {
     };
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(vault_id), vault);
-    return 0;
+    return vault_id;
 }
 
 entry borrow(vault_id: u64, amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
     let rs: Storage = Storage::new();
     let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
-    vault.borrow_plain += amount;
+    require(vault.owner == caller, "ny");
+    require(!vault.liquidated, "liq");
+    let new_borrow: u64 = vault.borrow_plain + amount;
+    require(new_borrow > vault.borrow_plain, "ovf");
+    require_healthy(vault.collateral_plain, new_borrow);
+    vault.borrow_plain = new_borrow;
     vault.last_update_topo = vault_id;
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(vault_id), vault);
-    return 0;
+    return new_borrow;
 }
 
 entry repay(vault_id: u64, amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
     let rs: Storage = Storage::new();
     let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
+    require(!vault.liquidated, "liq");
+    let repay_amount: u64 = amount;
     if amount >= vault.borrow_plain {
-        vault.borrow_plain = 0;
-    } else {
-        vault.borrow_plain -= amount;
+        repay_amount = vault.borrow_plain;
     }
+    vault.borrow_plain -= repay_amount;
     vault.last_update_topo = vault_id;
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(vault_id), vault);
-    return 0;
+    return vault.borrow_plain;
 }
 
 entry withdraw(vault_id: u64, amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
     let rs: Storage = Storage::new();
     let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
-    if amount >= vault.collateral_plain {
-        vault.collateral_plain = 0;
-    } else {
-        vault.collateral_plain -= amount;
+    require(vault.owner == caller, "ny");
+    require(!vault.liquidated, "liq");
+    require(amount <= vault.collateral_plain, "lwcol");
+    let remaining: u64 = vault.collateral_plain - amount;
+    if vault.borrow_plain > 0 && remaining > 0 {
+        require_healthy(remaining, vault.borrow_plain);
     }
+    vault.collateral_plain = remaining;
     vault.last_update_topo = vault_id;
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(vault_id), vault);
+    return remaining;
+}
+
+entry liquidate(vault_id: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
+    require(!vault.liquidated, "liq");
+    require(vault.borrow_plain > 0, "nobp");
+    let liq_price: u64 = get_xel_price();
+    let liq_cv: u64 = calc_collateral_value(vault.collateral_plain, liq_price);
+    require(vault.borrow_plain > liq_cv * 100 / MIN_COLLATERAL_RATIO, "hlt");
+    let penalty: u64 = vault.collateral_plain * LIQUIDATION_PENALTY / 100;
+    vault.collateral_plain -= penalty;
+    vault.borrow_plain = 0;
+    vault.liquidated = true;
+    vault.last_update_topo = vault_id;
+    let ws: Storage = Storage::new();
+    ws.store(get_vault_key(vault_id), vault);
+    return vault.collateral_plain;
+}
+
+entry set_oracle_contract(oracle_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ORACLE_CONTRACT_KEY, oracle_hash);
+    return 0;
+}
+
+entry set_xusd_contract(contract_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_CONTRACT_KEY, contract_hash);
+    return 0;
+}
+
+entry set_xusd_asset(asset_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_ASSET_KEY, asset_hash);
+    return 0;
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
     return 0;
 }
 
@@ -115,7 +182,7 @@ entry get_health(vault_id: u64) -> u64 {
     let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
     if vault.liquidated { return 0; }
     if vault.borrow_plain == 0 { return 999; }
-    let cv: u64 = calc_collateral_value(vault.collateral_plain, get_xel_price_helper());
+    let cv: u64 = calc_collateral_value(vault.collateral_plain, get_xel_price());
     return cv * 100 / vault.borrow_plain;
 }
 
@@ -124,23 +191,7 @@ entry is_liquidatable(vault_id: u64) -> bool {
     let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
     if vault.liquidated { return false; }
     if vault.borrow_plain == 0 { return false; }
-    return !is_healthy(vault.collateral_plain, vault.borrow_plain);
-}
-
-entry set_oracle_contract(oracle_hash: Hash) -> u64 {
-    let ws: Storage = Storage::new();
-    ws.store(ORACLE_CONTRACT_KEY, oracle_hash);
-    return 0;
-}
-
-entry set_xusd_asset(asset_hash: Hash) -> u64 {
-    let ws: Storage = Storage::new();
-    ws.store(XUSD_ASSET_KEY, asset_hash);
-    return 0;
-}
-
-entry set_xusd_contract(contract_hash: Hash) -> u64 {
-    let ws: Storage = Storage::new();
-    ws.store(XUSD_CONTRACT_KEY, contract_hash);
-    return 0;
+    let price: u64 = get_xel_price();
+    let cv: u64 = calc_collateral_value(vault.collateral_plain, price);
+    return vault.borrow_plain > cv * 100 / MIN_COLLATERAL_RATIO;
 }

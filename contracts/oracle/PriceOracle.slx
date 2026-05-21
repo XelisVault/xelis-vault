@@ -1,23 +1,35 @@
-const ADMIN_KEY: string = "admin"
-const XEL_KEY: string = "px"
+const ADMIN_KEY: string = "a"
+const XEL_PRICE_KEY: string = "p"
 
 hook constructor() -> u64 {
-    let storage: Storage = Storage::new();
-    storage.store(ADMIN_KEY, get_caller().expect("nocalle"));
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     return 0;
 }
 
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
 entry set_price(price: u64) -> u64 {
-    let storage: Storage = Storage::new();
-    storage.store(XEL_KEY, price);
+    only_admin();
+    require(price > 0, "inval");
+    let ws: Storage = Storage::new();
+    ws.store(XEL_PRICE_KEY, price);
     return 0;
 }
 
 entry get_price(asset: Hash) -> u64 {
-    let storage: Storage = Storage::new();
-    let price: optional<u64> = storage.load(XEL_KEY);
-    if price.is_none() {
-        return 0;
-    }
-    return price.unwrap();
+    let s: Storage = Storage::new();
+    return s.load(XEL_PRICE_KEY).unwrap_or(0);
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
 }

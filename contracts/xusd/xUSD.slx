@@ -1,74 +1,49 @@
-const XUSD_NAME: string = "xUSD Savings Stablecoin"
-const XUSD_TICKER: string = "XUSD"
-const MAX_SUPPLY: u64 = 18446744073709551615
-const VAULT_CONTRACT_KEY: string = "vc"
-const ASSET_HASH_KEY: string = "ah"
 const ADMIN_KEY: string = "a"
+const TOTAL_KEY: string = "ts"
 
 hook constructor() -> u64 {
-    let storage: Storage = Storage::new();
-    storage.store(ADMIN_KEY, get_caller().expect("nocaller"));
-    let asset: Asset = Asset::create(0, XUSD_NAME, XUSD_TICKER, 8u8, MaxSupplyMode::Mintable { max_supply: MAX_SUPPLY }).expect("crxusd");
-    storage.store(ASSET_HASH_KEY, asset.get_hash());
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(TOTAL_KEY, 0u64);
     return 0;
 }
 
 fn only_admin() {
-    let storage: Storage = Storage::new();
+    let s: Storage = Storage::new();
     let caller: Address = get_caller().expect("nocaller");
-    let admin: Address = storage.load(ADMIN_KEY).expect("anotset");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
     require(caller == admin, "notauth");
 }
 
-fn only_vault() {
-    let storage: Storage = Storage::new();
-    let vault_hash: Hash = storage.load(VAULT_CONTRACT_KEY).expect("vcnotset");
-    let caller_contract: optional<Hash> = get_contract_caller();
-    require(caller_contract.is_some(), "nocontractcall");
-    require(caller_contract.unwrap() == vault_hash, "onlyvault");
-}
-
-fn get_asset() -> Asset {
-    let storage: Storage = Storage::new();
-    let asset_hash: Hash = storage.load(ASSET_HASH_KEY).expect("ahnotset");
-    return Asset::get_by_hash(asset_hash).expect("ahnotfound");
-}
-
-entry init(vault_hash: Hash) -> u64 {
+entry mint_tokens(amount: u64) -> u64 {
     only_admin();
-    let storage: Storage = Storage::new();
-    storage.store(VAULT_CONTRACT_KEY, vault_hash);
-    return 0;
-}
-
-entry mint(to: Address, amount: u64) -> u64 {
-    only_vault();
     require(amount > 0, "amtgt0");
-    let asset: Asset = get_asset();
-    asset.mint(amount);
-    let ok: bool = transfer(to, amount, asset.get_hash());
-    require(ok, "txfail");
+    let rs: Storage = Storage::new();
+    let total: u64 = rs.load(TOTAL_KEY).expect("tns");
+    require(total + amount > total, "ovf");
+    let ws: Storage = Storage::new();
+    ws.store(TOTAL_KEY, total + amount);
     return 0;
 }
 
-entry burn_from(amount: u64) -> u64 {
-    only_vault();
+entry burn_tokens(amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
-    let asset: Asset = get_asset();
-    let ok: bool = burn(amount, asset.get_hash());
-    require(ok, "burnfail");
+    let rs: Storage = Storage::new();
+    let total: u64 = rs.load(TOTAL_KEY).expect("tns");
+    require(amount <= total, "lwbal");
+    let ws: Storage = Storage::new();
+    ws.store(TOTAL_KEY, total - amount);
     return 0;
 }
 
-entry get_asset_hash() -> Hash {
-    let storage: Storage = Storage::new();
-    return storage.load(ASSET_HASH_KEY).expect("ahnotset");
+entry total_supply() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(TOTAL_KEY).unwrap_or(0);
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
-    require(new_admin != Address::from_string(""), "invaddr");
-    let storage: Storage = Storage::new();
-    storage.store(ADMIN_KEY, new_admin);
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
     return 0;
 }
