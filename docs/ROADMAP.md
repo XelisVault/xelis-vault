@@ -4,83 +4,91 @@
 
 ---
 
-## Phase 0: Foundation 
+## Phase 0: Foundation ✅
 
 | Task | Status |
 |------|--------|
-| GitHub repo setup | 👷 | 
-| Devnet environment | 👷 | 
-| Whitepaper v1 | ✅ | 
+| Whitepaper v1 | ✅ |
 | Architecture docs | ✅ |
-| Smart contract skeletons | ✅ |
+| Smart contract design | ✅ |
+| Devnet environment | ✅ |
 
-## Phase 1: Core Vault 
-
-| Task | Status | 
-|------|--------|
-| VaultEngine.slx — deposit/borrow/repay/withdraw | ✅ |
-| xUSD Confidential Asset | ✅ |
-| InterestRateModel.slx | ✅ |
-| PriceOracle.slx | ✅ |
-| Deploy & test on devnet | 👷 | 
-| Debug & iterate | 👷 |
-
-**Milestone**: Single-asset lending working on devnet
-
-## Phase 2: Yield & Automation 
+## Phase 1: Core Vault ✅
 
 | Task | Status |
 |------|--------|
-| xUSD Savings Rate | 🔲 | 
-| Auto-Remining Loans | 🔲 | 
-| LiquidationBot (keeper) | ✅ | 
-| SDK TypeScript | ✅ |
-| Dashboard React | ✅ | 
-| Testnet deployment | 🔲 | 
+| VaultEngine — deposit / borrow / repay / withdraw | ✅ Live on devnet |
+| xUSD Confidential Asset — mint & burn | ✅ Live on devnet |
+| InterestRateModel — kinked rates | ✅ Live on devnet |
+| PriceOracle — XEL price feed | ✅ Live on devnet |
+| Deploy & test full lifecycle | ✅ Verified |
+| Document VM constraints & workarounds | ✅ Documented |
 
-**Milestone**: Full lending + savings + bot working on testnet
+> **Milestone achieved** — Single-asset lending fully working on devnet with all state mutations persisting correctly.
 
-## Phase 3: Launch 
+```
+Test results (all passing):
+  ✓ deposit(100000) → vault_id=1 created
+  ✓ get_vault(1)    → returns VaultSnapshot with collateral=100000
+  ✓ borrow(30000)   → borrow_plain updated to 30000
+  ✓ repay(10000)    → borrow_plain reduced to 20000
+  ✓ withdraw(50000) → collateral_plain reduced by 50000
+```
+
+## Phase 2: Yield & Automation 🚧
 
 | Task | Status |
 |------|--------|
-| Security audit (internal) | 🔲 |
-| Bug bounties | 🔲 | 
+| Dashboard (React) | 🚧 In progress |
+| TypeScript SDK | ✅ Built |
+| Liquidation Bot | ✅ Built |
+| xUSD Savings Rate | 🔲 |
+| Auto-Remining Loans | 🔲 |
+| Testnet deployment | 🔲 |
+
+> **Next milestone** — Full lending + savings + automation on testnet
+
+## Phase 3: Launch 📅
+
+| Task | Status |
+|------|--------|
+| Security audit | 🔲 |
+| Bug bounties | 🔲 |
 | Mainnet deployment | 🔲 |
-| Dashboard live | 🔲 | 
-| Community announcement | 🔲 |
-| Forge DEX xUSD/XEL pool | 🔲 | 
+| Community launch | 🔲 |
+| Forge DEX xUSD/XEL pool | 🔲 |
 
-**Milestone**: Live on mainnet with real TVL
+> **Next milestone** — Live on mainnet with real TVL
 
-## Phase 4: Expansion 
+## Phase 4: Expansion 📅
 
-| Task | Status | 
+| Task | Status |
 |------|--------|
-| InsurancePool.slx | ✅ |
-| FlashLoan.slx | ✅ | 
+| InsurancePool | ✅ Compiled |
+| FlashLoan | ✅ Compiled |
 | Multi-collateral support | 🔲 |
-| Governance VLT token | 🔲 | 
+| Governance VLT token | 🔲 |
 | DeFi composability (Forge DEX) | 🔲 |
 
-**Milestone**: Multi-asset lending with insurance + flash loans
+## Phase 5: Dominance 📅
 
-## Phase 5: Dominance 
-
-| Task | Status | 
+| Task | Status |
 |------|--------|
 | Cross-chain xUSD (Trocador) | 🔲 |
-| Position NFTs | 🔲 | 
+| Position NFTs | 🔲 |
 | Credit scores | 🔲 |
-| Full DAO governance | 🔲 | 
+| Full DAO governance | 🔲 |
 | Institutional API | 🔲 |
-
-**Milestone**: Dominant privacy lending protocol
 
 ---
 
 ## Legend
 
-- ✅ **Done** — Code written, ready for review/test
+- ✅ **Done** — Deployed and verified
+- 🚧 **In progress** — Currently being worked on
 - 🔲 **Pending** — Not yet started
-- 👷 **In progress** — Currently being worked on
+- 📅 **Planned** — Scheduled for future
+
+---
+
+[⬅ Back to README](../README.md)
