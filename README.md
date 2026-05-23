@@ -161,7 +161,7 @@ Built on XELIS native homomorphic encryption, XELIS Vault is the first platform 
 | **Dashboard** | 🚧 In progress |
 | **TypeScript SDK** | ✅ Built |
 | **Liquidation Bot** | ✅ Built |
-| **Devnet Deployment** | 🔲 Blocked by wallet binary hex format |
+| **Devnet Deployment** |🚧 In progress|
 | **Testnet Launch** | 📅 Post-VM-fix |
 | **Mainnet** | 📅 Q3 2026 |
 
