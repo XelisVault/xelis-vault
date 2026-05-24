@@ -134,12 +134,6 @@ Built on XELIS native homomorphic encryption, XELIS Vault is the first platform 
 
 ---
 
-## How It Works
-
-[..]
-
----
-
 ## Progress
 
 | Phase | Status |
