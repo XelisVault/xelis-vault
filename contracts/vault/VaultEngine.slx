@@ -24,11 +24,14 @@ struct VaultSnapshot {
     id: u64
 }
 
-hook constructor() -> u64 {
+entry init() -> u64 {
     let s: Storage = Storage::new();
+    let flag: optional<u64> = s.load("init");
+    require(flag.is_none(), "inited");
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     s.store(COUNTER_KEY, 0u64);
     s.store(QUEUE_LEN_KEY, 0u64);
+    s.store("init", 1u64);
     return 0;
 }
 

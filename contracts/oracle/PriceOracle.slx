@@ -4,7 +4,7 @@ const PENDING_PRICE_KEY: string = "pp"
 const PENDING_TOPO_KEY: string = "pt"
 const TIMELOCK_BLOCKS: u64 = 720
 
-hook constructor() -> u64 {
+entry init() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     return 0;
