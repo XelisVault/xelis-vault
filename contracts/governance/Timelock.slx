@@ -70,7 +70,7 @@ entry execute_proposal(proposal_id: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(proposal_id), prop);
     let target: Contract = Contract::new(prop.target_contract).expect("tcnf");
-    target.call(prop.entry_id, [], {});
+    target.call(prop.entry_id, [prop.value], {});
     return 0;
 }
 

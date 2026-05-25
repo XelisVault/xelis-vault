@@ -13,7 +13,6 @@ export interface VaultSnapshot {
     id: string;
     owner: string;
     collateralAsset: string;
-    borrowAsset: string;
     collateralPlain: string;
     borrowPlain: string;
     lastUpdateTopo: number;
@@ -26,12 +25,6 @@ export interface UserSummary {
     totalBorrowPlain: string;
     vaultCount: number;
     vaultIds: string[];
-}
-
-export interface SavingsBalance {
-    amount: string;
-    lastUpdateTopo: number;
-    accumulated: string;
 }
 
 export interface HealthInfo {
@@ -94,7 +87,7 @@ export class XelisVaultSDK {
     async getVault(vaultId: string): Promise<VaultSnapshot | null> {
         const res = await this.callDaemon('get_contract_state', {
             contract: this.config.vaultContract,
-            key: `vault_${vaultId}`
+            key: `v${vaultId}`
         });
         if (!res.result?.value) return null;
         return res.result.value as VaultSnapshot;
@@ -119,12 +112,28 @@ export class XelisVaultSDK {
     }
 
     async getUserSummary(address: string): Promise<UserSummary> {
-        const res = await this.callDaemon('contract_call', {
+        const res = await this.callDaemon('get_contract_state', {
             contract: this.config.vaultContract,
-            entry: 'get_user_summary',
-            params: [address]
+            key: 'n'
         });
-        return res.result?.value ?? { totalCollateralPlain: '0', totalBorrowPlain: '0', vaultCount: 0, vaultIds: [] };
+        const vaultCount = parseInt(res.result?.value ?? '0');
+        const vaultIds: string[] = [];
+        let totalCollateral = 0n;
+        let totalBorrow = 0n;
+        for (let i = 0; i < vaultCount; i++) {
+            const v = await this.getVault(String(i));
+            if (v && v.owner === address && !v.liquidated) {
+                vaultIds.push(v.id);
+                totalCollateral += BigInt(v.collateralPlain);
+                totalBorrow += BigInt(v.borrowPlain);
+            }
+        }
+        return {
+            totalCollateralPlain: String(totalCollateral),
+            totalBorrowPlain: String(totalBorrow),
+            vaultCount: vaultIds.length,
+            vaultIds
+        };
     }
 
     async getBorrowRate(totalBorrows: string, totalSupply: string): Promise<number> {
@@ -154,13 +163,12 @@ export class XelisVaultSDK {
         return res.result?.value?.[0] ?? '0';
     }
 
-    async getSavingsInfo(address: string): Promise<SavingsBalance> {
-        const res = await this.callDaemon('contract_call', {
-            contract: this.config.xusdAsset,
-            entry: 'get_savings_info',
-            params: [address]
+    async getXusdBalance(address: string): Promise<string> {
+        const res = await this.callDaemon('get_balance', {
+            address,
+            asset: this.config.xusdAsset
         });
-        return res.result?.value ?? { amount: '0', lastUpdateTopo: 0, accumulated: '0' };
+        return res.result?.balance ?? '0';
     }
 
     async getTotalStaked(): Promise<string> {

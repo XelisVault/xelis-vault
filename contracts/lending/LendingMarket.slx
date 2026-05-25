@@ -2,6 +2,7 @@ const ADMIN_KEY: string = "a"
 const POOL_PREFIX: string = "pl"
 const BORROW_PREFIX: string = "br"
 const COUNTER_KEY: string = "n"
+const ORACLE_CONTRACT_KEY: string = "oc"
 
 struct LendingPool {
     asset_hash: Hash,
@@ -83,7 +84,13 @@ entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
     require(pool.total_borrows < pool.total_liquidity, "noliquid");
     let col_dep: optional<u64> = get_deposit_for_asset(collateral_asset);
     require(col_dep.is_some() && col_dep.unwrap() > 0, "nocol");
-    let col_val: u64 = col_dep.unwrap();
+    let col_raw: u64 = col_dep.unwrap();
+    let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
+    let oc: Contract = Contract::new(oh).expect("ocnf");
+    let prices: u64[] = oc.call(3u16, [collateral_asset], {});
+    let price: u64 = prices[0];
+    require(price > 0, "nopr");
+    let col_val: u64 = col_raw * price / 100000000;
     let max_borrow: u64 = col_val * 10000 / pool.min_collateral_bps;
     let available: u64 = pool.total_liquidity - pool.total_borrows;
     let borrow_amount: u64 = max_borrow;
@@ -163,6 +170,13 @@ entry get_pool(pool_id: u64) -> optional<LendingPool> {
 entry get_borrow_position(borrow_id: u64) -> optional<BorrowPosition> {
     let rs: Storage = Storage::new();
     return rs.load(get_borrow_key(borrow_id));
+}
+
+entry set_oracle_contract(oracle_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ORACLE_CONTRACT_KEY, oracle_hash);
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {
