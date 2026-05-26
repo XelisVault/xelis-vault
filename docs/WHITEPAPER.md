@@ -607,91 +607,147 @@ All 24 bugs must be resolved before testnet deployment. The 7 critical and 8 ele
 
 ---
 
-## 14. XelisVault Messenger
+## 14. XelisVault Messenger (VaultChat)
 
-XelisVault Messenger is a **wallet-to-wallet encrypted messaging protocol** built directly on XELIS smart contracts. It enables private, censorship-resistant communication with optional payment bundling, group management, and DAO integrations — all secured by XELIS native cryptography.
+XelisVault Messenger (codename **VaultChat**) is a fully decentralized, wallet-to-wallet encrypted messaging protocol built directly on XELIS smart contracts. Think of it as a decentralized, uncensorable Telegram — but built natively on XELIS with maximum confidentiality.
 
 ### 14.1 Motivation
 
 Blockchain communication today relies on off-chain platforms (Telegram, Discord, Signal) that:
-- Require trust in centralized infrastructure
-- Expose metadata (who talks to whom, when)
+- Require trust in centralized infrastructure — a single company controls the servers
+- Expose metadata (who talks to whom, when, how often)
 - Cannot natively integrate with on-chain actions (payments, proposals, governance)
+- Can be blocked, censored, or shut down by governments
+- Collect and monetize user data
 
-XelisVault Messenger solves this by bringing communication **on-chain** where it inherits blockchain security, censorship resistance, and native payment integration.
+XelisVault Messenger solves this by bringing communication **on-chain** where it inherits blockchain security, censorship resistance, and native payment integration. No central server, no data collection, no surveillance — just private, persistent communication.
 
 ### 14.2 Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│            XelisVault Messenger              │
-├─────────────────────────────────────────────┤
-│  MessageContract.slx — core messaging engine │
-│  GroupContract.slx — group/DAO channel mgmt  │
-│  PaymentContract.slx — payment bundling      │
-│  StorageContract.slx — encrypted storage     │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│              XelisVault Messenger               │
+├────────────────────────────────────────────────┤
+│  MessageContract.slx — core messaging engine    │
+│  GroupContract.slx — group/DAO channel mgmt     │
+│  PaymentContract.slx — payment bundling         │
+│  StorageContract.slx — encrypted message store  │
+│  ReputationContract.slx — anti-spam (future)    │
+└────────────────────────────────────────────────┘
 ```
 
 ### 14.3 Features
 
 #### 14.3.1 One-to-One Messaging
 
-- **Commit-reveal delivery**: sender commits to a message hash, recipient reveals on first read
-- **End-to-end encrypted**: messages use XELIS public key cryptography — only sender and recipient can decrypt
-- **Proof-of-delivery**: sender can verify recipient has read the message without revealing content
-- **Payment+message bundling**: send XEL or xUSD in the same transaction as a message — "I paid you, here's why"
+- **End-to-end encrypted**: messages use XELIS public key cryptography — only sender and recipient can decrypt. The smart contract never sees message content.
+- **Full conversation history**: all messages persisted on-chain, encrypted. Your entire chat history is always available, never lost.
+- **Message status**: sent → received → read. Sender can verify delivery and read status without revealing content.
+- **Timestamps**: precise timestamps (topoheight) on every message for ordering and proof.
+- **Message deletion**: sender can delete their own messages. The blockchain retains the proof of deletion, not the content.
+- **Address-based contact lookup**: search any XELIS wallet address and start a conversation.
+- **Payment+message bundling**: send XEL, xUSD, or any confidential asset in the same transaction as a message. Example: "Here's the 500 xUSD I'm lending you" — the payment and message arrive together.
 
 #### 14.3.2 Group Messaging
 
-- **On-chain group creation**: groups of up to 50-100 members
-- **Role-based access**: admin, moderator, member, read-only
-- **Encrypted group channels**: only members see messages and member list
-- **Invite system**: encrypted invites with optional payment requirements
-- **Thread support**: messages organized by topic within a group
+- **On-chain group creation**: create groups with up to 50-100 members at launch.
+- **Private group channels**: only members can see the group, its member list, and its messages.
+- **Role-based access**: admin, moderator, member, read-only. Admins can add/remove members and moderate content.
+- **Encrypted invites**: invite new members with encrypted invitations. Optional: require an onboarding payment.
+- **Thread replies**: reply to a specific message within a group — organized discussions instead of linear chat.
+- **Group message history**: full searchable history available to members.
 
-#### 14.3.3 Self-Destructing Messages
+#### 14.3.3 Reactions & Engagement
 
-- **Time-locked reads**: message auto-destructs after N blocks if not read
-- **Burn-after-reading**: message is permanently deleted from chain after first read
-- **Configurable timers**: per-message expiration (minutes, hours, days)
+- **Message reactions**: react with emojis (❤️, 👍, 😂, etc.) to any message. Reactions are also private — only participants see them.
+- **Typing indicators**: see when someone is typing (lightweight on-chain signals).
+- **Message replies**: quote and reply to specific messages, creating threaded conversations.
 
-#### 14.3.4 DAO & Governance Integration
+#### 14.3.4 Self-Destructing Messages
 
-- **DAO channels**: private governance discussion channels tied to GovernanceVault proposals
-- **Proposal-linked messaging**: discuss proposals in encrypted threads visible only to VLT holders
-- **Vote-signaling**: react to messages with on-chain votes (yes/no/abstain)
-- **Treasury notifications**: automatic encrypted notifications for TreasuryVault transactions
+- **Time-locked auto-delete**: message automatically disappears after N blocks if unread.
+- **Burn-after-reading**: message is permanently deleted from the blockchain after first read — no trace remains.
+- **Configurable timers**: per-message expiration from minutes to days.
+- **Sender-controlled**: the sender chooses the timer when writing the message.
 
-#### 14.3.5 Privacy & Security
+#### 14.3.5 File Attachments
 
-| Feature | Implementation |
-|---------|---------------|
-| Message encryption | XELIS public key crypto (Curve25519) |
-| Metadata hiding | Commit-reveal delivery, no plaintext sender/recipient on-chain |
-| Anti-spam | Payment-per-message micro-fees (configurable) |
-| Message ordering | TopoHeight-based sequencing |
+- **Off-chain storage**: files, images, and documents stored on Arweave or IPFS (decentralized permanent storage).
+- **On-chain proof**: the file hash and encryption key are stored on-chain, verifiable by the recipient.
+- **Encrypted attachments**: files are encrypted client-side before upload — no one but the recipient can decrypt.
+- **Efficient**: only the hash and key metadata are stored on-chain, keeping storage costs minimal.
+
+#### 14.3.6 Conversation Search
+
+- **Search your own messages**: full-text search across your conversations. Search is performed client-side on decrypted messages — never exposed to the chain.
+- **Filter by contact, date, or amount**: find specific messages or payment transactions quickly.
+
+#### 14.3.7 DAO & Governance Integration
+
+- **DAO private channels**: confidential governance discussion channels tied to GovernanceVault proposals. VLT holders can discuss proposals in encrypted threads.
+- **Proposal-linked messaging**: each governance proposal has an associated encrypted channel visible only to eligible voters.
+- **Vote-signaling**: react to messages with on-chain votes (yes/no/abstain) without revealing your position publicly.
+- **Treasury notifications**: automatic encrypted notifications for TreasuryVault transactions — multi-sig signers are notified when a transaction requires approval.
+- **Quick actions**: "Send Payment" button directly in a conversation — initiate a vault deposit, loan repayment, or DAO vote without leaving the chat.
+
+### 14.4 User Experience
+
+1. **Open** the XelisVault dashboard
+2. **Go** to the "Messenger" tab
+3. **Search** for a wallet address or contact
+4. **Write** your message (optionally attach a payment)
+5. **Send** — the recipient receives an encrypted notification
+6. **Everything** stays private, persistent, and uncensorable
+
+### 14.5 Privacy & Security Model
+
+| Property | Implementation |
+|----------|---------------|
+| Message encryption | XELIS public key crypto (Curve25519) — E2E by default |
+| Metadata protection | Commit-reveal delivery — no plaintext sender/recipient on-chain |
+| Anti-spam | Payment-per-message micro-fees (configurable). Future: reputation system |
+| Censorship resistance | No central server — messages on XELIS chain, immutable |
+| Message ordering | TopoHeight-based sequencing — messages in exact order sent |
+| Data collection | Zero. No servers, no logs, no metadata harvesting |
 | File attachments | Off-chain (Arweave/IPFS) with on-chain hash + encryption key |
+| Message deletion | Sender-controlled deletion with on-chain proof |
+| Government resistance | Impossible to block — XELIS is a decentralized global network |
 
-### 14.4 Use Cases
+### 14.6 Comparison
 
-| Use Case | How Messenger Solves It |
+| Feature | Telegram | Signal | WhatsApp | **VaultChat** |
+|---------|----------|--------|----------|---------------|
+| E2E encryption | Optional | ✅ | ✅ | ✅ |
+| Decentralized | ❌ | ❌ | ❌ | ✅ |
+| No server | ❌ | ❌ | ❌ | ✅ |
+| Censorship-resistant | ❌ | ❌ | ❌ | ✅ |
+| Native payments | ❌ | ❌ | ❌ | ✅ |
+| On-chain history | ❌ | ❌ | ❌ | ✅ |
+| No data collection | ❌ | ✅ | ❌ | ✅ |
+| DAO integration | ❌ | ❌ | ❌ | ✅ |
+| Self-destruct messages | ✅ | ❌ | ❌ | ✅ |
+| File attachments | ✅ | ✅ | ✅ | ✅ (decentralized) |
+
+### 14.7 Use Cases
+
+| Use Case | How VaultChat Solves It |
 |----------|------------------------|
-| **P2P loan negotiation** | Borrow and lender discuss terms in an encrypted thread, then execute via PeerLoan in the same session |
-| **Syndicate coordination** | Lead arranger communicates with lenders privately, all within the syndicate's encrypted channel |
-| **Governance discussion** | VLT holders debate proposals in private, vote-signal without revealing position |
-| **Treasury operations** | Multi-sig signers coordinate via encrypted notifications — no Telegram dependency |
-| **Institutional compliance** | Regulated entities communicate within ZK-verified channels |
-| **Private auction bidding** | Bidder-auctioneer communication, sealed bid submission, and reveal — all in-messenger |
+| **P2P loan negotiation** | Borrower and lender discuss terms in an encrypted thread, then execute via PeerLoan in the same session — payment bundled with the final message |
+| **Syndicate coordination** | Lead arranger communicates with all lenders privately within the syndicate's encrypted channel — no Telegram dependency |
+| **Governance discussion** | VLT holders debate proposals in private encrypted channels, vote-signal without revealing position |
+| **Treasury operations** | Multi-sig signers coordinate via encrypted notifications — every approval is automatically logged |
+| **Institutional compliance** | Regulated entities communicate within ZK-verified channels — regulators can audit without breaking privacy |
+| **Private auction bidding** | Bidder-auctioneer communication, sealed bid submission, and reveal — all within the messenger |
+| **Personal finance** | Send money to friends with a message explaining why — "Happy birthday, here's 100 xUSD" |
 
-### 14.5 Roadmap
+### 14.8 Development Roadmap
 
 | Phase | Features | Timeline |
 |-------|----------|----------|
-| **Messenger 1.0** | 1-to-1 encrypted messaging, payment bundling, proof-of-delivery | Phase 7 |
-| **Messenger 2.0** | Groups (50 members), roles, threads, self-destruct messages | Phase 8 |
-| **Messenger 3.0** | DAO integration, proposal-linked channels, VLT-gated access | Phase 9 |
-| **Messenger 4.0** | File attachments (IPFS/Arweave), reactions, typing indicators | Phase 10 |
+| **VaultChat 1.0** | 1-to-1 encrypted messaging, payment+message bundling, message status (sent/received/read), full conversation history, address search | Phase 7 (Q4 2026) |
+| **VaultChat 2.0** | Groups (up to 50 members), roles (admin/mod/member), thread replies, reactions (❤️👍😂), self-destruct messages, message deletion | Phase 8 (Q1 2027) |
+| **VaultChat 3.0** | DAO governance channels, proposal-linked messaging, VLT-gated access, vote-signaling, treasury notifications, quick actions | Phase 9 (Q2 2027) |
+| **VaultChat 4.0** | File attachments (Arweave/IPFS), typing indicators, conversation search, mobile SDK, reputation-based anti-spam | Phase 10 (Q2-Q3 2027) |
 
 ---
 

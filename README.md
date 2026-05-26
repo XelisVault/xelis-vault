@@ -75,11 +75,11 @@ XELIS Vault is a complete suite of **19 smart contracts** covering every major D
 | **GovernanceVault** | Stake VLT, earn boosted voting power, control protocol parameters |
 | **Timelock** | 48-hour delay on all parameter changes with guardian veto |
 
-### Communication
+### Communication (VaultChat)
 
 | Product | Description |
 |---------|-------------|
-| **XelisVault Messenger** | Wallet-to-wallet encrypted messaging, groups, self-destruct, payment bundling, DAO channels |
+| **XelisVault Messenger** | Fully decentralized, E2E-encrypted wallet-to-wallet messaging. Groups, reactions, file attachments (Arweave/IPFS), self-destruct messages, payment bundling, DAO governance channels, thread replies, search. No central server, no data collection, uncensorable. |
 
 ---
 
