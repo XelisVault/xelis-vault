@@ -113,28 +113,16 @@ xUSD is designed to trade at $1 through four mechanisms:
 
 ## Current Status
 
-| Phase | Status |
-|-------|--------|
+| Milestone | Status |
+|-----------|--------|
 | **19 Smart Contracts** — all compiled, bug-fixed, hex-generated | ✅ Complete |
-| **Bug Fixes Applied** — 18+ static analysis & compilation fixes | ✅ Complete |
+| **Bug Fix Sprint** — VM syscall ID mismatch fixed, 24 bugs audited | ✅ Complete |
 | **TypeScript SDK** | ✅ Built |
 | **Liquidation Bot** | ✅ Built |
+| **Testnet Deployment** (internal) | 🔧 Testing |
 | **Dashboard (React)** | 🚧 In progress |
-| **VM Storage Bug Fix** — syscall ID mismatch fixed (stdlib rewritten) | ✅ Complete |
-| **Bug Fix Sprint** — 24 bugs found via comprehensive static audit | 🔧 In progress |
-| **Testnet Deployment** | 📅 Post-bug-fix |
 | **XelisVault Messenger** — encrypted messaging protocol | 📅 Phase 7 |
 | **Mainnet Launch** | 📅 Q3 2026 |
-
-### Current Blocker: Storage Persistence on Testnet
-
-The silex-cli environment has been **fully rewritten** to match the daemon's `build_environment()` registration order exactly. The previous syscall ID mismatch between compiler and daemon — caused by iterator registration order, Ciphertext method naming (`generate` vs `new`), and extra compiler stubs — has been resolved.
-
-Storage operations (`storage_store`, `storage_load`) should now reach the daemon's handlers. **Next step: deploy a test contract to verify `/tmp/dbg_storage.txt` is created**, confirming storage persistence works end-to-end.
-
-### Comprehensive Bug Audit
-
-A detailed static analysis of all 19 contracts identified **24 bugs** (7 critical, 8 elevated, 6 medium, 3 minor). Critical bugs include the price oracle storing 0 instead of deleting, VaultEngine missing xUSD mint/transfer/burn, liquidate not transferring collateral, and GovernanceVault using the wrong asset hash. A dedicated **bug fix sprint** is underway.
 
 ---
 

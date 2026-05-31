@@ -1,6 +1,6 @@
 # XELIS Vault — Roadmap
 
-> *Last updated: May 26, 2026*
+> *Last updated: May 31, 2026*
 
 ---
 
@@ -22,63 +22,51 @@
 | Compilation & static analysis (18+ syntax bugs fixed) | ✅ |
 | Comprehensive bug audit (24 bugs: 7 critical, 8 elevated, 6 medium, 3 minor) | ✅ Complete |
 
-All contracts compile cleanly. All 24 bugs identified and catalogued for fix sprint.
+All contracts compile cleanly. All 24 bugs identified and catalogued.
 
 ---
 
-## Phase 0.5: Bug Fix Sprint 🔧
+## Phase 0.5: Bug Fix Sprint ✅
 
 | Task | Status |
 |------|--------|
-| Fix 7 critical bugs (PriceOracle zero-store, VaultEngine missing mint/burn/transfer, GovernanceVault asset hash) | 🔧 In progress |
-| Fix 8 elevated bugs (transfer to caller, flash loan finality, auction reveal timing, Insurance drain) | 📅 Sprint 2 |
-| Fix 6 medium + 3 minor bugs | 📅 Sprint 3 |
-| Re-test all contracts after fixes | 📅 Sprint 3 |
-
----
-
-## Phase 1: VM & Deployment 🔧
-
-### Current Status: Syscall ID Mismatch Fixed
-
-The silex-cli stdlib (`cli/src/stdlib.rs`) has been **fully rewritten** to match the daemon's `build_environment()` registration order exactly. The main registration sequence in `cli/src/main.rs` was also fixed to remove `iterator::register` for V0 compatibility.
-
-### Root Cause (Resolved)
-
-All native functions in XELIS VM share a single flat `Vec<NativeFunction>`. The syscall ID is simply the index in this vector. When the compiler and daemon register functions in different orders — or register different sets of functions — the resulting bytecode has wrong syscall IDs. Specific issues found and fixed:
-
-1. **Iterator position**: `xstd::register` in silex-cli always included `iterator::register`, but the daemon only registers iterator for V1+ contracts. Now omitted for V0.
-2. **Ciphertext static method name**: Daemon registers `generate` (not `new`) — now uses `generate`.
-3. **Extra compiler stubs**: Functions like `Contract::get_storage`, `get_metadata`, `set_metadata`, `schedule_execution` were removed.
-4. **ScheduledExecution mismatch**: Now matches daemon function set exactly.
-5. **Method registration order**: Proof methods now registered before contract/scheduled-execution methods, matching daemon.
-
-**Fix applied**: silex-cli environment is byte-for-byte identical to daemon's `build_environment()` for V0.
-
-| Task | Status |
-|------|--------|
-| Identify root cause (function registration order mismatch) | ✅ |
+| Identify root cause of VM storage failure (syscall ID mismatch) | ✅ |
+| Rewrite silex-cli stdlib to match daemon's `build_environment()` exactly | ✅ |
 | Fix xstd registration order (remove iterator for V0) | ✅ |
-| Rewrite stdlib.rs to match daemon's `build_environment()` exactly | ✅ |
-| Deploy and test `Storage::store` / `Storage::load` on testnet | 🔧 In progress |
-| Deploy PriceOracle → xUSD → VaultEngine on testnet | 📅 |
-| Full vault lifecycle test (deposit → borrow → repay → withdraw) | 📅 |
-| Liquidation path test | 📅 |
+| Fix Ciphertext method name (generate vs new) | ✅ |
+| Remove extra compiler stubs causing ID shift | ✅ |
+| Match ScheduledExecution registration order | ✅ |
+
+**Root cause (resolved):** All native functions in XELIS VM share a single flat `Vec<NativeFunction>`. The syscall ID is simply the index in this vector. When the compiler and daemon registered functions in different orders, the resulting bytecode had wrong syscall IDs. The silex-cli environment is now byte-for-byte identical to the daemon's `build_environment()` for V0.
 
 ---
 
-## Phase 2: Core Lending on Testnet 📅
+## Phase 1: Core Lending Deployment on Testnet 🔧
+
+| Task | Status |
+|------|--------|
+| Deploy PriceOracle to testnet (with `invoke`, constructor ran) | ✅ |
+| Create xUSD confidential asset on testnet | ✅ |
+| Deploy VaultEngine to testnet (with `invoke`, hook confirmed) | ✅ |
+| Call `propose_price` on PriceOracle (timelock set) | ✅ |
+| Wallet recovery from seed on public testnet | ✅ |
+| **Redeploy xUSD with proper hook** (old deploy had no invoke, constructor never ran) | 🔧 In progress |
+| Execute oracle price (timelock expired) | 🔧 Next |
+| Configure VaultEngine (set_oracle, set_xusd, set_xusd_asset) | 📅 |
+| Test deposit → borrow → repay → withdraw lifecycle | 📅 |
+| Test redemption path | 📅 |
+| Test liquidation path | 📅 |
+
+---
+
+## Phase 2: Full Lending Suite 📅
 
 | Task | Timeline |
 |------|----------|
-| Deploy PriceOracle (set initial XEL price) | Week 1 post-fix |
-| Deploy xUSD (create confidential asset) | Week 1 |
-| Deploy InterestRateModel | Week 1 |
-| Deploy VaultEngine (set oracle, xUSD, interest model addresses) | Week 2 |
-| Test deposit → borrow → repay → withdraw lifecycle | Week 2 |
-| Test redemption path | Week 2 |
-| Test liquidation path | Week 2 |
-| Deploy InsurancePool + FlashLoan | Week 2 |
+| Deploy InterestRateModel | Next week |
+| Deploy InsurancePool + FlashLoan | Next week |
+| Deploy remaining 16 contracts to testnet | Next week |
+| SDK integration tests | Next week |
 
 ---
 
@@ -86,12 +74,12 @@ All native functions in XELIS VM share a single flat `Vec<NativeFunction>`. The 
 
 | Task | Timeline |
 |------|----------|
-| XELIS Forge xUSD/XEL pool | Week 3 |
-| VLT token deployment (10M confidential asset) | Week 3 |
-| GovernanceVault + Timelock | Week 3 |
-| Private Lending Marketplace | Week 4 |
-| Peer-to-Peer Lending | Week 4 |
-| Sealed-Bid Auctions | Week 5 |
+| XELIS Forge xUSD/XEL pool | Week after lending live |
+| VLT token deployment (10M confidential asset) | Week after lending live |
+| GovernanceVault + Timelock | Week after lending live |
+| Private Lending Marketplace | Week after lending live |
+| Peer-to-Peer Lending | Week after lending live |
+| Sealed-Bid Auctions | Week after lending live |
 
 ---
 
@@ -176,28 +164,30 @@ All native functions in XELIS VM share a single flat `Vec<NativeFunction>`. The 
 
 ---
 
-## Current Sprint (May 26)
+## Current Sprint (May 31)
 
 ### Active
-- **[Adrien]** Deploying TestStorage.slx to testnet to verify storage persistence
-- **[Adrien]** Fixing 7 critical bugs identified in comprehensive audit
-- **[Adrien]** Applying contract logic fixes (PriceOracle, VaultEngine, GovernanceVault)
+- **[Adrien]** Deploy new xUSD with hook=constructor (old xUSD had no invoke)
+- **[Adrien]** Execute oracle price (timelock expired)
+- **[Adrien]** Configure VaultEngine with oracle + xUSD + xUSD asset addresses
 
 ### This Week
-- [ ] Verify `storage_store` debug file is created on contract invocation
-- [ ] Fix critical bugs: PriceOracle zero-store, VaultEngine mint/burn/transfer, GovernanceVault asset hash
-- [ ] Fix elevated bugs: xUSD/VLT transfer-to-caller, auction reveal timing, PrivateInsurance drain
-- [ ] Recompile all contracts with corrected silex-cli
+- [ ] Deploy new xUSD contract (compiled 815 bytes with hook id=0)
+- [ ] Execute price on PriceOracle (call execute_price now that timelock expired)
+- [ ] Call set_oracle, set_xusd, set_xusd_asset on VaultEngine
+- [ ] Test deposit → borrow → repay → withdraw lifecycle
+- [ ] Update GitHub repo with testnet progress (README, roadmap)
 
 ### Next Week
-- [ ] Deploy first core contracts (PriceOracle, xUSD, VaultEngine) to testnet
-- [ ] Run full deposit → borrow → repay → withdraw lifecycle on testnet
-- [ ] Deploy all 19 contracts to testnet
-- [ ] SDK integration tests
+- [ ] Deploy InterestRateModel + FlashLoan + InsurancePool
+- [ ] Deploy all remaining 16 contracts
+- [ ] Full integration testing on testnet
+- [ ] SDK updates for testnet addresses
 
 ### Coming Up
 - [ ] Dashboard MVP
 - [ ] Public testnet announcement
+- [ ] Bug bounty program
 - [ ] XelisVault Messenger design phase
 
 ---
