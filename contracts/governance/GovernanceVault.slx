@@ -4,6 +4,7 @@ const VLT_ASSET_KEY: string = "va"
 const STAKE_PREFIX: string = "s"
 const TOTAL_KEY: string = "tt"
 const COUNTER_KEY: string = "n"
+const VOTER_PREFIX: string = "vp"
 const BLOCKS_PER_DAY: u64 = 17280
 
 struct StakePosition {
@@ -31,6 +32,10 @@ fn only_admin() {
 
 fn get_stake_key(id: u64) -> string {
     return STAKE_PREFIX + id.to_string(10u32);
+}
+
+fn get_voter_key(addr: Address) -> string {
+    return VOTER_PREFIX + addr.to_string();
 }
 
 fn calc_voting_power(amount: u64, lock_days: u64) -> u64 {
@@ -78,6 +83,8 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     ws.store(COUNTER_KEY, id + 1);
     let total: u64 = ws.load(TOTAL_KEY).unwrap_or(0);
     ws.store(TOTAL_KEY, total + vp);
+    let voter_total: u64 = ws.load(get_voter_key(caller)).unwrap_or(0);
+    ws.store(get_voter_key(caller), voter_total + vp);
     return id;
 }
 
@@ -99,6 +106,12 @@ entry unstake(stake_id: u64) -> u64 {
     } else {
         ws.store(TOTAL_KEY, 0u64);
     }
+    let voter_total: u64 = ws.load(get_voter_key(caller)).unwrap_or(0);
+    if voter_total >= pos.voting_power {
+        ws.store(get_voter_key(caller), voter_total - pos.voting_power);
+    } else {
+        ws.store(get_voter_key(caller), 0u64);
+    }
     return pos.amount;
 }
 
@@ -116,6 +129,11 @@ entry get_voting_power(stake_id: u64) -> u64 {
     let rs: Storage = Storage::new();
     let pos: StakePosition = rs.load(get_stake_key(stake_id)).expect("snf");
     return pos.voting_power;
+}
+
+entry get_voter_power(addr: Address) -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(get_voter_key(addr)).unwrap_or(0);
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {
