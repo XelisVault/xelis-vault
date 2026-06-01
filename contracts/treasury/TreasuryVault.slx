@@ -77,6 +77,18 @@ entry remove_allocation(index: u64) -> u64 {
     alloc.active = false;
     let ws: Storage = Storage::new();
     ws.store(get_alloc_key(index), alloc);
+    let count: u64 = ws.load(ALLOC_COUNT_KEY).unwrap_or(0);
+    if count > 0 {
+        let last_idx: u64 = count - 1;
+        if last_idx != index {
+            let last: Allocation = ws.load(get_alloc_key(last_idx)).expect("lnf");
+            ws.store(get_alloc_key(index), last);
+            ws.delete(get_alloc_key(last_idx));
+        } else {
+            ws.delete(get_alloc_key(index));
+        }
+        ws.store(ALLOC_COUNT_KEY, count - 1);
+    }
     return 0;
 }
 

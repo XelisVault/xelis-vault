@@ -35,6 +35,8 @@ xelis-vault/
 │   │   ├── RevenueShare.slx       # Revenue distribution
 │   │   ├── Payroll.slx            # Recurring payments
 │   │   └── PrivateInsurance.slx   # P2P insurance & derivatives
+│   ├── savings/
+│   │   └── SavingsRate.slx       # xUSD yield savings account
 │   └── math/
 │       └── InterestRateModel.slx  # Pure-math rates
 ├── sdk/

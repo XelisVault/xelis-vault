@@ -1,5 +1,5 @@
 #!/bin/bash
-# Batch deploy all 19 contracts to devnet
+# Batch deploy all 20 contracts to devnet
 # Each deploy takes ~30-60s for range proofs, total ~10-20min
 
 set -e
@@ -14,7 +14,7 @@ CONTRACTS=(
   PriceOracle xUSD InterestRateModel VaultEngine FlashLoan
   InsurancePool PrivateInsurance LendingMarket PeerLoan
   SyndicatePool SealedBidAuction AssetVault TreasuryVault
-  RevenueShare Payroll ComplianceModule VLT GovernanceVault Timelock
+  RevenueShare Payroll SavingsRate ComplianceModule VLT GovernanceVault Timelock
 )
 
 # Check wallet

@@ -28,7 +28,7 @@ Built on XELIS native homomorphic encryption, XELIS Vault is the first platform 
 
 ## What We're Building
 
-XELIS Vault is a complete suite of **19 smart contracts** covering every major DeFi primitive — all with built-in confidentiality via XELIS native Twisted ElGamal encryption.
+XELIS Vault is a complete suite of **20 smart contracts** covering every major DeFi primitive — all with built-in confidentiality via XELIS native Twisted ElGamal encryption.
 
 ### Core Lending
 

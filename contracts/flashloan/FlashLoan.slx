@@ -34,9 +34,9 @@ fn get_loan_key(id: u64) -> string {
 
 entry flash_loan(asset: Hash, amount: u64, callback_contract: Hash) -> u64 {
     require(amount > 0, "amtgt0");
+    require(callback_contract != Hash::zero(), "nocb");
     let caller: Address = get_caller().expect("nocaller");
     let fee: u64 = amount * FLASH_FEE_BPS / 10000;
-    require(fee > 0, "feezero");
     let rs: Storage = Storage::new();
     let id: u64 = rs.load(COUNTER_KEY).expect("idns");
     let loan: FlashLoan = FlashLoan {
@@ -53,10 +53,10 @@ entry flash_loan(asset: Hash, amount: u64, callback_contract: Hash) -> u64 {
     ws.store(COUNTER_KEY, id + 1);
     let ok: bool = transfer(caller, amount, asset);
     require(ok, "txfail");
-    if callback_contract != Hash::zero() {
-        let cb: Contract = Contract::new(callback_contract).expect("cbnf");
-        cb.call(CALLBACK_ENTRY, [caller, amount, asset, id], {});
-    }
+    let cb: Contract = Contract::new(callback_contract).expect("cbnf");
+    cb.call(CALLBACK_ENTRY, [caller, amount, asset, id], {});
+    let updated: FlashLoan = ws.load(get_loan_key(id)).expect("lnf");
+    require(updated.repaid, "notrepaid");
     return id;
 }
 

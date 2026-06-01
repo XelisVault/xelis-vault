@@ -28,16 +28,13 @@ entry create_asset() -> u64 {
 entry mint(to: Address, amount: u64) -> u64 {
     only_admin();
     require(amount > 0, "amtgt0");
-    let caller: Address = get_caller().expect("nocaller");
     let rs: Storage = Storage::new();
     let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
     require(ok, "mintfail");
-    if to != caller {
-        let ok2: bool = transfer(to, amount, hash);
-        require(ok2, "txfail");
-    }
+    let ok2: bool = transfer(to, amount, hash);
+    require(ok2, "txfail");
     return 0;
 }
 

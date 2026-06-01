@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch deploy all 19 contracts to devnet and extract addresses."""
+"""Batch deploy all 20 contracts to devnet and extract addresses."""
 
 import json, os, time, re, base64, urllib.request
 
@@ -16,6 +16,7 @@ WITH_CTOR = {
     "TreasuryVault": True, "RevenueShare": True, "Payroll": True,
     "ComplianceModule": True, "VLT": True, "GovernanceVault": True,
     "Timelock": True,
+    "SavingsRate": True,
 }
 
 CONTRACTS = list(WITH_CTOR.keys())
@@ -57,7 +58,7 @@ try:
 except:
     matches = set()
 
-print(f"Already deployed (from log): PriceOracle, xUSD, InterestRateModel", flush=True)
+print(f"Skipping already known deployments: PriceOracle, xUSD, InterestRateModel", flush=True)
 
 for c in CONTRACTS:
     if c in already:

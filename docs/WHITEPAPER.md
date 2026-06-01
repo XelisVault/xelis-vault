@@ -58,7 +58,8 @@ XELIS Vault is the first platform to productize these primitives into a complete
 ```
                     ┌──────────────────────────────────────┐
                     │           CORE LENDING               │
-                    │  VaultEngine  |  xUSD  |  FlashLoan  │
+                     │  VaultEngine  |  xUSD  |  FlashLoan  │
+                     │  SavingsRate  |                       │
                     └──────────────────────────────────────┘
                     ┌──────────────────────────────────────┐
                     │         FINANCIAL MARKETS            │
@@ -94,6 +95,7 @@ XELIS Vault is the first platform to productize these primitives into a complete
 | `InterestRateModel.slx` | Core | Kinked interest rate calculation |
 | `PriceOracle.slx` | Core | XEL price feed with timelock |
 | `FlashLoan.slx` | Core | Confidential uncollateralized flash loans |
+| `SavingsRate.slx` | Core | xUSD yield savings account with per-block interest |
 | `LendingMarket.slx` | Market | Multi-pool, multi-collateral lending marketplace |
 | `PeerLoan.slx` | Market | Bilateral peer-to-peer confidential loans |
 | `SyndicatePool.slx` | Market | Multi-lender, single-borrower syndicated credit |

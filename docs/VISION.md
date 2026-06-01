@@ -49,11 +49,11 @@ XELIS Vault est la première plateforme à transformer ces primitives en un éco
 
 ## Ce qu'on a fait
 
-### 19 Smart Contracts — de zéro à suite complète
+### 20 Smart Contracts — de zéro à suite complète
 
-En partant de rien, on a conçu, écrit, compilé et débogué 19 contrats interconnectés :
+En partant de rien, on a conçu, écrit, compilé et débogué 20 contrats interconnectés :
 
-- **Core** : VaultEngine, xUSD, PriceOracle, InterestRateModel, FlashLoan, Redemption
+- **Core** : VaultEngine, xUSD, PriceOracle, InterestRateModel, FlashLoan, SavingsRate, Redemption
 - **Markets** : LendingMarket, PeerLoan, SyndicatePool, SealedBidAuction
 - **Tokenization** : AssetVault, TreasuryVault
 - **Compliance** : ComplianceModule
@@ -93,7 +93,8 @@ Tout compile. Les bugs de syntaxe/logique sont corrigés. L'infrastructure SDK/C
 2. 🔧 Corriger les 24 bugs identifiés par l'audit complet (7 critiques, 8 élevés)
 3. Déployer PriceOracle → xUSD → VaultEngine sur testnet
 4. Tester le cycle complet deposit → borrow → repay → withdraw
-5. Déployer les 16 contrats restants
+5. Déployer SavingsRate + tests de yield
+6. Déployer les 15 contrats restants
 6. Annonce publique + testnet ouvert
 7. Audit de sécurité + bug bounty
 8. Mainnet
@@ -103,7 +104,7 @@ Tout compile. Les bugs de syntaxe/logique sont corrigés. L'infrastructure SDK/C
 
 XELIS Vault n'est pas "un énième protocole de lending". C'est la première plateforme financière vraiment confidentielle sur la première blockchain vraiment privée.
 
-**Quand le VM bug sera fixé, on sera les premiers à déployer un écosystème DeFi complet sur XELIS.** Pas un POC, pas une démo — 19 contrats interconnectés, prêts pour la production.
+**Quand le VM bug sera fixé, on sera les premiers à déployer un écosystème DeFi complet sur XELIS.** Pas un POC, pas une démo — 20 contrats interconnectés, prêts pour la production.
 
 Le marché du privacy DeFi est vierge. XELIS a la technologie. XELIS Vault a les produits. Il manque juste une ligne de code.
 

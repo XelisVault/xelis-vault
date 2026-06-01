@@ -7,8 +7,7 @@ const MAX_DELAY_KEY: string = "xd"
 struct Proposal {
     target_contract: Hash,
     entry_id: u16,
-    params: u8[],
-    value: u64,
+    param_value: u64,
     submitted_at: u64,
     delay: u64,
     executed: bool,
@@ -35,7 +34,7 @@ fn get_proposal_key(id: u64) -> string {
     return PROPOSAL_PREFIX + id.to_string(10u32);
 }
 
-entry submit_proposal(target: Hash, entry: u16, params: u8[], delay: u64) -> u64 {
+entry submit_proposal(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
     only_admin();
     require(delay >= Storage::new().load(MIN_DELAY_KEY).unwrap_or(720), "min");
     let max_delay: u64 = Storage::new().load(MAX_DELAY_KEY).unwrap_or(259200);
@@ -46,8 +45,7 @@ entry submit_proposal(target: Hash, entry: u16, params: u8[], delay: u64) -> u64
     let prop: Proposal = Proposal {
         target_contract: target,
         entry_id: entry,
-        params: params,
-        value: 0,
+        param_value: param_value,
         submitted_at: topo,
         delay: delay,
         executed: false,
@@ -70,7 +68,7 @@ entry execute_proposal(proposal_id: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(proposal_id), prop);
     let target: Contract = Contract::new(prop.target_contract).expect("tcnf");
-    target.call(prop.entry_id, [prop.value], {});
+    target.call(prop.entry_id, [prop.param_value], {});
     return 0;
 }
 

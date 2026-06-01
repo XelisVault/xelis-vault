@@ -35,8 +35,8 @@ fn get_stake_key(id: u64) -> string {
 
 fn calc_voting_power(amount: u64, lock_days: u64) -> u64 {
     let multiplier: u64 = 100 + (lock_days * 200 / 365);
-    if multiplier > 200 { return amount * 200 / 100; }
-    return amount * multiplier / 100;
+    if multiplier > 200 { return (amount as u128 * 200u128 / 100u128) as u64; }
+    return (amount as u128 * multiplier as u128 / 100u128) as u64;
 }
 
 entry set_vlt_contract(contract_hash: Hash) -> u64 {

@@ -62,11 +62,12 @@ entry fund_stream(stream_id: u64) -> u64 {
     let rs: Storage = Storage::new();
     let stream: PayrollStream = rs.load(get_stream_key(stream_id)).expect("pnf");
     require(stream.active, "inactive");
-    let total_needed: u64 = stream.amount_per_block * (stream.total_blocks - stream.blocks_paid);
     let dep: optional<u64> = get_deposit_for_asset(stream.asset_hash);
-    require(dep.is_some() && dep.unwrap() >= total_needed, "nodep");
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
+    let deposit_amt: u64 = dep.unwrap();
     let ws: Storage = Storage::new();
-    ws.store(get_funded_key(stream_id), dep.unwrap());
+    let existing: u64 = ws.load(get_funded_key(stream_id)).unwrap_or(0);
+    ws.store(get_funded_key(stream_id), existing + deposit_amt);
     return 0;
 }
 

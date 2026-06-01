@@ -35,6 +35,7 @@ fn get_loan_key(id: u64) -> string {
 entry create_loan(borrower: Address, asset: Hash, principal: u64, interest_bps: u64, maturity_topo: u64) -> u64 {
     require(principal > 0, "princgt0");
     require(interest_bps <= 10000, "max100pct");
+    require(maturity_topo > get_current_topoheight(), "past");
     let caller: Address = get_caller().expect("nocaller");
     let dep: optional<u64> = get_deposit_for_asset(asset);
     require(dep.is_some() && dep.unwrap() >= principal, "nodep");
@@ -66,7 +67,7 @@ entry repay(loan_id: u64) -> u64 {
     require(loan.active, "inactive");
     require(!loan.defaulted, "defaulted");
     require(caller == loan.borrower, "ny");
-    let interest: u64 = loan.principal * loan.interest_bps / 10000;
+    let interest: u64 = (loan.principal as u128 * loan.interest_bps as u128 / 10000u128) as u64;
     let total_due: u64 = loan.principal + interest;
     let remaining: u64 = total_due - loan.repaid;
     let dep: optional<u64> = get_deposit_for_asset(loan.asset_hash);
@@ -86,7 +87,7 @@ entry default_loan(loan_id: u64) -> u64 {
     require(loan.active, "inactive");
     let topo: u64 = get_current_topoheight();
     require(topo >= loan.maturity_topo, "notdue");
-    let interest: u64 = loan.principal * loan.interest_bps / 10000;
+    let interest: u64 = (loan.principal as u128 * loan.interest_bps as u128 / 10000u128) as u64;
     let total_due: u64 = loan.principal + interest;
     require(loan.repaid < total_due, "paid");
     loan.defaulted = true;

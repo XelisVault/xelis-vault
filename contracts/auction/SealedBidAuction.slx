@@ -116,10 +116,16 @@ entry reveal_bid(bid_id: u64, actual_value: u64, nonce: u64) -> u64 {
     let vbytes: bytes = actual_value.to_le_bytes();
     let nbytes: bytes = nonce.to_le_bytes();
     vbytes.extend(nbytes);
-    let computed: Hash = Hash::blake3(vbytes);
+    require(actual_value <= bid.deposited, "bidxdep");
     require(computed == bid.commitment, "invcommit");
     bid.value = actual_value;
     bid.revealed = true;
+    if actual_value < bid.deposited {
+        let refund_amt: u64 = bid.deposited - actual_value;
+        bid.deposited = actual_value;
+        let ok_r: bool = transfer(caller, refund_amt, Hash::zero());
+        require(ok_r, "rfail");
+    }
     if actual_value > auction.winning_bid && actual_value >= auction.min_price {
         auction.winner_bid_id = bid_id;
         auction.winning_bid = actual_value;

@@ -18,7 +18,7 @@
 |------|--------|
 | Whitepaper v2 | ✅ |
 | Architecture docs | ✅ |
-| All 19 smart contracts (core, markets, treasury, compliance, governance) | ✅ Written |
+| All 20 smart contracts (core, markets, treasury, compliance, governance, savings) | ✅ Written |
 | Compilation & static analysis (18+ syntax bugs fixed) | ✅ |
 | Comprehensive bug audit (24 bugs: 7 critical, 8 elevated, 6 medium, 3 minor) | ✅ Complete |
 

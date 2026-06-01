@@ -49,14 +49,14 @@ fn get_queue_key(index: u64) -> string {
 }
 
 fn calc_collateral_value(cp: u64, price: u64) -> u64 {
-    return cp * price / 100000000;
+    return (cp as u128 * price as u128 / 100000000u128) as u64;
 }
 
 fn get_xel_price() -> u64 {
     let rs: Storage = Storage::new();
     let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
     let oc: Contract = Contract::new(oh).expect("ocnf");
-    let price: u64 = oc.call(4u16, [Hash::zero()], {});
+    let price: u64 = oc.call(2u16, [Hash::zero()], {});
     return price;
 }
 
@@ -124,6 +124,8 @@ fn dequeue(vault_id: u64) {
 
 entry deposit(collateral_asset: Hash, collateral_amount: u64) -> u64 {
     require(collateral_amount > 0, "amtgt0");
+    let dep: u64 = get_deposit_for_asset(collateral_asset).expect("nodep");
+    require(dep >= collateral_amount, "insdep");
     let caller: Address = get_caller().expect("nocaller");
     let rs: Storage = Storage::new();
     let id: u64 = rs.load(COUNTER_KEY).expect("idns");
@@ -163,11 +165,11 @@ entry borrow(vault_id: u64, amount: u64) -> u64 {
     let xusd_asset: Hash = ws.load(XUSD_ASSET_KEY).expect("xans");
     let xusd_contract_hash: Hash = ws.load(XUSD_CONTRACT_KEY).expect("xcns");
     let xusd_contract: Contract = Contract::new(xusd_contract_hash).expect("xcnf");
-    xusd_contract.call(3u16, [caller, net_amount], {});
+    xusd_contract.call(1u16, [caller, net_amount], {});
     if fee > 0 {
         let treasury: optional<Address> = ws.load(TREASURY_KEY);
         if treasury.is_some() {
-            xusd_contract.call(3u16, [treasury.unwrap(), fee], {});
+            xusd_contract.call(1u16, [treasury.unwrap(), fee], {});
         }
     }
     let health: u64 = calc_health(vault.collateral_plain, new_borrow, get_xel_price());
@@ -254,7 +256,7 @@ entry redeem(amount: u64) -> u64 {
         }
         let fee: u64 = redeem_amount * REDEMPTION_FEE_BPS / 10000;
         let net_redeem: u64 = redeem_amount - fee;
-        let col_portion: u64 = vault.collateral_plain * net_redeem / vault.borrow_plain;
+        let col_portion: u64 = (vault.collateral_plain as u128 * net_redeem as u128 / vault.borrow_plain as u128) as u64;
         vault.borrow_plain -= redeem_amount;
         vault.collateral_plain -= col_portion;
         vault.last_update_topo = get_current_topoheight();
@@ -286,6 +288,8 @@ entry liquidate(vault_id: u64) -> u64 {
     let cv: u64 = calc_collateral_value(vault.collateral_plain, price);
     require(vault.borrow_plain > cv * 100 / MIN_COLLATERAL_RATIO, "hlt");
     let xusd_asset: Hash = rs.load(XUSD_ASSET_KEY).expect("xans");
+    let dep: u64 = get_deposit_for_asset(xusd_asset).expect("noxusddep");
+    require(dep >= vault.borrow_plain, "insuffdep");
     let ok_burn: bool = burn(vault.borrow_plain, xusd_asset);
     require(ok_burn, "burnfail");
     let penalty: u64 = vault.collateral_plain * LIQUIDATION_PENALTY / 100;

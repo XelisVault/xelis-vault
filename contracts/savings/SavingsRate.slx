@@ -1,0 +1,174 @@
+const ADMIN_KEY: string = "a"
+const RATE_KEY: string = "sr"
+const XUSD_ASSET_KEY: string = "xa"
+const XUSD_CONTRACT_KEY: string = "xc"
+const TOTAL_DEPOSITS_KEY: string = "td"
+const USER_PREFIX: string = "u"
+
+const BLOCKS_PER_DAY: u64 = 17280
+const YEARLY_BLOCKS: u64 = 365 * 17280
+
+struct Position {
+    principal: u64,
+    checkpoint_topo: u64,
+    collected: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(RATE_KEY, 500u64);
+    s.store(TOTAL_DEPOSITS_KEY, 0u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    require(caller == admin, "notauth");
+}
+
+fn get_user_key(addr: Address) -> string {
+    return USER_PREFIX + addr.to_string();
+}
+
+fn calc_yield(principal: u64, rate_bps: u64, blocks: u64) -> u64 {
+    if principal == 0 || rate_bps == 0 || blocks == 0 { return 0; }
+    return (principal as u128 * rate_bps as u128 * blocks as u128 / (YEARLY_BLOCKS as u128 * 10000u128)) as u64;
+}
+
+entry set_rate(rate_bps: u64) -> u64 {
+    only_admin();
+    require(rate_bps <= 5000, "max50pct");
+    let ws: Storage = Storage::new();
+    ws.store(RATE_KEY, rate_bps);
+    return 0;
+}
+
+entry set_xusd_asset(asset_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_ASSET_KEY, asset_hash);
+    return 0;
+}
+
+entry set_xusd_contract(contract_hash: Hash) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(XUSD_CONTRACT_KEY, contract_hash);
+    return 0;
+}
+
+entry deposit() -> u64 {
+    let rs: Storage = Storage::new();
+    let xusd_asset: Hash = rs.load(XUSD_ASSET_KEY).expect("xans");
+    let dep: optional<u64> = get_deposit_for_asset(xusd_asset);
+    require(dep.is_some() && dep.unwrap() > 0, "nodep");
+    let deposit_amt: u64 = dep.unwrap();
+    let caller: Address = get_caller().expect("nocaller");
+    let topo: u64 = get_current_topoheight();
+    let ws: Storage = Storage::new();
+    let existing: optional<Position> = ws.load(get_user_key(caller));
+    if existing.is_some() {
+        let pos: Position = existing.unwrap();
+        let blocks: u64 = topo - pos.checkpoint_topo;
+        let rate: u64 = ws.load(RATE_KEY).unwrap_or(0);
+        let pending: u64 = calc_yield(pos.principal, rate, blocks);
+        let updated: Position = Position {
+            principal: pos.principal + deposit_amt,
+            checkpoint_topo: topo,
+            collected: pos.collected + pending
+        };
+        ws.store(get_user_key(caller), updated);
+    } else {
+        let pos: Position = Position {
+            principal: deposit_amt,
+            checkpoint_topo: topo,
+            collected: 0
+        };
+        ws.store(get_user_key(caller), pos);
+    }
+    let total: u64 = ws.load(TOTAL_DEPOSITS_KEY).unwrap_or(0);
+    ws.store(TOTAL_DEPOSITS_KEY, total + deposit_amt);
+    return deposit_amt;
+}
+
+entry withdraw(amount: u64) -> u64 {
+    require(amount > 0, "amtgt0");
+    let caller: Address = get_caller().expect("nocaller");
+    let rs: Storage = Storage::new();
+    let pos: Position = rs.load(get_user_key(caller)).expect("nopos");
+    let topo: u64 = get_current_topoheight();
+    let blocks: u64 = topo - pos.checkpoint_topo;
+    let rate: u64 = rs.load(RATE_KEY).unwrap_or(0);
+    let pending: u64 = calc_yield(pos.principal, rate, blocks);
+    let total_yield: u64 = pos.collected + pending;
+    let total_available: u64 = pos.principal + total_yield;
+    require(amount <= total_available, "lowbal");
+    let xusd_asset: Hash = rs.load(XUSD_ASSET_KEY).expect("xans");
+    let xusd_contract_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("xcns");
+    let xusd_contract: Contract = Contract::new(xusd_contract_hash).expect("xcnf");
+    let withdraw_principal: u64 = amount;
+    let withdraw_yield: u64 = 0;
+    if amount > pos.principal {
+        withdraw_principal = pos.principal;
+        withdraw_yield = amount - pos.principal;
+    }
+    if withdraw_yield > total_yield {
+        withdraw_yield = total_yield;
+        withdraw_principal = amount - withdraw_yield;
+    }
+    let ws: Storage = Storage::new();
+    let total: u64 = ws.load(TOTAL_DEPOSITS_KEY).unwrap_or(0);
+    if amount >= total_available {
+        ws.delete(get_user_key(caller));
+        if total >= withdraw_principal {
+            ws.store(TOTAL_DEPOSITS_KEY, total - withdraw_principal);
+        } else {
+            ws.store(TOTAL_DEPOSITS_KEY, 0u64);
+        }
+    } else {
+        let remaining_principal: u64 = pos.principal - withdraw_principal;
+        let remaining_yield_collected: u64 = total_yield - withdraw_yield;
+        let updated: Position = Position {
+            principal: remaining_principal,
+            checkpoint_topo: topo,
+            collected: remaining_yield_collected
+        };
+        ws.store(get_user_key(caller), updated);
+        if total >= withdraw_principal {
+            ws.store(TOTAL_DEPOSITS_KEY, total - withdraw_principal);
+        } else {
+            ws.store(TOTAL_DEPOSITS_KEY, 0u64);
+        }
+    }
+    if withdraw_yield > 0 {
+        xusd_contract.call(1u16, [caller, withdraw_yield], {});
+    }
+    let ok: bool = transfer(caller, withdraw_principal, xusd_asset);
+    require(ok, "txfail");
+    return amount;
+}
+
+entry get_position(addr: Address) -> optional<Position> {
+    let rs: Storage = Storage::new();
+    return rs.load(get_user_key(addr));
+}
+
+entry get_rate() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(RATE_KEY).unwrap_or(0);
+}
+
+entry get_total_deposits() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(TOTAL_DEPOSITS_KEY).unwrap_or(0);
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    let ws: Storage = Storage::new();
+    ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}

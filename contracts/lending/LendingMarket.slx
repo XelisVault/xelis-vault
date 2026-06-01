@@ -87,10 +87,9 @@ entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
     let col_raw: u64 = col_dep.unwrap();
     let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
     let oc: Contract = Contract::new(oh).expect("ocnf");
-    let prices: u64[] = oc.call(3u16, [collateral_asset], {});
-    let price: u64 = prices[0];
+    let price: u64 = oc.call(2u16, [collateral_asset], {});
     require(price > 0, "nopr");
-    let col_val: u64 = col_raw * price / 100000000;
+    let col_val: u64 = (col_raw as u128 * price as u128 / 100000000u128) as u64;
     let max_borrow: u64 = col_val * 10000 / pool.min_collateral_bps;
     let available: u64 = pool.total_liquidity - pool.total_borrows;
     let borrow_amount: u64 = 0;
@@ -103,7 +102,7 @@ entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
         pool_id: pool_id,
         amount: borrow_amount,
         collateral_asset: collateral_asset,
-        collateral_amount: col_val,
+        collateral_amount: col_raw,
         active: true
     };
     let ws: Storage = Storage::new();

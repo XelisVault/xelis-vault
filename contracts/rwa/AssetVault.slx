@@ -37,7 +37,7 @@ entry create_vault(name: string, desc: string, valuation: u64, decimals: u8) -> 
     require(bal.is_some() && bal.unwrap() >= 100000000, "lowbal");
     let rs: Storage = Storage::new();
     let id: u64 = rs.load(COUNTER_KEY).expect("idns");
-    let share_asset: Asset = Asset::create(0u64, "RWA " + id.to_string(10u32), "RWA" + id.to_string(10u32), decimals, MaxSupplyMode::None).expect("crefail");
+    let share_asset: Asset = Asset::create(id + 1, "RWA " + id.to_string(10u32), "RWA" + id.to_string(10u32), decimals, MaxSupplyMode::None).expect("crefail");
     let share_hash: Hash = share_asset.get_hash();
     let vault: AssetVault = AssetVault {
         owner: caller,

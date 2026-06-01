@@ -1,7 +1,7 @@
 const ADMIN_KEY: string = "a"
 const ASSET_HASH_KEY: string = "ah"
 
-entry init() -> u64 {
+hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     return 0;
@@ -34,11 +34,8 @@ entry mint_tokens(to: Address, amount: u64) -> u64 {
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
     require(ok, "mintfail");
-    let caller: Address = get_caller().expect("nocaller");
-    if to != caller {
-        let ok2: bool = transfer(to, amount, hash);
-        require(ok2, "txfail");
-    }
+    let ok2: bool = transfer(to, amount, hash);
+    require(ok2, "txfail");
     return 0;
 }
 
