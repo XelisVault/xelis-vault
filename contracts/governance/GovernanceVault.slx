@@ -2,9 +2,16 @@ const ADMIN_KEY: string = "a"
 const VLT_CONTRACT_KEY: string = "vc"
 const VLT_ASSET_KEY: string = "va"
 const STAKE_PREFIX: string = "s"
-const TOTAL_KEY: string = "tt"
+const TOTAL_VP_KEY: string = "tt"
+const TOTAL_STAKED_KEY: string = "ts"
 const COUNTER_KEY: string = "n"
 const VOTER_PREFIX: string = "vp"
+const VOTER_AMT_PREFIX: string = "vam"
+const REWARD_PREFIX: string = "ru"
+const REWARD_RATE_KEY: string = "rr"
+const PERIOD_FINISH_KEY: string = "pf"
+const LAST_UPDATE_KEY: string = "lu"
+const REWARD_PER_TOKEN_KEY: string = "rpt"
 const BLOCKS_PER_DAY: u64 = 17280
 
 struct StakePosition {
@@ -15,11 +22,18 @@ struct StakePosition {
     created_at: u64
 }
 
+struct RewardInfo {
+    reward_per_token_paid: u64,
+    rewards_pending: u64
+}
+
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
     s.store(COUNTER_KEY, 0u64);
-    s.store(TOTAL_KEY, 0u64);
+    s.store(TOTAL_VP_KEY, 0u64);
+    s.store(TOTAL_STAKED_KEY, 0u64);
+    s.store(LAST_UPDATE_KEY, get_current_topoheight());
     return 0;
 }
 
@@ -38,10 +52,62 @@ fn get_voter_key(addr: Address) -> string {
     return VOTER_PREFIX + addr.to_string();
 }
 
+fn get_voter_amt_key(addr: Address) -> string {
+    return VOTER_AMT_PREFIX + addr.to_string();
+}
+
+fn get_reward_key(addr: Address) -> string {
+    return REWARD_PREFIX + addr.to_string();
+}
+
 fn calc_voting_power(amount: u64, lock_days: u64) -> u64 {
     let multiplier: u64 = 100 + (lock_days * 200 / 365);
     if multiplier > 200 { return (amount as u128 * 200u128 / 100u128) as u64; }
     return (amount as u128 * multiplier as u128 / 100u128) as u64;
+}
+
+fn last_time_reward_applicable() -> u64 {
+    let rs: Storage = Storage::new();
+    let finish: u64 = rs.load(PERIOD_FINISH_KEY).unwrap_or(0);
+    let topo: u64 = get_current_topoheight();
+    if finish == 0 || topo < finish { return topo; }
+    return finish;
+}
+
+fn calc_reward_per_token() -> u64 {
+    let rs: Storage = Storage::new();
+    let total_staked: u64 = rs.load(TOTAL_STAKED_KEY).unwrap_or(0);
+    if total_staked == 0 { return rs.load(REWARD_PER_TOKEN_KEY).unwrap_or(0); }
+    let rate: u64 = rs.load(REWARD_RATE_KEY).unwrap_or(0);
+    if rate == 0 { return rs.load(REWARD_PER_TOKEN_KEY).unwrap_or(0); }
+    let last_update: u64 = rs.load(LAST_UPDATE_KEY).unwrap_or(0);
+    let now: u64 = last_time_reward_applicable();
+    if now <= last_update { return rs.load(REWARD_PER_TOKEN_KEY).unwrap_or(0); }
+    let elapsed: u64 = now - last_update;
+    let rpt: u64 = rs.load(REWARD_PER_TOKEN_KEY).unwrap_or(0);
+    let addition: u64 = (elapsed as u128 * rate as u128 * 1000000000000u128 / total_staked as u128) as u64;
+    return rpt + addition;
+}
+
+fn get_user_staked(addr: Address) -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(get_voter_amt_key(addr)).unwrap_or(0);
+}
+
+fn update_reward(addr: Address) {
+    let ws: Storage = Storage::new();
+    let rpt: u64 = calc_reward_per_token();
+    ws.store(REWARD_PER_TOKEN_KEY, rpt);
+    ws.store(LAST_UPDATE_KEY, last_time_reward_applicable());
+    let user_staked: u64 = get_user_staked(addr);
+    if user_staked > 0 {
+        let key: string = get_reward_key(addr);
+        let info: RewardInfo = ws.load(key).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 });
+        let earned: u64 = (user_staked as u128 * (rpt - info.reward_per_token_paid) as u128 / 1000000000000u128) as u64;
+        info.rewards_pending += earned;
+        info.reward_per_token_paid = rpt;
+        ws.store(key, info);
+    }
 }
 
 entry set_vlt_contract(contract_hash: Hash) -> u64 {
@@ -66,6 +132,7 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     let vlt_asset: Hash = Storage::new().load(VLT_ASSET_KEY).expect("vans");
     let dep: optional<u64> = get_deposit_for_asset(vlt_asset);
     require(dep.is_some() && dep.unwrap() >= amount, "nodep");
+    update_reward(caller);
     let rs: Storage = Storage::new();
     let id: u64 = rs.load(COUNTER_KEY).expect("idns");
     let topo: u64 = get_current_topoheight();
@@ -81,10 +148,18 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_stake_key(id), pos);
     ws.store(COUNTER_KEY, id + 1);
-    let total: u64 = ws.load(TOTAL_KEY).unwrap_or(0);
-    ws.store(TOTAL_KEY, total + vp);
+    let total_vp: u64 = ws.load(TOTAL_VP_KEY).unwrap_or(0);
+    ws.store(TOTAL_VP_KEY, total_vp + vp);
     let voter_total: u64 = ws.load(get_voter_key(caller)).unwrap_or(0);
     ws.store(get_voter_key(caller), voter_total + vp);
+    let total_staked: u64 = ws.load(TOTAL_STAKED_KEY).unwrap_or(0);
+    ws.store(TOTAL_STAKED_KEY, total_staked + amount);
+    let voter_amt: u64 = ws.load(get_voter_amt_key(caller)).unwrap_or(0);
+    ws.store(get_voter_amt_key(caller), voter_amt + amount);
+    let key: string = get_reward_key(caller);
+    let info: RewardInfo = ws.load(key).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 });
+    info.reward_per_token_paid = calc_reward_per_token();
+    ws.store(key, info);
     return id;
 }
 
@@ -95,16 +170,17 @@ entry unstake(stake_id: u64) -> u64 {
     require(pos.owner == caller, "ny");
     let topo: u64 = get_current_topoheight();
     require(topo >= pos.locked_until_topo, "locked");
+    update_reward(caller);
     let vlt_asset: Hash = Storage::new().load(VLT_ASSET_KEY).expect("vans");
     let ok: bool = transfer(caller, pos.amount, vlt_asset);
     require(ok, "txfail");
     let ws: Storage = Storage::new();
     ws.delete(get_stake_key(stake_id));
-    let total: u64 = ws.load(TOTAL_KEY).unwrap_or(0);
-    if total >= pos.voting_power {
-        ws.store(TOTAL_KEY, total - pos.voting_power);
+    let total_vp: u64 = ws.load(TOTAL_VP_KEY).unwrap_or(0);
+    if total_vp >= pos.voting_power {
+        ws.store(TOTAL_VP_KEY, total_vp - pos.voting_power);
     } else {
-        ws.store(TOTAL_KEY, 0u64);
+        ws.store(TOTAL_VP_KEY, 0u64);
     }
     let voter_total: u64 = ws.load(get_voter_key(caller)).unwrap_or(0);
     if voter_total >= pos.voting_power {
@@ -112,7 +188,59 @@ entry unstake(stake_id: u64) -> u64 {
     } else {
         ws.store(get_voter_key(caller), 0u64);
     }
+    let total_staked: u64 = ws.load(TOTAL_STAKED_KEY).unwrap_or(0);
+    if total_staked >= pos.amount {
+        ws.store(TOTAL_STAKED_KEY, total_staked - pos.amount);
+    } else {
+        ws.store(TOTAL_STAKED_KEY, 0u64);
+    }
+    let voter_amt: u64 = ws.load(get_voter_amt_key(caller)).unwrap_or(0);
+    if voter_amt >= pos.amount {
+        ws.store(get_voter_amt_key(caller), voter_amt - pos.amount);
+    } else {
+        ws.store(get_voter_amt_key(caller), 0u64);
+    }
+    let key: string = get_reward_key(caller);
+    let info: RewardInfo = ws.load(key).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 });
+    info.reward_per_token_paid = calc_reward_per_token();
+    ws.store(key, info);
     return pos.amount;
+}
+
+entry claim() -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    update_reward(caller);
+    let ws: Storage = Storage::new();
+    let key: string = get_reward_key(caller);
+    let info: RewardInfo = ws.load(key).expect("noreward");
+    let amount: u64 = info.rewards_pending;
+    require(amount > 0, "noreward");
+    info.rewards_pending = 0;
+    ws.store(key, info);
+    let vlt_asset: Hash = ws.load(VLT_ASSET_KEY).expect("vans");
+    let ok: bool = transfer(caller, amount, vlt_asset);
+    require(ok, "txfail");
+    return amount;
+}
+
+entry set_reward_rate(rate: u64, duration_blocks: u64) -> u64 {
+    only_admin();
+    require(duration_blocks >= 720, "mindur");
+    let topo: u64 = get_current_topoheight();
+    let ws: Storage = Storage::new();
+    let rpt: u64 = calc_reward_per_token();
+    ws.store(REWARD_PER_TOKEN_KEY, rpt);
+    ws.store(LAST_UPDATE_KEY, topo);
+    ws.store(REWARD_RATE_KEY, rate);
+    if duration_blocks > 0 {
+        ws.store(PERIOD_FINISH_KEY, topo + duration_blocks);
+    }
+    return 0;
+}
+
+entry get_reward_info(addr: Address) -> RewardInfo {
+    let rs: Storage = Storage::new();
+    return rs.load(get_reward_key(addr)).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 });
 }
 
 entry get_stake(stake_id: u64) -> optional<StakePosition> {
@@ -122,7 +250,12 @@ entry get_stake(stake_id: u64) -> optional<StakePosition> {
 
 entry get_total_voting_power() -> u64 {
     let rs: Storage = Storage::new();
-    return rs.load(TOTAL_KEY).unwrap_or(0);
+    return rs.load(TOTAL_VP_KEY).unwrap_or(0);
+}
+
+entry get_total_staked() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(TOTAL_STAKED_KEY).unwrap_or(0);
 }
 
 entry get_voting_power(stake_id: u64) -> u64 {
@@ -134,6 +267,16 @@ entry get_voting_power(stake_id: u64) -> u64 {
 entry get_voter_power(addr: Address) -> u64 {
     let rs: Storage = Storage::new();
     return rs.load(get_voter_key(addr)).unwrap_or(0);
+}
+
+entry get_reward_rate() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(REWARD_RATE_KEY).unwrap_or(0);
+}
+
+entry get_period_finish() -> u64 {
+    let rs: Storage = Storage::new();
+    return rs.load(PERIOD_FINISH_KEY).unwrap_or(0);
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

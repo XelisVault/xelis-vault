@@ -67,13 +67,13 @@ fn get_vote_key(proposal_id: u64, voter: Address) -> string {
 fn get_voting_power(addr: Address) -> u64 {
     let gv_hash: Hash = Storage::new().load(GOV_VAULT_KEY).expect("gvns");
     let gv: Contract = Contract::new(gv_hash).expect("gvnf");
-    return gv.call(8u16, [addr], {});
+    return gv.call(11u16, [addr], {});
 }
 
 fn get_total_supply() -> u64 {
     let gv_hash: Hash = Storage::new().load(GOV_VAULT_KEY).expect("gvns");
     let gv: Contract = Contract::new(gv_hash).expect("gvnf");
-    return gv.call(5u16, [], {});
+    return gv.call(8u16, [], {});
 }
 
 fn state(prop: GovProposal) -> ProposalState {
