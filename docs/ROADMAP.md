@@ -167,9 +167,9 @@ All contracts compile cleanly. All 24 bugs identified and catalogued.
 ## Current Sprint (May 31)
 
 ### Active
-- **[Adrien]** Deploy new xUSD with hook=constructor (old xUSD had no invoke)
-- **[Adrien]** Execute oracle price (timelock expired)
-- **[Adrien]** Configure VaultEngine with oracle + xUSD + xUSD asset addresses
+- Deploy new xUSD with hook=constructor (old xUSD had no invoke)
+- Execute oracle price (timelock expired)
+   Configure VaultEngine with oracle + xUSD + xUSD asset addresses
 
 ### This Week
 - [ ] Deploy new xUSD contract (compiled 815 bytes with hook id=0)
