@@ -42,6 +42,24 @@ pub fn mint_tokens(to: Address, amount: u64) -> u64 {
     return 0;
 }
 
+pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
+    let rs: Storage = Storage::new();
+    let vault: Hash = rs.load(VAULT_KEY).expect("nvk");
+    let caller: Hash = get_contract_caller().expect("nocontract");
+    require(caller == vault, "notauth");
+    let total: u64 = amount + fee;
+    require(total > 0, "amtgt0");
+    require(total >= amount, "ovf");
+    let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
+    let asset: Asset = Asset::get_by_hash(hash).expect("anf");
+    let ok: bool = asset.mint(total);
+    require(ok, "mintfail");
+    let ok1: bool = transfer(to, amount, hash);
+    let ok2: bool = transfer(treasury, fee, hash);
+    require(ok1 && ok2, "txfail");
+    return 0;
+}
+
 pub fn burn_tokens(amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
     let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");

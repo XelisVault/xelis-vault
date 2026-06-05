@@ -171,9 +171,14 @@ entry borrow(vault_id: u64, amount: u64) -> u64 {
         id: vault.id
     };
     s.store(get_vault_key(vault_id), upd);
-    let xusd_contract_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcns");
-    let xusd_contract: Contract = Contract::new(xusd_contract_hash).expect("xcnf");
-    let minted: u64 = xusd_contract.call(3u16, [caller, net_amount], {});
+    let xc_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcns");
+    let xc: Contract = Contract::new(xc_hash).expect("xcnf");
+    let treasury: optional<Address> = s.load(TREASURY_KEY);
+    if fee > 0 && treasury.is_some() {
+        let minted: u64 = xc.call(4u16, [caller, net_amount, treasury.unwrap(), fee], {});
+    } else {
+        let minted: u64 = xc.call(3u16, [caller, net_amount], {});
+    }
     let health: u64 = calc_health(vault.collateral_plain, new_borrow, get_xel_price());
     enqueue(vault_id, health);
     return 0;
@@ -280,12 +285,12 @@ entry redeem(amount: u64) -> u64 {
     require(total_collateral > 0, "nored");
     let ra: u64 = qs.load("amt").unwrap_or(0);
     let rr: u64 = qs.load("rem").unwrap_or(0);
-    let burned: u64 = ra - rr;
+    let redeemed: u64 = ra - rr;
     let xc_hash: Hash = Storage::new().load(XUSD_CONTRACT_KEY).expect("xcns");
-    let ok_tc: bool = transfer_contract(xc_hash, burned, xusd_asset);
+    let ok_tc: bool = transfer_contract(xc_hash, redeemed, xusd_asset);
     if ok_tc {
         let xc: Contract = Contract::new(xc_hash).expect("xcnf");
-        let ret: u64 = xc.call(4u16, [burned], {});
+        let ret: u64 = xc.call(5u16, [redeemed], {});
     }
     let ok_tx: bool = transfer(caller, total_collateral, Hash::zero());
     require(ok_tx, "txfail");
@@ -310,14 +315,20 @@ entry liquidate(vault_id: u64) -> u64 {
     let liquidator_collateral: u64 = vault.collateral_plain - penalty;
     vault.liquidated = true;
     vault.last_update_topo = get_current_topoheight();
-    let borrow_was: u64 = vault.borrow_plain;
     vault.borrow_plain = 0;
     vault.collateral_plain = 0;
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(vault_id), vault);
     dequeue(vault_id);
-    let ok: bool = transfer(caller, liquidator_collateral, vault.collateral_asset);
-    require(ok, "txfail");
+    let ok_lq: bool = transfer(caller, liquidator_collateral, vault.collateral_asset);
+    require(ok_lq, "txfail");
+    if penalty > 0 {
+        let treasury: optional<Address> = ws.load(TREASURY_KEY);
+        if treasury.is_some() {
+            let ok_tp: bool = transfer(treasury.unwrap(), penalty, vault.collateral_asset);
+            require(ok_tp, "txfail");
+        }
+    }
     return 0;
 }
 
