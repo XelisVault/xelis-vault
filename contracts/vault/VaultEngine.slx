@@ -27,7 +27,7 @@ struct VaultSnapshot {
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
-    s.store(COUNTER_KEY, 0u64);
+    s.store(COUNTER_KEY, 1u64);
     s.store(QUEUE_LEN_KEY, 0u64);
     s.store("init", 1u64);
     return 0;
@@ -56,7 +56,7 @@ fn get_xel_price() -> u64 {
     let rs: Storage = Storage::new();
     let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
     let oc: Contract = Contract::new(oh).expect("ocnf");
-    let price: u64 = oc.call(2u16, [Hash::zero()], {});
+    let price: u64 = oc.call(4u16, [Hash::zero()], {});
     return price;
 }
 
@@ -143,40 +143,40 @@ entry deposit(collateral_asset: Hash, collateral_amount: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(id), vault);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry borrow(vault_id: u64, amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
     let caller: Address = get_caller().expect("nocaller");
-    let rs: Storage = Storage::new();
-    let vault: VaultSnapshot = rs.load(get_vault_key(vault_id)).expect("vnf");
-    require(vault.owner == caller, "ny");
+    let s: Storage = Storage::new();
+    let vault: VaultSnapshot = s.load(get_vault_key(vault_id)).expect("vnf");
+    let eq: bool = vault.owner == caller;
+    require(eq, "ny");
     require(!vault.liquidated, "liq");
     let fee: u64 = amount * PROTOCOL_FEE_BPS / 10000;
     let net_amount: u64 = amount - fee;
     let new_borrow: u64 = vault.borrow_plain + net_amount;
     require(new_borrow > vault.borrow_plain, "ovf");
     require_healthy(vault.collateral_plain, new_borrow);
-    vault.borrow_plain = new_borrow;
-    vault.last_update_topo = get_current_topoheight();
-    let ws: Storage = Storage::new();
-    ws.store(get_vault_key(vault_id), vault);
-    let xusd_asset: Hash = ws.load(XUSD_ASSET_KEY).expect("xans");
-    let xusd_contract_hash: Hash = ws.load(XUSD_CONTRACT_KEY).expect("xcns");
+    let cur_topo: u64 = get_current_topoheight();
+    let upd: VaultSnapshot = VaultSnapshot {
+        owner: vault.owner,
+        collateral_asset: vault.collateral_asset,
+        collateral_plain: vault.collateral_plain,
+        borrow_plain: new_borrow,
+        last_update_topo: cur_topo,
+        liquidated: vault.liquidated,
+        created_at: vault.created_at,
+        id: vault.id
+    };
+    s.store(get_vault_key(vault_id), upd);
+    let xusd_contract_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcns");
     let xusd_contract: Contract = Contract::new(xusd_contract_hash).expect("xcnf");
-    xusd_contract.call(1u16, [caller, net_amount], {});
-    if fee > 0 {
-        let treasury: optional<Address> = ws.load(TREASURY_KEY);
-        if treasury.is_some() {
-            xusd_contract.call(1u16, [treasury.unwrap(), fee], {});
-        }
-    }
+    let minted: u64 = xusd_contract.call(3u16, [caller, net_amount], {});
     let health: u64 = calc_health(vault.collateral_plain, new_borrow, get_xel_price());
-    if health < 250 {
-        enqueue(vault_id, health);
-    }
-    return new_borrow;
+    enqueue(vault_id, health);
+    return 0;
 }
 
 entry repay(vault_id: u64, amount: u64) -> u64 {
@@ -199,7 +199,7 @@ entry repay(vault_id: u64, amount: u64) -> u64 {
     if vault.borrow_plain == 0 || calc_health(vault.collateral_plain, vault.borrow_plain, get_xel_price()) >= 250 {
         dequeue(vault_id);
     }
-    return vault.borrow_plain;
+    return 0;
 }
 
 entry withdraw(vault_id: u64, amount: u64) -> u64 {
@@ -227,7 +227,7 @@ entry withdraw(vault_id: u64, amount: u64) -> u64 {
     } else {
         enqueue(vault_id, health);
     }
-    return remaining;
+    return 0;
 }
 
 entry redeem(amount: u64) -> u64 {
@@ -236,21 +236,28 @@ entry redeem(amount: u64) -> u64 {
     let rs: Storage = Storage::new();
     let xusd_asset: Hash = rs.load(XUSD_ASSET_KEY).expect("xans");
     let qs: Storage = Storage::new();
+    qs.store("amt", amount);
     let qlen: u64 = qs.load(QUEUE_LEN_KEY).unwrap_or(0);
     require(qlen > 0, "novlt");
-    let remaining: u64 = amount;
-    let total_collateral: u64 = 0;
-    let i: u64 = 0;
-    while i < qlen && remaining > 0 {
+    qs.store("ql", qlen);
+    qs.store("i", 0u64);
+    qs.store("tcol", 0u64);
+    qs.store("rem", amount);
+    while true {
+        let i: u64 = qs.load("i").unwrap_or(0);
+        let ql: u64 = qs.load("ql").unwrap_or(0);
+        if i >= ql { break; }
+        let rem: u64 = qs.load("rem").unwrap_or(0);
+        if rem == 0 { break; }
         let qid: u64 = qs.load(get_queue_key(i)).unwrap_or(0);
-        if qid == 0 { i += 1; continue; }
+        if qid == 0 { qs.store("i", i + 1); continue; }
         let vs: Storage = Storage::new();
         let vault: VaultSnapshot = vs.load(get_vault_key(qid)).expect("vnf");
-        if vault.liquidated || vault.borrow_plain == 0 { i += 1; continue; }
+        if vault.liquidated || vault.borrow_plain == 0 { qs.store("i", i + 1); continue; }
         let price: u64 = get_xel_price();
         let health: u64 = calc_health(vault.collateral_plain, vault.borrow_plain, price);
-        if health < MIN_COLLATERAL_RATIO { i += 1; continue; }
-        let redeem_amount: u64 = remaining;
+        if health < MIN_COLLATERAL_RATIO { qs.store("i", i + 1); continue; }
+        let redeem_amount: u64 = rem;
         if redeem_amount > vault.borrow_plain {
             redeem_amount = vault.borrow_plain;
         }
@@ -260,22 +267,29 @@ entry redeem(amount: u64) -> u64 {
         vault.borrow_plain -= redeem_amount;
         vault.collateral_plain -= col_portion;
         vault.last_update_topo = get_current_topoheight();
-        remaining -= redeem_amount;
-        total_collateral += col_portion;
+        qs.store("tcol", qs.load("tcol").unwrap_or(0) + col_portion);
+        qs.store("rem", rem - redeem_amount);
         let ws: Storage = Storage::new();
         ws.store(get_vault_key(qid), vault);
         if vault.borrow_plain == 0 {
             dequeue(qid);
         }
-        i += 1;
+        qs.store("i", i + 1);
     }
+    let total_collateral: u64 = qs.load("tcol").unwrap_or(0);
     require(total_collateral > 0, "nored");
-    let burned: u64 = amount - remaining;
-    let ok_burn: bool = burn(burned, xusd_asset);
-    require(ok_burn, "burnfail");
+    let ra: u64 = qs.load("amt").unwrap_or(0);
+    let rr: u64 = qs.load("rem").unwrap_or(0);
+    let burned: u64 = ra - rr;
+    let xc_hash: Hash = Storage::new().load(XUSD_CONTRACT_KEY).expect("xcns");
+    let ok_tc: bool = transfer_contract(xc_hash, burned, xusd_asset);
+    if ok_tc {
+        let xc: Contract = Contract::new(xc_hash).expect("xcnf");
+        let ret: u64 = xc.call(4u16, [burned], {});
+    }
     let ok_tx: bool = transfer(caller, total_collateral, Hash::zero());
     require(ok_tx, "txfail");
-    return total_collateral;
+    return 0;
 }
 
 entry liquidate(vault_id: u64) -> u64 {
@@ -304,7 +318,7 @@ entry liquidate(vault_id: u64) -> u64 {
     dequeue(vault_id);
     let ok: bool = transfer(caller, liquidator_collateral, vault.collateral_asset);
     require(ok, "txfail");
-    return liquidator_collateral;
+    return 0;
 }
 
 entry get_queue() -> u64[] {

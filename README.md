@@ -116,11 +116,12 @@ xUSD is designed to trade at $1 through four mechanisms:
 | Milestone | Status |
 |-----------|--------|
 | **19 Smart Contracts** — all compiled, bug-fixed, hex-generated | ✅ Complete |
-| **Bug Fix Sprint** — VM syscall ID mismatch fixed, 24 bugs audited | ✅ Complete |
 | **TypeScript SDK** | ✅ Built |
 | **Liquidation Bot** | ✅ Built |
-| **Testnet Deployment** (internal) | 🔧 Testing |
+| **Core Contracts Testnet** — PriceOracle, xUSD, VaultEngine deployed & verified | ✅ Complete |
+| **Core Flow Tested** — deposit, borrow, repay, withdraw, redeem, liquidate all pass | ✅ Complete |
 | **Dashboard (React)** | 🚧 In progress |
+| **Full Testnet Deployment** (all 19 contracts) | 📅 Next |
 | **XelisVault Messenger** — encrypted messaging protocol | 📅 Phase 7 |
 | **Mainnet Launch** | 📅 Q3 2026 |
 

@@ -18,8 +18,8 @@ entry create_asset(rewards_vault: Address) -> u64 {
     only_admin();
     let bal: optional<u64> = get_balance_for_asset(Hash::zero());
     require(bal.is_some() && bal.unwrap() >= 100000000, "lowbal");
-    let max_supply: u64 = 10000000000000000u64;
-    let asset: Asset = Asset::create(1u64, "XELIS Vault Token", "VLT", 8u8, MaxSupplyMode::Fixed { max_supply: max_supply }).expect("crefail");
+    let max_supply: u64 = 1000000000000000u64;
+    let asset: Asset = Asset::create(1u64, "XELIS Vault Token", "VLT", 8u8, MaxSupplyMode::Mintable { max_supply: max_supply }).expect("crefail");
     let hash: Hash = asset.get_hash();
     let ws: Storage = Storage::new();
     ws.store(ASSET_HASH_KEY, hash);

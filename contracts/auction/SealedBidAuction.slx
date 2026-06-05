@@ -113,10 +113,11 @@ entry reveal_bid(bid_id: u64, actual_value: u64, nonce: u64) -> u64 {
     let topo: u64 = get_current_topoheight();
     require(topo > auction.end_topo, "bidphase");
     require(topo <= auction.reveal_end_topo, "revexpired");
-    let vbytes: bytes = actual_value.to_le_bytes();
-    let nbytes: bytes = nonce.to_le_bytes();
-    vbytes.extend(nbytes);
     require(actual_value <= bid.deposited, "bidxdep");
+    let vbytes = actual_value.to_le_bytes();
+    let nbytes = nonce.to_le_bytes();
+    vbytes.extend(nbytes);
+    let computed: Hash = Hash::blake3(vbytes);
     require(computed == bid.commitment, "invcommit");
     bid.value = actual_value;
     bid.revealed = true;

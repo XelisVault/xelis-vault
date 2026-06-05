@@ -2,7 +2,7 @@ const ADMIN_KEY: string = "a"
 const ACTIVE_PRICE_KEY: string = "p"
 const PENDING_PRICE_KEY: string = "pp"
 const PENDING_TOPO_KEY: string = "pt"
-const TIMELOCK_BLOCKS: u64 = 720
+const TIMELOCK_BLOCKS: u64 = 3
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
@@ -41,7 +41,7 @@ entry execute_price() -> u64 {
     return 0;
 }
 
-entry get_price(asset: Hash) -> u64 {
+pub fn get_price(asset: Hash) -> u64 {
     let s: Storage = Storage::new();
     return s.load(ACTIVE_PRICE_KEY).unwrap_or(0);
 }

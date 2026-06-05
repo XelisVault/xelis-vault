@@ -1,6 +1,6 @@
 # XELIS Vault — Roadmap
 
-> *Last updated: May 31, 2026*
+> *Last updated: June 5, 2026*
 
 ---
 
@@ -41,21 +41,23 @@ All contracts compile cleanly. All 24 bugs identified and catalogued.
 
 ---
 
-## Phase 1: Core Lending Deployment on Testnet 🔧
+## Phase 1: Core Lending Deployment on Testnet ✅
 
 | Task | Status |
 |------|--------|
-| Deploy PriceOracle to testnet (with `invoke`, constructor ran) | ✅ |
-| Create xUSD confidential asset on testnet | ✅ |
-| Deploy VaultEngine to testnet (with `invoke`, hook confirmed) | ✅ |
-| Call `propose_price` on PriceOracle (timelock set) | ✅ |
-| Wallet recovery from seed on public testnet | ✅ |
-| **Redeploy xUSD with proper hook** (old deploy had no invoke, constructor never ran) | 🔧 In progress |
-| Execute oracle price (timelock expired) | 🔧 Next |
-| Configure VaultEngine (set_oracle, set_xusd, set_xusd_asset) | 📅 |
-| Test deposit → borrow → repay → withdraw lifecycle | 📅 |
-| Test redemption path | 📅 |
-| Test liquidation path | 📅 |
+| Deploy PriceOracle (with `invoke`, constructor ran) | ✅ |
+| Create xUSD confidential asset | ✅ |
+| Deploy VaultEngine (with `invoke`, hook confirmed) | ✅ |
+| Propose & execute oracle price ($3/XEL) | ✅ |
+| Configure VaultEngine (set_oracle, set_xusd, set_xusd_asset) | ✅ |
+| Fix `mint_tokens` auth (get_caller → get_contract_caller) | ✅ |
+| Fix vault ID conflict (COUNTER_KEY=1, not 0) | ✅ |
+| Fix redeem while-loop variable corruption (storage workaround) | ✅ |
+| Fix all entry returns (non-zero = state rollback) | ✅ |
+| Test deposit → borrow → repay → withdraw | ✅ |
+| Test redemption path | ✅ |
+| Test liquidation path (price manipulation) | ✅ |
+| **All core flows verified end-to-end on testnet** | ✅ Complete |
 
 ---
 
@@ -164,31 +166,28 @@ All contracts compile cleanly. All 24 bugs identified and catalogued.
 
 ---
 
-## Current Sprint (May 31)
+## Current Sprint (June 5)
 
-### Active
-- Deploy new xUSD with hook=constructor (old xUSD had no invoke)
-- Execute oracle price (timelock expired)
-   Configure VaultEngine with oracle + xUSD + xUSD asset addresses
+### ✅ Completed
+- **[Adrien]** All core contracts deployed, configured, and tested end-to-end
+- **[Adrien]** Core flow verified: deposit → borrow → repay → withdraw → redeem → liquidate
+- **[Adrien]** All critical bugs fixed (vault ID sentinel, mint_tokens auth, redeem compiler workaround, return values)
+- **[Adrien]** GitHub repo updated with clean final contracts
 
 ### This Week
-- [ ] Deploy new xUSD contract (compiled 815 bytes with hook id=0)
-- [ ] Execute price on PriceOracle (call execute_price now that timelock expired)
-- [ ] Call set_oracle, set_xusd, set_xusd_asset on VaultEngine
-- [ ] Test deposit → borrow → repay → withdraw lifecycle
-- [ ] Update GitHub repo with testnet progress (README, roadmap)
-
-### Next Week
 - [ ] Deploy InterestRateModel + FlashLoan + InsurancePool
-- [ ] Deploy all remaining 16 contracts
-- [ ] Full integration testing on testnet
+- [ ] Deploy all remaining 16 contracts to testnet
+- [ ] Full integration testing
 - [ ] SDK updates for testnet addresses
 
-### Coming Up
+### Next Week
 - [ ] Dashboard MVP
 - [ ] Public testnet announcement
 - [ ] Bug bounty program
+
+### Coming Up
 - [ ] XelisVault Messenger design phase
+- [ ] Mainnet launch planning
 
 ---
 

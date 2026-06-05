@@ -1,5 +1,6 @@
 const ADMIN_KEY: string = "a"
 const ASSET_HASH_KEY: string = "ah"
+const VAULT_KEY: string = "vk"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
@@ -26,10 +27,12 @@ entry create_asset() -> u64 {
     return 0;
 }
 
-entry mint_tokens(to: Address, amount: u64) -> u64 {
-    only_admin();
-    require(amount > 0, "amtgt0");
+pub fn mint_tokens(to: Address, amount: u64) -> u64 {
     let rs: Storage = Storage::new();
+    let vault: Hash = rs.load(VAULT_KEY).expect("nvk");
+    let caller: Hash = get_contract_caller().expect("nocontract");
+    require(caller == vault, "notauth");
+    require(amount > 0, "amtgt0");
     let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
@@ -39,11 +42,9 @@ entry mint_tokens(to: Address, amount: u64) -> u64 {
     return 0;
 }
 
-entry burn_tokens(amount: u64) -> u64 {
+pub fn burn_tokens(amount: u64) -> u64 {
     require(amount > 0, "amtgt0");
     let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
-    let dep: optional<u64> = get_deposit_for_asset(hash);
-    require(dep.is_some() && dep.unwrap() >= amount, "nodep");
     let ok: bool = burn(amount, hash);
     require(ok, "burnfail");
     return 0;
@@ -71,6 +72,12 @@ entry get_asset_info() -> (string, string, u64) {
     let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     return (asset.get_name(), asset.get_ticker(), asset.get_supply());
+}
+
+entry set_vault_contract(vault: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(VAULT_KEY, vault);
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {
