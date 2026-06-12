@@ -214,7 +214,7 @@ entry borrow(vault_id: u64, amount: u64) -> u64 {
         let ih: Hash = insurance.unwrap();
         let _m: u64 = xc.call(17u16, [ih, premium], {});
         let ic: Contract = Contract::new(ih).expect("icnf");
-        let _n: u64 = ic.call(7u16, [premium], {});
+        let _n: u64 = ic.call(11u16, [premium], {});
     }
     let health: u64 = calc_health(vault.collateral_plain, new_borrow, get_xel_price());
     enqueue(vault_id, health);

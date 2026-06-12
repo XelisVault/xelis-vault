@@ -1,0 +1,197 @@
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const GUARDIAN_PREFIX: string = "g"
+const GUARDIAN_COUNT_KEY: string = "gc"
+const THRESHOLD_KEY: string = "th"
+const ACTION_COUNTER_KEY: string = "ac"
+const ACTION_PREFIX: string = "a"
+const CONFIRM_PREFIX: string = "c"
+
+struct Action {
+    target: Hash,
+    entry_id: u16,
+    executed: bool,
+    confirm_count: u64,
+    proposer: Address
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    s.store(ADMIN_KEY, caller);
+    s.store(EMERGENCY_KEY, caller);
+    s.store(GUARDIAN_PREFIX + "0", caller);
+    s.store(GUARDIAN_COUNT_KEY, 1u64);
+    s.store(THRESHOLD_KEY, 1u64);
+    s.store(ACTION_COUNTER_KEY, 1u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    if caller == admin { return; }
+    let tl: Hash = s.load(TIMELOCK_KEY).expect("tlnotset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == tl, "notauth");
+}
+
+fn is_guardian(addr: Address) -> bool {
+    let s: Storage = Storage::new();
+    let count: u64 = s.load(GUARDIAN_COUNT_KEY).unwrap_or(0);
+    let i: u64 = 0;
+    while i < count {
+        let g: Address = s.load(GUARDIAN_PREFIX + i.to_string(10u32)).expect("gnf");
+        if g == addr { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+fn get_action_key(id: u64) -> string {
+    return ACTION_PREFIX + id.to_string(10u32);
+}
+
+fn get_confirm_key(action_id: u64, addr: Address) -> string {
+    return CONFIRM_PREFIX + action_id.to_string(10u32) + addr.to_string();
+}
+
+entry add_guardian(addr: Address) -> u64 {
+    only_admin();
+    require(!is_guardian(addr), "exists");
+    let s: Storage = Storage::new();
+    let count: u64 = s.load(GUARDIAN_COUNT_KEY).expect("cntns");
+    s.store(GUARDIAN_PREFIX + count.to_string(10u32), addr);
+    s.store(GUARDIAN_COUNT_KEY, count + 1);
+    return 0;
+}
+
+entry remove_guardian(addr: Address) -> u64 {
+    only_admin();
+    let s: Storage = Storage::new();
+    let count: u64 = s.load(GUARDIAN_COUNT_KEY).expect("cntns");
+    let found_idx: optional<u64> = optional::none();
+    let i: u64 = 0;
+    while i < count {
+        let g: Address = s.load(GUARDIAN_PREFIX + i.to_string(10u32)).expect("gnf");
+        if g == addr {
+            found_idx = optional::some(i);
+            break;
+        }
+        i += 1;
+    }
+    if found_idx.is_some() {
+        let idx: u64 = found_idx.unwrap();
+        if idx + 1 < count {
+            let last: Address = s.load(GUARDIAN_PREFIX + (count - 1).to_string(10u32)).expect("gnf");
+            s.store(GUARDIAN_PREFIX + idx.to_string(10u32), last);
+        }
+        s.store(GUARDIAN_COUNT_KEY, count - 1);
+        let threshold: u64 = s.load(THRESHOLD_KEY).expect("thns");
+        if threshold > count - 1 {
+            s.store(THRESHOLD_KEY, count - 1);
+        }
+    }
+    return 0;
+}
+
+entry set_threshold(t: u64) -> u64 {
+    only_admin();
+    let count: u64 = Storage::new().load(GUARDIAN_COUNT_KEY).expect("cntns");
+    require(t > 0 && t <= count, "invth");
+    Storage::new().store(THRESHOLD_KEY, t);
+    return 0;
+}
+
+entry propose(target: Hash, entry_id: u16) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    require(is_guardian(caller), "notgd");
+    let s: Storage = Storage::new();
+    let id: u64 = s.load(ACTION_COUNTER_KEY).expect("idns");
+    let action: Action = Action {
+        target: target,
+        entry_id: entry_id,
+        executed: false,
+        confirm_count: 0,
+        proposer: caller
+    };
+    s.store(get_action_key(id), action);
+    s.store(ACTION_COUNTER_KEY, id + 1);
+    return 0;
+}
+
+entry confirm(action_id: u64) -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    require(is_guardian(caller), "notgd");
+    let s: Storage = Storage::new();
+    let action: Action = s.load(get_action_key(action_id)).expect("anf");
+    require(!action.executed, "execd");
+    let ck: string = get_confirm_key(action_id, caller);
+    let already: optional<bool> = s.load(ck);
+    require(already.is_none() || !already.unwrap(), "dup");
+    s.store(ck, true);
+    action.confirm_count += 1;
+    let threshold: u64 = s.load(THRESHOLD_KEY).expect("thns");
+    if action.confirm_count >= threshold {
+        action.executed = true;
+        s.store(get_action_key(action_id), action);
+        let target: Contract = Contract::new(action.target).expect("tgtnf");
+        let _: u64 = target.call(action.entry_id, [], {});
+    } else {
+        s.store(get_action_key(action_id), action);
+    }
+    return 0;
+}
+
+entry get_action(id: u64) -> optional<Action> {
+    return Storage::new().load(get_action_key(id));
+}
+
+entry get_guardian_count() -> u64 {
+    return Storage::new().load(GUARDIAN_COUNT_KEY).unwrap_or(0);
+}
+
+entry get_threshold() -> u64 {
+    return Storage::new().load(THRESHOLD_KEY).expect("thns");
+}
+
+entry set_timelock(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_timelock_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    Storage::new().store(ADMIN_KEY, new_admin);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
+}

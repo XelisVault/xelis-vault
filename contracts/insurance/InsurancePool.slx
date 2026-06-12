@@ -3,6 +3,7 @@ const STAKER_PREFIX: string = "s"
 const MEMBER_PREFIX: string = "m"
 const COUNTER_KEY: string = "n"
 const TOTAL_STAKED_KEY: string = "ts"
+const TOTAL_PREMIUMS_KEY: string = "tp"
 
 struct StakePosition {
     owner: Address,
@@ -110,4 +111,16 @@ entry transfer_admin(new_admin: Address) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(ADMIN_KEY, new_admin);
     return 0;
+}
+
+pub fn receive_premium(amount: u64) -> u64 {
+    require(amount > 0, "amtgt0");
+    let s: Storage = Storage::new();
+    let total: u64 = s.load(TOTAL_PREMIUMS_KEY).unwrap_or(0);
+    s.store(TOTAL_PREMIUMS_KEY, total + amount);
+    return 0;
+}
+
+entry get_total_premiums() -> u64 {
+    return Storage::new().load(TOTAL_PREMIUMS_KEY).unwrap_or(0);
 }
