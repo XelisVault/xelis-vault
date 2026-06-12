@@ -4,6 +4,7 @@ const EMERGENCY_KEY: string = "ea"
 const ASSET_HASH_KEY: string = "ah"
 const VAULT_KEY: string = "vk"
 const PSM_KEY: string = "ps"
+const SAVINGS_KEY: string = "sv"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
@@ -24,6 +25,9 @@ fn only_admin() {
 
 entry create_asset() -> u64 {
     only_admin();
+    let s: Storage = Storage::new();
+    let existing: optional<Hash> = s.load(ASSET_HASH_KEY);
+    require(existing.is_none(), "exists");
     require(get_deposits().len() == 1, "nodep");
     let xel_dep: u64 = get_deposit_for_asset(Hash::zero()).expect("noxel");
     require(xel_dep >= 100000000, "lowdep");
@@ -34,19 +38,16 @@ entry create_asset() -> u64 {
     return 0;
 }
 
-fn only_minter() {
-    let rs: Storage = Storage::new();
-    let vault: Hash = rs.load(VAULT_KEY).expect("nvk");
-    let caller: Hash = get_contract_caller().expect("nocontract");
-    if caller == vault { return; }
-    let psm: optional<Hash> = rs.load(PSM_KEY);
-    require(psm.is_some() && caller == psm.unwrap(), "notauth");
-}
-
 pub fn mint_tokens(to: Address, amount: u64) -> u64 {
-    only_minter();
+    let s: Storage = Storage::new();
+    let cc: Hash = get_contract_caller().expect("nocontract");
+    let vault: optional<Hash> = s.load(VAULT_KEY);
+    let psm: optional<Hash> = s.load(PSM_KEY);
+    let sav: optional<Hash> = s.load(SAVINGS_KEY);
+    let auth: bool = (vault.is_some() && cc == vault.unwrap()) || (psm.is_some() && cc == psm.unwrap()) || (sav.is_some() && cc == sav.unwrap());
+    require(auth, "notauth");
     require(amount > 0, "amtgt0");
-    let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
     require(ok, "mintfail");
@@ -56,11 +57,17 @@ pub fn mint_tokens(to: Address, amount: u64) -> u64 {
 }
 
 pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
-    only_minter();
+    let s: Storage = Storage::new();
+    let cc: Hash = get_contract_caller().expect("nocontract");
+    let vault: optional<Hash> = s.load(VAULT_KEY);
+    let psm: optional<Hash> = s.load(PSM_KEY);
+    let sav: optional<Hash> = s.load(SAVINGS_KEY);
+    let auth: bool = (vault.is_some() && cc == vault.unwrap()) || (psm.is_some() && cc == psm.unwrap()) || (sav.is_some() && cc == sav.unwrap());
+    require(auth, "notauth");
     let total: u64 = amount + fee;
     require(total > 0, "amtgt0");
     require(total >= amount, "ovf");
-    let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(total);
     require(ok, "mintfail");
@@ -71,8 +78,17 @@ pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 
 }
 
 pub fn burn_tokens(amount: u64) -> u64 {
+    let s: Storage = Storage::new();
+    let cc: Hash = get_contract_caller().expect("nocontract");
+    let vault: optional<Hash> = s.load(VAULT_KEY);
+    let psm: optional<Hash> = s.load(PSM_KEY);
+    let sav: optional<Hash> = s.load(SAVINGS_KEY);
+    let auth: bool = (vault.is_some() && cc == vault.unwrap()) || (psm.is_some() && cc == psm.unwrap()) || (sav.is_some() && cc == sav.unwrap());
+    require(auth, "notauth");
     require(amount > 0, "amtgt0");
-    let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset");
+    let bal: u64 = get_balance_for_asset(hash).unwrap_or(0);
+    require(bal >= amount, "lowbal");
     let ok: bool = burn(amount, hash);
     require(ok, "burnfail");
     return 0;
@@ -87,6 +103,10 @@ entry transfer_tokens(to: Address, amount: u64) -> u64 {
     require(dep.is_some() && dep.unwrap() >= amount, "nodep");
     let ok: bool = transfer(to, amount, hash);
     require(ok, "txfail");
+    if dep.unwrap() > amount {
+        let ok_r: bool = transfer(caller, dep.unwrap() - amount, hash);
+        require(ok_r, "rfail");
+    }
     return 0;
 }
 
@@ -151,5 +171,29 @@ entry emergency_withdraw() -> u64 {
     require(balance > 0, "nofunds");
     let ok: bool = transfer(caller, balance, Hash::zero());
     require(ok, "txfail");
+    return 0;
+}
+
+entry set_savings(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(SAVINGS_KEY, contract_hash);
+    return 0;
+}
+
+pub fn mint_to_contract(target: Hash, amount: u64) -> u64 {
+    let s: Storage = Storage::new();
+    let cc: Hash = get_contract_caller().expect("nocontract");
+    let vault: optional<Hash> = s.load(VAULT_KEY);
+    let psm: optional<Hash> = s.load(PSM_KEY);
+    let sav: optional<Hash> = s.load(SAVINGS_KEY);
+    let auth: bool = (vault.is_some() && cc == vault.unwrap()) || (psm.is_some() && cc == psm.unwrap()) || (sav.is_some() && cc == sav.unwrap());
+    require(auth, "notauth");
+    require(amount > 0, "amtgt0");
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset");
+    let asset: Asset = Asset::get_by_hash(hash).expect("anf");
+    let ok: bool = asset.mint(amount);
+    require(ok, "mintfail");
+    let ok2: bool = transfer_contract(target, amount, hash);
+    require(ok2, "txfail");
     return 0;
 }

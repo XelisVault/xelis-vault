@@ -22,6 +22,9 @@ fn only_admin() {
 
 entry create_asset(rewards_vault: Address) -> u64 {
     only_admin();
+    let s0: Storage = Storage::new();
+    let existing: optional<Hash> = s0.load(ASSET_HASH_KEY);
+    require(existing.is_none(), "exists");
     let bal: optional<u64> = get_deposit_for_asset(Hash::zero());
     require(bal.is_some() && bal.unwrap() >= 100000000, "lowbal");
     let max_supply: u64 = 1000000000000000u64;
