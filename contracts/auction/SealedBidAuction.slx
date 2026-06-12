@@ -75,7 +75,7 @@ entry create_auction(asset: Hash, amount: u64, min_price: u64, duration_blocks: 
     let ws: Storage = Storage::new();
     ws.store(get_auction_key(id), auction);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry submit_bid(auction_id: u64, commitment: Hash) -> u64 {
@@ -100,7 +100,7 @@ entry submit_bid(auction_id: u64, commitment: Hash) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_bid_key(bid_id), bid);
     ws.store(BID_COUNTER_KEY, bid_id + 1);
-    return bid_id;
+    return 0;
 }
 
 entry reveal_bid(bid_id: u64, actual_value: u64, nonce: u64) -> u64 {
@@ -175,7 +175,7 @@ entry refund_bid(bid_id: u64) -> u64 {
     ws.store(get_bid_key(bid_id), bid);
     let ok: bool = transfer(caller, amount, Hash::zero());
     require(ok, "txfail");
-    return amount;
+    return 0;
 }
 
 entry get_auction(auction_id: u64) -> optional<Auction> {
@@ -186,6 +186,15 @@ entry get_auction(auction_id: u64) -> optional<Auction> {
 entry get_bid(bid_id: u64) -> optional<Bid> {
     let rs: Storage = Storage::new();
     return rs.load(get_bid_key(bid_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

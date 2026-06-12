@@ -54,7 +54,7 @@ entry create_stream(employee: Address, asset: Hash, amount_per_block: u64, total
     let ws: Storage = Storage::new();
     ws.store(get_stream_key(id), stream);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry fund_stream(stream_id: u64) -> u64 {
@@ -95,7 +95,7 @@ entry execute_payroll(stream_id: u64) -> u64 {
     ws.store(get_funded_key(stream_id), remaining);
     let ok: bool = transfer(stream.employee, amount, stream.asset_hash);
     require(ok, "txfail");
-    return amount;
+    return 0;
 }
 
 entry cancel_stream(stream_id: u64) -> u64 {
@@ -112,6 +112,15 @@ entry cancel_stream(stream_id: u64) -> u64 {
 entry get_stream(stream_id: u64) -> optional<PayrollStream> {
     let rs: Storage = Storage::new();
     return rs.load(get_stream_key(stream_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

@@ -65,7 +65,7 @@ entry create_pool(name: string, premium_asset: Hash, premium_amount: u64, covera
     let ws: Storage = Storage::new();
     ws.store(get_pool_key(id), pool);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry join_pool(pool_id: u64) -> u64 {
@@ -103,12 +103,21 @@ entry claim_payout(pool_id: u64) -> u64 {
     ws.store(get_claimed_key(pool_id, caller), true);
     let ok: bool = transfer(caller, pool.coverage_amount, pool.coverage_asset);
     require(ok, "txfail");
-    return pool.coverage_amount;
+    return 0;
 }
 
 entry get_pool(pool_id: u64) -> optional<InsurancePool> {
     let rs: Storage = Storage::new();
     return rs.load(get_pool_key(pool_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

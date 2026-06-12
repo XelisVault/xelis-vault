@@ -3,6 +3,8 @@ const PROPOSAL_PREFIX: string = "p"
 const COUNTER_KEY: string = "n"
 const MIN_DELAY_KEY: string = "md"
 const MAX_DELAY_KEY: string = "xd"
+const GOVERNOR_KEY: string = "gv"
+const EMERGENCY_KEY: string = "ea"
 
 struct Proposal {
     target_contract: Hash,
@@ -17,8 +19,9 @@ struct Proposal {
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
     s.store(COUNTER_KEY, 0u64);
-    s.store(MIN_DELAY_KEY, 720u64);
+    s.store(MIN_DELAY_KEY, 1u64);
     s.store(MAX_DELAY_KEY, 259200u64);
     return 0;
 }
@@ -27,16 +30,40 @@ fn only_admin() {
     let s: Storage = Storage::new();
     let caller: Address = get_caller().expect("nocaller");
     let admin: Address = s.load(ADMIN_KEY).expect("anset");
-    require(caller == admin, "notauth");
+    if caller == admin { return; }
+    let gv: Hash = s.load(GOVERNOR_KEY).expect("gvset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == gv, "notauth");
 }
 
 fn get_proposal_key(id: u64) -> string {
     return PROPOSAL_PREFIX + id.to_string(10u32);
 }
 
-entry submit_proposal(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
-    only_admin();
-    require(delay >= Storage::new().load(MIN_DELAY_KEY).unwrap_or(720), "min");
+fn _set_min_delay(delay: u64) {
+    require(delay >= 1, "min1");
+    Storage::new().store(MIN_DELAY_KEY, delay);
+}
+
+fn _set_max_delay(delay: u64) {
+    Storage::new().store(MAX_DELAY_KEY, delay);
+}
+
+fn _cancel_proposal(id: u64) {
+    let rs: Storage = Storage::new();
+    let prop: Proposal = rs.load(get_proposal_key(id)).expect("pnf");
+    require(!prop.executed, "done");
+    require(!prop.cancelled, "alrdy");
+    prop.cancelled = true;
+    Storage::new().store(get_proposal_key(id), prop);
+}
+
+fn _transfer_admin(new_admin: Address) {
+    Storage::new().store(ADMIN_KEY, new_admin);
+}
+
+fn _submit_proposal(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
+    require(delay >= Storage::new().load(MIN_DELAY_KEY).unwrap_or(1), "min");
     let max_delay: u64 = Storage::new().load(MAX_DELAY_KEY).unwrap_or(259200);
     require(delay <= max_delay, "max");
     let rs: Storage = Storage::new();
@@ -57,7 +84,7 @@ entry submit_proposal(target: Hash, entry: u16, param_value: u64, delay: u64) ->
     return id;
 }
 
-entry execute_proposal(proposal_id: u64) -> u64 {
+fn _execute_proposal(proposal_id: u64) -> u64 {
     let rs: Storage = Storage::new();
     let prop: Proposal = rs.load(get_proposal_key(proposal_id)).expect("pnf");
     require(!prop.executed, "done");
@@ -68,34 +95,80 @@ entry execute_proposal(proposal_id: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(proposal_id), prop);
     let target: Contract = Contract::new(prop.target_contract).expect("tcnf");
-    target.call(prop.entry_id, [prop.param_value], {});
+    let _ = target.call(prop.entry_id, [prop.param_value], {});
     return 0;
+}
+
+entry submit_proposal(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
+    only_admin();
+    let _ = _submit_proposal(target, entry, param_value, delay);
+    return 0;
+}
+
+pub fn submit_proposal_tl(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
+    only_admin();
+    return _submit_proposal(target, entry, param_value, delay);
+}
+
+pub fn submit_proposal_tl_id(target: Hash, entry: u16, param_value: u64, delay: u64) -> u64 {
+    only_admin();
+    let id: u64 = _submit_proposal(target, entry, param_value, delay);
+    return id;
+}
+
+entry execute_proposal(proposal_id: u64) -> u64 {
+    return _execute_proposal(proposal_id);
+}
+
+pub fn execute_proposal_tl(proposal_id: u64) -> u64 {
+    return _execute_proposal(proposal_id);
 }
 
 entry cancel_proposal(proposal_id: u64) -> u64 {
     only_admin();
-    let rs: Storage = Storage::new();
-    let prop: Proposal = rs.load(get_proposal_key(proposal_id)).expect("pnf");
-    require(!prop.executed, "done");
-    require(!prop.cancelled, "alrdy");
-    prop.cancelled = true;
-    let ws: Storage = Storage::new();
-    ws.store(get_proposal_key(proposal_id), prop);
+    _cancel_proposal(proposal_id);
+    return 0;
+}
+
+pub fn cancel_proposal_tl(proposal_id: u64) -> u64 {
+    only_admin();
+    _cancel_proposal(proposal_id);
     return 0;
 }
 
 entry set_min_delay(delay: u64) -> u64 {
     only_admin();
-    require(delay >= 1, "min1");
-    let ws: Storage = Storage::new();
-    ws.store(MIN_DELAY_KEY, delay);
+    _set_min_delay(delay);
+    return 0;
+}
+
+pub fn set_min_delay_tl(delay: u64) -> u64 {
+    only_admin();
+    _set_min_delay(delay);
     return 0;
 }
 
 entry set_max_delay(delay: u64) -> u64 {
     only_admin();
-    let ws: Storage = Storage::new();
-    ws.store(MAX_DELAY_KEY, delay);
+    _set_max_delay(delay);
+    return 0;
+}
+
+pub fn set_max_delay_tl(delay: u64) -> u64 {
+    only_admin();
+    _set_max_delay(delay);
+    return 0;
+}
+
+entry set_governor(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(GOVERNOR_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_governor_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(GOVERNOR_KEY, contract_hash);
     return 0;
 }
 
@@ -106,7 +179,42 @@ entry get_proposal(proposal_id: u64) -> optional<Proposal> {
 
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
-    let ws: Storage = Storage::new();
-    ws.store(ADMIN_KEY, new_admin);
+    _transfer_admin(new_admin);
+    return 0;
+}
+
+pub fn transfer_admin_tl(new_admin: Address) -> u64 {
+    only_admin();
+    _transfer_admin(new_admin);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+pub fn set_emergency_tl(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
     return 0;
 }

@@ -1,0 +1,492 @@
+const MIN_LIQUIDITY: u64 = 1000
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const POOL_COUNT_KEY: string = "np"
+const ASSET_ID_KEY: string = "na"
+const ORACLE_KEY: string = "oc"
+const XUSD_CONTRACT_KEY: string = "xc"
+const XUSD_ASSET_KEY: string = "xa"
+const TREASURY_KEY: string = "tr"
+const FEE_SWAP_KEY: string = "fs"
+const FEE_PROTOCOL_KEY: string = "fp"
+const FEE_PSM_MINT_KEY: string = "fm"
+const FEE_PSM_REDEEM_KEY: string = "fr"
+
+const POOL_PREFIX: string = "p"
+const PAIR_PREFIX: string = "k"
+
+struct Pool {
+    token_a: Hash,
+    token_b: Hash,
+    reserve_a: u64,
+    reserve_b: u64,
+    lp_asset_hash: Hash,
+    lp_total_supply: u64,
+    is_psm: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new();
+    s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
+    s.store(POOL_COUNT_KEY, 0u64);
+    s.store(ASSET_ID_KEY, 0u64);
+    s.store(FEE_SWAP_KEY, 30u64);
+    s.store(FEE_PROTOCOL_KEY, 5u64);
+    s.store(FEE_PSM_MINT_KEY, 50u64);
+    s.store(FEE_PSM_REDEEM_KEY, 10u64);
+    return 0;
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let admin: Address = s.load(ADMIN_KEY).expect("anset");
+    if caller == admin { return; }
+    let tl: Hash = s.load(TIMELOCK_KEY).expect("tlnotset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == tl, "notauth");
+}
+
+fn get_pool_key(id: u64) -> string {
+    return POOL_PREFIX + id.to_string(10u32);
+}
+
+fn get_pair_key(a: Hash, b: Hash) -> string {
+    let au: u256 = a.to_u256();
+    let bu: u256 = b.to_u256();
+    let first: Hash = au > bu ? a : b;
+    let second: Hash = au > bu ? b : a;
+    return PAIR_PREFIX + first.to_hex() + second.to_hex();
+}
+
+fn store_pair(a: Hash, b: Hash, pool_id: u64) {
+    let key: string = get_pair_key(a, b);
+    Storage::new().store(key, pool_id);
+}
+
+fn load_pair(a: Hash, b: Hash) -> optional<u64> {
+    let key: string = get_pair_key(a, b);
+    return Storage::new().load(key);
+}
+
+fn new_asset_id() -> u64 {
+    let s: Storage = Storage::new();
+    let id: u64 = s.load(ASSET_ID_KEY).expect("na");
+    let next: u64 = id + 1;
+    s.store(ASSET_ID_KEY, next);
+    return id;
+}
+
+fn quote(amount_a: u64, reserve_a: u64, reserve_b: u64) -> u64 {
+    require(amount_a > 0, "insamt");
+    require(reserve_a > 0 && reserve_b > 0, "insliq");
+    return (amount_a as u128 * reserve_b as u128 / reserve_a as u128) as u64;
+}
+
+fn calc_liquidity(amount_a: u64, amount_b: u64, total_supply: u64, res_a: u64, res_b: u64, lp_hash: Hash) -> u64 {
+    if total_supply == 0 {
+        let asset: Asset = Asset::get_by_hash(lp_hash).expect("anf");
+        let ok: bool = asset.mint(MIN_LIQUIDITY);
+        require(ok, "mintfail");
+        return (((amount_a as u128) * (amount_b as u128)).sqrt() as u64) - MIN_LIQUIDITY;
+    }
+    return ((amount_a as u128 * total_supply as u128 / res_a as u128) as u64).min(
+        (amount_b as u128 * total_supply as u128 / res_b as u128) as u64
+    );
+}
+
+fn calc_optimal(amount_a_in: u64, amount_b_in: u64, res_a: u64, res_b: u64, tok_a: Hash, tok_b: Hash) -> (u64, u64) {
+    let optimal_b: u64 = quote(amount_a_in, res_a, res_b);
+    if optimal_b <= amount_b_in {
+        if optimal_b < amount_b_in {
+            let caller: Address = get_caller().expect("nocaller");
+            let ok: bool = transfer(caller, amount_b_in - optimal_b, tok_b);
+            require(ok, "txfail");
+        }
+        return (amount_a_in, optimal_b);
+    }
+    let optimal_a: u64 = quote(amount_b_in, res_b, res_a);
+    require(optimal_a <= amount_a_in, "optfail");
+    if optimal_a < amount_a_in {
+        let caller: Address = get_caller().expect("nocaller");
+        let ok: bool = transfer(caller, amount_a_in - optimal_a, tok_a);
+        require(ok, "txfail");
+    }
+    return (optimal_a, amount_b_in);
+}
+
+fn mint_lp(receiver: Address, amount_a: u64, amount_b: u64, pool_id: u64) -> u64 {
+    let s: Storage = Storage::new();
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    let asset: Asset = Asset::get_by_hash(pool.lp_asset_hash).expect("anf");
+    let total_supply: u64 = asset.get_supply();
+    let res_a: u64 = pool.reserve_a;
+    let res_b: u64 = pool.reserve_b;
+    let liquidity: u64 = calc_liquidity(amount_a, amount_b, total_supply, res_a, res_b, pool.lp_asset_hash);
+    require(liquidity > 0, "insliqmint");
+    let ok: bool = asset.mint(liquidity);
+    require(ok, "mintfail");
+    let ok2: bool = transfer(receiver, liquidity, pool.lp_asset_hash);
+    require(ok2, "txfail");
+    pool.reserve_a = res_a + amount_a;
+    pool.reserve_b = res_b + amount_b;
+    pool.lp_total_supply = total_supply + liquidity;
+    s.store(get_pool_key(pool_id), pool);
+    return liquidity;
+}
+
+fn calc_swap_out(amount_in: u64, res_in: u64, res_out: u64, swap_fee_bps: u64) -> (u64, u64, u64) {
+    let fee_scaled: u256 = (amount_in as u256) * (swap_fee_bps as u256);
+    let fee: u64 = (fee_scaled / 10000u256) as u64;
+    let amount_after_fee: u64 = amount_in - fee;
+    let numerator: u128 = (amount_after_fee as u128) * (res_out as u128);
+    let denominator: u128 = (res_in as u128) + (amount_after_fee as u128);
+    require(denominator > 0, "div0");
+    return (amount_after_fee, (numerator / denominator) as u64, fee);
+}
+
+fn do_add_liquidity(token_a: Hash, token_b: Hash) -> u64 {
+    require(token_a != token_b, "dup");
+    let pool_id_opt: optional<u64> = load_pair(token_a, token_b);
+    let s: Storage = Storage::new();
+    let xelis: Hash = Hash::zero();
+    let pool_id: u64 = 0;
+    if pool_id_opt.is_none() {
+        let xel_dep: u64 = get_deposit_for_asset(xelis).expect("deps");
+        require(xel_dep >= 100000000, "insxel");
+        pool_id = s.load(POOL_COUNT_KEY).expect("np");
+        let na: u64 = s.load(ASSET_ID_KEY).expect("na");
+        let aid: u64 = na + 1;
+        s.store(ASSET_ID_KEY, aid);
+        let ticker_a: string = Asset::get_by_hash(token_a).expect("tknf").get_ticker();
+        let ticker_b: string = Asset::get_by_hash(token_b).expect("tknf").get_ticker();
+        let asset: Asset = Asset::create(aid, ticker_a + "-" + ticker_b + " VLP", "VLP", 8u8, MaxSupplyMode::None).expect("crefail");
+        let lp_hash: Hash = asset.get_hash();
+        let is_psm: bool = false;
+        let xusd_asset: optional<Hash> = s.load(XUSD_ASSET_KEY);
+        if xusd_asset.is_some() {
+            let xa: Hash = xusd_asset.unwrap();
+            if (token_a == xa && token_b == xelis) || (token_a == xelis && token_b == xa) {
+                is_psm = true;
+            }
+        }
+        let pool: Pool = Pool {
+            token_a: token_a,
+            token_b: token_b,
+            reserve_a: 0,
+            reserve_b: 0,
+            lp_asset_hash: lp_hash,
+            lp_total_supply: 0,
+            is_psm: is_psm
+        };
+        s.store(get_pool_key(pool_id), pool);
+        store_pair(token_a, token_b, pool_id);
+        s.store(POOL_COUNT_KEY, pool_id + 1);
+    } else {
+        pool_id = pool_id_opt.unwrap();
+    }
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    let amount_a: u64 = get_deposit_for_asset(token_a).expect("nodep");
+    let amount_b: u64 = get_deposit_for_asset(token_b).expect("nodep");
+    let res_a: u64 = pool.reserve_a;
+    let res_b: u64 = pool.reserve_b;
+    let caller: Address = get_caller().expect("nocaller");
+    if res_a == 0 && res_b == 0 {
+        require(amount_a > 1000, "lowin");
+        require(amount_b > 1000, "lowin");
+        return mint_lp(caller, amount_a, amount_b, pool_id);
+    }
+    let (final_a, final_b): (u64, u64) = calc_optimal(amount_a, amount_b, res_a, res_b, token_a, token_b);
+    require(final_a > 1000, "lowin");
+    require(final_b > 1000, "lowin");
+    return mint_lp(caller, final_a, final_b, pool_id);
+}
+
+fn do_remove_liquidity(pool_id: u64) -> map<Hash, u64> {
+    require(get_deposits().len() == 1, "invdepcnt");
+    let s: Storage = Storage::new();
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    let lp_hash: Hash = pool.lp_asset_hash;
+    let liquidity: u64 = get_deposit_for_asset(lp_hash).expect("nodep");
+    let asset: Asset = Asset::get_by_hash(lp_hash).expect("anf");
+    let total_supply: u64 = asset.get_supply();
+    let tok_a: Hash = pool.token_a;
+    let tok_b: Hash = pool.token_b;
+    let res_a: u64 = pool.reserve_a;
+    let res_b: u64 = pool.reserve_b;
+    let amount_a: u64 = (liquidity as u128 * res_a as u128 / total_supply as u128) as u64;
+    let amount_b: u64 = (liquidity as u128 * res_b as u128 / total_supply as u128) as u64;
+    require(amount_a > 0 && amount_b > 0, "insliqburn");
+    let ok: bool = burn(liquidity, lp_hash);
+    require(ok, "burnfail");
+    pool.reserve_a = res_a - amount_a;
+    pool.reserve_b = res_b - amount_b;
+    pool.lp_total_supply = total_supply - liquidity;
+    s.store(get_pool_key(pool_id), pool);
+    let caller: Address = get_caller().expect("nocaller");
+    let ok1: bool = transfer(caller, amount_a, tok_a);
+    let ok2: bool = transfer(caller, amount_b, tok_b);
+    require(ok1 && ok2, "txfail");
+    return {tok_a: amount_a, tok_b: amount_b};
+}
+
+fn do_swap(pool_id: u64, token_in: Hash, token_out: Hash, amount_out_min: u64) -> u64 {
+    require(get_deposits().len() == 1, "invdepcnt");
+    let amount_in: u64 = get_deposit_for_asset(token_in).expect("nodep");
+    require(amount_in > 0, "noin");
+    let s: Storage = Storage::new();
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    let res_in: u64 = token_in == pool.token_a ? pool.reserve_a : pool.reserve_b;
+    let res_out: u64 = token_in == pool.token_a ? pool.reserve_b : pool.reserve_a;
+    require(res_in > 0 && res_out > 0, "nores");
+    let swap_fee_bps: u64 = s.load(FEE_SWAP_KEY).expect("feens");
+    let protocol_share_bps: u64 = s.load(FEE_PROTOCOL_KEY).expect("fens");
+    let (amount_after_fee, amount_out, gross_fee): (u64, u64, u64) = calc_swap_out(amount_in, res_in, res_out, swap_fee_bps);
+    require(amount_out >= amount_out_min, "slippage");
+    require(amount_out > 0, "insout");
+    require(amount_out < res_out, "insliq");
+    let protocol_fee: u64 = gross_fee * protocol_share_bps / swap_fee_bps;
+    if protocol_fee > 0 {
+        let treasury: optional<Address> = s.load(TREASURY_KEY);
+        if treasury.is_some() {
+            let ok: bool = transfer(treasury.unwrap(), protocol_fee, token_in);
+            require(ok, "txfail");
+        }
+    }
+    let new_res_in: u64 = res_in + amount_after_fee;
+    let new_res_out: u64 = res_out - amount_out;
+    if token_in == pool.token_a {
+        pool.reserve_a = new_res_in;
+        pool.reserve_b = new_res_out;
+    } else {
+        pool.reserve_b = new_res_in;
+        pool.reserve_a = new_res_out;
+    }
+    s.store(get_pool_key(pool_id), pool);
+    let caller: Address = get_caller().expect("nocaller");
+    let ok: bool = transfer(caller, amount_out, token_out);
+    require(ok, "txfail");
+    return amount_out;
+}
+
+fn do_psm_mint() -> u64 {
+    let s: Storage = Storage::new();
+    let xc_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcns");
+    let xa: Hash = s.load(XUSD_ASSET_KEY).expect("xans");
+    let xelis: Hash = Hash::zero();
+    let pool_id_opt: optional<u64> = load_pair(xa, xelis);
+    require(pool_id_opt.is_some(), "psmnopool");
+    let pool_id: u64 = pool_id_opt.unwrap();
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.is_psm, "psmoff");
+    let xel_dep: u64 = get_deposit_for_asset(xelis).expect("noxel");
+    require(xel_dep > 0, "noxel");
+    let oh: Hash = s.load(ORACLE_KEY).expect("ocns");
+    let oc: Contract = Contract::new(oh).expect("ocnf");
+    let price: u64 = oc.call(4u16, [xelis], {});
+    require(price > 0, "noprice");
+    let fee_bps: u64 = s.load(FEE_PSM_MINT_KEY).expect("fens");
+    let fee: u64 = xel_dep * fee_bps / 10000;
+    let xel_after_fee: u64 = xel_dep - fee;
+    let xusd_amount: u64 = (xel_after_fee as u128 * price as u128 / 100000000u128) as u64;
+    require(xusd_amount > 0, "insxusd");
+    let caller: Address = get_caller().expect("nocaller");
+    if fee > 0 {
+        let treasury: optional<Address> = s.load(TREASURY_KEY);
+        if treasury.is_some() {
+            let ok: bool = transfer(treasury.unwrap(), fee, xelis);
+            require(ok, "txfail");
+        }
+    }
+    let xc: Contract = Contract::new(xc_hash).expect("xcnf");
+    let _: u64 = xc.call(3u16, [caller, xusd_amount], {});
+    if xelis == pool.token_a {
+        pool.reserve_a = pool.reserve_a + xel_after_fee;
+    } else {
+        pool.reserve_b = pool.reserve_b + xel_after_fee;
+    }
+    s.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+fn do_psm_redeem() -> u64 {
+    let s: Storage = Storage::new();
+    let xc_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcns");
+    let xa: Hash = s.load(XUSD_ASSET_KEY).expect("xans");
+    let xelis: Hash = Hash::zero();
+    let pool_id_opt: optional<u64> = load_pair(xa, xelis);
+    require(pool_id_opt.is_some(), "psmnopool");
+    let pool_id: u64 = pool_id_opt.unwrap();
+    let pool: Pool = s.load(get_pool_key(pool_id)).expect("pnf");
+    require(pool.is_psm, "psmoff");
+    let xusd_dep: u64 = get_deposit_for_asset(xa).expect("noxusd");
+    require(xusd_dep > 0, "noxusd");
+    let oh: Hash = s.load(ORACLE_KEY).expect("ocns");
+    let oc: Contract = Contract::new(oh).expect("ocnf");
+    let price: u64 = oc.call(4u16, [xelis], {});
+    require(price > 0, "noprice");
+    let fee_bps: u64 = s.load(FEE_PSM_REDEEM_KEY).expect("fens");
+    let fee: u64 = xusd_dep * fee_bps / 10000;
+    let xusd_after_fee: u64 = xusd_dep - fee;
+    let xel_amount: u64 = (xusd_after_fee as u128 * 100000000u128 / price as u128) as u64;
+    require(xel_amount > 0, "insxel");
+    let caller: Address = get_caller().expect("nocaller");
+    if fee > 0 {
+        let treasury: optional<Address> = s.load(TREASURY_KEY);
+        if treasury.is_some() {
+            let ok: bool = transfer(treasury.unwrap(), fee, xa);
+            require(ok, "txfail");
+        }
+    }
+    let ok_tc: bool = transfer_contract(xc_hash, xusd_after_fee, xa);
+    require(ok_tc, "txfail");
+    let xc: Contract = Contract::new(xc_hash).expect("xcnf");
+    let _: u64 = xc.call(5u16, [xusd_after_fee], {});
+    let bal: u64 = get_balance_for_asset(xelis).expect("nobal");
+    require(bal >= xel_amount, "insxelbal");
+    let ok: bool = transfer(caller, xel_amount, xelis);
+    require(ok, "txfail");
+    if xelis == pool.token_a {
+        pool.reserve_a = pool.reserve_a - xel_amount;
+    } else {
+        pool.reserve_b = pool.reserve_b - xel_amount;
+    }
+    s.store(get_pool_key(pool_id), pool);
+    return 0;
+}
+
+entry add_liquidity(token_a: Hash, token_b: Hash) -> u64 {
+    let _: u64 = do_add_liquidity(token_a, token_b);
+    return 0;
+}
+
+entry remove_liquidity(pool_id: u64) -> u64 {
+    let _: map<Hash, u64> = do_remove_liquidity(pool_id);
+    return 0;
+}
+
+entry swap(pool_id: u64, token_in: Hash, token_out: Hash, amount_out_min: u64) -> u64 {
+    let _: u64 = do_swap(pool_id, token_in, token_out, amount_out_min);
+    return 0;
+}
+
+entry psm_mint() -> u64 {
+    let _: u64 = do_psm_mint();
+    return 0;
+}
+
+entry psm_redeem() -> u64 {
+    let _: u64 = do_psm_redeem();
+    return 0;
+}
+
+entry set_oracle(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(ORACLE_KEY, contract_hash);
+    return 0;
+}
+
+entry set_xusd(contract_hash: Hash, asset_hash: Hash) -> u64 {
+    only_admin();
+    let s: Storage = Storage::new();
+    s.store(XUSD_CONTRACT_KEY, contract_hash);
+    s.store(XUSD_ASSET_KEY, asset_hash);
+    return 0;
+}
+
+entry set_treasury(addr: Address) -> u64 {
+    only_admin();
+    Storage::new().store(TREASURY_KEY, addr);
+    return 0;
+}
+
+entry set_fees(swap_bps: u64, protocol_bps: u64, psm_mint_bps: u64, psm_redeem_bps: u64) -> u64 {
+    only_admin();
+    require(protocol_bps <= swap_bps, "protover");
+    let s: Storage = Storage::new();
+    s.store(FEE_SWAP_KEY, swap_bps);
+    s.store(FEE_PROTOCOL_KEY, protocol_bps);
+    s.store(FEE_PSM_MINT_KEY, psm_mint_bps);
+    s.store(FEE_PSM_REDEEM_KEY, psm_redeem_bps);
+    return 0;
+}
+
+entry set_timelock(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_timelock_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin();
+    Storage::new().store(ADMIN_KEY, new_admin);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
+}
+
+entry get_pool(pool_id: u64) -> optional<Pool> {
+    return Storage::new().load(get_pool_key(pool_id));
+}
+
+entry get_reserves(pool_id: u64) -> (Hash, Hash, u64, u64) {
+    let pool: Pool = Storage::new().load(get_pool_key(pool_id)).expect("pnf");
+    return (pool.token_a, pool.token_b, pool.reserve_a, pool.reserve_b);
+}
+
+entry get_pair(token_a: Hash, token_b: Hash) -> optional<u64> {
+    return load_pair(token_a, token_b);
+}
+
+entry get_pools_count() -> u64 {
+    return Storage::new().load(POOL_COUNT_KEY).unwrap_or(0);
+}
+
+entry get_config() -> (u64, u64, u64, u64, optional<Address>) {
+    let s: Storage = Storage::new();
+    let swap_bps: u64 = s.load(FEE_SWAP_KEY).expect("fens");
+    let proto_bps: u64 = s.load(FEE_PROTOCOL_KEY).expect("fens");
+    let mint_bps: u64 = s.load(FEE_PSM_MINT_KEY).expect("fens");
+    let redeem_bps: u64 = s.load(FEE_PSM_REDEEM_KEY).expect("fens");
+    return (swap_bps, proto_bps, mint_bps, redeem_bps, s.load(TREASURY_KEY));
+}
+
+pub fn add_liquidity_cc(token_a: Hash, token_b: Hash) -> u64 {
+    return do_add_liquidity(token_a, token_b);
+}
+
+pub fn remove_liquidity_cc(pool_id: u64) -> map<Hash, u64> {
+    return do_remove_liquidity(pool_id);
+}
+
+pub fn swap_cc(pool_id: u64, token_in: Hash, token_out: Hash, amount_out_min: u64) -> u64 {
+    return do_swap(pool_id, token_in, token_out, amount_out_min);
+}

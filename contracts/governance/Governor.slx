@@ -1,6 +1,7 @@
 const ADMIN_KEY: string = "a"
 const GOV_VAULT_KEY: string = "gv"
 const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const PROPOSAL_PREFIX: string = "p"
 const VOTE_PREFIX: string = "v"
 const COUNTER_KEY: string = "n"
@@ -45,6 +46,7 @@ struct VoteReceipt {
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
     s.store(COUNTER_KEY, 0u64);
     return 0;
 }
@@ -64,16 +66,16 @@ fn get_vote_key(proposal_id: u64, voter: Address) -> string {
     return VOTE_PREFIX + proposal_id.to_string(10u32) + voter.to_string();
 }
 
-fn get_voting_power(addr: Address) -> u64 {
+fn get_voter_power(addr: Address) -> u64 {
     let gv_hash: Hash = Storage::new().load(GOV_VAULT_KEY).expect("gvns");
     let gv: Contract = Contract::new(gv_hash).expect("gvnf");
-    return gv.call(11u16, [addr], {});
+    return gv.call(30u16, [addr], {});
 }
 
-fn get_total_supply() -> u64 {
+fn get_total_vp() -> u64 {
     let gv_hash: Hash = Storage::new().load(GOV_VAULT_KEY).expect("gvns");
     let gv: Contract = Contract::new(gv_hash).expect("gvnf");
-    return gv.call(8u16, [], {});
+    return gv.call(26u16, [], {});
 }
 
 fn state(prop: GovProposal) -> ProposalState {
@@ -84,7 +86,7 @@ fn state(prop: GovProposal) -> ProposalState {
     if topo < prop.start_topo { return ProposalState::Pending; }
     if topo <= prop.end_topo { return ProposalState::Active; }
     if prop.for_votes <= prop.against_votes { return ProposalState::Defeated; }
-    let total: u64 = get_total_supply();
+    let total: u64 = get_total_vp();
     if prop.for_votes < total * QUORUM_BPS / 10000 { return ProposalState::Defeated; }
     return ProposalState::Succeeded;
 }
@@ -105,8 +107,8 @@ entry set_timelock(hash: Hash) -> u64 {
 
 entry propose(target: Hash, entry_id: u16, param_value: u64, description: string) -> u64 {
     let caller: Address = get_caller().expect("nocaller");
-    let power: u64 = get_voting_power(caller);
-    let total: u64 = get_total_supply();
+    let power: u64 = get_voter_power(caller);
+    let total: u64 = get_total_vp();
     let threshold: u64 = total * PROPOSAL_THRESHOLD_BPS / 10000;
     require(power >= threshold, "lowpower");
     let rs: Storage = Storage::new();
@@ -130,7 +132,7 @@ entry propose(target: Hash, entry_id: u16, param_value: u64, description: string
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(id), prop);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry vote(proposal_id: u64, support: u8) -> u64 {
@@ -142,7 +144,7 @@ entry vote(proposal_id: u64, support: u8) -> u64 {
     require(s == ProposalState::Active, "notactive");
     let existing: optional<VoteReceipt> = rs.load(get_vote_key(proposal_id, caller));
     require(existing.is_none(), "alrdy");
-    let power: u64 = get_voting_power(caller);
+    let power: u64 = get_voter_power(caller);
     require(power > 0, "nopower");
     let receipt: VoteReceipt = VoteReceipt { support: support, power: power };
     let ws: Storage = Storage::new();
@@ -153,7 +155,7 @@ entry vote(proposal_id: u64, support: u8) -> u64 {
         prop.against_votes += power;
     }
     ws.store(get_proposal_key(proposal_id), prop);
-    return power;
+    return 0;
 }
 
 entry queue(proposal_id: u64) -> u64 {
@@ -163,11 +165,11 @@ entry queue(proposal_id: u64) -> u64 {
     require(s == ProposalState::Succeeded, "notsucceeded");
     let tl_hash: Hash = Storage::new().load(TIMELOCK_KEY).expect("tlns");
     let tl: Contract = Contract::new(tl_hash).expect("tlnf");
-    let tl_id: u64 = tl.call(0u16, [prop.target, prop.entry_id, prop.param_value, TIMELOCK_DELAY], {});
+    let tl_id: u64 = tl.call(10u16, [prop.target, prop.entry_id, prop.param_value, TIMELOCK_DELAY], {});
     prop.timelock_id = tl_id;
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(proposal_id), prop);
-    return tl_id;
+    return 0;
 }
 
 entry execute(proposal_id: u64) -> u64 {
@@ -177,7 +179,7 @@ entry execute(proposal_id: u64) -> u64 {
     require(s == ProposalState::Queued, "notqueued");
     let tl_hash: Hash = Storage::new().load(TIMELOCK_KEY).expect("tlns");
     let tl: Contract = Contract::new(tl_hash).expect("tlnf");
-    tl.call(1u16, [prop.timelock_id], {});
+    let _ = tl.call(13u16, [prop.timelock_id], {});
     prop.executed = true;
     let ws: Storage = Storage::new();
     ws.store(get_proposal_key(proposal_id), prop);
@@ -217,5 +219,26 @@ entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
     let ws: Storage = Storage::new();
     ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
     return 0;
 }

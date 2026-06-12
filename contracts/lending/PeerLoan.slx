@@ -57,7 +57,7 @@ entry create_loan(borrower: Address, asset: Hash, principal: u64, interest_bps: 
     ws.store(COUNTER_KEY, id + 1);
     let ok: bool = transfer(borrower, principal, asset);
     require(ok, "txfail");
-    return id;
+    return 0;
 }
 
 entry repay(loan_id: u64) -> u64 {
@@ -100,6 +100,15 @@ entry default_loan(loan_id: u64) -> u64 {
 entry get_loan(loan_id: u64) -> optional<PeerLoan> {
     let rs: Storage = Storage::new();
     return rs.load(get_loan_key(loan_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

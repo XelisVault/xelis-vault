@@ -60,7 +60,7 @@ entry create_share(name: string, total_shares: u64, asset: Hash) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_share_key(id), share);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry assign_shares(share_id: u64, holder: Address, amount: u64) -> u64 {
@@ -126,7 +126,7 @@ entry claim_dividends(share_id: u64) -> u64 {
     ws.store(get_holder_key(share_id, caller), holder_rec);
     let ok: bool = transfer(caller, amount, share.asset_hash);
     require(ok, "txfail");
-    return amount;
+    return 0;
 }
 
 entry get_share(share_id: u64) -> optional<RevenueShare> {
@@ -137,6 +137,15 @@ entry get_share(share_id: u64) -> optional<RevenueShare> {
 entry get_holder(share_id: u64, holder: Address) -> optional<ShareHolder> {
     let rs: Storage = Storage::new();
     return rs.load(get_holder_key(share_id, holder));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

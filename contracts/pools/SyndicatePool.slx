@@ -61,7 +61,7 @@ entry create_pool(name: string, target_asset: Hash, target_amount: u64, min_inve
     let ws: Storage = Storage::new();
     ws.store(get_pool_key(id), pool);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry invest(pool_id: u64) -> u64 {
@@ -137,12 +137,22 @@ entry refund(pool_id: u64) -> u64 {
     let pool: SyndicatePool = rs.load(get_pool_key(pool_id)).expect("pnf");
     require(pool.closed, "notclosed");
     require(pool.raised < pool.target_amount, "targetmet");
-    return refund_investor(pool_id, caller);
+    let _ = refund_investor(pool_id, caller);
+    return 0;
 }
 
 entry get_pool(pool_id: u64) -> optional<SyndicatePool> {
     let rs: Storage = Storage::new();
     return rs.load(get_pool_key(pool_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

@@ -51,7 +51,7 @@ entry create_vault(name: string, desc: string, valuation: u64, decimals: u8) -> 
     let ws: Storage = Storage::new();
     ws.store(get_vault_key(id), vault);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry mint_shares(vault_id: u64, amount: u64) -> u64 {
@@ -69,7 +69,7 @@ entry mint_shares(vault_id: u64, amount: u64) -> u64 {
     ws.store(get_vault_key(vault_id), vault);
     let ok2: bool = transfer(caller, amount, vault.asset_hash);
     require(ok2, "txfail");
-    return amount;
+    return 0;
 }
 
 entry buy_shares(vault_id: u64, xel_amount: u64) -> u64 {
@@ -87,7 +87,7 @@ entry buy_shares(vault_id: u64, xel_amount: u64) -> u64 {
     require(ok, "txfail");
     let ok2: bool = transfer(caller, shares, vault.asset_hash);
     require(ok2, "txfail2");
-    return shares;
+    return 0;
 }
 
 entry update_valuation(vault_id: u64, new_valuation: u64) -> u64 {
@@ -106,6 +106,15 @@ entry update_valuation(vault_id: u64, new_valuation: u64) -> u64 {
 entry get_vault(vault_id: u64) -> optional<AssetVault> {
     let rs: Storage = Storage::new();
     return rs.load(get_vault_key(vault_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

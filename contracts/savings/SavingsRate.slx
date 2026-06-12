@@ -1,4 +1,6 @@
 const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const RATE_KEY: string = "sr"
 const XUSD_ASSET_KEY: string = "xa"
 const XUSD_CONTRACT_KEY: string = "xc"
@@ -17,6 +19,7 @@ struct Position {
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
     s.store(RATE_KEY, 500u64);
     s.store(TOTAL_DEPOSITS_KEY, 0u64);
     return 0;
@@ -26,7 +29,10 @@ fn only_admin() {
     let s: Storage = Storage::new();
     let caller: Address = get_caller().expect("nocaller");
     let admin: Address = s.load(ADMIN_KEY).expect("anset");
-    require(caller == admin, "notauth");
+    if caller == admin { return; }
+    let tl: Hash = s.load(TIMELOCK_KEY).expect("tlnotset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == tl, "notauth");
 }
 
 fn get_user_key(addr: Address) -> string {
@@ -91,7 +97,7 @@ entry deposit() -> u64 {
     }
     let total: u64 = ws.load(TOTAL_DEPOSITS_KEY).unwrap_or(0);
     ws.store(TOTAL_DEPOSITS_KEY, total + deposit_amt);
-    return deposit_amt;
+    return 0;
 }
 
 entry withdraw(amount: u64) -> u64 {
@@ -144,11 +150,11 @@ entry withdraw(amount: u64) -> u64 {
         }
     }
     if withdraw_yield > 0 {
-        xusd_contract.call(1u16, [caller, withdraw_yield], {});
+        let _ = xusd_contract.call(3u16, [caller, withdraw_yield], {});
     }
     let ok: bool = transfer(caller, withdraw_principal, xusd_asset);
     require(ok, "txfail");
-    return amount;
+    return 0;
 }
 
 entry get_position(addr: Address) -> optional<Position> {
@@ -164,6 +170,39 @@ entry get_rate() -> u64 {
 entry get_total_deposits() -> u64 {
     let rs: Storage = Storage::new();
     return rs.load(TOTAL_DEPOSITS_KEY).unwrap_or(0);
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
+}
+
+entry set_timelock(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_timelock_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

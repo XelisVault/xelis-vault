@@ -16,29 +16,36 @@ xelis-vault/
 │   ├── insurance/
 │   │   └── InsurancePool.slx      # Community insurance
 │   ├── flashloan/
-│   │   └── FlashLoan.slx          # Confidential flash loans
+│   │   ├── FlashLoan.slx          # Confidential flash loans
+│   │   └── FlashCallback.slx      # Reusable flash loan callback
 │   ├── governance/
 │   │   ├── VLT.slx                # Governance token
 │   │   ├── GovernanceVault.slx    # Staking & voting
-│   │   └── Timelock.slx           # 48h execution delay
-│   ├── market/
+│   │   ├── Governor.slx           # Proposal & voting engine
+│   │   └── Timelock.slx           # Configurable execution delay
+│   ├── pools/
+│   │   ├── VaultSwap.slx          # Custom AMM + Peg Stability Module
+│   │   └── SyndicatePool.slx      # Syndicated credit pools
+│   ├── lending/
 │   │   ├── LendingMarket.slx      # Multi-pool lending
-│   │   ├── PeerLoan.slx           # P2P bilateral loans
-│   │   ├── SyndicatePool.slx      # Syndicated credit
+│   │   └── PeerLoan.slx           # P2P bilateral loans
+│   ├── auction/
 │   │   └── SealedBidAuction.slx   # Confidential auctions
-│   ├── tokenization/
+│   ├── rwa/
 │   │   ├── AssetVault.slx         # RWA tokenization standard
 │   │   └── TreasuryVault.slx      # Multi-sig treasury
 │   ├── compliance/
 │   │   └── ComplianceModule.slx   # ZK KYC/AML layer
-│   ├── finance/
+│   ├── payroll/
 │   │   ├── RevenueShare.slx       # Revenue distribution
-│   │   ├── Payroll.slx            # Recurring payments
-│   │   └── PrivateInsurance.slx   # P2P insurance & derivatives
+│   │   └── Payroll.slx            # Recurring payments
+│   ├── treasury/
+│   │   ├── RevenueShare.slx       # Revenue distribution
+│   │   └── TreasuryVault.slx      # Multi-sig treasury
 │   ├── savings/
 │   │   └── SavingsRate.slx       # xUSD yield savings account
-│   └── math/
-│       └── InterestRateModel.slx  # Pure-math rates
+│   └── token/
+│       └── VLT.slx                # Governance token
 ├── sdk/
 │   └── src/
 │       ├── index.ts               # Main SDK entry
@@ -95,6 +102,12 @@ xelis-vault/
 ## Smart Contract Dependencies
 
 ```
+VaultSwap
+    ├── depends on → PriceOracle (XEL price for PSM)
+    ├── depends on → xUSD (mint/burn for PSM)
+    ├── manages → xUSD/XEL pool (PSM-enabled)
+    └── manages → VLT/XEL pool (standard AMM)
+
 VaultEngine
     ├── depends on → PriceOracle (XEL price data)
     ├── depends on → xUSD (mint/burn)
@@ -146,12 +159,38 @@ FlashLoan
 
 ## Data Flow
 
-### Forge DEX Integration
+### VaultSwap — AMM with PSM
 
-XELIS Forge (`xelisforge.app`) is the native DEX on XELIS. xUSD will have:
-- xUSD/XEL liquidity pool for market price discovery
-- Arbitrage: if xUSD < $1 → buy on Forge, redeem with protocol for XEL
-- Arbitrage: if xUSD > $1 → borrow xUSD from vault, sell on Forge
+VaultSwap is a custom AMM (constant product x*y=k) with integrated Peg Stability Module:
+
+```
+1. ADD LIQUIDITY
+   User → deposit token_a + token_b (or XEL for new pool)
+   VaultSwap → create pool (first time) or add to existing
+   VaultSwap → mint LP tokens (e.g., "xUSD-XEL VLP")
+   Return: LP tokens to user
+
+2. SWAP
+   User → deposit token_in
+   VaultSwap → 0.3% fee (0.25% to LP, 0.05% to protocol treasury)
+   VaultSwap → x*y=k swap
+   User ← token_out
+
+3. PSM MINT (xUSD/XEL pool only)
+   User → deposit XEL
+   VaultSwap → fetch XEL price from PriceOracle
+   VaultSwap → 0.5% mint fee to treasury
+   VaultSwap → call xUSD.mint_tokens(user, amount) at oracle price
+   User ← xUSD at oracle peg
+
+4. PSM REDEEM (xUSD/XEL pool only)
+   User → deposit xUSD
+   VaultSwap → fetch XEL price from PriceOracle
+   VaultSwap → 0.1% redeem fee to treasury
+   VaultSwap → call xUSD.burn_tokens(amount)
+   VaultSwap → transfer XEL from pool reserves to user
+   User ← XEL at oracle peg
+```
 
 ### Redemption Flow (Peg Support)
 

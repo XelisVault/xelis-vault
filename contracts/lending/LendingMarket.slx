@@ -61,7 +61,7 @@ entry create_pool(asset: Hash, rate_bps: u64, min_col_bps: u64) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_pool_key(id), pool);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry supply(pool_id: u64) -> u64 {
@@ -74,7 +74,7 @@ entry supply(pool_id: u64) -> u64 {
     pool.total_liquidity += amount;
     let ws: Storage = Storage::new();
     ws.store(get_pool_key(pool_id), pool);
-    return amount;
+    return 0;
 }
 
 entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
@@ -87,7 +87,7 @@ entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
     let col_raw: u64 = col_dep.unwrap();
     let oh: Hash = rs.load(ORACLE_CONTRACT_KEY).expect("ocns");
     let oc: Contract = Contract::new(oh).expect("ocnf");
-    let price: u64 = oc.call(2u16, [collateral_asset], {});
+    let price: u64 = oc.call(4u16, [collateral_asset], {});
     require(price > 0, "nopr");
     let col_val: u64 = (col_raw as u128 * price as u128 / 100000000u128) as u64;
     let max_borrow: u64 = col_val * 10000 / pool.min_collateral_bps;
@@ -112,7 +112,7 @@ entry borrow(pool_id: u64, collateral_asset: Hash) -> u64 {
     ws.store(get_pool_key(pool_id), pool);
     let ok: bool = transfer(caller, borrow_amount, pool.asset_hash);
     require(ok, "txfail");
-    return borrow_id;
+    return 0;
 }
 
 entry repay(borrow_id: u64) -> u64 {
@@ -147,7 +147,7 @@ entry withdraw_liquidity(pool_id: u64, amount: u64) -> u64 {
     ws.store(get_pool_key(pool_id), pool);
     let ok: bool = transfer(caller, amount, pool.asset_hash);
     require(ok, "txfail");
-    return amount;
+    return 0;
 }
 
 entry deactivate_pool(pool_id: u64) -> u64 {
@@ -174,6 +174,15 @@ entry set_oracle_contract(oracle_hash: Hash) -> u64 {
     only_admin();
     let ws: Storage = Storage::new();
     ws.store(ORACLE_CONTRACT_KEY, oracle_hash);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
     return 0;
 }
 

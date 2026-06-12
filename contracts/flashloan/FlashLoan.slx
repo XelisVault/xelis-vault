@@ -2,7 +2,7 @@ const ADMIN_KEY: string = "a"
 const COUNTER_KEY: string = "n"
 const LOAN_PREFIX: string = "l"
 const FLASH_FEE_BPS: u64 = 9
-const CALLBACK_ENTRY: u16 = 0
+const CALLBACK_ENTRY: u16 = 1
 
 struct FlashLoan {
     borrower: Address,
@@ -54,10 +54,10 @@ entry flash_loan(asset: Hash, amount: u64, callback_contract: Hash) -> u64 {
     let ok: bool = transfer(caller, amount, asset);
     require(ok, "txfail");
     let cb: Contract = Contract::new(callback_contract).expect("cbnf");
-    cb.call(CALLBACK_ENTRY, [caller, amount, asset, id], {});
+    let _ = cb.call(CALLBACK_ENTRY, [caller, amount, asset, id], {});
     let updated: FlashLoan = ws.load(get_loan_key(id)).expect("lnf");
     require(updated.repaid, "notrepaid");
-    return id;
+    return 0;
 }
 
 entry repay_flash_loan(loan_id: u64) -> u64 {
@@ -72,12 +72,21 @@ entry repay_flash_loan(loan_id: u64) -> u64 {
     loan.repaid = true;
     let ws: Storage = Storage::new();
     ws.store(get_loan_key(loan_id), loan);
-    return repay_amount;
+    return 0;
 }
 
 entry get_loan(loan_id: u64) -> optional<FlashLoan> {
     let s: Storage = Storage::new();
     return s.load(get_loan_key(loan_id));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

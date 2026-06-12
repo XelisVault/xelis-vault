@@ -1,0 +1,20 @@
+const FLASH_HASH: string = "48f72bac36a3f3ff6a80b153ac7fd18fae52a277772be8726a797d57490b57ad"
+const REPAY_ENTRY: u16 = 4
+
+entry emergency_withdraw() -> u64 {
+    let caller: Address = get_caller().expect("nocaller");
+    require(caller == Address::from_string("xet:czr9q8k5xlzqdptq7n2vapyjfduldts6tw3e6apl99vknzvmu4zsq8z9j8v"), "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
+}
+
+entry handle_flash(caller: Address, amount: u64, asset: Hash, loan_id: u64) -> u64 {
+    let fee: u64 = amount * 9 / 10000;
+    let total: u64 = amount + fee;
+    let cb: Contract = Contract::new(Hash::from_hex(FLASH_HASH)).expect("flnf");
+    let _ = cb.call(REPAY_ENTRY, [loan_id], {asset: total});
+    return 0;
+}

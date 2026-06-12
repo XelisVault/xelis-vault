@@ -54,7 +54,7 @@ entry stake(amount: u64) -> u64 {
     ws.store(COUNTER_KEY, id + 1);
     let total: u64 = rs.load(TOTAL_STAKED_KEY).unwrap_or(0);
     ws.store(TOTAL_STAKED_KEY, total + amount);
-    return id;
+    return 0;
 }
 
 entry claim(position_id: u64) -> u64 {
@@ -74,7 +74,7 @@ entry claim(position_id: u64) -> u64 {
     }
     let ok: bool = transfer(caller, pos.amount, Hash::zero());
     require(ok, "txfail");
-    return pos.amount;
+    return 0;
 }
 
 entry get_position(position_id: u64) -> optional<StakePosition> {
@@ -94,6 +94,15 @@ entry is_member(addr: Address) -> bool {
     let pos: optional<StakePosition> = s.load(get_stake_key(id.unwrap()));
     if pos.is_none() { return false; }
     return !pos.unwrap().claimed;
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

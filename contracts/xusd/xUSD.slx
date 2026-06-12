@@ -1,10 +1,14 @@
 const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const ASSET_HASH_KEY: string = "ah"
 const VAULT_KEY: string = "vk"
+const PSM_KEY: string = "ps"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
     return 0;
 }
 
@@ -12,7 +16,10 @@ fn only_admin() {
     let s: Storage = Storage::new();
     let caller: Address = get_caller().expect("nocaller");
     let admin: Address = s.load(ADMIN_KEY).expect("anset");
-    require(caller == admin, "notauth");
+    if caller == admin { return; }
+    let tl: Hash = s.load(TIMELOCK_KEY).expect("tlnotset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == tl, "notauth");
 }
 
 entry create_asset() -> u64 {
@@ -27,13 +34,19 @@ entry create_asset() -> u64 {
     return 0;
 }
 
-pub fn mint_tokens(to: Address, amount: u64) -> u64 {
+fn only_minter() {
     let rs: Storage = Storage::new();
     let vault: Hash = rs.load(VAULT_KEY).expect("nvk");
     let caller: Hash = get_contract_caller().expect("nocontract");
-    require(caller == vault, "notauth");
+    if caller == vault { return; }
+    let psm: optional<Hash> = rs.load(PSM_KEY);
+    require(psm.is_some() && caller == psm.unwrap(), "notauth");
+}
+
+pub fn mint_tokens(to: Address, amount: u64) -> u64 {
+    only_minter();
     require(amount > 0, "amtgt0");
-    let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
+    let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(amount);
     require(ok, "mintfail");
@@ -43,14 +56,11 @@ pub fn mint_tokens(to: Address, amount: u64) -> u64 {
 }
 
 pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
-    let rs: Storage = Storage::new();
-    let vault: Hash = rs.load(VAULT_KEY).expect("nvk");
-    let caller: Hash = get_contract_caller().expect("nocontract");
-    require(caller == vault, "notauth");
+    only_minter();
     let total: u64 = amount + fee;
     require(total > 0, "amtgt0");
     require(total >= amount, "ovf");
-    let hash: Hash = rs.load(ASSET_HASH_KEY).expect("anset");
+    let hash: Hash = Storage::new().load(ASSET_HASH_KEY).expect("anset");
     let asset: Asset = Asset::get_by_hash(hash).expect("anf");
     let ok: bool = asset.mint(total);
     require(ok, "mintfail");
@@ -98,9 +108,48 @@ entry set_vault_contract(vault: Hash) -> u64 {
     return 0;
 }
 
+entry set_timelock(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_timelock_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
     let ws: Storage = Storage::new();
     ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}
+
+entry set_psm(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(PSM_KEY, contract_hash);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
     return 0;
 }

@@ -1,12 +1,12 @@
 # XELIS Vault — Roadmap
 
-> *Last updated: June 5, 2026*
+> *Last updated: June 12, 2026*
 
 ---
 
 ## Legend
 
-- ✅ **Done** — Deployed and/or verified
+- ✅ **Done** — Deployed and/or verified on testnet
 - 🔧 **In progress** — Currently being actively worked on
 - 📅 **Planned** — Scheduled for future iteration
 
@@ -18,37 +18,21 @@
 |------|--------|
 | Whitepaper v2 | ✅ |
 | Architecture docs | ✅ |
-| All 20 smart contracts (core, markets, treasury, compliance, governance, savings) | ✅ Written |
-| Compilation & static analysis (18+ syntax bugs fixed) | ✅ |
-| Comprehensive bug audit (24 bugs: 7 critical, 8 elevated, 6 medium, 3 minor) | ✅ Complete |
-
-All contracts compile cleanly. All 24 bugs identified and catalogued.
-
----
-
-## Phase 0.5: Bug Fix Sprint ✅
-
-| Task | Status |
-|------|--------|
-| Identify root cause of VM storage failure (syscall ID mismatch) | ✅ |
-| Rewrite silex-cli stdlib to match daemon's `build_environment()` exactly | ✅ |
-| Fix xstd registration order (remove iterator for V0) | ✅ |
-| Fix Ciphertext method name (generate vs new) | ✅ |
-| Remove extra compiler stubs causing ID shift | ✅ |
-| Match ScheduledExecution registration order | ✅ |
-
-**Root cause (resolved):** All native functions in XELIS VM share a single flat `Vec<NativeFunction>`. The syscall ID is simply the index in this vector. When the compiler and daemon registered functions in different orders, the resulting bytecode had wrong syscall IDs. The silex-cli environment is now byte-for-byte identical to the daemon's `build_environment()` for V0.
+| All 23 smart contracts (core, pools, markets, treasury, compliance, governance, savings) | ✅ Written |
+| Compilation & static analysis | ✅ |
+| Comprehensive security audit (critical, high, medium bugs fixed) | ✅ Complete |
+| Emergency withdraw pattern on all contracts | ✅ Complete |
 
 ---
 
-## Phase 1: Core Lending Deployment on Testnet ✅
+## Phase 1: Core Lending Testnet ✅
 
 | Task | Status |
 |------|--------|
 | Deploy PriceOracle (with `invoke`, constructor ran) | ✅ |
 | Create xUSD confidential asset | ✅ |
 | Deploy VaultEngine (with `invoke`, hook confirmed) | ✅ |
-| Propose & execute oracle price ($3/XEL) | ✅ |
+| Propose & execute oracle price | ✅ |
 | Configure VaultEngine (set_oracle, set_xusd, set_xusd_asset) | ✅ |
 | Fix `mint_tokens` auth (get_caller → get_contract_caller) | ✅ |
 | Fix vault ID conflict (COUNTER_KEY=1, not 0) | ✅ |
@@ -61,49 +45,67 @@ All contracts compile cleanly. All 24 bugs identified and catalogued.
 
 ---
 
-## Phase 2: Full Lending Suite 📅
+## Phase 2: Non-Core Contracts Testnet ✅
 
-| Task | Timeline |
-|------|----------|
-| Deploy InterestRateModel | Next week |
-| Deploy InsurancePool + FlashLoan | Next week |
-| Deploy remaining 16 contracts to testnet | Next week |
-| SDK integration tests | Next week |
-
----
-
-## Phase 3: Peg, Governance & Markets 📅
-
-| Task | Timeline |
-|------|----------|
-| XELIS Forge xUSD/XEL pool | Week after lending live |
-| VLT token deployment (10M confidential asset) | Week after lending live |
-| GovernanceVault + Timelock | Week after lending live |
-| Private Lending Marketplace | Week after lending live |
-| Peer-to-Peer Lending | Week after lending live |
-| Sealed-Bid Auctions | Week after lending live |
+| Task | Status |
+|------|--------|
+| Deploy InterestRateModel | ✅ |
+| Deploy FlashLoan + FlashCallback | ✅ |
+| Deploy InsurancePool + PrivateInsurance | ✅ |
+| Deploy PeerLoan | ✅ |
+| Deploy ComplianceModule | ✅ |
+| Deploy AssetVault + TreasuryVault | ✅ |
+| Deploy RevenueShare + Payroll | ✅ |
+| Deploy SealedBidAuction + SyndicatePool | ✅ |
+| Deploy LendingMarket | ✅ |
+| Deploy SavingsRate | ✅ |
+| Emergency_withdraw functional tests (14/14 passed, 5 wallet nonce races) | ✅ Complete |
+| Functional tests on all non-core contracts | ✅ Complete |
 
 ---
 
-## Phase 4: Institutional 📅
+## Phase 3: Governance Testnet ✅
 
-| Task | Timeline |
-|------|----------|
-| Compliance Module (ZK KYC/AML) | Week 6 |
-| Syndicated Loans | Week 6 |
-| Treasury Vault (multi-sig) | Week 7 |
-| RWA Tokenization Standard (AssetVault) | Week 7 |
+| Task | Status |
+|------|--------|
+| Deploy VLT token (10M confidential asset) | ✅ |
+| Deploy Timelock v4 (with emergency addresses) | ✅ |
+| Deploy Governor v3 (with emergency addresses) | ✅ |
+| Deploy GovernanceVault v2 | ✅ |
+| Cross-contract configuration (Gov→GV, Gov→TL, TL→Gov) | ✅ |
+| VLT.create_asset mints all 10M | ✅ |
+| GovernanceVault staking test | ✅ |
+| Governor proposal + queue + execute test | ✅ |
 
 ---
 
-## Phase 5: Expansion 📅
+## Phase 4: VaultSwap (AMM + PSM) 🔧
+
+| Task | Status |
+|------|--------|
+| **VaultSwap.slx** — custom multi-pool AMM with PSM | ✅ Written & compiled |
+| Cross-contract integration (PriceOracle entry 4, xUSD entries 3/5) | ✅ Designed |
+| Fee structure (swap 0.3%, PSM mint 0.5%, PSM redeem 0.1%) | ✅ Designed |
+| Compile bytecode | ✅ Compiled |
+| Deploy to testnet | 🔧 Blocked by syscall ID mismatch |
+| Configure (set_oracle, set_xusd, set_treasury) | 📅 |
+| Create xUSD/XEL pool with PSM | 📅 |
+| Create VLT/XEL pool | 📅 |
+| Test add/remove liquidity | 📅 |
+| Test swap | 📅 |
+| Test PSM mint/redeem | 📅 |
+
+---
+
+## Phase 5: Full Integration 📅
 
 | Task | Timeline |
 |------|----------|
-| Revenue Sharing | Week 8 |
-| Private Payroll | Week 8 |
-| Private Insurance | Week 9 |
-| Multi-Collateral Support | Week 9 |
+| Resolve syscall ID mismatch (compile for public node) | This week |
+| Deploy VaultSwap | This week |
+| Deploy xUSD+VaultEngine+VLT security fixes (redeploy with emergency) | This week |
+| SDK integration tests for all contracts | This week |
+| Dashboard MVP | Next week |
 
 ---
 
@@ -123,70 +125,43 @@ All contracts compile cleanly. All 24 bugs identified and catalogued.
 
 ---
 
-## Phase 7: XelisVault Messenger 1.0 📅
+## Phase 7: VaultSwap Expansion 📅
 
 | Task | Timeline |
 |------|----------|
-| 1-to-1 encrypted messaging contract | Q4 2026 |
-| Payment+message bundling | Q4 2026 |
-| Proof-of-delivery | Q4 2026 |
-| XELIS public key crypto integration | Q4 2026 |
+| Multi-hop swaps | Q4 2026 |
+| Concentrated liquidity pools | Q4 2026 |
+| TWAP oracles | Q4 2026 |
+| Yield-bearing LP tokens | Q4 2026 |
+| VaultSwap governance (fee voting) | Q4 2026 |
 
 ---
 
-## Phase 8: XelisVault Messenger 2.0 📅
-
-| Task | Timeline |
-|------|----------|
-| Group messaging (50 members) | Q1 2027 |
-| Role-based access (admin, mod, member) | Q1 2027 |
-| Thread support | Q1 2027 |
-| Self-destructing messages | Q1 2027 |
-
----
-
-## Phase 9: XelisVault Messenger 3.0 📅
-
-| Task | Timeline |
-|------|----------|
-| DAO governance channels | Q2 2027 |
-| Proposal-linked messaging | Q2 2027 |
-| VLT-gated access | Q2 2027 |
-| Vote-signaling | Q2 2027 |
-
----
-
-## Phase 10: XelisVault Messenger 4.0 📅
-
-| Task | Timeline |
-|------|----------|
-| File attachments (IPFS/Arweave) | Q2 2027 |
-| Reactions and typing indicators | Q2 2027 |
-| Mobile SDK | Q3 2027 |
-
----
-
-## Current Sprint (June 5)
+## Current Sprint (June 12)
 
 ### ✅ Completed
-- **[Adrien]** All core contracts deployed, configured, and tested end-to-end
-- **[Adrien]** Core flow verified: deposit → borrow → repay → withdraw → redeem → liquidate
-- **[Adrien]** All critical bugs fixed (vault ID sentinel, mint_tokens auth, redeem compiler workaround, return values)
-- **[Adrien]** GitHub repo updated with clean final contracts
+- **VaultSwap.slx** — Full AMM + PSM contract written and compiled
+- PSM integration with PriceOracle (entry 4) and xUSD (entries 3/5) designed
+- Protocol revenue model finalized (swap 0.3%, PSM mint 0.5%, PSM redeem 0.1%)
+- All 8 core contracts updated with emergency withdraw pattern in source
+- AGENTS.md updated with complete VaultSwap architecture and entry IDs
 
 ### This Week
-- [ ] Deploy InterestRateModel + FlashLoan + InsurancePool
-- [ ] Deploy all remaining 16 contracts to testnet
-- [ ] Full integration testing
-- [ ] SDK updates for testnet addresses
+- [ ] Resolve syscall ID mismatch (public node rejects bytecode with syscall ID 489)
+- [ ] Deploy VaultSwap to testnet
+- [ ] Configure xUSD.set_psm to point to VaultSwap
+- [ ] Create xUSD/XEL pool with initial liquidity
+- [ ] Create VLT/XEL pool
 
 ### Next Week
-- [ ] Dashboard MVP
-- [ ] Public testnet announcement
-- [ ] Bug bounty program
+- [ ] Deploy security fixes to xUSD, VaultEngine, VLT (emergency_withdraw)
+- [ ] Full integration testing of VaultSwap with VaultEngine
+- [ ] Dashboard MVP with pool UI
+- [ ] SDK updates for VaultSwap
 
 ### Coming Up
-- [ ] XelisVault Messenger design phase
+- [ ] Public testnet announcement
+- [ ] Bug bounty program
 - [ ] Mainnet launch planning
 
 ---

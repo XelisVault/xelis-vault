@@ -1,4 +1,6 @@
 const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const ACTIVE_PRICE_KEY: string = "p"
 const PENDING_PRICE_KEY: string = "pp"
 const PENDING_TOPO_KEY: string = "pt"
@@ -7,6 +9,7 @@ const TIMELOCK_BLOCKS: u64 = 3
 hook constructor() -> u64 {
     let s: Storage = Storage::new();
     s.store(ADMIN_KEY, get_caller().expect("nocaller"));
+    s.store(EMERGENCY_KEY, get_caller().expect("nocaller"));
     return 0;
 }
 
@@ -14,7 +17,10 @@ fn only_admin() {
     let s: Storage = Storage::new();
     let caller: Address = get_caller().expect("nocaller");
     let admin: Address = s.load(ADMIN_KEY).expect("anset");
-    require(caller == admin, "notauth");
+    if caller == admin { return; }
+    let tl: Hash = s.load(TIMELOCK_KEY).expect("tlnotset");
+    let cc: Hash = get_contract_caller().expect("nocontractcaller");
+    require(cc == tl, "notauth");
 }
 
 entry propose_price(price: u64) -> u64 {
@@ -59,9 +65,42 @@ entry cancel_pending() -> u64 {
     return 0;
 }
 
+entry set_timelock(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
+pub fn set_timelock_tl(contract_hash: Hash) -> u64 {
+    only_admin();
+    Storage::new().store(TIMELOCK_KEY, contract_hash);
+    return 0;
+}
+
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin();
     let ws: Storage = Storage::new();
     ws.store(ADMIN_KEY, new_admin);
+    return 0;
+}
+
+entry set_emergency(addr: Address) -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == current, "notauth");
+    s.store(EMERGENCY_KEY, addr);
+    return 0;
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new();
+    let caller: Address = get_caller().expect("nocaller");
+    let emergency: Address = s.load(EMERGENCY_KEY).expect("easet");
+    require(caller == emergency, "notauth");
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "nofunds");
+    let ok: bool = transfer(caller, balance, Hash::zero());
+    require(ok, "txfail");
     return 0;
 }

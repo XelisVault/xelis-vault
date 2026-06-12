@@ -65,7 +65,7 @@ entry set_allocation(recipient: Address, share_bps: u64, asset: Hash) -> u64 {
     let ws: Storage = Storage::new();
     ws.store(get_alloc_key(count), alloc);
     ws.store(ALLOC_COUNT_KEY, count + 1);
-    return count;
+    return 0;
 }
 
 entry remove_allocation(index: u64) -> u64 {
@@ -118,12 +118,21 @@ entry distribute() -> u64 {
         let ws: Storage = Storage::new();
         ws.store(BALANCE_KEY, bal - total_distributed);
     }
-    return total_distributed;
+    return 0;
 }
 
 entry get_balance() -> u64 {
     let rs: Storage = Storage::new();
     return rs.load(BALANCE_KEY).unwrap_or(0);
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {

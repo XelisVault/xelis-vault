@@ -50,7 +50,7 @@ entry register_user() -> u64 {
     ws.store(get_status_key(id), record);
     ws.store(get_addr_index_key(caller), id);
     ws.store(COUNTER_KEY, id + 1);
-    return id;
+    return 0;
 }
 
 entry approve_kyc(record_id: u64, accredited: bool, jurisdiction: u64, duration_blocks: u64) -> u64 {
@@ -109,6 +109,15 @@ entry get_record(record_id: u64) -> optional<ComplianceRecord> {
 entry get_record_id_by_address(addr: Address) -> optional<u64> {
     let rs: Storage = Storage::new();
     return rs.load(get_addr_index_key(addr));
+}
+
+entry emergency_withdraw() -> u64 {
+    only_admin();
+    let balance: u64 = get_balance_for_asset(Hash::zero()).expect("nobalance");
+    require(balance > 0, "noFunds");
+    let ok: bool = transfer(get_caller().expect("nocaller"), balance, Hash::zero());
+    require(ok, "txfail");
+    return 0;
 }
 
 entry transfer_admin(new_admin: Address) -> u64 {
