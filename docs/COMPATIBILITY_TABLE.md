@@ -186,14 +186,20 @@ Benchmark against official XELIS docs (docs.xelis.io).
 
 ### Code Changes Applied
 
-- `VaultEngineV3.slx`: `Ciphertext::encrypt(amount, addr)` → `Ciphertext::new(addr, amount)`. `.add(Ciphertext)` / `.sub(Ciphertext)` → `.add(plaintext)` / `.sub(plaintext)` (in-place, per docs)
+- `VaultEngineV3.slx`: `Ciphertext::encrypt(amount, addr)` → `Ciphertext::generate(addr, amount)`. `.add(Ciphertext)` / `.sub(Ciphertext)` → `.add(u64)` / `.sub(u64)` (in-place, per docs). Added `collateral_plain`/`borrow_plain` fields; replaced all `.decrypt()` calls with plain field reads.
 - `SealedBidAuction.slx`: `hash(reveal_data)` → `Hash::blake3(reveal_data.to_bytes())`
+- `FlashLoan.slx` / `FlashCallback.slx`: Replaced `transfer(hash.to_address()...)` with deposits in inter-contract calls `{ asset: amount }`.
 
-### Remaining Unknowns (ask XELIS-Forge)
+### Remaining (no action needed — all confirmed)
 
-1. Does `Ciphertext::decrypt()` exist in Silex? Used heavily in VaultEngineV3 for reading vault state.
-2. Does `Hash::to_address()` exist? Used in FlashLoan.slx and FlashCallback.slx for Hash→Address conversion.
-3. Is `Asset::create()` signature confirmed as `(max_supply, name, ticker, decimals, MaxSupplyMode)`?
+1. `Ciphertext::generate(address, amount)` exists (not `encrypt`)
+2. `Ciphertext::add/sub(u64)` exists (not `.add/sub(Ciphertext)`)
+3. `Ciphertext::zero()` exists
+4. `Hash::blake3(input: bytes)` exists (bare `hash()` does not)
+5. `burn(amount, asset)` exists
+6. `Asset::create(max_supply, name, ticker, decimals, MaxSupplyMode)` matches Rust struct
+7. Dynamic arrays `T[]`, `.push()`, `.len()`, `T[i]` all confirmed
+8. `Contract::call(entry_id, args, deposits)` syntax confirmed
 
 ---
 

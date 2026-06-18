@@ -91,11 +91,8 @@ entry flash_loan(
     require(total_to_repay >= amount, "ovf")
 
     let caller: Address = get_caller().expect("nocaller")
-    let ok: bool = transfer(callback_contract.to_address().expect("badaddr"), amount, asset)
-    require(ok, "txfail")
-
     let cb: Contract = Contract::new(callback_contract).expect("cbnf")
-    let result: u64 = cb.call(0u16, [asset, amount, fee, caller.to_string(), callback_data], {})
+    let result: u64 = cb.call(0u16, [asset, amount, fee, caller.to_string(), callback_data], { asset: amount })
     require(result == 0, "cbfail")
 
     let balance_after: u64 = get_balance_for_asset(asset).unwrap_or(0)

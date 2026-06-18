@@ -36,11 +36,8 @@ pub fn on_flash_loan(
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
     require(bal >= total_repay, "insrepay")
 
-    let ok: bool = transfer(flash_loan_hash.to_address().expect("badaddr"), total_repay, asset)
-    require(ok, "repayfail")
-
     let fl: Contract = Contract::new(flash_loan_hash).expect("flnf")
-    let _ = fl.call(1u16, [total_repay], {})
+    let _ = fl.call(1u16, [total_repay], { asset: total_repay })
 
 
     return 0
