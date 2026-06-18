@@ -196,7 +196,7 @@ entry deposit(collateral_asset: Hash, collateral_amount: u64) -> u64 {
     let rs: Storage = Storage::new()
     let id: u64 = rs.load(COUNTER_KEY).expect("idns")
     let topo: u64 = get_current_topoheight()
-    let collateral_cipher: Ciphertext = Ciphertext::encrypt(collateral_amount, caller)
+    let collateral_cipher: Ciphertext = Ciphertext::new(caller, collateral_amount)
     let vault: VaultSnapshot = VaultSnapshot {
         owner: caller, collateral_asset: collateral_asset,
         collateral_cipher: collateral_cipher, borrow_cipher: Ciphertext::zero(),
@@ -234,7 +234,7 @@ entry borrow(vault_id: u64, amount: u64) -> u64 {
     let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
     let treasury: Address = rs.load(TREASURY_KEY).expect("trnoset")
     let _ = xusd.call(2u16, [get_caller().expect("nocaller"), net, treasury, fee], {})
-    vault.borrow_cipher = vault.borrow_cipher.add(Ciphertext::encrypt(amount, vault.owner))
+    vault.borrow_cipher.add(amount)
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
@@ -255,7 +255,7 @@ entry repay(vault_id: u64, amount: u64) -> u64 {
     let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("xcnoset")
     let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
     let _ = xusd.call(3u16, [repay_amount], {})
-    vault.borrow_cipher = vault.borrow_cipher.sub(Ciphertext::encrypt(repay_amount, vault.owner))
+    vault.borrow_cipher.sub(repay_amount)
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
@@ -277,7 +277,7 @@ entry withdraw(vault_id: u64, amount: u64) -> u64 {
     require_healthy_after(new_cp, bp)
     let ok: bool = transfer(vault.owner, amount, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher.sub(Ciphertext::encrypt(amount, vault.owner))
+    vault.collateral_cipher.sub(amount)
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
@@ -315,8 +315,8 @@ entry liquidate(vault_id: u64, max_borrow_to_repay: u64) -> u64 {
     let caller: Address = get_caller().expect("nocaller")
     let ok: bool = transfer(caller, collateral_to_seize, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher.sub(Ciphertext::encrypt(collateral_to_seize, vault.owner))
-    vault.borrow_cipher = vault.borrow_cipher.sub(Ciphertext::encrypt(repay_amount, vault.owner))
+    vault.collateral_cipher.sub(collateral_to_seize)
+    vault.borrow_cipher.sub(repay_amount)
     vault.last_update_topo = now_topo
     let new_bp: u64 = vault.borrow_cipher.decrypt()
     if new_bp == 0 {
@@ -354,8 +354,8 @@ entry redeem(xusd_amount: u64) -> u64 {
     require(xel_to_send > 0 && xel_to_send <= cp, "badredeem")
     let ok: bool = transfer(caller, xel_to_send, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher.sub(Ciphertext::encrypt(xel_to_send, vault.owner))
-    vault.borrow_cipher = vault.borrow_cipher.sub(Ciphertext::encrypt(xusd_amount, vault.owner))
+    vault.collateral_cipher.sub(xel_to_send)
+    vault.borrow_cipher.sub(xusd_amount)
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     let remaining_bp: u64 = vault.borrow_cipher.decrypt()

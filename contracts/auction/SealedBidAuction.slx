@@ -126,7 +126,7 @@ entry reveal(auction_id: u64, bid_amount: u64, nonce: u64) -> u64 {
     let commit_key: string = COMMIT_PREFIX + auction_id.to_string(10u32) + "_" + caller.to_string()
     let committed_hash: Hash = s.load(commit_key).expect("nocommit")
     let reveal_data: string = bid_amount.to_string(10u32) + "_" + nonce.to_string(10u32) + "_" + caller.to_string()
-    let computed_hash: Hash = hash(reveal_data)
+    let computed_hash: Hash = Hash::blake3(reveal_data.to_bytes())
     require(computed_hash == committed_hash, "hashmismatch")
     let dep: u64 = get_deposit_for_asset(auction.bid_asset).expect("nodep")
     require(dep >= bid_amount, "insdep")

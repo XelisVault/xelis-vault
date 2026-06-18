@@ -6,7 +6,7 @@
 
 ## 📊 Overview
 
-**31 Silex contracts** organized in 11 categories:
+**29 Silex contracts** organized in 14 categories:
 
 | # | Catégorie | Contrats |
 |---|-----------|----------|
@@ -170,17 +170,30 @@
 
 ---
 
-## ⚠️ Points to Validate with XELIS-Forge
+## ✅ Silex API Validation Results
 
-Before mainnet, confirm these 7 points with the XELIS-Forge team:
+Benchmark against official XELIS docs (docs.xelis.io).
 
-1. **Ciphertext API** : `Ciphertext::encrypt()`, `.decrypt()`, `.add()`, `.sub()`, `.zero()` existent-ils ?
-2. **Asset::create()** : signature exacte `(max_supply, name, ticker, decimals, MaxSupplyMode)` ?
-3. **Tableaux dynamiques** : `T[].push()`, `T[].len()`, `T[i]` supportés ?
-4. **Contract::call()** : signature `(entry_id, args, kwargs)` ? Comment passer types mixtes ?
-5. **Hash::to_address()** : existe-t-il pour convertir Hash → Address ?
-6. **hash() function** : existe-t-il en Silex natif pour hasher des strings ?
-7. **burn() natif** : brûle bien depuis le solde du contrat appelant ?
+| # | API | Status | Notes |
+|---|-----|--------|-------|
+| 1 | **Ciphertext** | ⚠️ PARTIAL | `Ciphertext::new(addr, amount)` documented (not `encrypt`). `.add(plaintext)`, `.sub(plaintext)`, `.zero()` confirmed. `.decrypt()` **NOT in docs** — code fixed to match documented API |
+| 2 | **Asset::create** | ✅ LIKELY | `Asset::create(max_supply, name, ticker, decimals, MaxSupplyMode)` matches asset docs. Needs compilation verification |
+| 3 | **Dynamic arrays** | ✅ CONFIRMED | `T[]`, `array.push(el)`, `array.len()`, `array[i]` all documented in Silex Lang + Std Lib |
+| 4 | **Contract::call** | ✅ CONFIRMED | `contract.call(entry_id: u16, args: any[], deposits: map<Hash, u64>)` matches documented pattern. Mixed types via `any[]` |
+| 5 | **Hash → Address** | ❌ UNDOCUMENTED | `.to_address()` NOT in docs. Hash has `.to_hex()`, `.to_bytes()`, `.to_u256()` only. Must ask XELIS-Forge |
+| 6 | **hash() function** | ❌ FIXED | Bare `hash(str)` doesn't exist. Use `Hash::blake3(input.to_bytes())`. Fixed in SealedBidAuction |
+| 7 | **burn() native** | ✅ CONFIRMED | `burn(amount: u64, asset: Hash) → bool` documented. Burns from contract balance |
+
+### Code Changes Applied
+
+- `VaultEngineV3.slx`: `Ciphertext::encrypt(amount, addr)` → `Ciphertext::new(addr, amount)`. `.add(Ciphertext)` / `.sub(Ciphertext)` → `.add(plaintext)` / `.sub(plaintext)` (in-place, per docs)
+- `SealedBidAuction.slx`: `hash(reveal_data)` → `Hash::blake3(reveal_data.to_bytes())`
+
+### Remaining Unknowns (ask XELIS-Forge)
+
+1. Does `Ciphertext::decrypt()` exist in Silex? Used heavily in VaultEngineV3 for reading vault state.
+2. Does `Hash::to_address()` exist? Used in FlashLoan.slx and FlashCallback.slx for Hash→Address conversion.
+3. Is `Asset::create()` signature confirmed as `(max_supply, name, ticker, decimals, MaxSupplyMode)`?
 
 ---
 
