@@ -1,0 +1,122 @@
+
+const VERSION: string = "InterestRateModel v4.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+
+const BASE_RATE_KEY: string = "br"
+const MULTIPLIER_KEY: string = "ml"
+const JUMP_MULTIPLIER_KEY: string = "jm"
+const KINK_KEY: string = "kk"
+const RESERVE_FACTOR_KEY: string = "rf"
+
+const BLOCKS_PER_YEAR: u64 = 6307200
+const BPS_DENOMINATOR: u64 = 10000
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(BASE_RATE_KEY, 200u64)
+    s.store(MULTIPLIER_KEY, 1000u64)
+    s.store(JUMP_MULTIPLIER_KEY, 30000u64)
+    s.store(KINK_KEY, 8000u64)
+    s.store(RESERVE_FACTOR_KEY, 1000u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+pub fn get_borrow_rate(utilization_bps: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let base_rate: u64 = s.load(BASE_RATE_KEY).unwrap_or(200)
+    let multiplier: u64 = s.load(MULTIPLIER_KEY).unwrap_or(1000)
+    let jump_multiplier: u64 = s.load(JUMP_MULTIPLIER_KEY).unwrap_or(30000)
+    let kink: u64 = s.load(KINK_KEY).unwrap_or(8000)
+
+    if utilization_bps <= kink {
+        return base_rate + (utilization_bps as u128 * multiplier as u128 / BPS_DENOMINATOR as u128) as u64
+    }
+    let normal_rate: u64 = base_rate + (kink as u128 * multiplier as u128 / BPS_DENOMINATOR as u128) as u64
+    let excess_util: u64 = utilization_bps - kink
+    let excess_rate: u64 = (excess_util as u128 * jump_multiplier as u128 / BPS_DENOMINATOR as u128) as u64
+    return normal_rate + excess_rate
+}
+
+pub fn get_supply_rate(utilization_bps: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let reserve_factor: u64 = s.load(RESERVE_FACTOR_KEY).unwrap_or(1000)
+
+    let borrow_rate: u64 = get_borrow_rate(utilization_bps)
+    let one_minus_rf: u64 = BPS_DENOMINATOR - reserve_factor
+    let supply_rate: u64 = (borrow_rate as u128 * utilization_bps as u128 / BPS_DENOMINATOR as u128) as u64
+    let supply_rate: u64 = (supply_rate as u128 * one_minus_rf as u128 / BPS_DENOMINATOR as u128) as u64
+    return supply_rate
+}
+
+pub fn annual_to_per_block(annual_rate_bps: u64) -> u64 {
+    return (annual_rate_bps as u128 * 10000u128 / BLOCKS_PER_YEAR as u128) as u64
+}
+
+pub fn get_rates() -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(BASE_RATE_KEY).unwrap_or(200),
+        s.load(MULTIPLIER_KEY).unwrap_or(1000),
+        s.load(JUMP_MULTIPLIER_KEY).unwrap_or(30000),
+        s.load(KINK_KEY).unwrap_or(8000),
+        s.load(RESERVE_FACTOR_KEY).unwrap_or(1000)
+    )
+}
+
+entry set_rates(base: u64, multiplier: u64, jump: u64, kink: u64) -> u64 {
+    only_admin()
+    require(base <= 1000 && multiplier <= 50000 && jump <= 100000 && kink <= 10000, "badval")
+    let s: Storage = Storage::new()
+    s.store(BASE_RATE_KEY, base)
+    s.store(MULTIPLIER_KEY, multiplier)
+    s.store(JUMP_MULTIPLIER_KEY, jump)
+    s.store(KINK_KEY, kink)
+    return 0
+}
+
+entry set_reserve_factor(factor_bps: u64) -> u64 {
+    only_admin()
+    require(factor_bps <= 5000, "badval")
+    Storage::new().store(RESERVE_FACTOR_KEY, factor_bps)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

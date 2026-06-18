@@ -1,0 +1,27 @@
+const VERSION: string = "Upgradeable v4.2"
+
+const ADMIN_KEY: string = "a"
+const MIGRATED_KEY: string = "mg"
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(MIGRATED_KEY, false)
+    return 0
+}
+
+entry migrate_from(prev_hash: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    require(caller == admin, "notauth")
+    let migrated: bool = s.load(MIGRATED_KEY).unwrap_or(false)
+    require(!migrated, "alreadymigrated")
+    s.store(MIGRATED_KEY, true)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

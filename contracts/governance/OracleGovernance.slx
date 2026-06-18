@@ -1,0 +1,518 @@
+
+const VERSION: string = "OracleGovernance v3.0"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const ORACLE_KEY: string = "or"
+const GOVERNANCE_VAULT_KEY: string = "gv"
+
+const PROPOSAL_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "pp_"
+const VOTE_PREFIX: string = "pv_"
+
+const VOTING_PERIOD_KEY: string = "vp"
+const QUORUM_BPS_KEY: string = "qb"
+const APPROVAL_BPS_KEY: string = "ab"
+const EXECUTION_DELAY_KEY: string = "ed"
+
+const BLOCKS_PER_DAY: u64 = 17280
+
+const TYPE_ADD_FEED: u8 = 1
+const TYPE_UPDATE_FEED: u8 = 2
+const TYPE_REMOVE_FEED: u8 = 3
+const TYPE_SET_PARAM: u8 = 4
+const TYPE_SET_REWARD: u8 = 5
+const TYPE_EMERGENCY_CB: u8 = 6
+const TYPE_RESET_FEED: u8 = 7
+
+const PARAM_WINDOW_SIZE: u8 = 1
+const PARAM_MAX_STALE: u8 = 2
+const PARAM_HARD_STALE: u8 = 3
+const PARAM_MAX_DEV: u8 = 4
+const PARAM_CB_THRESH: u8 = 5
+const PARAM_SUBMIT_WINDOW: u8 = 6
+
+const DEFAULT_VOTING_PERIOD: u64 = 120960
+const DEFAULT_QUORUM_BPS: u64 = 1000
+const DEFAULT_APPROVAL_BPS: u64 = 6000
+const DEFAULT_EXECUTION_DELAY: u64 = 34560
+
+struct Proposal {
+    id: u64,
+    proposal_type: u8,
+    proposer: Address,
+    created_at: u64,
+    voting_deadline: u64,
+    executed: bool,
+    cancelled: bool,
+    yes_votes: u64,
+    no_votes: u64,
+
+    feed_id: u64,
+    feed_name: string,
+    feed_asset: Hash,
+    feed_decimals: u8,
+    feed_min: u64,
+    feed_max: u64,
+    param_key: u8,
+    param_value: u64,
+    reward_amount: u64,
+    description: string
+}
+
+struct VoteInfo {
+    voter: Address,
+    support: bool,
+    voting_power: u64,
+    timestamp: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PROPOSAL_COUNT_KEY, 0u64)
+    s.store(VOTING_PERIOD_KEY, DEFAULT_VOTING_PERIOD)
+    s.store(QUORUM_BPS_KEY, DEFAULT_QUORUM_BPS)
+    s.store(APPROVAL_BPS_KEY, DEFAULT_APPROVAL_BPS)
+    s.store(EXECUTION_DELAY_KEY, DEFAULT_EXECUTION_DELAY)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn get_voting_power(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("gvnotset")
+    let gv: Contract = Contract::new(gv_hash).expect("gvnf")
+    let vp: u64 = gv.call(0u16, [addr], {})
+    return vp
+}
+
+
+entry propose_add_feed(
+    name: string,
+    asset: Hash,
+    decimals: u8,
+    min_price: u64,
+    max_price: u64,
+    description: string
+) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_ADD_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: name,
+        feed_asset: asset,
+        feed_decimals: decimals,
+        feed_min: min_price,
+        feed_max: max_price,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+entry propose_update_feed(
+    feed_id: u64,
+    min_price: u64,
+    max_price: u64,
+    decimals: u8,
+    description: string
+) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_UPDATE_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: decimals,
+        feed_min: min_price,
+        feed_max: max_price,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+entry propose_remove_feed(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_REMOVE_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+entry propose_set_param(param_key: u8, param_value: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    require(get_voting_power(caller) > 0, "novp")
+    require(param_key >= 1 && param_key <= 6, "badkey")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_SET_PARAM,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: param_key,
+        param_value: param_value,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+entry propose_set_reward(reward_amount: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_SET_REWARD,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: reward_amount,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+
+entry vote(proposal_id: u64, support: bool) -> u64 {
+    let caller: Address = get_caller().expect("nocaller")
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.executed, "executed")
+    require(!proposal.cancelled, "cancelled")
+
+    let topo: u64 = get_current_topoheight()
+    require(topo <= proposal.voting_deadline, "votingended")
+
+    let vote_key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + caller.to_string()
+    let existing: optional = s.load(vote_key)
+    require(existing.is_none(), "alreadyvoted")
+
+    let vote_info: VoteInfo = VoteInfo {
+        voter: caller,
+        support: support,
+        voting_power: vp,
+        timestamp: topo
+    }
+    s.store(vote_key, vote_info)
+
+    if support {
+        proposal.yes_votes += vp
+    } else {
+        proposal.no_votes += vp
+    }
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    return 0
+}
+
+
+pub fn is_executable(proposal_id: u64) -> bool {
+    let s: Storage = Storage::new()
+    let proposal_opt: optional = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32))
+    if proposal_opt.is_none() {
+        return false
+    }
+    let proposal: Proposal = proposal_opt.unwrap()
+    if proposal.executed || proposal.cancelled {
+        return false
+    }
+    let topo: u64 = get_current_topoheight()
+    if topo <= proposal.voting_deadline {
+        return false
+    }
+    let total_votes: u64 = proposal.yes_votes + proposal.no_votes
+    let quorum_bps: u64 = s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS)
+    if total_votes == 0 {
+        return false
+    }
+    let approval_bps: u64 = s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS)
+    let yes_bps: u64 = (proposal.yes_votes as u128 * 10000u128 / total_votes as u128) as u64
+    if yes_bps < approval_bps {
+        return false
+    }
+    let elapsed_since_voting_end: u64 = topo - proposal.voting_deadline
+    let delay: u64 = s.load(EXECUTION_DELAY_KEY).unwrap_or(DEFAULT_EXECUTION_DELAY)
+    if elapsed_since_voting_end < delay {
+        return false
+    }
+    return true
+}
+
+entry execute_proposal(proposal_id: u64) -> u64 {
+    require(is_executable(proposal_id), "notexec")
+
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    proposal.executed = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("ornotset")
+    let oracle: Contract = Contract::new(oracle_hash).expect("ornf")
+
+    if proposal.proposal_type == TYPE_ADD_FEED {
+        let _ = oracle.call(6u16, [
+            proposal.feed_name,
+            proposal.feed_asset.to_string(),
+            proposal.feed_decimals as u64,
+            proposal.feed_min,
+            proposal.feed_max
+        ], {})
+    } else if proposal.proposal_type == TYPE_UPDATE_FEED {
+        let _ = oracle.call(7u16, [
+            proposal.feed_id,
+            proposal.feed_min,
+            proposal.feed_max,
+            proposal.feed_decimals as u64
+        ], {})
+    } else if proposal.proposal_type == TYPE_REMOVE_FEED {
+        let _ = oracle.call(8u16, [proposal.feed_id, 0u64], {})
+    } else if proposal.proposal_type == TYPE_SET_PARAM {
+        if proposal.param_key == PARAM_MAX_STALE {
+            let _ = oracle.call(19u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_HARD_STALE {
+            let _ = oracle.call(20u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_MAX_DEV {
+            let _ = oracle.call(16u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_CB_THRESH {
+            let _ = oracle.call(17u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_SUBMIT_WINDOW {
+            let _ = oracle.call(18u16, [proposal.param_value], {})
+        }
+    } else if proposal.proposal_type == TYPE_SET_REWARD {
+        let _ = oracle.call(14u16, [proposal.reward_amount], {})
+    } else if proposal.proposal_type == TYPE_EMERGENCY_CB {
+        let _ = oracle.call(9u16, [proposal.feed_id, "governance"], {})
+    } else if proposal.proposal_type == TYPE_RESET_FEED {
+        let _ = oracle.call(10u16, [proposal.feed_id], {})
+    }
+
+    return 0
+}
+
+entry cancel_proposal(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.executed, "executed")
+
+    let caller: Address = get_caller().expect("nocaller")
+    let is_admin: bool = caller == s.load(ADMIN_KEY).expect("anset")
+    require(caller == proposal.proposer || is_admin, "notauth")
+
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+
+pub fn get_proposal(proposal_id: u64) -> (u8, Address, u64, u64, bool, bool, u64, u64, string) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    return (
+        p.proposal_type,
+        p.proposer,
+        p.created_at,
+        p.voting_deadline,
+        p.executed,
+        p.cancelled,
+        p.yes_votes,
+        p.no_votes,
+        p.description
+    )
+}
+
+pub fn get_proposal_count() -> u64 {
+    return Storage::new().load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn has_voted(proposal_id: u64, voter: Address) -> bool {
+    let key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + voter.to_string()
+    return Storage::new().load(key).is_some()
+}
+
+
+entry set_voting_period(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 17280 && blocks <= 518400, "badval")
+    Storage::new().store(VOTING_PERIOD_KEY, blocks)
+    return 0
+}
+
+entry set_quorum_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(QUORUM_BPS_KEY, bps)
+    return 0
+}
+
+entry set_approval_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 5000 && bps <= 8000, "badval")
+    Storage::new().store(APPROVAL_BPS_KEY, bps)
+    return 0
+}
+
+entry set_execution_delay(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 720 && blocks <= 604800, "badval")
+    Storage::new().store(EXECUTION_DELAY_KEY, blocks)
+    return 0
+}
+
+
+entry set_oracle(oracle: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ORACLE_KEY, oracle)
+    return 0
+}
+
+entry set_governance_vault(gv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

@@ -1,0 +1,315 @@
+const VERSION: string = "SavingsRate v4.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const XUSD_CONTRACT_KEY: string = "xc"
+const XUSD_ASSET_KEY: string = "xa"
+const TREASURY_KEY: string = "tr"
+
+const TOTAL_DEPOSITS_KEY: string = "td"
+const APY_BPS_KEY: string = "ab"
+const LAST_UPDATE_KEY: string = "lu"
+const INTEREST_ACCUMULATED_KEY: string = "ia"
+
+const DEPOSITOR_PREFIX: string = "dep_"
+const DEFAULT_APY_BPS: u64 = 500
+const BLOCKS_PER_YEAR: u64 = 6307200
+
+struct DepositorPosition {
+    principal: u64,
+    last_update: u64,
+    interest_earned: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_DEPOSITS_KEY, 0u64)
+    s.store(APY_BPS_KEY, DEFAULT_APY_BPS)
+    s.store(LAST_UPDATE_KEY, get_current_topoheight())
+    s.store(INTEREST_ACCUMULATED_KEY, 1000000000000u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g {
+        return
+    }
+    only_admin()
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn update_accumulator() {
+    let s: Storage = Storage::new()
+    let last_update: u64 = s.load(LAST_UPDATE_KEY).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= last_update {
+        return
+    }
+    let blocks_elapsed: u64 = current_topo - last_update
+    let apy_bps: u64 = s.load(APY_BPS_KEY).unwrap_or(DEFAULT_APY_BPS)
+    let accumulated: u64 = s.load(INTEREST_ACCUMULATED_KEY).unwrap_or(1000000000000u64)
+
+    let factor: u128 = 10000u128 * BLOCKS_PER_YEAR as u128
+    let increment: u128 = (apy_bps as u128 * blocks_elapsed as u128 * accumulated as u128 / factor) as u64 as u128
+    let new_accumulated: u128 = accumulated as u128 + increment
+    if new_accumulated > u64::MAX as u128 {
+        s.store(INTEREST_ACCUMULATED_KEY, u64::MAX)
+    } else {
+        s.store(INTEREST_ACCUMULATED_KEY, new_accumulated as u64)
+    }
+    s.store(LAST_UPDATE_KEY, current_topo)
+}
+
+entry deposit(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+
+    update_accumulator()
+
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let dep: u64 = get_deposit_for_asset(xusd_asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, xusd_asset)
+    }
+
+    let key: string = DEPOSITOR_PREFIX + caller.to_string()
+    let existing: optional = s.load(key)
+    let mut position: DepositorPosition
+    if existing.is_none() {
+        position = DepositorPosition {
+            principal: 0,
+            last_update: get_current_topoheight(),
+            interest_earned: 0
+        }
+    } else {
+        position = existing.unwrap()
+    }
+    position.principal += amount
+    position.last_update = get_current_topoheight()
+    s.store(key, position)
+
+    let total: u64 = s.load(TOTAL_DEPOSITS_KEY).unwrap_or(0)
+    s.store(TOTAL_DEPOSITS_KEY, total + amount)
+
+    return 0
+}
+
+entry withdraw(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+
+    update_accumulator()
+
+    let key: string = DEPOSITOR_PREFIX + caller.to_string()
+    let position_opt: optional = s.load(key)
+    require(position_opt.is_some(), "nodeposit")
+    let mut position: DepositorPosition = position_opt.unwrap()
+    require(position.principal >= amount, "insbal")
+
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let ok: bool = transfer(caller, amount, xusd_asset)
+    require(ok, "txfail")
+
+    position.principal -= amount
+    position.last_update = get_current_topoheight()
+    s.store(key, position)
+
+    let total: u64 = s.load(TOTAL_DEPOSITS_KEY).unwrap_or(0)
+    s.store(TOTAL_DEPOSITS_KEY, total - amount)
+
+    return 0
+}
+
+entry claim_interest() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+
+    update_accumulator()
+
+    let key: string = DEPOSITOR_PREFIX + caller.to_string()
+    let position_opt: optional = s.load(key)
+    require(position_opt.is_some(), "nodeposit")
+    let mut position: DepositorPosition = position_opt.unwrap()
+
+    let accumulated: u64 = s.load(INTEREST_ACCUMULATED_KEY).unwrap_or(1000000000000u64)
+    let user_accumulated_at_last: u64 = position.interest_earned
+    let interest_due: u64 = if accumulated > user_accumulated_at_last {
+        let delta: u64 = accumulated - user_accumulated_at_last
+        (position.principal as u128 * delta as u128 / 1000000000000u128) as u64
+    } else {
+        0
+    }
+
+    if interest_due == 0 {
+        return 0
+    }
+
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let bal: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
+    let actual_payout: u64 = if interest_due > bal { bal } else { interest_due }
+    if actual_payout > 0 {
+        let _ = transfer(caller, actual_payout, xusd_asset)
+    }
+
+    position.interest_earned = accumulated
+    position.last_update = get_current_topoheight()
+    s.store(key, position)
+
+    return actual_payout
+}
+
+pub fn get_balance(addr: Address) -> (u64, u64) {
+    let s: Storage = Storage::new()
+    let key: string = DEPOSITOR_PREFIX + addr.to_string()
+    let position_opt: optional = s.load(key)
+    if position_opt.is_none() {
+        return (0, 0)
+    }
+    let position: DepositorPosition = position_opt.unwrap()
+    let accumulated: u64 = s.load(INTEREST_ACCUMULATED_KEY).unwrap_or(1000000000000u64)
+    let delta: u64 = if accumulated > position.interest_earned {
+        accumulated - position.interest_earned
+    } else {
+        0
+    }
+    let pending_interest: u64 = (position.principal as u128 * delta as u128 / 1000000000000u128) as u64
+    return (position.principal, pending_interest)
+}
+
+pub fn get_total_deposits() -> u64 {
+    return Storage::new().load(TOTAL_DEPOSITS_KEY).unwrap_or(0)
+}
+
+pub fn get_apy() -> u64 {
+    return Storage::new().load(APY_BPS_KEY).unwrap_or(DEFAULT_APY_BPS)
+}
+
+entry set_apy_bps(apy: u64) -> u64 {
+    only_admin()
+    require(apy <= 5000, "badval")
+    update_accumulator()
+    Storage::new().store(APY_BPS_KEY, apy)
+    return 0
+}
+
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+entry set_xusd_contract(xc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_CONTRACT_KEY, xc)
+    return 0
+}
+
+entry set_xusd_asset(xa: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_ASSET_KEY, xa)
+    return 0
+}
+
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == e, "notemg")
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let bal: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
+    require(bal > 0, "nofunds")
+    let _ = transfer(caller, bal, xusd_asset)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

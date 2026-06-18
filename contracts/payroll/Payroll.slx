@@ -1,0 +1,215 @@
+const VERSION: string = "Payroll v4.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const TREASURY_KEY: string = "tr"
+
+const EMPLOYEES_COUNT_KEY: string = "ec"
+const EMPLOYEE_PREFIX: string = "e_"
+const LAST_CLAIM_PREFIX: string = "lc_"
+
+struct Employee {
+    addr: Address,
+    asset: Hash,
+    rate_per_block: u64,
+    start_topo: u64,
+    end_topo: u64,
+    active: bool,
+    total_paid: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(EMPLOYEES_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+entry add_employee(
+    addr: Address,
+    asset: Hash,
+    rate_per_block: u64,
+    start_topo: u64,
+    end_topo: u64
+) -> u64 {
+    when_not_paused()
+    only_admin()
+    require(rate_per_block > 0, "badrate")
+    require(end_topo > start_topo, "baddates")
+
+    let s: Storage = Storage::new()
+    let existing: optional = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    require(existing.is_none(), "exists")
+
+    let employee: Employee = Employee {
+        addr: addr,
+        asset: asset,
+        rate_per_block: rate_per_block,
+        start_topo: start_topo,
+        end_topo: end_topo,
+        active: true,
+        total_paid: 0
+    }
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    let count: u64 = s.load(EMPLOYEES_COUNT_KEY).unwrap_or(0)
+    s.store(EMPLOYEES_COUNT_KEY, count + 1)
+    return 0
+}
+
+entry update_employee(addr: Address, rate_per_block: u64, end_topo: u64) -> u64 {
+    when_not_paused()
+    only_admin()
+    let s: Storage = Storage::new()
+    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("enotfound")
+    require(employee.active, "inactive")
+    require(rate_per_block > 0, "badrate")
+    require(end_topo > employee.start_topo, "baddate")
+
+    employee.rate_per_block = rate_per_block
+    employee.end_topo = end_topo
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    return 0
+}
+
+entry remove_employee(addr: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("enotfound")
+    employee.active = false
+    employee.end_topo = get_current_topoheight()
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    return 0
+}
+
+entry claim() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + caller.to_string()).expect("enotfound")
+    require(employee.active, "inactive")
+
+    let current_topo: u64 = get_current_topoheight()
+    let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + caller.to_string()).unwrap_or(employee.start_topo)
+
+    let start: u64 = if last_claim > employee.start_topo { last_claim } else { employee.start_topo }
+    let end: u64 = if current_topo < employee.end_topo { current_topo } else { employee.end_topo }
+    require(end > start, "nothing")
+
+    let blocks_elapsed: u64 = end - start
+    let amount_due: u64 = (blocks_elapsed as u128 * employee.rate_per_block as u128) as u64
+
+    let bal: u64 = get_balance_for_asset(employee.asset).unwrap_or(0)
+    let actual: u64 = if amount_due > bal { bal } else { amount_due }
+    require(actual > 0, "nofunds")
+
+    let _ = transfer(caller, actual, employee.asset)
+
+    s.store(LAST_CLAIM_PREFIX + caller.to_string(), end)
+    employee.total_paid += actual
+    s.store(EMPLOYEE_PREFIX + caller.to_string(), employee)
+
+    return actual
+}
+
+pub fn get_pending(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let employee_opt: optional = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    if employee_opt.is_none() {
+        return 0
+    }
+    let employee: Employee = employee_opt.unwrap()
+    if !employee.active {
+        return 0
+    }
+    let current_topo: u64 = get_current_topoheight()
+    let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + addr.to_string()).unwrap_or(employee.start_topo)
+    let start: u64 = if last_claim > employee.start_topo { last_claim } else { employee.start_topo }
+    let end: u64 = if current_topo < employee.end_topo { current_topo } else { employee.end_topo }
+    if end <= start {
+        return 0
+    }
+    let blocks_elapsed: u64 = end - start
+    return (blocks_elapsed as u128 * employee.rate_per_block as u128) as u64
+}
+
+pub fn get_employees_count() -> u64 {
+    return Storage::new().load(EMPLOYEES_COUNT_KEY).unwrap_or(0)
+}
+
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry deposit_funds(asset: Hash, amount: u64) -> u64 {
+    require(amount > 0, "amtgt0")
+    let caller: Address = get_caller().expect("nocaller")
+    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

@@ -1,0 +1,221 @@
+
+const VERSION: string = "Timelock v4.2"
+
+const ADMIN_KEY: string = "a"
+const GOVERNOR_KEY: string = "gv"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+
+const MIN_DELAY_KEY: string = "md"
+const MAX_DELAY_KEY: string = "xd"
+const EMERGENCY_DELAY_KEY: string = "ed"
+const PROPOSALS_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "p_"
+
+const DEFAULT_MIN_DELAY: u64 = 720
+const DEFAULT_MAX_DELAY: u64 = 604800
+const DEFAULT_EMERGENCY_DELAY: u64 = 1440
+
+struct Proposal {
+    id: u64,
+    target_contract: Hash,
+    entry_id: u16,
+    params: bytes,
+    submitted_at: u64,
+    delay: u64,
+    executed: bool,
+    cancelled: bool,
+    is_emergency: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(MIN_DELAY_KEY, DEFAULT_MIN_DELAY)
+    s.store(MAX_DELAY_KEY, DEFAULT_MAX_DELAY)
+    s.store(EMERGENCY_DELAY_KEY, DEFAULT_EMERGENCY_DELAY)
+    s.store(PROPOSALS_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin_or_governor() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+
+    let gov_opt: optional = s.load(GOVERNOR_KEY)
+    if gov_opt.is_some() {
+        let gov: Hash = gov_opt.unwrap()
+        let cc_opt: optional = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.unwrap()
+            if cc == gov { return }
+        }
+    }
+    require(false, "notauth")
+}
+
+fn only_guardian() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    require(caller == g, "notguard")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    require(caller == admin, "notauth")
+}
+
+entry submit_proposal(
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    delay: u64
+) -> u64 {
+    only_admin_or_governor()
+    let s: Storage = Storage::new()
+    let min_delay: u64 = s.load(MIN_DELAY_KEY).unwrap_or(DEFAULT_MIN_DELAY)
+    let max_delay: u64 = s.load(MAX_DELAY_KEY).unwrap_or(DEFAULT_MAX_DELAY)
+    require(delay >= min_delay, "tooshort")
+    require(delay <= max_delay, "toolong")
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let proposal: Proposal = Proposal {
+        id: id,
+        target_contract: target,
+        entry_id: entry_id,
+        params: params,
+        submitted_at: get_current_topoheight(),
+        delay: delay,
+        executed: false,
+        cancelled: false,
+        is_emergency: false
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return id
+}
+
+entry execute_proposal(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.executed, "executed")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo >= proposal.submitted_at + proposal.delay, "early")
+
+    proposal.executed = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    let target: Contract = Contract::new(proposal.target_contract).expect("tnf")
+    let _ = target.call(proposal.entry_id, [], proposal.params)
+
+    return 0
+}
+
+entry cancel_proposal(proposal_id: u64) -> u64 {
+    only_admin_or_governor()
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.executed, "executed")
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+entry submit_emergency_proposal(
+    target: Hash,
+    entry_id: u16,
+    params: bytes
+) -> u64 {
+    only_guardian()
+    let s: Storage = Storage::new()
+    let emergency_delay: u64 = s.load(EMERGENCY_DELAY_KEY).unwrap_or(DEFAULT_EMERGENCY_DELAY)
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let proposal: Proposal = Proposal {
+        id: id,
+        target_contract: target,
+        entry_id: entry_id,
+        params: params,
+        submitted_at: get_current_topoheight(),
+        delay: emergency_delay,
+        executed: false,
+        cancelled: false,
+        is_emergency: true
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return id
+}
+
+entry set_min_delay(delay: u64) -> u64 {
+    only_admin()
+    require(delay >= 144 && delay <= 43200, "badval")
+    Storage::new().store(MIN_DELAY_KEY, delay)
+    return 0
+}
+
+entry set_max_delay(delay: u64) -> u64 {
+    only_admin()
+    require(delay >= 1440 && delay <= 2592000, "badval")
+    Storage::new().store(MAX_DELAY_KEY, delay)
+    return 0
+}
+
+entry set_governor(gov: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNOR_KEY, gov)
+    return 0
+}
+
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+pub fn get_proposal(proposal_id: u64) -> (Hash, u16, u64, u64, bool, bool, bool) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    return (p.target_contract, p.entry_id, p.submitted_at, p.delay, p.executed, p.cancelled, p.is_emergency)
+}
+
+pub fn get_proposals_count() -> u64 {
+    return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn get_delays() -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_DELAY_KEY).unwrap_or(DEFAULT_MIN_DELAY),
+        s.load(MAX_DELAY_KEY).unwrap_or(DEFAULT_MAX_DELAY),
+        s.load(EMERGENCY_DELAY_KEY).unwrap_or(DEFAULT_EMERGENCY_DELAY)
+    )
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

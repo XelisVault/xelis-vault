@@ -1,0 +1,224 @@
+const VERSION: string = "PrivateInsurance v4.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const POLICIES_COUNT_KEY: string = "pc"
+const POLICY_PREFIX: string = "p_"
+
+struct Policy {
+    id: u64,
+    insurer: Address,
+    insured: optional,
+    asset: Hash,
+    coverage_amount: u64,
+    premium: u64,
+    duration_blocks: u64,
+    trigger_hash: Hash,
+    created_at: u64,
+    activated_at: u64,
+    expires_at: u64,
+    status: u8
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(POLICIES_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+entry create_policy(
+    asset: Hash,
+    coverage_amount: u64,
+    premium: u64,
+    duration_blocks: u64,
+    trigger_hash: Hash
+) -> u64 {
+    when_not_paused()
+    require(coverage_amount > 0, "nocoverage")
+    require(premium > 0, "nopremium")
+    require(duration_blocks >= 1440, "baddur")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+
+    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    require(dep >= coverage_amount, "insdep")
+    if dep > coverage_amount {
+        let _ = transfer(caller, dep - coverage_amount, asset)
+    }
+
+    let id: u64 = s.load(POLICIES_COUNT_KEY).unwrap_or(0)
+    let policy: Policy = Policy {
+        id: id,
+        insurer: caller,
+        insured: null,
+        asset: asset,
+        coverage_amount: coverage_amount,
+        premium: premium,
+        duration_blocks: duration_blocks,
+        trigger_hash: trigger_hash,
+        created_at: get_current_topoheight(),
+        activated_at: 0,
+        expires_at: 0,
+        status: 0
+    }
+    s.store(POLICY_PREFIX + id.to_string(10u32), policy)
+    s.store(POLICIES_COUNT_KEY, id + 1)
+    return id
+}
+
+entry buy_policy(policy_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    require(policy.status == 0, "notopen")
+    require(policy.insurer != caller, "selfbuy")
+
+    let dep: u64 = get_deposit_for_asset(policy.asset).expect("nodep")
+    require(dep >= policy.premium, "insdep")
+    if dep > policy.premium {
+        let _ = transfer(caller, dep - policy.premium, policy.asset)
+    }
+
+    let _ = transfer(policy.insurer, policy.premium, policy.asset)
+
+    policy.insured = caller
+    policy.activated_at = get_current_topoheight()
+    policy.expires_at = policy.activated_at + policy.duration_blocks
+    policy.status = 1
+    s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
+    return 0
+}
+
+entry claim(policy_id: u64, evidence_hash: Hash) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    require(policy.status == 1, "notactive")
+    require(policy.insured.unwrap() == caller, "notinsured")
+    require(policy.trigger_hash == evidence_hash, "trigmatch")
+
+
+    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    policy.status = 2
+    s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
+    return 0
+}
+
+entry approve_claim(policy_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    require(policy.status == 1, "notactive")
+    require(policy.insurer == caller, "notinsurer")
+    require(policy.insured.is_some(), "noinsured")
+
+    let _ = transfer(policy.insured.unwrap(), policy.coverage_amount, policy.asset)
+    policy.status = 2
+    s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
+    return 0
+}
+
+entry cancel_policy(policy_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    require(policy.status == 0, "notopen")
+    require(policy.insurer == caller, "notinsurer")
+
+    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    policy.status = 4
+    s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
+    return 0
+}
+
+entry expire_policy(policy_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    require(policy.status == 1, "notactive")
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > policy.expires_at, "notexpired")
+
+    let _ = transfer(policy.insurer, policy.coverage_amount, policy.asset)
+    policy.status = 3
+    s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
+    return 0
+}
+
+pub fn get_policy(policy_id: u64) -> (Address, optional, Hash, u64, u64, u64, u64, u8) {
+    let p: Policy = Storage::new().load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    return (
+        p.insurer, p.insured, p.asset, p.coverage_amount, p.premium,
+        p.duration_blocks, p.expires_at, p.status
+    )
+}
+
+pub fn get_policies_count() -> u64 {
+    return Storage::new().load(POLICIES_COUNT_KEY).unwrap_or(0)
+}
+
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

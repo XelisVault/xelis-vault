@@ -1,0 +1,255 @@
+
+const VERSION: string = "Governor v4.2"
+
+const ADMIN_KEY: string = "a"
+const GOVERNANCE_VAULT_KEY: string = "gv"
+const TIMELOCK_KEY: string = "tl"
+
+const PROPOSALS_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "p_"
+const VOTE_PREFIX: string = "v_"
+
+const VOTING_PERIOD_KEY: string = "vp"
+const QUORUM_BPS_KEY: string = "qb"
+const APPROVAL_BPS_KEY: string = "ab"
+const PROPOSAL_THRESHOLD_KEY: string = "pt"
+
+const DEFAULT_VOTING_PERIOD: u64 = 120960
+const DEFAULT_QUORUM_BPS: u64 = 1000
+const DEFAULT_APPROVAL_BPS: u64 = 5000
+const DEFAULT_PROPOSAL_THRESHOLD: u64 = 10000000000
+
+struct Proposal {
+    id: u64,
+    proposer: Address,
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    description: string,
+    start_topo: u64,
+    end_topo: u64,
+    yes_votes: u64,
+    no_votes: u64,
+    abstain_votes: u64,
+    queued: bool,
+    cancelled: bool,
+    executed: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(PROPOSALS_COUNT_KEY, 0u64)
+    s.store(VOTING_PERIOD_KEY, DEFAULT_VOTING_PERIOD)
+    s.store(QUORUM_BPS_KEY, DEFAULT_QUORUM_BPS)
+    s.store(APPROVAL_BPS_KEY, DEFAULT_APPROVAL_BPS)
+    s.store(PROPOSAL_THRESHOLD_KEY, DEFAULT_PROPOSAL_THRESHOLD)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    require(caller == admin, "notauth")
+}
+
+fn get_voting_power(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("gvset")
+    let gv: Contract = Contract::new(gv_hash).expect("gvnf")
+    let vp: u64 = gv.call(3u16, [addr], {})
+    return vp
+}
+
+entry propose(
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    description: string
+) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let vp: u64 = get_voting_power(caller)
+    let threshold: u64 = s.load(PROPOSAL_THRESHOLD_KEY).unwrap_or(DEFAULT_PROPOSAL_THRESHOLD)
+    require(vp >= threshold, "novenough")
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposer: caller,
+        target: target,
+        entry_id: entry_id,
+        params: params,
+        description: description,
+        start_topo: current_topo,
+        end_topo: current_topo + voting_period,
+        yes_votes: 0,
+        no_votes: 0,
+        abstain_votes: 0,
+        queued: false,
+        cancelled: false,
+        executed: false
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return id
+}
+
+entry vote(proposal_id: u64, support: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.queued, "queued")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo >= proposal.start_topo, "notstarted")
+    require(current_topo <= proposal.end_topo, "ended")
+
+    let vote_key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + caller.to_string()
+    let already: bool = s.load(vote_key).unwrap_or(false)
+    require(!already, "alreadyvoted")
+
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    if support == 0 {
+        proposal.no_votes += vp
+    } else if support == 1 {
+        proposal.yes_votes += vp
+    } else {
+        proposal.abstain_votes += vp
+    }
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    s.store(vote_key, true)
+    return 0
+}
+
+entry queue(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.queued, "alreadyqueued")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > proposal.end_topo, "notended")
+
+    let total_votes: u64 = proposal.yes_votes + proposal.no_votes + proposal.abstain_votes
+    let quorum_bps: u64 = s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS)
+
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("gvset")
+    let gv: Contract = Contract::new(gv_hash).expect("gvnf")
+    let total_vp: u64 = gv.call(5u16, [], {})
+
+    let quorum_required: u64 = (total_vp as u128 * quorum_bps as u128 / 10000u128) as u64
+    require(total_votes >= quorum_required, "noquorum")
+
+    let approval_bps: u64 = s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS)
+    let cast_yes_no: u64 = proposal.yes_votes + proposal.no_votes
+    if cast_yes_no > 0 {
+        let yes_bps: u64 = (proposal.yes_votes as u128 * 10000u128 / cast_yes_no as u128) as u64
+        require(yes_bps >= approval_bps, "noapprove")
+    }
+
+    proposal.queued = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    let tl_hash: Hash = s.load(TIMELOCK_KEY).expect("tlset")
+    let tl: Contract = Contract::new(tl_hash).expect("tlnf")
+    let _ = tl.call(0u16, [proposal.target, proposal.entry_id as u64, proposal.params, 34560u64], {})
+
+    return 0
+}
+
+entry cancel(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    require(!proposal.queued, "queued")
+    require(!proposal.executed, "executed")
+
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    require(caller == proposal.proposer || caller == admin, "notauth")
+
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+pub fn get_proposal(proposal_id: u64) -> (Address, Hash, u16, u64, u64, u64, u64, u64, bool, bool) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    return (
+        p.proposer, p.target, p.entry_id,
+        p.start_topo, p.end_topo,
+        p.yes_votes, p.no_votes, p.abstain_votes,
+        p.queued, p.cancelled
+    )
+}
+
+pub fn get_proposals_count() -> u64 {
+    return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn get_config() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD),
+        s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS),
+        s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS),
+        s.load(PROPOSAL_THRESHOLD_KEY).unwrap_or(DEFAULT_PROPOSAL_THRESHOLD)
+    )
+}
+
+entry set_governance_vault(gv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry set_voting_period(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 17280 && blocks <= 604800, "badval")
+    Storage::new().store(VOTING_PERIOD_KEY, blocks)
+    return 0
+}
+
+entry set_quorum_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(QUORUM_BPS_KEY, bps)
+    return 0
+}
+
+entry set_approval_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 5000 && bps <= 8000, "badval")
+    Storage::new().store(APPROVAL_BPS_KEY, bps)
+    return 0
+}
+
+entry set_proposal_threshold(threshold: u64) -> u64 {
+    only_admin()
+    Storage::new().store(PROPOSAL_THRESHOLD_KEY, threshold)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}

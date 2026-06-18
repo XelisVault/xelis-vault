@@ -1,0 +1,539 @@
+const VERSION: string = "VaultSwapV2.0"
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const GUARDIAN_KEY: string = "gd"
+const REGISTRY_KEY: string = "reg"
+const PAUSED_KEY: string = "pz"
+const RG_STATUS_KEY: string = "rg"
+const TREASURY_KEY: string = "tr"
+const XUSD_ASSET_KEY: string = "xa"
+const XEL_ASSET: Hash = Hash::zero()
+const POOL_PREFIX: string = "p"
+const POOLS_COUNT_KEY: string = "pc"
+const POOL_ID_PREFIX: string = "pi"
+const TWAP_PREFIX: string = "tw"
+const TWAP_IDX_KEY: string = "twi"
+const TWAP_SIZE: u64 = 30
+const BASE_FEE_BPS_KEY: string = "bf"
+const TREASURY_FEE_BPS_KEY: string = "tf"
+const MAX_VOLATILITY_BPS_KEY: string = "mv"
+const HIGH_VOL_FEE_BPS_KEY: string = "hv"
+const MAX_SWAP_PCT_BPS_KEY: string = "ms"
+const PSM_MINT_FEE_KEY: string = "pm"
+const PSM_REDEEM_FEE_KEY: string = "pr"
+const DEFAULT_BASE_FEE: u64 = 30
+const DEFAULT_TREASURY_FEE: u64 = 5
+const DEFAULT_MAX_VOL: u64 = 1000
+const DEFAULT_HIGH_VOL_FEE: u64 = 100
+const DEFAULT_MAX_SWAP_PCT: u64 = 500
+const DEFAULT_PSM_MINT_FEE: u64 = 50
+const DEFAULT_PSM_REDEEM_FEE: u64 = 10
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+const PRICE_DECIMALS: u64 = 100000000
+struct Pool {
+    asset_a: Hash,
+    asset_b: Hash,
+    reserve_a: u64,
+    reserve_b: u64,
+    is_psm: bool,
+    last_price: u64,
+    created_at: u64
+}
+struct TWAPState {
+    prices: u64[],
+    head: u64,
+    count: u64
+}
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    s.store(POOLS_COUNT_KEY, 0u64)
+    s.store(BASE_FEE_BPS_KEY, DEFAULT_BASE_FEE)
+    s.store(TREASURY_FEE_BPS_KEY, DEFAULT_TREASURY_FEE)
+    s.store(MAX_VOLATILITY_BPS_KEY, DEFAULT_MAX_VOL)
+    s.store(HIGH_VOL_FEE_BPS_KEY, DEFAULT_HIGH_VOL_FEE)
+    s.store(MAX_SWAP_PCT_BPS_KEY, DEFAULT_MAX_SWAP_PCT)
+    s.store(PSM_MINT_FEE_KEY, DEFAULT_PSM_MINT_FEE)
+    s.store(PSM_REDEEM_FEE_KEY, DEFAULT_PSM_REDEEM_FEE)
+    return 0
+}
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g {
+        return
+    }
+    only_admin()
+}
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+fn non_reentrant() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+fn release_reentrancy() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+fn get_pool_key(a: Hash, b: Hash) -> string {
+    if a.to_string() <= b.to_string() {
+        return POOL_PREFIX + a.to_string() + "_" + b.to_string()
+    }
+    return POOL_PREFIX + b.to_string() + "_" + a.to_string()
+}
+fn get_oracle() -> Contract {
+    let s: Storage = Storage::new()
+    let reg_hash: Hash = s.load(REGISTRY_KEY).expect("regnoset")
+    let reg: Contract = Contract::new(reg_hash).expect("regnf")
+    let oracle_hash: Hash = reg.call(0u16, ["PriceOracle"], {})
+    require(oracle_hash != Hash::zero(), "oraclenotfound")
+    return Contract::new(oracle_hash).expect("oraclenf")
+}
+fn get_amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64, fee_bps: u64) -> u64 {
+    require(amount_in > 0, "amtgt0")
+    require(reserve_in > 0 && reserve_out > 0, "noreserve")
+    let amount_in_eff: u128 = (amount_in as u128) * (10000u128 - fee_bps as u128) / 10000u128
+    let num: u128 = amount_in_eff * (reserve_out as u128)
+    let den: u128 = (reserve_in as u128) + amount_in_eff
+    return (num / den) as u64
+}
+fn price_after_swap(pool: Pool, amount_in: u64, is_a_to_b: bool, fee_bps: u64) -> u64 {
+    if is_a_to_b {
+        let out: u64 = get_amount_out(amount_in, pool.reserve_a, pool.reserve_b, fee_bps)
+        let new_ra: u64 = pool.reserve_a + amount_in
+        let new_rb: u64 = pool.reserve_b - out
+        if new_rb == 0 { return 0 }
+        return (new_ra as u128 * PRICE_DECIMALS as u128 / new_rb as u128) as u64
+    } else {
+        let out: u64 = get_amount_out(amount_in, pool.reserve_b, pool.reserve_a, fee_bps)
+        let new_rb: u64 = pool.reserve_b + amount_in
+        let new_ra: u64 = pool.reserve_a - out
+        if new_rb == 0 { return 0 }
+        return (new_ra as u128 * PRICE_DECIMALS as u128 / new_rb as u128) as u64
+    }
+}
+fn twap_push(pool_key: string, price: u64) {
+    let s: Storage = Storage::new()
+    let state_key: string = TWAP_PREFIX + pool_key
+    let state_opt: optional = s.load(state_key)
+    let mut state: TWAPState
+    if state_opt.is_none() {
+        state = TWAPState { prices: [], head: 0, count: 0 }
+    } else {
+        state = state_opt.unwrap()
+    }
+    if state.count < TWAP_SIZE {
+        state.prices.push(price)
+        state.count += 1
+    } else {
+        state.prices[state.head] = price
+    }
+    state.head = (state.head + 1) % TWAP_SIZE
+    s.store(state_key, state)
+}
+fn twap_get(pool_key: string) -> u64 {
+    let s: Storage = Storage::new()
+    let state_opt: optional = s.load(TWAP_PREFIX + pool_key)
+    if state_opt.is_none() {
+        return 0
+    }
+    let state: TWAPState = state_opt.unwrap()
+    if state.count == 0 {
+        return 0
+    }
+    let sum: u128 = 0
+    let i: u64 = 0
+    while i < state.count {
+        sum += state.prices[i] as u128
+        i += 1
+    }
+    return (sum / state.count as u128) as u64
+}
+fn twap_volatility_bps(pool_key: string) -> u64 {
+    let s: Storage = Storage::new()
+    let state_opt: optional = s.load(TWAP_PREFIX + pool_key)
+    if state_opt.is_none() {
+        return 0
+    }
+    let state: TWAPState = state_opt.unwrap()
+    if state.count < 2 {
+        return 0
+    }
+    let mut mn: u64 = state.prices[0]
+    let mut mx: u64 = state.prices[0]
+    let sum: u128 = 0
+    let i: u64 = 0
+    while i < state.count {
+        let p: u64 = state.prices[i]
+        if p < mn { mn = p }
+        if p > mx { mx = p }
+        sum += p as u128
+        i += 1
+    }
+    let mean: u64 = (sum / state.count as u128) as u64
+    if mean == 0 {
+        return 0
+    }
+    return ((mx - mn) as u128 * 10000u128 / mean as u128) as u64
+}
+fn current_fee_bps(pool_key: string) -> u64 {
+    let s: Storage = Storage::new()
+    let base: u64 = s.load(BASE_FEE_BPS_KEY).unwrap_or(DEFAULT_BASE_FEE)
+    let treasury: u64 = s.load(TREASURY_FEE_BPS_KEY).unwrap_or(DEFAULT_TREASURY_FEE)
+    let high_vol_fee: u64 = s.load(HIGH_VOL_FEE_BPS_KEY).unwrap_or(DEFAULT_HIGH_VOL_FEE)
+    let max_vol: u64 = s.load(MAX_VOLATILITY_BPS_KEY).unwrap_or(DEFAULT_MAX_VOL)
+    let vol: u64 = twap_volatility_bps(pool_key)
+    if vol > max_vol {
+        return high_vol_fee + treasury
+    }
+    return base + treasury
+}
+entry create_pool(asset_a: Hash, asset_b: Hash, is_psm: bool) -> u64 {
+    only_admin()
+    require(asset_a != asset_b, "sameasset")
+    let s: Storage = Storage::new()
+    let key: string = get_pool_key(asset_a, asset_b)
+    let existing: optional = s.load(key)
+    require(existing.is_none(), "exists")
+    let pool: Pool = Pool {
+        asset_a: asset_a,
+        asset_b: asset_b,
+        reserve_a: 0,
+        reserve_b: 0,
+        is_psm: is_psm,
+        last_price: 0,
+        created_at: get_current_topoheight()
+    }
+    s.store(key, pool)
+    let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
+    s.store(POOL_ID_PREFIX + count.to_string(10u32), key)
+    s.store(POOLS_COUNT_KEY, count + 1)
+    return 0
+}
+entry add_liquidity(asset_a: Hash, asset_b: Hash, amount_a: u64, amount_b: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(amount_a > 0 && amount_b > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let key: string = get_pool_key(asset_a, asset_b)
+    let mut pool: Pool = s.load(key).expect("pnf")
+    require(!pool.is_psm, "psmnopool")
+    if pool.reserve_a > 0 && pool.reserve_b > 0 {
+        let expected_b: u64 = (pool.reserve_b as u128 * amount_a as u128 / pool.reserve_a as u128) as u64
+        require(amount_b == expected_b, "badratio")
+    }
+    let caller: Address = get_caller().expect("nocaller")
+    let dep_a: u64 = get_deposit_for_asset(asset_a).expect("nodepa")
+    let dep_b: u64 = get_deposit_for_asset(asset_b).expect("nodepb")
+    require(dep_a >= amount_a && dep_b >= amount_b, "insdep")
+    if dep_a > amount_a {
+        let _ = transfer(caller, dep_a - amount_a, asset_a)
+    }
+    if dep_b > amount_b {
+        let _ = transfer(caller, dep_b - amount_b, asset_b)
+    }
+    pool.reserve_a += amount_a
+    pool.reserve_b += amount_b
+    if pool.last_price == 0 && pool.reserve_b > 0 {
+        pool.last_price = (pool.reserve_a as u128 * PRICE_DECIMALS as u128 / pool.reserve_b as u128) as u64
+        twap_push(key, pool.last_price)
+    }
+    s.store(key, pool)
+    release_reentrancy()
+    return 0
+}
+entry swap(
+    asset_in: Hash,
+    asset_out: Hash,
+    amount_in: u64,
+    min_amount_out: u64
+) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(amount_in > 0, "amtgt0")
+    require(min_amount_out > 0, "noslippage")
+    require(asset_in != asset_out, "sameasset")
+    let s: Storage = Storage::new()
+    let key: string = get_pool_key(asset_in, asset_out)
+    let mut pool: Pool = s.load(key).expect("pnf")
+    let is_a_to_b: bool = (asset_in == pool.asset_a)
+    let reserve_in: u64 = if is_a_to_b { pool.reserve_a } else { pool.reserve_b }
+    let reserve_out: u64 = if is_a_to_b { pool.reserve_b } else { pool.reserve_a }
+    require(reserve_in > 0 && reserve_out > 0, "noreserve")
+    let max_swap_pct: u64 = s.load(MAX_SWAP_PCT_BPS_KEY).unwrap_or(DEFAULT_MAX_SWAP_PCT)
+    let max_amount_in: u64 = (reserve_in as u128 * max_swap_pct as u128 / 10000u128) as u64
+    require(amount_in <= max_amount_in, "toobig")
+    let fee_bps: u64 = current_fee_bps(key)
+    let amount_out: u64 = get_amount_out(amount_in, reserve_in, reserve_out, fee_bps)
+    require(amount_out >= min_amount_out, "slippage")
+    let new_price: u64 = price_after_swap(pool, amount_in, is_a_to_b, fee_bps)
+    if pool.last_price > 0 && new_price > 0 {
+        let diff: u64 = if new_price > pool.last_price {
+            new_price - pool.last_price
+        } else {
+            pool.last_price - new_price
+        }
+        let pct_bps: u64 = (diff as u128 * 10000u128 / pool.last_price as u128) as u64
+        let max_vol: u64 = s.load(MAX_VOLATILITY_BPS_KEY).unwrap_or(DEFAULT_MAX_VOL)
+        require(pct_bps <= max_vol, "cbtrip")
+    }
+    let caller: Address = get_caller().expect("nocaller")
+    let dep_in: u64 = get_deposit_for_asset(asset_in).expect("nodepin")
+    require(dep_in >= amount_in, "insdep")
+    if dep_in > amount_in {
+        let _ = transfer(caller, dep_in - amount_in, asset_in)
+    }
+    let ok: bool = transfer(caller, amount_out, asset_out)
+    require(ok, "txfail")
+    if is_a_to_b {
+        pool.reserve_a += amount_in
+        pool.reserve_b -= amount_out
+    } else {
+        pool.reserve_b += amount_in
+        pool.reserve_a -= amount_out
+    }
+    if pool.reserve_b > 0 {
+        pool.last_price = (pool.reserve_a as u128 * PRICE_DECIMALS as u128 / pool.reserve_b as u128) as u64
+        twap_push(key, pool.last_price)
+    }
+    s.store(key, pool)
+    let treasury_fee_bps: u64 = s.load(TREASURY_FEE_BPS_KEY).unwrap_or(DEFAULT_TREASURY_FEE)
+    let treasury_amt: u64 = (amount_out as u128 * treasury_fee_bps as u128 / 10000u128) as u64
+    if treasury_amt > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+        let _ = transfer(treasury, treasury_amt, asset_out)
+    }
+    release_reentrancy()
+    return 0
+}
+entry psm_mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(xel_amount > 0, "amtgt0")
+    require(min_xusd_out > 0, "noslippage")
+    let s: Storage = Storage::new()
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let key: string = get_pool_key(XEL_ASSET, xusd_asset)
+    let mut pool: Pool = s.load(key).expect("psmnf")
+    require(pool.is_psm, "notpsm")
+    let oracle: Contract = get_oracle()
+    let xel_price: u64 = oracle.call(0u16, [XEL_ASSET], {})
+    require(xel_price > 0, "noprice")
+    let gross_xusd: u64 = (xel_amount as u128 * xel_price as u128 / PRICE_DECIMALS as u128) as u64
+    let mint_fee_bps: u64 = s.load(PSM_MINT_FEE_KEY).unwrap_or(DEFAULT_PSM_MINT_FEE)
+    let fee: u64 = (gross_xusd as u128 * mint_fee_bps as u128 / 10000u128) as u64
+    let net_xusd: u64 = gross_xusd - fee
+    require(net_xusd >= min_xusd_out, "slippage")
+    let caller: Address = get_caller().expect("nocaller")
+    let dep: u64 = get_deposit_for_asset(XEL_ASSET).expect("nodep")
+    require(dep >= xel_amount, "insdep")
+    if dep > xel_amount {
+        let _ = transfer(caller, dep - xel_amount, XEL_ASSET)
+    }
+    let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+    let xusd_hash: Hash = s.load("xc").expect("xcnoset")
+    let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
+    let _ = xusd.call(2u16, [caller, net_xusd, treasury, fee], {})
+    pool.reserve_a += xel_amount
+    s.store(key, pool)
+    release_reentrancy()
+    return 0
+}
+entry psm_redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(xusd_amount > 0, "amtgt0")
+    require(min_xel_out > 0, "noslippage")
+    let s: Storage = Storage::new()
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let key: string = get_pool_key(XEL_ASSET, xusd_asset)
+    let mut pool: Pool = s.load(key).expect("psmnf")
+    require(pool.is_psm, "notpsm")
+    let oracle: Contract = get_oracle()
+    let xel_price: u64 = oracle.call(0u16, [XEL_ASSET], {})
+    require(xel_price > 0, "noprice")
+    let gross_xel: u64 = (xusd_amount as u128 * PRICE_DECIMALS as u128 / xel_price as u128) as u64
+    let redeem_fee_bps: u64 = s.load(PSM_REDEEM_FEE_KEY).unwrap_or(DEFAULT_PSM_REDEEM_FEE)
+    let fee_xel: u64 = (gross_xel as u128 * redeem_fee_bps as u128 / 10000u128) as u64
+    let net_xel: u64 = gross_xel - fee_xel
+    require(net_xel >= min_xel_out, "slippage")
+    require(pool.reserve_a >= net_xel, "insreserve")
+    let xusd_hash: Hash = s.load("xc").expect("xcnoset")
+    let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
+    let _ = xusd.call(3u16, [xusd_amount], {})
+    let caller: Address = get_caller().expect("nocaller")
+    let _ = transfer(caller, net_xel, XEL_ASSET)
+    if fee_xel > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+        let _ = transfer(treasury, fee_xel, XEL_ASSET)
+    }
+    pool.reserve_a -= net_xel + fee_xel
+    s.store(key, pool)
+    release_reentrancy()
+    return 0
+}
+pub fn get_pool(asset_a: Hash, asset_b: Hash) -> (u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let key: string = get_pool_key(asset_a, asset_b)
+    let pool_opt: optional = s.load(key)
+    if pool_opt.is_none() {
+        return (0, 0, 0, false)
+    }
+    let pool: Pool = pool_opt.unwrap()
+    return (pool.reserve_a, pool.reserve_b, pool.last_price, pool.is_psm)
+}
+pub fn get_amount_out_view(asset_in: Hash, asset_out: Hash, amount_in: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let key: string = get_pool_key(asset_in, asset_out)
+    let pool_opt: optional = s.load(key)
+    if pool_opt.is_none() {
+        return 0
+    }
+    let pool: Pool = pool_opt.unwrap()
+    let is_a_to_b: bool = (asset_in == pool.asset_a)
+    let reserve_in: u64 = if is_a_to_b { pool.reserve_a } else { pool.reserve_b }
+    let reserve_out: u64 = if is_a_to_b { pool.reserve_b } else { pool.reserve_a }
+    let fee_bps: u64 = current_fee_bps(key)
+    return get_amount_out(amount_in, reserve_in, reserve_out, fee_bps)
+}
+pub fn get_twap(asset_a: Hash, asset_b: Hash) -> u64 {
+    let key: string = get_pool_key(asset_a, asset_b)
+    return twap_get(key)
+}
+pub fn get_volatility_bps(asset_a: Hash, asset_b: Hash) -> u64 {
+    let key: string = get_pool_key(asset_a, asset_b)
+    return twap_volatility_bps(key)
+}
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    Storage::new().store("pausereason", reason)
+    return 0
+}
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+entry set_base_fee_bps(f: u64) -> u64 {
+    only_admin()
+    require(f <= 500, "badval")
+    Storage::new().store(BASE_FEE_BPS_KEY, f)
+    return 0
+}
+entry set_treasury_fee_bps(f: u64) -> u64 {
+    only_admin()
+    require(f <= 100, "badval")
+    Storage::new().store(TREASURY_FEE_BPS_KEY, f)
+    return 0
+}
+entry set_max_volatility_bps(v: u64) -> u64 {
+    only_admin()
+    require(v >= 100 && v <= 5000, "badval")
+    Storage::new().store(MAX_VOLATILITY_BPS_KEY, v)
+    return 0
+}
+entry set_max_swap_pct_bps(p: u64) -> u64 {
+    only_admin()
+    require(p >= 100 && p <= 2000, "badval")
+    Storage::new().store(MAX_SWAP_PCT_BPS_KEY, p)
+    return 0
+}
+entry set_psm_mint_fee_bps(f: u64) -> u64 {
+    only_admin()
+    require(f <= 500, "badval")
+    Storage::new().store(PSM_MINT_FEE_KEY, f)
+    return 0
+}
+entry set_psm_redeem_fee_bps(f: u64) -> u64 {
+    only_admin()
+    require(f <= 500, "badval")
+    Storage::new().store(PSM_REDEEM_FEE_KEY, f)
+    return 0
+}
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+entry set_xusd_asset(xa: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_ASSET_KEY, xa)
+    return 0
+}
+entry set_xusd_contract(xc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store("xc", xc)
+    return 0
+}
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == e, "notemg")
+    let bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
+    require(bal > 0, "nofunds")
+    let ok: bool = transfer(caller, bal, Hash::zero())
+    require(ok, "txfail")
+    return 0
+}
+entry get_version() -> string {
+    return VERSION
+}

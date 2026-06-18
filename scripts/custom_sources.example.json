@@ -1,0 +1,37 @@
+[
+  {
+    "_comment": "EXAMPLE 1 — HTTP API source (JSON response)",
+    "name": "my_exchange",
+    "type": "http",
+    "url": "https://api.my-exchange.com/v1/ticker?pair=XELUSD",
+    "json_path": "data.last_price",
+    "headers": {
+      "Authorization": "Bearer YOUR_API_KEY_HERE"
+    },
+    "timeout": 10
+  },
+  {
+    "_comment": "EXAMPLE 2 — Simple HTTP API (price at root)",
+    "name": "simple_api",
+    "type": "http",
+    "url": "https://api.simple-price.com/xel",
+    "json_path": "price",
+    "timeout": 10
+  },
+  {
+    "_comment": "EXAMPLE 3 — Command source (external script)",
+    "name": "my_script",
+    "type": "command",
+    "command": "/usr/local/bin/fetch_xel_price.sh",
+    "args": ["--asset", "XEL", "--currency", "USD"],
+    "timeout": 10
+  },
+  {
+    "_comment": "EXAMPLE 4 — Python script source",
+    "name": "python_fetcher",
+    "type": "command",
+    "command": "python3",
+    "args": ["/opt/my-tools/fetch_price.py", "--exchange", "binance"],
+    "timeout": 15
+  }
+]

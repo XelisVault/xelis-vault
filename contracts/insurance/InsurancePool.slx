@@ -1,0 +1,300 @@
+const VERSION: string = "InsurancePool v4.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const ASSET_KEY: string = "a"
+const TOTAL_STAKED_KEY: string = "ts"
+const TOTAL_PREMIUMS_KEY: string = "tp"
+const PREMIUM_ACCUM_KEY: string = "pa"
+const LAST_UPDATE_KEY: string = "lu"
+
+const STAKER_PREFIX: string = "s_"
+const CLAIMS_COUNT_KEY: string = "cc"
+const CLAIM_PREFIX: string = "c_"
+
+struct Staker {
+    addr: Address,
+    stake: u64,
+    last_accum: u64,
+    earned: u64
+}
+
+struct Claim {
+    id: u64,
+    claimant: Address,
+    amount: u64,
+    evidence_hash: Hash,
+    submitted_at: u64,
+    status: u8
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_STAKED_KEY, 0u64)
+    s.store(TOTAL_PREMIUMS_KEY, 0u64)
+    s.store(PREMIUM_ACCUM_KEY, 1000000000000u64)
+    s.store(LAST_UPDATE_KEY, get_current_topoheight())
+    s.store(CLAIMS_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g { return }
+    only_admin()
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+entry stake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+
+    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
+
+    let key: string = STAKER_PREFIX + caller.to_string()
+    let existing: optional = s.load(key)
+    let mut staker: Staker
+    if existing.is_none() {
+        staker = Staker { addr: caller, stake: 0, last_accum: 0, earned: 0 }
+    } else {
+        staker = existing.unwrap()
+    }
+    staker.stake += amount
+    staker.last_accum = s.load(PREMIUM_ACCUM_KEY).unwrap_or(1000000000000u64)
+    s.store(key, staker)
+
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total + amount)
+    return 0
+}
+
+entry unstake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+
+    let key: string = STAKER_PREFIX + caller.to_string()
+    let mut staker: Staker = s.load(key).expect("notstaker")
+    require(staker.stake >= amount, "insbal")
+
+    let _ = transfer(caller, amount, asset)
+    staker.stake -= amount
+    s.store(key, staker)
+
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total - amount)
+    return 0
+}
+
+entry claim_premium() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+
+    let key: string = STAKER_PREFIX + caller.to_string()
+    let mut staker: Staker = s.load(key).expect("notstaker")
+
+    let current_accum: u64 = s.load(PREMIUM_ACCUM_KEY).unwrap_or(1000000000000u64)
+    let delta: u64 = if current_accum > staker.last_accum {
+        current_accum - staker.last_accum
+    } else {
+        0
+    }
+    let pending: u64 = (staker.stake as u128 * delta as u128 / 1000000000000u128) as u64
+
+    if pending == 0 {
+        return 0
+    }
+
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    let actual: u64 = if pending > bal { bal } else { pending }
+    if actual > 0 {
+        let _ = transfer(caller, actual, asset)
+    }
+
+    staker.earned += actual
+    staker.last_accum = current_accum
+    s.store(key, staker)
+    return actual
+}
+
+entry submit_claim(amount: u64, evidence_hash: Hash) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+
+    let id: u64 = s.load(CLAIMS_COUNT_KEY).unwrap_or(0)
+    let claim: Claim = Claim {
+        id: id,
+        claimant: caller,
+        amount: amount,
+        evidence_hash: evidence_hash,
+        submitted_at: get_current_topoheight(),
+        status: 0
+    }
+    s.store(CLAIM_PREFIX + id.to_string(10u32), claim)
+    s.store(CLAIMS_COUNT_KEY, id + 1)
+    return id
+}
+
+entry approve_claim(claim_id: u64) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let mut claim: Claim = s.load(CLAIM_PREFIX + claim_id.to_string(10u32)).expect("cnf")
+    require(claim.status == 0, "notpending")
+
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(bal >= claim.amount, "insfunds")
+
+    let _ = transfer(claim.claimant, claim.amount, asset)
+    claim.status = 3
+    s.store(CLAIM_PREFIX + claim_id.to_string(10u32), claim)
+    return 0
+}
+
+entry reject_claim(claim_id: u64) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let mut claim: Claim = s.load(CLAIM_PREFIX + claim_id.to_string(10u32)).expect("cnf")
+    require(claim.status == 0, "notpending")
+    claim.status = 2
+    s.store(CLAIM_PREFIX + claim_id.to_string(10u32), claim)
+    return 0
+}
+
+entry pay_premium(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+    let caller: Address = get_caller().expect("nocaller")
+
+    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked > 0 {
+        let accum: u64 = s.load(PREMIUM_ACCUM_KEY).unwrap_or(1000000000000u64)
+        let increment: u64 = (amount as u128 * 1000000000000u128 / total_staked as u128) as u64
+        s.store(PREMIUM_ACCUM_KEY, accum + increment)
+    }
+
+    let total_premiums: u64 = s.load(TOTAL_PREMIUMS_KEY).unwrap_or(0)
+    s.store(TOTAL_PREMIUMS_KEY, total_premiums + amount)
+    return 0
+}
+
+pub fn get_pool_info() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let asset: Hash = s.load(ASSET_KEY).expect("anoset")
+    return (
+        s.load(TOTAL_STAKED_KEY).unwrap_or(0),
+        s.load(TOTAL_PREMIUMS_KEY).unwrap_or(0),
+        get_balance_for_asset(asset).unwrap_or(0),
+        s.load(CLAIMS_COUNT_KEY).unwrap_or(0)
+    )
+}
+
+pub fn get_staker(addr: Address) -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let staker_opt: optional = s.load(STAKER_PREFIX + addr.to_string())
+    if staker_opt.is_none() {
+        return (0, 0, 0)
+    }
+    let staker: Staker = staker_opt.unwrap()
+    return (staker.stake, staker.earned, staker.last_accum)
+}
+
+entry set_asset(a: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ASSET_KEY, a)
+    return 0
+}
+
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}
