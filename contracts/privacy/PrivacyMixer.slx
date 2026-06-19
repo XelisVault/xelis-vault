@@ -1,0 +1,191 @@
+const VERSION: string = "PrivacyMixer v4.2"
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const MERKLE_ROOT_KEY: string = "mr"
+const LEAF_PREFIX: string = "leaf_"
+const LEAF_COUNT_KEY: string = "lc"
+const NULLIFIER_PREFIX: string = "null_"
+const DENOM_DEPOSITS_PREFIX: string = "dd_"
+const ZK_VERIFIER_KEY: string = "zv"
+const DENOM_10: u64 = 1000000000
+const DENOM_100: u64 = 10000000000
+const DENOM_1000: u64 = 100000000000
+const MERKLE_DEPTH: u64 = 24
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(MERKLE_ROOT_KEY, Hash::zero())
+    s.store(LEAF_COUNT_KEY, 0u64)
+    return 0
+}
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g { return }
+    only_admin()
+}
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+fn get_denom_amount(denom_id: u64) -> u64 {
+    if denom_id == 0 { return DENOM_10 }
+    if denom_id == 1 { return DENOM_100 }
+    if denom_id == 2 { return DENOM_1000 }
+    require(false, "baddenom")
+    return 0
+}
+fn update_merkle_root(new_leaf: Hash, leaf_index: u64) {
+    let s: Storage = Storage::new()
+    let mut current: Hash = new_leaf
+    let mut idx: u64 = leaf_index
+    let level: u64 = 0
+    while level < MERKLE_DEPTH {
+        let sibling_idx: u64 = idx ^ 1
+        let sibling_key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + sibling_idx.to_string(10u32)
+        let sibling: Hash = s.load(sibling_key).unwrap_or(Hash::zero())
+        let combined: string = if idx % 2 == 0 {
+            current.to_string() + sibling.to_string()
+        } else {
+            sibling.to_string() + current.to_string()
+        }
+        current = Hash::blake3(combined)
+        s.store(LEAF_PREFIX + level.to_string(10u32) + "_" + idx.to_string(10u32), current)
+        idx = idx / 2
+        level += 1
+    }
+    s.store(MERKLE_ROOT_KEY, current)
+}
+entry deposit(asset: Hash, denomination_id: u64, commitment: Hash) -> u64 {
+    when_not_paused()
+    require(commitment != Hash::zero(), "badcommit")
+    let amount: u64 = get_denom_amount(denomination_id)
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount { let _ = transfer(caller, dep - amount, asset) }
+    let leaf_index: u64 = s.load(LEAF_COUNT_KEY).unwrap_or(0)
+    s.store(LEAF_PREFIX + "0_" + leaf_index.to_string(10u32), commitment)
+    s.store(LEAF_COUNT_KEY, leaf_index + 1)
+    update_merkle_root(commitment, leaf_index)
+    let denom_key: string = DENOM_DEPOSITS_PREFIX + asset.to_string() + "_" + denomination_id.to_string(10u32)
+    s.store(denom_key, s.load(denom_key).unwrap_or(0) + 1)
+    return 0
+}
+entry withdraw(
+    asset: Hash,
+    denomination_id: u64,
+    nullifier: Hash,
+    recipient: Address,
+    merkle_root: Hash,
+    zk_proof: bytes
+) -> u64 {
+    when_not_paused()
+    let amount: u64 = get_denom_amount(denomination_id)
+    let s: Storage = Storage::new()
+    let nullifier_key: string = NULLIFIER_PREFIX + nullifier.to_string()
+    require(!s.load(nullifier_key).unwrap_or(false), "used")
+    let current_root: Hash = s.load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+    require(merkle_root == current_root, "badroot")
+    let zk_verifier_opt: optional = s.load(ZK_VERIFIER_KEY)
+    require(zk_verifier_opt.is_some(), "nozkverifier")
+    let zk_verifier: Contract = Contract::new(zk_verifier_opt.unwrap()).expect("zvnf")
+    let valid: bool = zk_verifier.call(0u16, [zk_proof, merkle_root, nullifier], {})
+    require(valid, "badproof")
+    s.store(nullifier_key, true)
+    let ok: bool = transfer(recipient, amount, asset)
+    require(ok, "txfail")
+    return 0
+}
+pub fn get_merkle_root() -> Hash {
+    return Storage::new().load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+}
+pub fn get_deposit_count() -> u64 {
+    return Storage::new().load(LEAF_COUNT_KEY).unwrap_or(0)
+}
+pub fn is_nullifier_used(nullifier: Hash) -> bool {
+    return Storage::new().load(NULLIFIER_PREFIX + nullifier.to_string()).unwrap_or(false)
+}
+pub fn get_denomination_amount(denom_id: u64) -> u64 {
+    return get_denom_amount(denom_id)
+}
+pub fn get_deposit_count_for_denom(asset: Hash, denom_id: u64) -> u64 {
+    let key: string = DENOM_DEPOSITS_PREFIX + asset.to_string() + "_" + denom_id.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(0)
+}
+pub fn get_merkle_leaf(level: u64, index: u64) -> Hash {
+    let key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + index.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(Hash::zero())
+}
+entry set_zk_verifier(zv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ZK_VERIFIER_KEY, zv)
+    return 0
+}
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+entry emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    require(caller == admin, "notauth")
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(bal > 0, "nofunds")
+    let _ = transfer(caller, bal, asset)
+    return 0
+}
+entry get_version() -> string {
+    return VERSION
+}

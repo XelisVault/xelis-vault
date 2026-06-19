@@ -1,10 +1,10 @@
-# XELIS Vault — Technical Whitepaper v3.0
+# XELIS Vault — Technical Whitepaper v3.1
 
 > *The First Confidential Financial Platform on XELIS BlockDAG*
 >
-> *Confidential lending, tokenization, treasury, compliance, and markets — powered by native homomorphic encryption and a decentralized staked oracle*
+> *Confidential lending, tokenization, treasury, compliance, markets, encrypted chat, and anonymity mixing — powered by native homomorphic encryption, a decentralized staked oracle, and a unified miner network*
 
-**Version**: 3.0 (June 2026)
+**Version**: 3.1 (June 2026)
 **Status**: Draft for community review
 **Authors**: XELIS Vault team
 
@@ -21,8 +21,14 @@ XELIS Vault is a decentralized financial platform built on the XELIS BlockDAG. I
 - **Compliance & Identity Layer** — ZK-based KYC/AML proofs without exposing identity
 - **Private Sealed-Bid Auctions** — fully confidential bidding
 - **Governance Token (VLT)** — protocol ownership, parameter voting, and oracle participation
+- **Unified Miner Network (XelisVaultMiner)** — reputation-based mining system where miners stake 100 VLT and serve the oracle, the encrypted chat, or both
+- **Miner Pools** — miners can mutualize stake, reputation, and rewards into composable pools
+- **Encrypted Chat (VaultChat)** — end-to-end encrypted messaging anchored on-chain, served by miner relayers
+- **Anonymity Mixer (PrivacyMixer)** — Tornado Cash-style ZK mixer for unlinkable transfers in fixed denominations
 
-The v3 whitepaper introduces a **fundamental redesign of the oracle system**: instead of relying on permissioned price bots (v1/v2) or XELIS miners only (v3), the v4 architecture uses a **permissionless staked oracle** where any VLT holder can become a price provider by staking VLT as collateral. This eliminates single points of failure, aligns incentives through slashing, and creates a deflationary pressure on VLT through systematic burning.
+The v3.1 whitepaper introduces a **fundamental redesign of the oracle system**: instead of relying on permissioned price bots (v1/v2) or XELIS miners only (v3), the v4 architecture uses a **permissionless staked oracle** where any VLT holder can become a price provider by staking VLT as collateral. This eliminates single points of failure, aligns incentives through slashing, and creates a deflationary pressure on VLT through systematic burning.
+
+v3.1 also introduces the **unified mining layer** (`XelisVaultMiner`), which formalizes how miners contribute to multiple protocol services (oracle, chat, and future ones), with a precise reputation system, dynamic reward calibration, and an automatic 10-year budget control mechanism.
 
 ---
 
@@ -97,11 +103,15 @@ XELIS Vault is the first platform to productize these primitives into a complete
 ┌──────────────────────────────────────┐
 │         INFRASTRUCTURE                │
 │  ContractRegistry.slx                 │
+│  ReentrancyGuard.slx                  │
+│  Pausable.slx                         │
 │  Timelock.slx                         │
 └──────────────────────────────────────┘
 ```
 
 ### 2.2 Contract Catalog
+
+XELIS Vault v4.2 ships **33 smart contracts** organized in 14 categories. The 8 core contracts are summarized below; the full list is maintained in [`docs/COMPATIBILITY_TABLE.md`](COMPATIBILITY_TABLE.md) and [`README.md`](../README.md).
 
 | Contract | Type | Purpose |
 |----------|------|---------|
@@ -110,13 +120,21 @@ XELIS Vault is the first platform to productize these primitives into a complete
 | `OracleGovernance.slx` | Governance | VLT stakers vote to add/modify feeds |
 | `VaultEngineV3.slx` | Core | Overcollateralized lending with Ciphertext-encrypted positions |
 | `VaultSwapV2.slx` | AMM | Constant product AMM + PSM with slippage protection |
+| `XelisVaultMiner.slx` | Mining | Unified miner registry: reputation, dynamic rewards, 10-year budget control |
+| `MinerPool.slx` | Mining | Composable miner pools with mutualized stake and reputation |
+| `VaultChat.slx` | Chat | End-to-end encrypted chat with on-chain merkle anchoring |
+| `PrivacyMixer.slx` | Privacy | Tornado-style ZK anonymity mixer (denominations 10 / 100 / 1000) |
 | `ContractRegistry.slx` | Infra | Versioned registry for upgrade pattern |
+| `ReentrancyGuard.slx` | Lib | Anti-reentrancy module |
+| `Pausable.slx` | Lib | Emergency pause module |
 
 ---
 
 ## 3. VLT Token — Fixed Supply, Deflationary
 
 ### 3.1 Token Specifications
+
+> **Note (v3.1):** the minimum stake to become a miner/provider on `XelisVaultMiner` and `StakedOracle` is **100 VLT** (was 1,000 VLT in earlier drafts). This 10x reduction makes the network accessible to a much broader set of participants without meaningfully weakening Sybil resistance, since the slashing and reputation mechanics still make attacks economically infeasible (see §4.4 and §8).
 
 - **Name**: XELIS Vault
 - **Ticker**: VLT
@@ -178,7 +196,7 @@ The StakedOracle is built on three principles:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ 1. REGISTER: stake 1,000 VLT via register_provider│
+│ 1. REGISTER: stake 100 VLT via register_provider  │
 └──────────────────────────────────────────────────┘
                        │
                        ▼
@@ -223,9 +241,11 @@ Every `AGGREGATION_BLOCKS` (default 5 blocks = 25 seconds), the oracle:
 
 ### 4.4 Anti-Sybil Economics
 
-To manipulate the median, an attacker must control >50% of active providers. If 100 providers are active, the attacker needs 51 providers, requiring 51 × 1,000 = 51,000 VLT stake (0.5% of total supply).
+To manipulate the median, an attacker must control >50% of active providers. If 100 providers are active, the attacker needs 51 providers, requiring 51 × 100 = 5,100 VLT stake (0.05% of total supply).
 
-Even if successful, the attacker would be slashed at every cycle (50% of their providers would be outliers), losing ~510 VLT per cycle. Over one day (3,456 cycles), they would lose ~1.76M VLT — far more than their initial stake.
+The lower absolute stake is offset by the **reputation system** (§8.2): a brand-new attacker starts at reputation 10,000 but is rapidly drained by outliers (-50 rep/each, plus 1% of stake), and once their reputation falls below `REP_CRITICAL` (1,000), the miner is automatically deactivated and stops earning rewards. To re-activate, they must keep submitting valid prices to climb back above the threshold — meaning the attack surface is bounded by the *reputation regeneration rate*, not just the stake amount.
+
+Even if successful for a short window, the attacker would be slashed at every cycle (50% of their providers would be outliers), losing ~5.1 VLT per cycle per provider in stake alone. Over one day (3,456 cycles), an attacker running 51 sybil providers would lose ~900,000 VLT combined (stake + reputation) — far more than any price manipulation gain.
 
 ### 4.5 Reward Calibration
 
@@ -234,13 +254,13 @@ Even if successful, the attacker would be slashed at every cycle (50% of their p
 - Budget: 6M VLT / 10 years = 1,644 VLT/day
 - `REWARD_PER_CYCLE = 0.48 VLT` (47,564,687 atomic)
 
-| Active Providers | Reward per provider/cycle | Per day | ROI on 1,000 VLT stake |
-|------------------|---------------------------|---------|-------------------------|
-| 10 | 0.048 VLT | 165 VLT | 6 days |
-| 25 | 0.019 VLT | 66 VLT | 15 days |
-| 50 | 0.0095 VLT | 33 VLT | 30 days |
-| 100 | 0.0048 VLT | 16 VLT | 61 days |
-| 200 | 0.0024 VLT | 8 VLT | 122 days |
+| Active Providers | Reward per provider/cycle | Per day | ROI on 100 VLT stake |
+|------------------|---------------------------|---------|------------------------|
+| 10 | 0.048 VLT | 165 VLT | <1 day |
+| 25 | 0.019 VLT | 66 VLT | 1.5 days |
+| 50 | 0.0095 VLT | 33 VLT | 3 days |
+| 100 | 0.0048 VLT | 16 VLT | 6 days |
+| 200 | 0.0024 VLT | 8 VLT | 12 days |
 
 The system self-balances: too few providers → high ROI → attracts more; too many → low ROI → some leave.
 
@@ -379,7 +399,364 @@ VLT stakers can propose and vote on:
 
 ---
 
-## 8. Upgrade Pattern
+## 8. XelisVaultMiner — Unified Mining Layer
+
+### 8.1 Design Principles
+
+The original v3/v4 design had a single, narrow role for miners: submit prices to the oracle. In practice, the same miners who run a price provider are perfectly positioned to serve other protocol-level services — storing encrypted chat messages, anchoring data on-chain, and (in future versions) running an indexer or storage node.
+
+`XelisVaultMiner.slx` formalizes this by acting as a **single registry and incentive layer** for all protocol miners:
+
+1. **Unified registration** — a miner stakes **100 VLT** once, declares a service mask (oracle, chat, or both), and gets a single on-chain identity
+2. **Cross-service reputation** — one reputation score (0–10,000) is updated by *all* services the miner participates in, making a misbehaving chat node also lose oracle rewards
+3. **Dynamic rewards** — per-cycle rewards scale with reputation and with a global *budget factor* that auto-adjusts to make the 6M VLT reward pool last exactly 10 years
+4. **Budget control** — every ~1 week (2016 blocks), the contract compares the actual distribution rate against the target rate and gently corrects the `budget_factor` (clamped between 0.5× and 2×)
+
+### 8.2 Reputation System (0–10,000)
+
+Each miner has a reputation score in the range `0`–`10,000`. New miners start at the maximum (`10,000`). The score affects both reward multiplier and active status.
+
+**Reputation gains:**
+
+| Action | Gain |
+|--------|------|
+| Valid oracle price submitted | +1 |
+| Successful VaultChat anchor | +5 |
+| Heartbeat (proof of life) | +1 |
+| Bonus per day without infraction | +10 |
+
+**Reputation losses:**
+
+| Infraction | Loss | Slash |
+|------------|------|-------|
+| Oracle outlier price | -50 | 1% of stake |
+| Node offline detected | -200 | 2% of stake |
+| Chat data loss | -500 | 5% of stake |
+| Chat censorship | -1,000 | 10% of stake |
+| Malicious behavior | -5,000 | 50% of stake |
+
+**Reputation tiers and multipliers:**
+
+| Tier | Score range | Reward multiplier | Behavior |
+|------|-------------|-------------------|----------|
+| Excellent | 10,000 – 8,000 | 1.5× | Bonus rewards for reliable miners |
+| Good | 8,000 – 5,000 | 1.0× | Normal |
+| Warning | 5,000 – 2,000 | 0.5× | Reduced rewards (encourages improvement) |
+| Critical | 2,000 – 1,000 | 0.25× | Heavily reduced (last chance) |
+| Banned | < 1,000 | 0× | Auto-deactivated until reputation regenerates |
+
+Reputation regenerates naturally: each heartbeat (every ~8 minutes) awards +1 point if the miner has had no infraction in the last 1,000 blocks (~83 minutes).
+
+### 8.3 Dynamic Rewards
+
+The reward paid for a single valid submission is computed as:
+
+```
+dynamic_reward = base_reward × reputation_mult × budget_factor
+```
+
+Where:
+- `base_reward` — `BASE_REWARD_ORACLE` (0.48 VLT) for oracle service, `BASE_REWARD_CHAT` (0.5 VLT) for chat anchoring
+- `reputation_mult` — 0× / 0.25× / 0.5× / 1.0× / 1.5× depending on tier
+- `budget_factor` — global multiplier (in basis points, 10,000 = 1.0×) maintained by the budget control loop
+
+If the miner's reputation is in the Banned tier (`< 1,000`), `distribute_reward()` returns 0 — no VLT is minted, regardless of submission validity. This means an attacker cannot profit from a corrupted node.
+
+### 8.4 Budget Control (10-Year Distribution)
+
+The reward budget is sourced from the 60% VLT allocation (6,000,000 VLT). To guarantee this lasts exactly 10 years (`TARGET_DURATION_BLOCKS = 63,072,000` blocks at 5s/block), the contract self-adjusts:
+
+1. Every `BUDGET_ADJUST_INTERVAL` (2,016 blocks ≈ 1 week), `maybe_adjust_budget()` runs
+2. It computes the **actual distribution rate** = `distributed / elapsed_blocks`
+3. It computes the **target rate** = `remaining_budget / remaining_blocks`
+4. It updates `budget_factor` toward the ratio `target_rate / actual_rate`, using a 50/50 blend with the previous factor to avoid shocks
+5. The new factor is clamped to `[5,000; 20,000]` (i.e. 0.5× to 2.0×)
+
+This guarantees the budget lasts the full 10 years regardless of how many miners join or leave, what their reputation is, or how much volume the network handles.
+
+### 8.5 Service Mask
+
+Miners declare which services they run via a bitmask (`services_mask`):
+
+| Bit | Service ID | Service |
+|-----|------------|---------|
+| 0   | 1          | Oracle (price submission) |
+| 1   | 2          | Chat (message storage + anchoring) |
+| 2-7 | 3–8        | Reserved (storage, indexer, etc.) |
+
+Miners can enable or disable services at any time via `enable_service()` / `disable_service()`. Per-service counters let users and the frontend find miners running a specific service.
+
+### 8.6 Heartbeats and Slashing
+
+- **Heartbeat** (`submit_heartbeat()`): every ~8 minutes (100 blocks), miners call this entry as a proof of life. It also triggers reputation regeneration and the budget adjustment check.
+- **Slash** (`slash_miner()`): callable only by an authorized service contract (StakedOracle, VaultChat, …) — never directly by users. The service reports the offending miner, a severity (0–4), and an optional reporter address. The slash is split: 50% burned, 10% to the reporter, 40% to the treasury.
+
+### 8.7 Relationship with StakedOracle
+
+`StakedOracle` and `XelisVaultMiner` are complementary:
+
+- `StakedOracle` handles the **aggregation logic** (median, deviation, circuit breaker, feeds)
+- `XelisVaultMiner` handles the **miner lifecycle** (registration, reputation, budget, slashing)
+
+In the current deployment, the StakedOracle calls `XelisVaultMiner.distribute_reward()` and `XelisVaultMiner.slash_miner()` instead of minting rewards or slashing stakes itself. This avoids duplicating the reward budget logic and gives a single source of truth for "is this miner active and reputable?".
+
+---
+
+## 9. MinerPool — Composable Miner Pools
+
+### 9.1 Why Pools?
+
+Some services (especially VaultChat storage) benefit from **mutualized availability**: if one miner goes down, others in the same pool take over. Pools also let smaller miners combine their stakes and reputation to compete with larger operators.
+
+A `MinerPool` is a lightweight, opt-in grouping of miners that:
+
+- Mutualizes their stake (the pool's total stake is the sum of members')
+- Publishes a **pool reputation** (average of members' reputations)
+- Receives rewards from `XelisVaultMiner.distribute_reward()` and distributes them proportionally to each member's stake
+- Charges a configurable **creator commission** (default 5%, max 20%) to the pool creator
+
+### 9.2 Pool Lifecycle
+
+```
+┌─────────────────────────────────────────────────┐
+│ 1. CREATE POOL                                  │
+│    create_pool(name, description, commission)   │
+│    → must already be a registered miner         │
+│    → creator automatically becomes member #1    │
+└─────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ 2. JOIN POOL                                    │
+│    join_pool(pool_id)                           │
+│    → must be a registered miner                 │
+│    → max 50 members per pool                    │
+│    → one pool per miner at a time               │
+└─────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ 3. EARN (passive)                               │
+│    When XelisVaultMiner pays a reward to a      │
+│    member, the pool receives it via             │
+│    distribute_pool_rewards() and accumulates    │
+│    it pending distribution                     │
+└─────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ 4. CLAIM                                        │
+│    claim_pool_rewards()                         │
+│    → share = pending × (own_stake / total)      │
+│    → commission deducted and sent to creator    │
+│    → net share transferred to member            │
+└─────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ 5. LEAVE (or KICK by creator)                   │
+│    leave_pool() / kick_member()                 │
+│    → pending share paid out on exit             │
+│    → creator cannot leave (must dissolve pool)  │
+└─────────────────────────────────────────────────┘
+```
+
+### 9.3 Choosing a Pool (User Perspective)
+
+VaultChat users can elect to store their messages with a specific pool rather than with individual miners. The frontend ranks pools by:
+
+- **Pool reputation** (mean of member reputations)
+- **Total stake** (higher = stronger economic security)
+- **Member count** (higher = better availability through redundancy)
+- **Creator commission** (lower = more rewards to members, but creators who charge more may also run better infrastructure)
+
+This creates a market where pool operators compete on quality of service, not just on price.
+
+### 9.4 Reward Distribution Math
+
+When a member submits a valid action and `XelisVaultMiner` would normally pay them `R` VLT directly, the flow is:
+
+```
+1. XelisVaultMiner.distribute_reward(member, service, valid) → R
+2. If member is in pool P:
+     → MinerPool.distribute_pool_rewards(P, R)
+       (accumulates R in P's pending pool)
+3. Member calls claim_pool_rewards():
+     → share = pending × (member_stake / pool.total_stake)
+     → commission = share × creator_commission_bps / 10_000
+     → net = share - commission
+     → transfer(net, member)
+     → transfer(commission, pool.creator)
+     → pending -= share
+```
+
+This means members don't need to claim every cycle — they can accumulate rewards and claim them on their own schedule.
+
+---
+
+## 10. VaultChat — End-to-End Encrypted Chat
+
+### 10.1 Problem Statement
+
+A naive on-chain chat requires either (a) one transaction per message (expensive, terrible UX) or (b) plaintext messages (no privacy). VaultChat solves both problems with a **sign-once + E2E encryption + off-chain relayers + on-chain anchoring** design.
+
+### 10.2 Architecture
+
+```
+┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
+│  User A      │     │  Relayer        │     │  User B      │
+│  (frontend)  │     │  (off-chain)    │     │  (frontend)  │
+│              │     │                 │     │              │
+│ 1. Register  │     │                 │     │ 1. Register  │
+│    session   │─────┼─→ on-chain      │     │    session   │
+│    (1 tx)    │     │                 │     │    (1 tx)    │
+│              │     │                 │     │              │
+│ 2. Encrypt   │     │                 │     │              │
+│    msg with  │     │                 │     │              │
+│    B's pubkey│     │                 │     │              │
+│              │     │                 │     │              │
+│ 3. Sign msg  │──┐  │                 │     │              │
+│    locally   │  │  │                 │     │              │
+│    (0 gas)   │  │  │                 │     │              │
+│              │  └─→│ 4. Verify sig   │     │              │
+│              │     │    Store msg    │     │              │
+│              │     │    (off-chain)  │     │              │
+│              │     │                 │     │              │
+│              │     │ 5. Push to B    │────→│ 6. Decrypt   │
+│              │     │    via WS/poll  │     │    with      │
+│              │     │                 │     │    A's pubkey│
+│              │     │                 │     │    + priv key│
+└──────────────┘     └────────┬────────┘     └──────────────┘
+                              │
+                              │ 7. Every hour:
+                              │    anchor merkle root
+                              │    of all messages
+                              ▼
+                    ┌─────────────────┐
+                    │  XELIS Chain    │
+                    │  VaultChat.slx  │
+                    │  anchor_messages│
+                    │  (1 tx/hour)    │
+                    └─────────────────┘
+```
+
+### 10.3 End-to-End Encryption (Diffie-Hellman)
+
+Each user generates a long-lived X25519 keypair (or equivalent). The **private key never leaves the user's device**; the **public key** is registered on-chain via `register_session(chat_pubkey)` — a single, one-time transaction.
+
+To send a message to B:
+
+1. A fetches B's public key from the contract (`get_session(B)`)
+2. A computes `shared_secret = DH(A_priv, B_pub)`
+3. A encrypts: `ciphertext = encrypt(msg, shared_secret)`
+4. A signs the ciphertext: `signature = sign(ciphertext, A_priv)`
+5. A sends `(ciphertext, signature)` to a relayer (off-chain, **0 gas**)
+
+To read a message from A:
+
+1. B fetches A's public key from the contract
+2. B computes the same `shared_secret = DH(B_priv, A_pub)`
+3. B decrypts: `msg = decrypt(ciphertext, shared_secret)`
+
+The relayer sees ciphertexts but cannot decrypt them. The contract stores **no messages** — only public keys, sessions, group metadata, and merkle roots.
+
+### 10.4 Groups
+
+For group chats, a **group key** is used:
+
+1. The group creator generates a random `group_key` locally and creates the group on-chain via `create_group(group_pubkey)`
+2. For each member, the creator encrypts the `group_key` with the member's public key (`add_group_member(group_id, member, encrypted_group_key)`)
+3. Group messages are encrypted with the `group_key`
+4. When a member leaves or is removed, the creator regenerates the `group_key` and redistributes it (forward secrecy)
+
+### 10.5 On-Chain Anchoring
+
+Once per hour, an authorized relayer computes a Merkle root over all messages (DMs + groups) seen in the last hour and submits it via `anchor_messages(merkle_root, count, msg_type)`. This:
+
+- Proves **immutability** of the message log without revealing contents
+- Allows clients to verify that a specific message was included in a specific anchor (Merkle proof)
+- Costs only ~1 transaction per hour, regardless of message volume
+
+### 10.6 Confidentiality Properties
+
+- The contract stores **no messages, no ciphertexts** — only public keys, sessions, group metadata, and Merkle roots
+- Relayers see ciphertexts but cannot decrypt them
+- Only sender and receiver can decrypt (E2E)
+- Moderation: the guardian/admin can revoke a user's session (`revoke_session(user)`) — relayers then refuse to accept messages from that user
+
+### 10.7 Miner Integration
+
+Miners running the Chat service (bit 2 in `XelisVaultMiner`) operate relayer nodes:
+
+- Receive and verify signed ciphertexts from users
+- Store ciphertexts off-chain (with redundancy inside a `MinerPool`)
+- Compute hourly Merkle roots and call `anchor_messages()`
+- Earn chat rewards via `XelisVaultMiner.distribute_reward(miner, 2, true)`
+
+A miner that loses stored messages is reported with severity 2 (data loss) → -500 reputation + 5% stake slash. A miner that censors valid messages is reported with severity 3 (censorship) → -1,000 reputation + 10% stake slash.
+
+---
+
+## 11. PrivacyMixer — Anonymity Mixer
+
+### 11.1 Principle
+
+`PrivacyMixer.slx` is a Tornado Cash–style anonymity mixer adapted to XELIS Confidential Assets. It allows users to deposit a fixed amount of xUSD or VLT, then later withdraw the same amount to a **different address** with no on-chain link between the deposit and the withdrawal.
+
+### 11.2 Denominations
+
+To preserve anonymity sets, deposits must match one of three fixed denominations:
+
+| Denomination ID | Amount (xUSD or VLT) | Atomic units |
+|-----------------|----------------------|--------------|
+| 0               | 10                   | 1,000,000,000 |
+| 1               | 100                  | 10,000,000,000 |
+| 2               | 1,000                | 100,000,000,000 |
+
+Each denomination × asset pair forms an independent anonymity set.
+
+### 11.3 Mechanism
+
+**Deposit (entry `deposit(asset, denomination_id, commitment)`):**
+
+1. User generates a random `secret` and `nonce` locally (never revealed on-chain)
+2. User computes `commitment = hash(secret || nonce)`
+3. User calls `deposit(asset, denom_id, commitment)` with the deposit amount of the asset
+4. The contract inserts `commitment` as a new leaf in the Merkle tree at the current `leaf_index`
+5. The Merkle root is updated incrementally (depth 24 → supports up to 2²⁴ ≈ 16.7M deposits per asset)
+
+**Withdraw (entry `withdraw(asset, denom_id, nullifier, recipient, merkle_root, zk_proof)`):**
+
+1. From a **new address** (different from the deposit address), the user generates a ZK proof showing:
+   - They know a `(secret, nonce)` whose hash is some leaf in the tree
+   - The Merkle root they're proving against matches the contract's current root
+   - The `nullifier` they're presenting is `hash(secret)` (a unique identifier for this deposit)
+2. The contract checks that the nullifier has **not** been used before (prevents double-spending)
+3. The contract verifies the ZK proof via the configured verifier contract
+4. The contract marks the nullifier as used and transfers the denomination amount to `recipient`
+
+The ZK proof reveals nothing about which leaf was used — the deposit and withdrawal are cryptographically unlinkable.
+
+### 11.4 Privacy Guarantees
+
+- **Unlinkability**: An observer cannot connect a withdrawal to a specific deposit, even if they see all transactions
+- **Double-spend protection**: Each deposit's `nullifier` can only be used once
+- **Resistance to the "1-out-of-N" attack**: Larger anonymity sets (more deposits) make correlation exponentially harder
+- **No relayer needed**: The withdraw transaction can be submitted from any address; the ZK proof does the authentication
+
+### 11.5 Operational Notes
+
+- The ZK verifier contract is configurable via `set_zk_verifier()` (Timelock-gated). This lets the protocol upgrade the proof system without redeploying the mixer
+- An `emergency_withdraw()` function is reserved for the admin in case of catastrophic bug — it allows recovery of stuck funds, but does not compromise privacy
+- All deposits/withdrawals are XELIS Confidential Asset transfers — meaning the **amount** is already hidden by XELIS native privacy. The mixer adds **address unlinkability** on top
+
+### 11.6 Composability
+
+The mixer works with any XELIS Confidential Asset registered via `asset` parameter. Initial deployment supports xUSD and VLT; community governance can whitelist additional assets in future versions.
+
+---
+
+## 12. Upgrade Pattern
 
 Since Silex/XELIS does not support `delegatecall` (unlike Solidity's EIP-1967), we use a **Versioned Registry** pattern:
 
@@ -392,11 +769,11 @@ See [`docs/UPGRADE.md`](docs/UPGRADE.md) for the full upgrade procedure.
 
 ---
 
-## 9. Security
+## 13. Security
 
-### 9.1 Defense in Depth (10 layers)
+### 13.1 Defense in Depth (10 layers)
 
-1. **Staking** — 1,000 VLT minimum per provider (Sybil resistance)
+1. **Staking** — 100 VLT minimum per provider/miner (Sybil resistance)
 2. **Slashing** — 1% of stake per outlier (economic penalty)
 3. **Median aggregation** — Resistant to outliers
 4. **Deviation check** — Outliers get no reward
@@ -407,7 +784,11 @@ See [`docs/UPGRADE.md`](docs/UPGRADE.md) for the full upgrade procedure.
 9. **Timelock** — 48h delay on all config changes
 10. **Guardian multisig** — Emergency pause capability
 
-### 9.2 Audit Status
+Additionally, the unified mining layer (§8) adds:
+11. **Reputation system** — misbehaving miners lose reputation and get auto-deactivated below threshold
+12. **Dynamic budget factor** — auto-throttles rewards if distribution runs ahead of schedule
+
+### 13.2 Audit Status
 
 - **Internal audit v4.2**: Complete (see `docs/AUDIT.md`)
 - **External audit**: Planned for Q3 2026 (Trail of Bits or OpenZeppelin)
@@ -415,7 +796,7 @@ See [`docs/UPGRADE.md`](docs/UPGRADE.md) for the full upgrade procedure.
 
 ---
 
-## 10. Roadmap Summary
+## 14. Roadmap Summary
 
 | Quarter | Milestone |
 |---------|-----------|
@@ -425,19 +806,19 @@ See [`docs/UPGRADE.md`](docs/UPGRADE.md) for the full upgrade procedure.
 | Q1 2027 | RWA tokenization, first governance vote for XAU/USD feed |
 | Q2 2027 | LendingMarket, PeerLoan, SyndicatePool |
 | Q3 2027 | InsurancePool, PrivateInsurance |
-| Q4 2027 | Full feature set (23 contracts total) |
+| Q4 2027 | Full feature set (33 contracts total) |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detailed timeline.
 
 ---
 
-## 11. Conclusion
+## 15. Conclusion
 
-XELIS Vault v4.2 represents a fundamental advance in decentralized finance: a **fully permissionless, confidential, deflationary** financial platform. By combining XELIS's native homomorphic encryption with a staked oracle design, we solve both the privacy problem and the oracle problem in a single coherent architecture.
+XELIS Vault v4.2 represents a fundamental advance in decentralized finance: a **fully permissionless, confidential, deflationary** financial platform. By combining XELIS's native homomorphic encryption with a staked oracle design, a unified miner reputation system, end-to-end encrypted chat, and a ZK anonymity mixer, we solve both the privacy problem and the oracle problem in a single coherent architecture — and extend privacy from "hidden balances" to "hidden conversations" and "unlinkable transfers".
 
-The VLT token's fixed supply and deflationary burn mechanism ensure that early participants are rewarded as the protocol grows, while the permissionless provider model ensures long-term decentralization and censorship resistance.
+The VLT token's fixed supply and deflationary burn mechanism ensure that early participants are rewarded as the protocol grows, while the permissionless provider model and the unified miner reputation system ensure long-term decentralization and censorship resistance. The 10-year budget control loop guarantees the reward pool lasts exactly as long as intended, regardless of how the network grows.
 
-We invite the community to review the code, run a price provider, and help build the future of confidential finance.
+We invite the community to review the code, run a miner (oracle, chat, or both), and help build the future of confidential finance.
 
 ---
 

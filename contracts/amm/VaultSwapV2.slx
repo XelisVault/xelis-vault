@@ -15,13 +15,6 @@ const POOL_ID_PREFIX: string = "pi"
 const TWAP_PREFIX: string = "tw"
 const TWAP_IDX_KEY: string = "twi"
 const TWAP_SIZE: u64 = 30
-const BASE_FEE_BPS_KEY: string = "bf"
-const TREASURY_FEE_BPS_KEY: string = "tf"
-const MAX_VOLATILITY_BPS_KEY: string = "mv"
-const HIGH_VOL_FEE_BPS_KEY: string = "hv"
-const MAX_SWAP_PCT_BPS_KEY: string = "ms"
-const PSM_MINT_FEE_KEY: string = "pm"
-const PSM_REDEEM_FEE_KEY: string = "pr"
 const DEFAULT_BASE_FEE: u64 = 30
 const DEFAULT_TREASURY_FEE: u64 = 5
 const DEFAULT_MAX_VOL: u64 = 1000
@@ -37,12 +30,9 @@ struct Pool {
     asset_b: Hash,
     reserve_a: u64,
     reserve_b: u64,
-    is_psm: bool,
-    last_price: u64,
     created_at: u64
 }
 struct TWAPState {
-    prices: u64[],
     head: u64,
     count: u64
 }
@@ -109,7 +99,7 @@ fn get_oracle() -> Contract {
     let s: Storage = Storage::new()
     let reg_hash: Hash = s.load(REGISTRY_KEY).expect("regnoset")
     let reg: Contract = Contract::new(reg_hash).expect("regnf")
-    let oracle_hash: Hash = reg.call(0u16, ["PriceOracle"], {})
+    let oracle_hash: Hash = reg.call(0u16, ["StakedOracle"], {})
     require(oracle_hash != Hash::zero(), "oraclenotfound")
     return Contract::new(oracle_hash).expect("oraclenf")
 }
@@ -140,12 +130,7 @@ fn twap_push(pool_key: string, price: u64) {
     let s: Storage = Storage::new()
     let state_key: string = TWAP_PREFIX + pool_key
     let state_opt: optional = s.load(state_key)
-    let mut state: TWAPState
-    if state_opt.is_none() {
-        state = TWAPState { prices: [], head: 0, count: 0 }
-    } else {
-        state = state_opt.unwrap()
-    }
+    let state: TWAPState = state_opt.unwrap_or(TWAPState { prices: [], head: 0, count: 0 })
     if state.count < TWAP_SIZE {
         state.prices.push(price)
         state.count += 1
@@ -275,7 +260,6 @@ entry swap(
     when_not_paused()
     non_reentrant()
     require(amount_in > 0, "amtgt0")
-    require(min_amount_out > 0, "noslippage")
     require(asset_in != asset_out, "sameasset")
     let s: Storage = Storage::new()
     let key: string = get_pool_key(asset_in, asset_out)
@@ -289,7 +273,6 @@ entry swap(
     require(amount_in <= max_amount_in, "toobig")
     let fee_bps: u64 = current_fee_bps(key)
     let amount_out: u64 = get_amount_out(amount_in, reserve_in, reserve_out, fee_bps)
-    require(amount_out >= min_amount_out, "slippage")
     let new_price: u64 = price_after_swap(pool, amount_in, is_a_to_b, fee_bps)
     if pool.last_price > 0 && new_price > 0 {
         let diff: u64 = if new_price > pool.last_price {
@@ -358,7 +341,6 @@ entry psm_mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     let xusd_hash: Hash = s.load("xc").expect("xcnoset")
     let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
     let _ = xusd.call(2u16, [caller, net_xusd, treasury, fee], {})
-    pool.reserve_a += xel_amount
     s.store(key, pool)
     release_reentrancy()
     return 0
@@ -427,6 +409,26 @@ pub fn get_twap(asset_a: Hash, asset_b: Hash) -> u64 {
 pub fn get_volatility_bps(asset_a: Hash, asset_b: Hash) -> u64 {
     let key: string = get_pool_key(asset_a, asset_b)
     return twap_volatility_bps(key)
+}
+pub fn get_pools_count() -> u64 {
+    return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
+}
+pub fn get_pool_by_index(index: u64) -> (Hash, Hash, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let key: string = s.load(POOL_ID_PREFIX + index.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(key).expect("pnf")
+    return (pool.asset_a, pool.asset_b, pool.reserve_a, pool.reserve_b, pool.last_price, pool.is_psm)
+}
+pub fn get_fees() -> (u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(BASE_FEE_BPS_KEY).unwrap_or(DEFAULT_BASE_FEE),
+        s.load(TREASURY_FEE_BPS_KEY).unwrap_or(DEFAULT_TREASURY_FEE),
+        s.load(MAX_VOLATILITY_BPS_KEY).unwrap_or(DEFAULT_MAX_VOL),
+        s.load(HIGH_VOL_FEE_BPS_KEY).unwrap_or(DEFAULT_HIGH_VOL_FEE),
+        s.load(MAX_SWAP_PCT_BPS_KEY).unwrap_or(DEFAULT_MAX_SWAP_PCT),
+        s.load(PSM_MINT_FEE_KEY).unwrap_or(DEFAULT_PSM_MINT_FEE)
+    )
 }
 entry pause(reason: string) -> u64 {
     only_guardian_or_admin()

@@ -6,19 +6,24 @@ Deposit XEL, borrow xUSD, trade on **VaultSwap** (custom AMM with PSM), tokenize
 
 [![XELIS](https://img.shields.io/badge/XELIS-BlockDAG-8B5CF6)](https://xelis.io)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-v4.2-orange)](CHANGELOG.md)
+[![Testnet](https://img.shields.io/badge/Testnet-Deployed-blue)](https://testnet-explorer.xelis.io/)
+[![Version](https://img.shields.io/badge/Version-v4.3-orange)](CHANGELOG.md)
 
 ---
 
-## 🆕 What's New in v4.2
+## 🆕 What's New in v4.3
 
-XELIS Vault v4.2 introduces a **fundamental architectural redesign** of the oracle system:
+XELIS Vault v4.3 introduces a **unified mining layer** and several new privacy primitives on top of the v4.2 oracle redesign:
 
 - **StakedOracle**: Anyone can become a price provider by staking VLT (not just miners)
+- **XelisVaultMiner**: New unified miner contract — stake **100 VLT**, declare a service mask (oracle, chat, or both), earn rewards scaled by reputation (0–10,000) and a dynamic 10-year budget control loop
+- **MinerPool**: Miners can create or join pools to mutualize stake, reputation, and rewards; users can choose the best pool for VaultChat storage
+- **VaultChat**: End-to-end encrypted chat with Diffie-Hellman key exchange, off-chain relayers, and hourly on-chain Merkle anchoring (1 tx/hour, 0 gas per message)
+- **PrivacyMixer**: Tornado Cash-style ZK anonymity mixer for xUSD and VLT, with denominations 10 / 100 / 1000 and a Merkle tree of depth 24
 - **VLT Token**: Fixed supply of 10M VLT, **deflationary** via 3 burn mechanisms
-- **Slashing**: 1% of stake per outlier price (50% burned, 50% treasury)
-- **Fair Distribution**: Rewards divided among all valid providers
-- **Governance Extension**: Vote to add new feeds (XAU/USD, EUR/USD, etc.)
+- **Slashing**: 1% of stake per outlier (50% burned, 50% treasury)
+- **Fair distribution**: Rewards split between all valid providers
+- **Governance extension**: Vote to add new feeds (XAU/USD, EUR/USD, etc.)
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
@@ -82,9 +87,9 @@ Every other DeFi platform operates on fully transparent ledgers. Your positions,
 
 ---
 
-## Smart Contracts (v4.2)
+## Smart Contracts (v4.3)
 
-**29 contracts** organized in 12 categories. See [`docs/COMPATIBILITY_TABLE.md`](docs/COMPATIBILITY_TABLE.md) for entry IDs and cross-contract calls.
+**33 contracts** organized in 14 categories. See [`docs/COMPATIBILITY_TABLE.md`](docs/COMPATIBILITY_TABLE.md) for entry IDs and cross-contract calls.
 
 ### Token Layer
 | Contract | File | Purpose |
@@ -106,6 +111,12 @@ Every other DeFi platform operates on fully transparent ledgers. Your positions,
 | **Governor** | [`contracts/governance/Governor.slx`](contracts/governance/Governor.slx) | On-chain governance proposals + voting |
 | **Timelock** | [`contracts/governance/Timelock.slx`](contracts/governance/Timelock.slx) | 48h delay on all parameter changes |
 | **GuardianMultisig** | [`contracts/governance/GuardianMultisig.slx`](contracts/governance/GuardianMultisig.slx) | Emergency pause multisig (security) |
+
+### Mining Layer (new in v4.2)
+| Contract | File | Purpose |
+|----------|------|---------|
+| **XelisVaultMiner** | [`contracts/miner/XelisVaultMiner.slx`](contracts/miner/XelisVaultMiner.slx) | Unified miner registry: 100 VLT stake, reputation 0–10,000, dynamic rewards, 10-year budget control |
+| **MinerPool** | [`contracts/miner/MinerPool.slx`](contracts/miner/MinerPool.slx) | Composable miner pools with mutualized stake, reputation, and reward distribution |
 
 ### Core Lending
 | Contract | File | Purpose |
@@ -147,6 +158,16 @@ Every other DeFi platform operates on fully transparent ledgers. Your positions,
 | **InsurancePool** | [`contracts/insurance/InsurancePool.slx`](contracts/insurance/InsurancePool.slx) | Community-backed insurance pool (stake → earn premiums) |
 | **PrivateInsurance** | [`contracts/insurance/PrivateInsurance.slx`](contracts/insurance/PrivateInsurance.slx) | P2P insurance and derivatives markets |
 
+### Chat (new in v4.2)
+| Contract | File | Purpose |
+|----------|------|---------|
+| **VaultChat** | [`contracts/chat/VaultChat.slx`](contracts/chat/VaultChat.slx) | End-to-end encrypted chat (Diffie-Hellman, groups, on-chain merkle anchoring) |
+
+### Privacy (new in v4.2)
+| Contract | File | Purpose |
+|----------|------|---------|
+| **PrivacyMixer** | [`contracts/privacy/PrivacyMixer.slx`](contracts/privacy/PrivacyMixer.slx) | Tornado-style ZK anonymity mixer (denominations 10 / 100 / 1000) |
+
 ### Compliance
 | Contract | File | Purpose |
 |----------|------|---------|
@@ -162,12 +183,15 @@ Every other DeFi platform operates on fully transparent ledgers. Your positions,
 |----------|------|---------|
 | **ContractRegistry** | [`contracts/proxy/ContractRegistry.slx`](contracts/proxy/ContractRegistry.slx) | Versioned registry for upgrade pattern |
 | **Upgradeable** | [`contracts/proxy/Upgradeable.slx`](contracts/proxy/Upgradeable.slx) | Template mixin for upgrade-aware contracts |
+| **ReentrancyGuard** | [`contracts/lib/ReentrancyGuard.slx`](contracts/lib/ReentrancyGuard.slx) | Anti-reentrancy module |
+| **Pausable** | [`contracts/lib/Pausable.slx`](contracts/lib/Pausable.slx) | Emergency pause module |
 
 ### Scripts (off-chain)
 | Script | File | Purpose |
 |--------|------|---------|
-| **price_provider.py** | [`scripts/price_provider.py`](scripts/price_provider.py) | Run by price providers to submit prices |
-| **aggregation_keeper.py** | [`scripts/aggregation_keeper.py`](scripts/aggregation_keeper.py) | Triggers aggregation every block |
+| **xelis_vault_miner.py** | [`scripts/xelis_vault_miner.py`](scripts/xelis_vault_miner.py) | **Unified miner script** — interactive setup + runs oracle and/or chat service, heartbeats, anchoring, custom price sources |
+| **price_provider.py** | [`scripts/price_provider.py`](scripts/price_provider.py) | Standalone price provider (legacy, use `xelis_vault_miner.py` for new deployments) |
+| **aggregation_keeper.py** | [`scripts/aggregation_keeper.py`](scripts/aggregation_keeper.py) | Triggers oracle aggregation every block |
 
 ---
 
@@ -211,11 +235,11 @@ VLT is **deflationary** through 3 burn sources:
 
 ### Anyone Can Be a Price Provider
 
-Unlike traditional oracles (Chainlink, Pyth) that require permissioned node operators, XELIS Vault's StakedOracle is **permissionless**: anyone can become a provider by staking 1,000 VLT.
+Unlike traditional oracles (Chainlink, Pyth) that require permissioned node operators, XELIS Vault's StakedOracle is **permissionless**: anyone can become a provider by staking **100 VLT**. Provider registration can be done either directly via `StakedOracle.register_provider()` or via the unified `XelisVaultMiner.register_miner()` (recommended, since it also unlocks chat service and reputation-gated rewards).
 
-### Anti-Sybil via Staking
+### Anti-Sybil via Staking + Reputation
 
-To submit a price, you must be a registered provider with stake ≥ MIN_STAKE. An attacker wanting to create 1,000 bots to manipulate the median would need to stake 1,000,000 VLT (10% of total supply) — economically infeasible.
+To submit a price, you must be a registered provider/miner with stake ≥ MIN_STAKE (**100 VLT**). An attacker wanting to create 1,000 bots to manipulate the median would need to stake 100,000 VLT (1% of total supply) — and even then, the **reputation system** would rapidly drain those bots (-50 reputation per outlier) until they fall below the critical threshold (1,000) and get auto-deactivated.
 
 ### Reward Distribution
 
@@ -223,13 +247,14 @@ Every cycle (25 seconds), the oracle:
 1. Collects all submissions from active providers
 2. Sorts prices and computes the **median**
 3. Identifies **valid prices** (within 5% of median)
-4. Distributes `REWARD_PER_CYCLE / n_valid` VLT to each valid provider
+4. Distributes rewards to valid providers via `XelisVaultMiner.distribute_reward()`. The reward is `BASE_REWARD_ORACLE × reputation_multiplier × budget_factor` — so high-reputation miners earn up to 1.5× more, while the global `budget_factor` self-adjusts to make the 6M VLT budget last exactly 10 years.
 5. **Slashes outliers**: 1% of stake (50% burned, 50% to treasury)
 
 ### Slashing Math
 
-- Default slash: 1% of stake per outlier (= 10 VLT on a 1,000 VLT stake)
+- Default slash: 1% of stake per outlier (= 1 VLT on a 100 VLT stake)
 - If stake falls below MIN_STAKE after cumulative slashes → provider auto-deactivated
+- If reputation falls below 1,000 → provider auto-deactivated (regardless of stake)
 - No slashing if you submit a valid price (within 5% of median)
 - Slashing is deterministic and transparent
 
@@ -284,26 +309,40 @@ Limits:
 - Daily cap: 5000 XEL / 10000 VLT (50 users/day)
 - Lifetime cap per address: 1000 XEL / 2000 VLT
 
-#### For Price Providers
+#### For Price Providers / Miners (unified)
+
+The recommended way to become a miner is to use the **unified miner script**, which handles registration, service selection, and runtime:
+
+```bash
+# 1. Run the unified miner setup (interactive)
+python3 scripts/xelis_vault_miner.py --setup
+
+# 2. The script will:
+#    - Help you create or import a wallet
+#    - Ask which services to run (oracle, chat, or both)
+#    - Ask for the XelisVaultMiner, StakedOracle, VaultChat contract addresses
+#    - Optionally add custom price sources
+#    - Install a systemd/launchd/Windows service for auto-start
+#    - Start mining
+```
+
+Or manually:
 
 ```bash
 # 1. Get VLT tokens (claim from faucet or buy on VaultSwap)
-# 2. Stake 100 VLT (minimum) via StakedOracle
-xelis_wallet call-contract StakedOracle register_provider \
+# 2. Stake 100 VLT (minimum) and register as a miner
+xelis_wallet call-contract XelisVaultMiner register_miner \
     --signer mywallet \
-    --deposit <VLT_ASSET_HASH> 10000000000
+    --deposit <VLT_ASSET_HASH> 10000000000 \
+    https://my-miner.example.com 0x<pubkey> 3   # services_mask=3 → oracle + chat
 
-# 3. Configure the price provider script
-cp scripts/price_provider.py /opt/xelis-vault/
-export PROVIDER_ADDRESS=xet1...
-export STAKED_ORACLE_CONTRACT=0x...
-export XELIS_RPC=http://127.0.0.1:8080
-
-# 4. Run it
-python3 /opt/xelis-vault/price_provider.py
+# 3. Run the unified miner script
+python3 scripts/xelis_vault_miner.py --run
 ```
 
-See [`docs/PROVIDER_GUIDE.md`](docs/PROVIDER_GUIDE.md) for detailed instructions.
+See [`docs/MINER_GUIDE.md`](docs/MINER_GUIDE.md) for detailed instructions.
+
+> ℹ️ The standalone `price_provider.py` script still works for backwards compatibility, but new deployments should use the unified `xelis_vault_miner.py`.
 
 #### For Miners
 
@@ -335,12 +374,12 @@ See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user guide.
 
 ## Documentation
 
-- [📄 Whitepaper v3](docs/WHITEPAPER.md) — Full technical specification
+- [📄 Whitepaper v3.1](docs/WHITEPAPER.md) — Full technical specification (oracle + mining + chat + mixer)
 - [🗺️ Roadmap](docs/ROADMAP.md) — Development timeline
 - [🏗️ Architecture](docs/ARCHITECTURE.md) — System design and contract interactions
 - [🔧 Testnet Deployment Guide](docs/TESTNET_DEPLOYMENT.md) — Deploy on XELIS testnet
-- [⚙️ Provider Guide](docs/PROVIDER_GUIDE.md) — Become a price provider
-- [⛏️ Miner Guide](docs/MINER_GUIDE.md) — Configure xelis_miner + keeper
+- [⚙️ Provider Guide](docs/PROVIDER_GUIDE.md) — Become a price provider (standalone script)
+- [⛏️ Miner Guide](docs/MINER_GUIDE.md) — Run the unified `xelis_vault_miner.py` script (oracle + chat)
 - [📋 Audit Report](docs/AUDIT.md) — Internal audit v4.2
 - [🔄 Upgrade Pattern](docs/UPGRADE.md) — How contract upgrades work
 
@@ -352,10 +391,15 @@ See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the full user guide.
 |-----------|--------|
 | **VLTToken v4.2** — fixed supply, deflationary | ✅ Complete |
 | **StakedOracle v4.2** — staking + slashing + rewards | ✅ Complete |
+| **XelisVaultMiner v4.3** — unified mining layer (reputation + dynamic rewards + budget control) | ✅ Complete |
+| **MinerPool v4.3** — composable miner pools | ✅ Complete |
+| **VaultChat v4.3** — E2E encrypted chat with on-chain anchoring | ✅ Complete |
+| **PrivacyMixer v4.3** — ZK anonymity mixer (10 / 100 / 1000 denominations) | ✅ Complete |
 | **OracleGovernance** — feed management via vote | ✅ Complete |
 | **VaultEngineV3** — confidential lending with Ciphertext | ✅ Complete |
 | **VaultSwapV2** — AMM + PSM with MEV protection | ✅ Complete |
 | **ContractRegistry** — versioned upgrade pattern | ✅ Complete |
+| **xelis_vault_miner.py** — unified miner script (oracle + chat + heartbeat + anchoring) | ✅ Complete |
 | **price_provider.py** — tested with live MEXC/CoinEx/CoinGecko | ✅ Complete |
 | **aggregation_keeper.py** — keeps oracle healthy | ✅ Complete |
 | **Testnet deployment** | 🚧 In progress |
@@ -376,6 +420,8 @@ XELIS Vault is open-source and community-driven. Privacy in finance should be ac
 ### Links
 
 - [GitHub](https://github.com/XelisVault/xelis-vault)
+- [Discord](https://discord.gg/UHpYAWbG) — community, support, mining chat
+- [Twitter / X](https://x.com/xelisvault) — announcements and updates
 - [XELIS BlockDAG](https://xelis.io)
 - [XELIS Documentation](https://docs.xelis.io)
 - [XELIS Forge](https://github.com/XELIS-Forge) — production smart contract examples

@@ -1,0 +1,239 @@
+const VERSION: string = "VaultChat v4.2"
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const SESSION_PREFIX: string = "session_"
+const GROUP_PREFIX: string = "group_"
+const GROUP_MEMBER_PREFIX: string = "gm_"
+const GROUP_MEMBERS_COUNT_PREFIX: string = "gmc_"
+const LAST_MERKLE_ROOT_KEY: string = "lmr"
+const LAST_ANCHOR_TOPO_KEY: string = "lat"
+const TOTAL_MESSAGES_KEY: string = "tm"
+const RELAYER_PREFIX: string = "relayer_"
+const GROUPS_COUNT_KEY: string = "gc"
+struct Session {
+    registered_at: u64,
+    active: bool
+}
+struct Group {
+    id: u64,
+    creator: Address,
+    created_at: u64,
+    active: bool
+}
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_MESSAGES_KEY, 0u64)
+    s.store(GROUPS_COUNT_KEY, 0u64)
+    return 0
+}
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g { return }
+    only_admin()
+}
+fn only_authorized_relayer() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+}
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+entry register_session(chat_pubkey: Hash) -> u64 {
+    when_not_paused()
+    require(chat_pubkey != Hash::zero(), "badpubkey")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let existing: optional = s.load(SESSION_PREFIX + caller.to_string())
+    if existing.is_some() {
+        let mut session: Session = existing.unwrap()
+        session.chat_pubkey = chat_pubkey
+        session.active = true
+        s.store(SESSION_PREFIX + caller.to_string(), session)
+    } else {
+        let session: Session = Session {
+            chat_pubkey: chat_pubkey,
+            registered_at: get_current_topoheight(),
+            active: true
+        }
+        s.store(SESSION_PREFIX + caller.to_string(), session)
+    }
+    return 0
+}
+entry create_group(group_pubkey: Hash) -> u64 {
+    when_not_paused()
+    require(group_pubkey != Hash::zero(), "badpubkey")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let id: u64 = s.load(GROUPS_COUNT_KEY).unwrap_or(0)
+    let group: Group = Group {
+        id: id,
+        creator: caller,
+        group_pubkey: group_pubkey,
+        created_at: get_current_topoheight(),
+        active: true
+    }
+    s.store(GROUP_PREFIX + id.to_string(10u32), group)
+    s.store(GROUP_MEMBERS_COUNT_PREFIX + id.to_string(10u32), 0u64)
+    s.store(GROUPS_COUNT_KEY, id + 1)
+    return id
+}
+entry add_group_member(group_id: u64, member: Address, encrypted_group_key: bytes) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    require(group.creator == caller, "notcreator")
+    require(group.active, "ginactive")
+    let member_session: Session = s.load(SESSION_PREFIX + member.to_string()).expect("nosession")
+    require(member_session.active, "minactive")
+    let key: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(key, encrypted_group_key)
+    let count_key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    s.store(count_key, count + 1)
+    return 0
+}
+entry remove_group_member(group_id: u64, member: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    require(group.creator == caller, "notcreator")
+    let key: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.delete(key)
+    let count_key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    if count > 0 {
+        s.store(count_key, count - 1)
+    }
+    return 0
+}
+entry anchor_messages(merkle_root: Hash, message_count: u64, msg_type: u8) -> u64 {
+    only_authorized_relayer()
+    require(merkle_root != Hash::zero(), "badroot")
+    require(message_count > 0, "badcount")
+    let s: Storage = Storage::new()
+    s.store(LAST_MERKLE_ROOT_KEY, merkle_root)
+    s.store(LAST_ANCHOR_TOPO_KEY, get_current_topoheight())
+    let total: u64 = s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    s.store(TOTAL_MESSAGES_KEY, total + message_count)
+    return 0
+}
+entry revoke_session(user: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let session_opt: optional = s.load(SESSION_PREFIX + user.to_string())
+    require(session_opt.is_some(), "nosession")
+    let mut session: Session = session_opt.unwrap()
+    session.active = false
+    s.store(SESSION_PREFIX + user.to_string(), session)
+    return 0
+}
+pub fn get_session(user: Address) -> (Hash, u64, bool) {
+    let s: Storage = Storage::new()
+    let session_opt: optional = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return (Hash::zero(), 0, false)
+    }
+    let session: Session = session_opt.unwrap()
+    return (session.chat_pubkey, session.registered_at, session.active)
+}
+pub fn get_group(group_id: u64) -> (Hash, Address, u64, bool) {
+    let s: Storage = Storage::new()
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    return (group.group_pubkey, group.creator, group.created_at, group.active)
+}
+pub fn get_group_member_key(group_id: u64, member: Address) -> bytes {
+    let key: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    let s: Storage = Storage::new()
+    let opt: optional = s.load(key)
+    if opt.is_none() {
+        return bytes::new()
+    }
+    return opt.unwrap()
+}
+pub fn is_session_active(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    let session_opt: optional = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return false
+    }
+    let session: Session = session_opt.unwrap()
+    return session.active
+}
+pub fn get_last_anchor() -> (Hash, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(LAST_MERKLE_ROOT_KEY).unwrap_or(Hash::zero()),
+        s.load(LAST_ANCHOR_TOPO_KEY).unwrap_or(0),
+        s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    )
+}
+pub fn get_groups_count() -> u64 {
+    return Storage::new().load(GROUPS_COUNT_KEY).unwrap_or(0)
+}
+pub fn get_group_members_count(group_id: u64) -> u64 {
+    let key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(0)
+}
+entry set_relayer(addr: Address, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store(RELAYER_PREFIX + addr.to_string(), enabled)
+    return 0
+}
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+entry get_version() -> string {
+    return VERSION
+}

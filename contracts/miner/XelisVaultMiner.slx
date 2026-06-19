@@ -1,0 +1,596 @@
+const VERSION: string = "XelisVaultMiner v4.2"
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+const TREASURY_KEY: string = "tr"
+const MIN_STAKE_KEY: string = "ms"
+const HEARTBEAT_INTERVAL_KEY: string = "hi"
+const HEARTBEAT_TIMEOUT_KEY: string = "ht"
+const SERVICE_PREFIX: string = "svc_"
+const MINERS_COUNT_KEY: string = "mc"
+const MINER_PREFIX: string = "miner_"
+const MINER_LIST_PREFIX: string = "ml_"
+const SERVICE_MINERS_PREFIX: string = "sm_"
+const TOTAL_STAKED_KEY: string = "ts"
+const REP_MAX: u64 = 10000
+const REP_GAIN_PRICE: u64 = 1
+const REP_GAIN_ANCHOR: u64 = 5
+const REP_GAIN_HEARTBEAT: u64 = 1
+const REP_LOSS_OUTLIER: u64 = 50
+const REP_LOSS_OFFLINE: u64 = 200
+const REP_LOSS_DATA_LOSS: u64 = 500
+const REP_LOSS_CENSORSHIP: u64 = 1000
+const REP_LOSS_MALICIOUS: u64 = 5000
+struct Miner {
+    addr: Address,
+    endpoint_url: string,
+    miner_pubkey: Hash,
+    stake: u64,
+    services_mask: u8,
+    registered_at: u64,
+    last_heartbeat: u64,
+    total_rewards_earned: u64,
+    total_slashed: u64,
+    active: bool
+}
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(MINERS_COUNT_KEY, 0u64)
+    s.store(TOTAL_STAKED_KEY, 0u64)
+    s.store(MIN_STAKE_KEY, DEFAULT_MIN_STAKE)
+    s.store(HEARTBEAT_INTERVAL_KEY, DEFAULT_HEARTBEAT_INTERVAL)
+    s.store(HEARTBEAT_TIMEOUT_KEY, DEFAULT_HEARTBEAT_TIMEOUT)
+    s.store(TOTAL_BUDGET_KEY, DEFAULT_TOTAL_BUDGET)
+    s.store(DISTRIBUTED_KEY, 0u64)
+    s.store(LAUNCH_TOPO_KEY, get_current_topoheight())
+    s.store(TARGET_DURATION_BLOCKS_KEY, DEFAULT_TARGET_DURATION)
+    s.store(BUDGET_FACTOR_KEY, DEFAULT_BUDGET_FACTOR)
+    s.store(LAST_BUDGET_ADJUST_KEY, get_current_topoheight())
+    s.store(BUDGET_ADJUST_INTERVAL_KEY, DEFAULT_BUDGET_ADJUST_INTERVAL)
+    s.store(BASE_REWARD_ORACLE_KEY, DEFAULT_BASE_REWARD_ORACLE)
+    s.store(BASE_REWARD_CHAT_KEY, DEFAULT_BASE_REWARD_CHAT)
+    return 0
+}
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g { return }
+    only_admin()
+}
+fn only_authorized_service() {
+    let s: Storage = Storage::new()
+    let cc_opt: optional = get_contract_caller()
+    require(cc_opt.is_some(), "noservice")
+    let cc: Hash = cc_opt.unwrap()
+    let service_id: u8 = s.load(SERVICE_PREFIX + cc.to_string()).unwrap_or(0)
+    require(service_id > 0, "notauth")
+}
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+fn get_reputation_multiplier(rep: u64) -> u64 {
+    if rep >= REP_EXCELLENT {
+    }
+    if rep >= REP_GOOD {
+    }
+    if rep >= REP_WARNING {
+    }
+    if rep >= REP_CRITICAL {
+    }
+}
+fn add_reputation(addr: Address, points: u64) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return }
+    let mut miner: Miner = miner_opt.unwrap()
+    miner.reputation += points
+    if miner.reputation > REP_MAX {
+        miner.reputation = REP_MAX
+    }
+    if miner.reputation >= REP_CRITICAL && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
+        miner.active = true
+    }
+    s.store(MINER_PREFIX + addr.to_string(), miner)
+}
+fn remove_reputation(addr: Address, points: u64) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return }
+    let mut miner: Miner = miner_opt.unwrap()
+    if miner.reputation > points {
+        miner.reputation -= points
+    } else {
+        miner.reputation = 0
+    }
+    miner.last_infraction_topo = get_current_topoheight()
+    if miner.reputation < REP_CRITICAL {
+        miner.active = false
+    }
+    s.store(MINER_PREFIX + addr.to_string(), miner)
+}
+fn get_dynamic_reward(base_reward: u64, miner_addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.unwrap()
+    let rep_mult: u64 = get_reputation_multiplier(miner.reputation)
+    let budget_factor: u64 = s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR)
+    let reward: u64 = (base_reward as u128 * rep_mult as u128 * budget_factor as u128 / 100000000u128) as u64
+    return reward
+}
+fn maybe_adjust_budget() {
+    let s: Storage = Storage::new()
+    let last_adjust: u64 = s.load(LAST_BUDGET_ADJUST_KEY).unwrap_or(0)
+    let interval: u64 = s.load(BUDGET_ADJUST_INTERVAL_KEY).unwrap_or(DEFAULT_BUDGET_ADJUST_INTERVAL)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo < last_adjust + interval {
+        return
+    }
+    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    let remaining_budget: u64 = if total_budget > distributed { total_budget - distributed } else { 0 }
+    let launch_topo: u64 = s.load(LAUNCH_TOPO_KEY).unwrap_or(current_topo)
+    let elapsed: u64 = if current_topo > launch_topo { current_topo - launch_topo } else { 1 }
+    let target_duration: u64 = s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
+    let remaining_time: u64 = if target_duration > elapsed { target_duration - elapsed } else { 1 }
+    let target_rate: u64 = (remaining_budget as u128 / remaining_time as u128) as u64
+    let actual_rate: u64 = (distributed as u128 / elapsed as u128) as u64
+    let current_factor: u64 = s.load(BUDGET_FACTOR_KEY).unwrapOr(DEFAULT_BUDGET_FACTOR)
+    let new_factor: u64 = if actual_rate > target_rate {
+        if actual_rate > 0 {
+            let ratio: u64 = (target_rate as u128 * 10000u128 / actual_rate as u128) as u64
+            (current_factor + ratio) / 2
+        } else {
+            current_factor
+        }
+    } else if actual_rate < target_rate / 2 {
+        if actual_rate > 0 {
+            let ratio: u64 = (target_rate as u128 * 10000u128 / actual_rate as u128) as u64
+            (current_factor + ratio) / 2
+        } else {
+        }
+    } else {
+        current_factor
+    }
+    let clamped: u64 = if new_factor < 5000 { 5000 } else if new_factor > 20000 { 20000 } else { new_factor }
+    s.store(BUDGET_FACTOR_KEY, clamped)
+    s.store(LAST_BUDGET_ADJUST_KEY, current_topo)
+}
+entry register_miner(endpoint_url: string, miner_pubkey: Hash, services_mask: u8) -> u64 {
+    when_not_paused()
+    require(endpoint_url != "", "badurl")
+    require(miner_pubkey != Hash::zero(), "badpubkey")
+    require(services_mask > 0, "noservices")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let existing: optional = s.load(MINER_PREFIX + caller.to_string())
+    require(existing.is_none(), "already")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("nodep")
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    require(dep >= min_stake, "insstake")
+    if dep > min_stake {
+        let _ = transfer(caller, dep - min_stake, vlt_asset)
+    }
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    let miner: Miner = Miner {
+        addr: caller,
+        endpoint_url: endpoint_url,
+        miner_pubkey: miner_pubkey,
+        stake: min_stake,
+        services_mask: services_mask,
+        registered_at: get_current_topoheight(),
+        last_heartbeat: get_current_topoheight(),
+        total_rewards_earned: 0,
+        total_slashed: 0,
+        valid_submissions: 0,
+        successful_anchors: 0,
+        total_submissions: 0,
+        last_infraction_topo: 0,
+        active: true
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    s.store(MINER_LIST_PREFIX + count.to_string(10u32), caller)
+    s.store(MINERS_COUNT_KEY, count + 1)
+    if services_mask & 1 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
+        s.store(SERVICE_MINERS_PREFIX + "1", c + 1)
+    }
+    if services_mask & 2 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
+        s.store(SERVICE_MINERS_PREFIX + "2", c + 1)
+    }
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total + min_stake)
+    return 0
+}
+entry enable_service(service_id: u8) -> u64 {
+    when_not_paused()
+    require(service_id >= 1 && service_id <= 8, "badservice")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    let bit: u8 = 1 << (service_id - 1)
+    require(miner.services_mask & bit == 0, "alreadyon")
+    miner.services_mask = miner.services_mask | bit
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string()).unwrap_or(0)
+    s.store(SERVICE_MINERS_PREFIX + service_id.to_string(), c + 1)
+    return 0
+}
+entry disable_service(service_id: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    let bit: u8 = 1 << (service_id - 1)
+    require(miner.services_mask & bit != 0, "alreadyoff")
+    miner.services_mask = miner.services_mask & (255 - bit)
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string()).unwrap_or(0)
+    if c > 0 { s.store(SERVICE_MINERS_PREFIX + service_id.to_string(), c - 1) }
+    return 0
+}
+entry increase_stake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("nodep")
+    require(dep >= amount, "insdep")
+    if dep > amount { let _ = transfer(caller, dep - amount, vlt_asset) }
+    miner.stake += amount
+    if !miner.active && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
+        miner.active = true
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total + amount)
+    return 0
+}
+entry decrease_stake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    require(miner.stake >= amount, "insstake")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
+    let _ = transfer(caller, amount, vlt_asset)
+    miner.stake -= amount
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    if miner.stake < min_stake { miner.active = false }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total >= amount { s.store(TOTAL_STAKED_KEY, total - amount) }
+    return 0
+}
+entry deregister_miner() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
+    let _ = transfer(caller, miner.stake, vlt_asset)
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total >= miner.stake { s.store(TOTAL_STAKED_KEY, total - miner.stake) }
+    if miner.services_mask & 1 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
+        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "1", c - 1) }
+    }
+    if miner.services_mask & 2 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
+        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "2", c - 1) }
+    }
+    s.delete(MINER_PREFIX + caller.to_string())
+    return 0
+}
+entry submit_heartbeat() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let mut miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("notminer")
+    require(miner.active, "inactive")
+    let current_topo: u64 = get_current_topoheight()
+    let interval: u64 = s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+    require(current_topo >= miner.last_heartbeat + interval, "toosoon")
+    miner.last_heartbeat = current_topo
+    if current_topo > miner.last_infraction_topo + 1000 {
+        if miner.reputation < REP_MAX {
+            miner.reputation += REP_GAIN_HEARTBEAT
+            if miner.reputation > REP_MAX {
+                miner.reputation = REP_MAX
+            }
+        }
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    maybe_adjust_budget()
+    return 0
+}
+pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 {
+    only_authorized_service()
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let mut miner: Miner = miner_opt.unwrap()
+    let slash_bps: u64
+    let rep_loss: u64
+    if severity == 0 {
+        rep_loss = REP_LOSS_OUTLIER
+    } else if severity == 1 {
+        rep_loss = REP_LOSS_OFFLINE
+    } else if severity == 2 {
+        rep_loss = REP_LOSS_DATA_LOSS
+    } else if severity == 3 {
+        rep_loss = REP_LOSS_CENSORSHIP
+    } else {
+        rep_loss = REP_LOSS_MALICIOUS
+    }
+    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    if slash_amount > 0 {
+        let actual_slash: u64 = if slash_amount > miner.stake { miner.stake } else { slash_amount }
+        miner.stake -= actual_slash
+        miner.total_slashed += actual_slash
+        let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+        if miner.stake < min_stake { miner.active = false }
+    }
+    if miner.reputation > rep_loss {
+        miner.reputation -= rep_loss
+    } else {
+        miner.reputation = 0
+    }
+    miner.last_infraction_topo = get_current_topoheight()
+    if miner.reputation < REP_CRITICAL {
+        miner.active = false
+    }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total >= slash_amount { s.store(TOTAL_STAKED_KEY, total - slash_amount) }
+    let burn_amount: u64 = slash_amount / 2
+    let reporter_reward: u64 = slash_amount / 10
+    let treasury_amount: u64 = slash_amount - burn_amount - reporter_reward
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
+    if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
+    if reporter_reward > 0 { let _ = transfer(reporter, reporter_reward, vlt_asset) }
+    if treasury_amount > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+        let _ = transfer(treasury, treasury_amount, vlt_asset)
+    }
+    return slash_amount
+}
+pub fn distribute_reward(miner_addr: Address, service_id: u8, is_valid: bool) -> u64 {
+    only_authorized_service()
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let mut miner: Miner = miner_opt.unwrap()
+    if !miner.active { return 0 }
+    miner.total_submissions += 1
+    if !is_valid {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+    let base_reward: u64 = if service_id == 1 {
+        s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE)
+    } else if service_id == 2 {
+        s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT)
+    } else {
+        0
+    }
+    if base_reward == 0 { return 0 }
+    let reward: u64 = get_dynamic_reward(base_reward, miner_addr)
+    if reward == 0 {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+    if distributed + reward > total_budget {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("vcnoset")
+    let vlt: Contract = Contract::new(vlt_hash).expect("vcnf")
+    let _ = vlt.call(0u16, [miner_addr, reward], {})
+    miner.total_rewards_earned += reward
+    miner.valid_submissions += 1
+    if service_id == 2 {
+        miner.successful_anchors += 1
+    }
+    let rep_gain: u64 = if service_id == 1 { REP_GAIN_PRICE } else { REP_GAIN_ANCHOR }
+    if miner.reputation < REP_MAX {
+        miner.reputation += rep_gain
+        if miner.reputation > REP_MAX {
+            miner.reputation = REP_MAX
+        }
+    }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    s.store(DISTRIBUTED_KEY, distributed + reward)
+    maybe_adjust_budget()
+    return reward
+}
+pub fn is_miner_active(addr: Address, service_id: u8) -> bool {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return false }
+    let miner: Miner = miner_opt.unwrap()
+    if !miner.active { return false }
+    if miner.reputation < REP_CRITICAL { return false }
+    let bit: u8 = 1 << (service_id - 1)
+    return miner.services_mask & bit != 0
+}
+pub fn get_miner_stake(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.unwrap()
+    return miner.stake
+}
+pub fn get_miner_reputation(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.unwrap()
+    return miner.reputation
+}
+pub fn get_reputation_tier(rep: u64) -> u8 {
+    if rep >= REP_EXCELLENT { return 4 }
+    if rep >= REP_GOOD { return 3 }
+    if rep >= REP_WARNING { return 2 }
+    if rep >= REP_CRITICAL { return 1 }
+    return 0
+}
+pub fn get_miner(addr: Address) -> (string, Hash, u64, u8, u64, u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return ("", Hash::zero(), 0, 0, 0, 0, 0, 0, 0, 0, false) }
+    let miner: Miner = miner_opt.unwrap()
+    return (
+        miner.endpoint_url,
+        miner.miner_pubkey,
+        miner.stake,
+        miner.services_mask,
+        miner.reputation,
+        miner.valid_submissions,
+        miner.successful_anchors,
+        miner.total_submissions,
+        miner.total_rewards_earned,
+        miner.total_slashed,
+        miner.active
+    )
+}
+pub fn get_miners_count() -> u64 { return Storage::new().load(MINERS_COUNT_KEY).unwrap_or(0) }
+pub fn get_miner_at(index: u64) -> Address {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    require(index < count, "oob")
+    return s.load(MINER_LIST_PREFIX + index.to_string(10u32)).expect("mlnf")
+}
+pub fn get_total_staked() -> u64 { return Storage::new().load(TOTAL_STAKED_KEY).unwrap_or(0) }
+pub fn get_active_miners_count() -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    let mut active: u64 = 0
+    let i: u64 = 0
+    while i < count {
+        let addr: Address = s.load(MINER_LIST_PREFIX + i.to_string(10u32)).expect("mlnf")
+        let miner: Miner = s.load(MINER_PREFIX + addr.to_string()).expect("notminer")
+        if miner.active { active += 1 }
+        i += 1
+    }
+    return active
+}
+pub fn get_active_miners_for_service(service_id: u8) -> u64 {
+    return Storage::new().load(SERVICE_MINERS_PREFIX + service_id.to_string()).unwrap_or(0)
+}
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE),
+        s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL),
+        s.load(HEARTBEAT_TIMEOUT_KEY).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
+        s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE),
+        s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT),
+        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
+        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
+        s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    )
+}
+pub fn get_budget_info() -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
+        s.load(DISTRIBUTED_KEY).unwrap_or(0),
+        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
+        s.load(LAUNCH_TOPO_KEY).unwrap_or(0),
+        s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
+    )
+}
+pub fn is_authorized_service(contract_hash: Hash) -> bool {
+    let service_id: u8 = Storage::new().load(SERVICE_PREFIX + contract_hash.to_string()).unwrap_or(0)
+    return service_id > 0
+}
+entry register_service(service_id: u8, contract_hash: Hash) -> u64 {
+    only_admin()
+    require(service_id >= 1 && service_id <= 8, "badservice")
+    Storage::new().store(SERVICE_PREFIX + contract_hash.to_string(), service_id)
+    return 0
+}
+entry unregister_service(contract_hash: Hash) -> u64 {
+    only_admin()
+    Storage::new().delete(SERVICE_PREFIX + contract_hash.to_string())
+    return 0
+}
+entry set_min_stake(amount: u64) -> u64 {
+    only_admin()
+    Storage::new().store(MIN_STAKE_KEY, amount)
+    return 0
+}
+entry set_heartbeat_interval(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 10 && blocks <= 1000, "badval")
+    Storage::new().store(HEARTBEAT_INTERVAL_KEY, blocks)
+    return 0
+}
+entry set_heartbeat_timeout(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 100 && blocks <= 10000, "badval")
+    Storage::new().store(HEARTBEAT_TIMEOUT_KEY, blocks)
+    return 0
+}
+entry set_base_reward_oracle(amount: u64) -> u64 {
+    only_admin()
+    require(amount <= 1000000000, "badval")
+    Storage::new().store(BASE_REWARD_ORACLE_KEY, amount)
+    return 0
+}
+entry set_base_reward_chat(amount: u64) -> u64 {
+    only_admin()
+    require(amount <= 1000000000, "badval")
+    Storage::new().store(BASE_REWARD_CHAT_KEY, amount)
+    return 0
+}
+entry set_total_budget(amount: u64) -> u64 {
+    only_admin()
+    Storage::new().store(TOTAL_BUDGET_KEY, amount)
+    return 0
+}
+entry set_target_duration(blocks: u64) -> u64 {
+    only_admin()
+    Storage::new().store(TARGET_DURATION_BLOCKS_KEY, blocks)
+    return 0
+}
+entry set_vlt_contract(vc: Hash) -> u64 { only_admin() Storage::new().store(VLT_CONTRACT_KEY, vc) return 0 }
+entry set_vlt_asset(va: Hash) -> u64 { only_admin() Storage::new().store(VLT_ASSET_KEY, va) return 0 }
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+entry set_emergency(e: Address) -> u64 { let s: Storage = Storage::new() let caller: Address = get_caller().expect("nocaller") let current: Address = s.load(EMERGENCY_KEY).expect("easet") require(caller == current, "notemg") s.store(EMERGENCY_KEY, e) return 0 }
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+entry get_version() -> string { return VERSION }
