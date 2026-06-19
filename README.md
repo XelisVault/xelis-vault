@@ -6,7 +6,6 @@ Deposit XEL, borrow xUSD, trade on **VaultSwap** (custom AMM with PSM), tokenize
 
 [![XELIS](https://img.shields.io/badge/XELIS-BlockDAG-8B5CF6)](https://xelis.io)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
-[![Testnet](https://img.shields.io/badge/Testnet-Deployed-blue)](https://testnet-explorer.xelis.io/)
 [![Version](https://img.shields.io/badge/Version-v4.3-orange)](CHANGELOG.md)
 
 ---
