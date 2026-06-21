@@ -6,15 +6,15 @@ const REGISTRY_KEY: string = "reg"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     require(caller == admin, "notauth")
 }
 
@@ -26,9 +26,7 @@ pub fn on_flash_loan(
     data: bytes
 ) -> u64 {
     let s: Storage = Storage::new()
-    let flash_loan_hash: Hash = s.load(FLASH_LOAN_KEY).expect("flnoset")
-
-
+    let flash_loan_hash: Hash = s.load(FLASH_LOAN_KEY).unwrap()
 
     let total_repay: u64 = amount + fee
     require(total_repay >= amount, "ovf")
@@ -36,19 +34,18 @@ pub fn on_flash_loan(
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
     require(bal >= total_repay, "insrepay")
 
-    let fl: Contract = Contract::new(flash_loan_hash).expect("flnf")
+    let fl: Contract = Contract::new(flash_loan_hash).unwrap()
     let _ = fl.call(1u16, [total_repay], { asset: total_repay })
-
 
     return 0
 }
 
 entry claim_profit(asset: Hash) -> u64 {
     only_admin()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
     require(bal > 0, "noprofit")
-    let _ = transfer(caller, bal, asset)
+    transfer(caller, bal, asset)
     return 0
 }
 

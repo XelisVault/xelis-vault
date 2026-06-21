@@ -1,4 +1,3 @@
-
 const VERSION: string = "Timelock v4.2"
 
 const ADMIN_KEY: string = "a"
@@ -30,7 +29,7 @@ struct Proposal {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -43,14 +42,14 @@ hook constructor() -> u64 {
 
 fn only_admin_or_governor() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
 
-    let gov_opt: optional = s.load(GOVERNOR_KEY)
+    let gov_opt: optional<Hash> = s.load(GOVERNOR_KEY)
     if gov_opt.is_some() {
         let gov: Hash = gov_opt.unwrap()
-        let cc_opt: optional = get_contract_caller()
+        let cc_opt: optional<Hash> = get_contract_caller()
         if cc_opt.is_some() {
             let cc: Hash = cc_opt.unwrap()
             if cc == gov { return }
@@ -61,15 +60,15 @@ fn only_admin_or_governor() {
 
 fn only_guardian() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let caller: Address = get_caller().unwrap()
+    let g: Address = s.load(GUARDIAN_KEY).unwrap()
     require(caller == g, "notguard")
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     require(caller == admin, "notauth")
 }
 
@@ -105,7 +104,7 @@ entry submit_proposal(
 
 entry execute_proposal(proposal_id: u64) -> u64 {
     let s: Storage = Storage::new()
-    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     require(!proposal.executed, "executed")
     require(!proposal.cancelled, "cancelled")
 
@@ -115,8 +114,8 @@ entry execute_proposal(proposal_id: u64) -> u64 {
     proposal.executed = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
 
-    let target: Contract = Contract::new(proposal.target_contract).expect("tnf")
-    let _ = target.call(proposal.entry_id, [], proposal.params)
+    let target: Contract = Contract::new(proposal.target_contract).unwrap()
+    let _ = target.call(proposal.entry_id, [proposal.params], {})
 
     return 0
 }
@@ -124,7 +123,7 @@ entry execute_proposal(proposal_id: u64) -> u64 {
 entry cancel_proposal(proposal_id: u64) -> u64 {
     only_admin_or_governor()
     let s: Storage = Storage::new()
-    let mut proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     require(!proposal.executed, "executed")
     proposal.cancelled = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
@@ -185,15 +184,15 @@ entry set_guardian(g: Address) -> u64 {
 
 entry set_emergency(e: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let current: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == current, "notemg")
     s.store(EMERGENCY_KEY, e)
     return 0
 }
 
 pub fn get_proposal(proposal_id: u64) -> (Hash, u16, u64, u64, bool, bool, bool) {
-    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     return (p.target_contract, p.entry_id, p.submitted_at, p.delay, p.executed, p.cancelled, p.is_emergency)
 }
 

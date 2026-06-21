@@ -22,7 +22,7 @@ struct Employee {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(EMPLOYEES_COUNT_KEY, 0u64)
@@ -31,13 +31,13 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
@@ -59,7 +59,7 @@ entry add_employee(
     require(end_topo > start_topo, "baddates")
 
     let s: Storage = Storage::new()
-    let existing: optional = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    let existing: optional<Employee> = s.load(EMPLOYEE_PREFIX + addr.to_string())
     require(existing.is_none(), "exists")
 
     let employee: Employee = Employee {
@@ -81,7 +81,7 @@ entry update_employee(addr: Address, rate_per_block: u64, end_topo: u64) -> u64 
     when_not_paused()
     only_admin()
     let s: Storage = Storage::new()
-    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("enotfound")
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).unwrap()
     require(employee.active, "inactive")
     require(rate_per_block > 0, "badrate")
     require(end_topo > employee.start_topo, "baddate")
@@ -95,7 +95,7 @@ entry update_employee(addr: Address, rate_per_block: u64, end_topo: u64) -> u64 
 entry remove_employee(addr: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
-    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("enotfound")
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).unwrap()
     employee.active = false
     employee.end_topo = get_current_topoheight()
     s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
@@ -105,25 +105,40 @@ entry remove_employee(addr: Address) -> u64 {
 entry claim() -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut employee: Employee = s.load(EMPLOYEE_PREFIX + caller.to_string()).expect("enotfound")
+    let caller: Address = get_caller().unwrap()
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + caller.to_string()).unwrap()
     require(employee.active, "inactive")
 
     let current_topo: u64 = get_current_topoheight()
     let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + caller.to_string()).unwrap_or(employee.start_topo)
 
-    let start: u64 = if last_claim > employee.start_topo { last_claim } else { employee.start_topo }
-    let end: u64 = if current_topo < employee.end_topo { current_topo } else { employee.end_topo }
+    let start: u64 = 0
+    if last_claim > employee.start_topo {
+        start = last_claim
+    } else {
+        start = employee.start_topo
+    }
+    let end: u64 = 0
+    if current_topo < employee.end_topo {
+        end = current_topo
+    } else {
+        end = employee.end_topo
+    }
     require(end > start, "nothing")
 
     let blocks_elapsed: u64 = end - start
     let amount_due: u64 = (blocks_elapsed as u128 * employee.rate_per_block as u128) as u64
 
     let bal: u64 = get_balance_for_asset(employee.asset).unwrap_or(0)
-    let actual: u64 = if amount_due > bal { bal } else { amount_due }
+    let actual: u64 = 0
+    if amount_due > bal {
+        actual = bal
+    } else {
+        actual = amount_due
+    }
     require(actual > 0, "nofunds")
 
-    let _ = transfer(caller, actual, employee.asset)
+    transfer(caller, actual, employee.asset)
 
     s.store(LAST_CLAIM_PREFIX + caller.to_string(), end)
     employee.total_paid += actual
@@ -134,7 +149,7 @@ entry claim() -> u64 {
 
 pub fn get_pending(addr: Address) -> u64 {
     let s: Storage = Storage::new()
-    let employee_opt: optional = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    let employee_opt: optional<Employee> = s.load(EMPLOYEE_PREFIX + addr.to_string())
     if employee_opt.is_none() {
         return 0
     }
@@ -144,8 +159,18 @@ pub fn get_pending(addr: Address) -> u64 {
     }
     let current_topo: u64 = get_current_topoheight()
     let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + addr.to_string()).unwrap_or(employee.start_topo)
-    let start: u64 = if last_claim > employee.start_topo { last_claim } else { employee.start_topo }
-    let end: u64 = if current_topo < employee.end_topo { current_topo } else { employee.end_topo }
+    let start: u64 = 0
+    if last_claim > employee.start_topo {
+        start = last_claim
+    } else {
+        start = employee.start_topo
+    }
+    let end: u64 = 0
+    if current_topo < employee.end_topo {
+        end = current_topo
+    } else {
+        end = employee.end_topo
+    }
     if end <= start {
         return 0
     }
@@ -201,11 +226,11 @@ entry transfer_admin(new_admin: Address) -> u64 {
 
 entry deposit_funds(asset: Hash, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
-    let caller: Address = get_caller().expect("nocaller")
-    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    let caller: Address = get_caller().unwrap()
+    let dep: u64 = get_deposit_for_asset(asset).unwrap()
     require(dep >= amount, "insdep")
     if dep > amount {
-        let _ = transfer(caller, dep - amount, asset)
+        transfer(caller, dep - amount, asset)
     }
     return 0
 }

@@ -1,4 +1,3 @@
-
 const VERSION: string = "xUSD v4.2"
 
 const ADMIN_KEY: string = "a"
@@ -13,9 +12,46 @@ const BURNER_PREFIX: string = "bu_"
 const DECIMALS: u8 = 8
 const MAX_SUPPLY: u64 = 18446744073709551615
 
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.unwrap()
+    let cc: Hash = get_contract_caller().unwrap()
+    require(cc == tl, "notauth")
+}
+fn require_minter() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    if caller == admin {
+        return
+    }
+    let cc_opt: optional<Hash> = get_contract_caller()
+    if cc_opt.is_some() {
+        let cc: Hash = cc_opt.unwrap()
+        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_minter, "notminter")
+        return
+    }
+    require(false, "notminter")
+}
+fn require_burner() {
+    let s: Storage = Storage::new()
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notburner")
+    let cc: Hash = cc_opt.unwrap()
+    let is_burner: bool = s.load(BURNER_PREFIX + cc.to_hex()).unwrap_or(false)
+    require(is_burner, "notburner")
+}
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
     return 0
@@ -24,7 +60,7 @@ hook constructor() -> u64 {
 entry create_asset() -> u64 {
     only_admin()
     let s: Storage = Storage::new()
-    let existing: optional = s.load(ASSET_HASH_KEY)
+    let existing: optional<Hash> = s.load(ASSET_HASH_KEY)
     require(existing.is_none(), "exists")
 
     let asset: Asset = Asset::create(
@@ -33,7 +69,7 @@ entry create_asset() -> u64 {
         "xUSD",
         DECIMALS,
         MaxSupplyMode::None
-    ).expect("crefail")
+    ).unwrap()
     let hash: Hash = asset.get_hash()
     s.store(ASSET_HASH_KEY, hash)
     return 0
@@ -44,8 +80,8 @@ pub fn mint_tokens(to: Address, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let asset: Asset = Asset::get_by_hash(hash).expect("anf")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let asset: Asset = Asset::get_by_hash(hash).unwrap()
 
     let ok: bool = asset.mint(amount)
     require(ok, "mintfail")
@@ -61,8 +97,8 @@ pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 
     require(total >= amount, "ovf")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let asset: Asset = Asset::get_by_hash(hash).expect("anf")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let asset: Asset = Asset::get_by_hash(hash).unwrap()
 
     let ok: bool = asset.mint(total)
     require(ok, "mintfail")
@@ -83,7 +119,7 @@ pub fn burn_tokens(amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
 
     let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
     require(bal >= amount, "lowbal")
@@ -95,13 +131,13 @@ pub fn burn_tokens(amount: u64) -> u64 {
 
 entry transfer_tokens(to: Address, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     require(to != caller, "selfxfer")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
 
-    let dep: optional = get_deposit_for_asset(hash)
+    let dep: optional<u64> = get_deposit_for_asset(hash)
     require(dep.is_some() && dep.unwrap() >= amount, "nodep")
 
     let ok: bool = transfer(to, amount, hash)
@@ -115,71 +151,34 @@ entry transfer_tokens(to: Address, amount: u64) -> u64 {
 }
 
 pub fn get_asset_hash() -> Hash {
-    return Storage::new().load(ASSET_HASH_KEY).expect("anset")
+    return Storage::new().load(ASSET_HASH_KEY).unwrap()
 }
 
 pub fn get_asset_info() -> (string, string, u64, u8) {
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let asset: Asset = Asset::get_by_hash(hash).expect("anf")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let asset: Asset = Asset::get_by_hash(hash).unwrap()
     return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
 }
 
 pub fn get_balance(addr: Address) -> u64 {
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
     return get_balance_for_asset(hash).unwrap_or(0)
 }
 
-fn only_admin() {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
-    if caller == admin {
-        return
-    }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
-    require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
-    require(cc == tl, "notauth")
-}
 
-fn require_minter() {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
-    if caller == admin {
-        return
-    }
-    let cc_opt: optional = get_contract_caller()
-    if cc_opt.is_some() {
-        let cc: Hash = cc_opt.unwrap()
-        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_string()).unwrap_or(false)
-        require(is_minter, "notminter")
-        return
-    }
-    require(false, "notminter")
-}
 
-fn require_burner() {
-    let s: Storage = Storage::new()
-    let cc_opt: optional = get_contract_caller()
-    require(cc_opt.is_some(), "notburner")
-    let cc: Hash = cc_opt.unwrap()
-    let is_burner: bool = s.load(BURNER_PREFIX + cc.to_string()).unwrap_or(false)
-    require(is_burner, "notburner")
-}
 
 entry set_minter(contract_hash: Hash, enabled: bool) -> u64 {
     only_admin()
-    Storage::new().store(MINTER_PREFIX + contract_hash.to_string(), enabled)
+    Storage::new().store(MINTER_PREFIX + contract_hash.to_hex(), enabled)
     return 0
 }
 
 entry set_burner(contract_hash: Hash, enabled: bool) -> u64 {
     only_admin()
-    Storage::new().store(BURNER_PREFIX + contract_hash.to_string(), enabled)
+    Storage::new().store(BURNER_PREFIX + contract_hash.to_hex(), enabled)
     return 0
 }
 
@@ -209,8 +208,8 @@ entry transfer_admin(new_admin: Address) -> u64 {
 
 entry set_emergency(e: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let current: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == current, "notemg")
     s.store(EMERGENCY_KEY, e)
     return 0
@@ -218,14 +217,14 @@ entry set_emergency(e: Address) -> u64 {
 
 entry emergency_withdraw() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let e: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == e, "notemg")
     let xel_bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
     if xel_bal > 0 {
         let _ = transfer(caller, xel_bal, Hash::zero())
     }
-    let xusd_hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
+    let xusd_hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
     let xusd_bal: u64 = get_balance_for_asset(xusd_hash).unwrap_or(0)
     if xusd_bal > 0 {
         let _ = transfer(caller, xusd_bal, xusd_hash)

@@ -15,7 +15,7 @@ const TOTAL_MINTED_KEY: string = "tm"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ISSUER_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(TOTAL_MINTED_KEY, 0u64)
@@ -24,8 +24,8 @@ hook constructor() -> u64 {
 
 fn only_issuer() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let issuer: Address = s.load(ISSUER_KEY).expect("inset")
+    let caller: Address = get_caller().unwrap()
+    let issuer: Address = s.load(ISSUER_KEY).unwrap()
     require(caller == issuer, "notissuer")
 }
 
@@ -42,7 +42,7 @@ entry create_asset(
 ) -> u64 {
     only_issuer()
     let s: Storage = Storage::new()
-    let existing: optional = s.load(ASSET_HASH_KEY)
+    let existing: optional<Hash> = s.load(ASSET_HASH_KEY)
     require(existing.is_none(), "exists")
     require(name != "" && ticker != "", "emptyname")
     require(decimals >= 0 && decimals <= 18, "baddec")
@@ -54,7 +54,7 @@ entry create_asset(
         ticker,
         decimals,
         MaxSupplyMode::None
-    ).expect("crefail")
+    ).unwrap()
     let hash: Hash = asset.get_hash()
     s.store(ASSET_HASH_KEY, hash)
     s.store(ASSET_NAME_KEY, name)
@@ -70,11 +70,11 @@ entry mint(to: Address, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let asset: Asset = Asset::get_by_hash(hash).expect("anf")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let asset: Asset = Asset::get_by_hash(hash).unwrap()
 
     let current_supply: u64 = asset.get_supply()
-    let max_supply: u64 = s.load(ASSET_MAX_SUPPLY_KEY).expect("amsset")
+    let max_supply: u64 = s.load(ASSET_MAX_SUPPLY_KEY).unwrap()
     require(current_supply + amount <= max_supply, "supmax")
 
     let ok: bool = asset.mint(amount)
@@ -87,35 +87,35 @@ entry mint(to: Address, amount: u64) -> u64 {
     return 0
 }
 
-entry burn(amount: u64) -> u64 {
-    only_issuer()
+// entry burn(amount: u64) -> u64 {
+//     only_issuer()
+//     when_not_paused()
+//     require(amount > 0, "amtgt0")
+// 
+//     let s: Storage = Storage::new()
+//     let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+//     let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+//     require(bal >= amount, "insbal")
+// 
+//     let ok: bool = burn(amount, hash)
+//     require(ok, "burnfail")
+//     return 0
+// }
+
+entry transfer_asset(to: Address, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
-
-    let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
-    require(bal >= amount, "insbal")
-
-    let ok: bool = burn(amount, hash)
-    require(ok, "burnfail")
-    return 0
-}
-
-entry transfer(to: Address, amount: u64) -> u64 {
-    when_not_paused()
-    require(amount > 0, "amtgt0")
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     require(to != caller, "selfxfer")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let dep: optional = get_deposit_for_asset(hash)
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let dep: optional<u64> = get_deposit_for_asset(hash)
     require(dep.is_some() && dep.unwrap() >= amount, "nodep")
 
-    let compliance_opt: optional = s.load(COMPLIANCE_KEY)
+    let compliance_opt: optional<Hash> = s.load(COMPLIANCE_KEY)
     if compliance_opt.is_some() {
-        let compliance: Contract = Contract::new(compliance_opt.unwrap()).expect("cmnf")
+        let compliance: Contract = Contract::new(compliance_opt.unwrap()).unwrap()
         let allowed: bool = compliance.call(0u16, [caller, to, hash, amount], {})
         require(allowed, "notallowed")
     }
@@ -124,7 +124,7 @@ entry transfer(to: Address, amount: u64) -> u64 {
     require(ok, "txfail")
 
     if dep.unwrap() > amount {
-        let _ = transfer(caller, dep.unwrap() - amount, hash)
+        transfer(caller, dep.unwrap() - amount, hash)
     }
     return 0
 }
@@ -153,13 +153,13 @@ pub fn get_asset_info() -> (string, string, u8, u64, u64) {
 }
 
 pub fn get_asset_hash() -> Hash {
-    return Storage::new().load(ASSET_HASH_KEY).expect("anset")
+    return Storage::new().load(ASSET_HASH_KEY).unwrap()
 }
 
 pub fn get_total_supply() -> u64 {
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).expect("anset")
-    let asset: Asset = Asset::get_by_hash(hash).expect("anf")
+    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let asset: Asset = Asset::get_by_hash(hash).unwrap()
     return asset.get_supply()
 }
 
@@ -181,12 +181,12 @@ entry set_timelock(tl: Hash) -> u64 {
     return 0
 }
 
-entry transfer_issuer(new_issuer: Address) -> u64 {
-    only_issuer()
-    Storage::new().store(ISSUER_KEY, new_issuer)
-    return 0
-}
-
+// entry transfer_issuer(new_issuer: Address) -> u64 {
+    // only_issuer()
+    // Storage::new().store(ISSUER_KEY, new_issuer)
+    // return 0
+    // }
+    // 
 entry get_version() -> string {
     return VERSION
 }

@@ -16,7 +16,7 @@ const PROTOCOL_FEE_BPS: u64 = 10
 struct Offer {
     id: u64,
     lender: Address,
-    borrower: optional,
+    borrower: optional<Address>,
     asset_lent: Hash,
     amount: u64,
     interest_bps: u64,
@@ -33,7 +33,7 @@ struct Offer {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -44,20 +44,20 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let caller: Address = get_caller().unwrap()
+    let g: Address = s.load(GUARDIAN_KEY).unwrap()
     if caller == g { return }
     only_admin()
 }
@@ -66,9 +66,6 @@ fn when_not_paused() {
     let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
     require(!paused, "paused")
 }
-
-
-
 
 entry create_offer(
     asset_lent: Hash,
@@ -85,13 +82,12 @@ entry create_offer(
     require(duration_blocks >= 1440 && duration_blocks <= 525960, "baddur")
 
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
 
-
-    let dep: u64 = get_deposit_for_asset(asset_lent).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(asset_lent).unwrap()
     require(dep >= amount, "insdep")
     if dep > amount {
-        let _ = transfer(caller, dep - amount, asset_lent)
+        transfer(caller, dep - amount, asset_lent)
     }
 
     let id: u64 = s.load(OFFERS_COUNT_KEY).unwrap_or(0)
@@ -117,52 +113,40 @@ entry create_offer(
     return id
 }
 
-
-
-
 entry cancel_offer(offer_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("onf")
+    let caller: Address = get_caller().unwrap()
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).unwrap()
     require(offer.lender == caller, "notlender")
     require(offer.status == 0, "notopen")
 
-
-    let _ = transfer(offer.lender, offer.amount, offer.asset_lent)
+    transfer(offer.lender, offer.amount, offer.asset_lent)
 
     offer.status = 4
     s.store(OFFER_PREFIX + offer_id.to_string(10u32), offer)
     return 0
 }
 
-
-
-
 entry accept_offer(offer_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("onf")
+    let caller: Address = get_caller().unwrap()
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).unwrap()
     require(offer.status == 0, "notopen")
     require(offer.lender != caller, "selfaccept")
 
-
-    let dep: u64 = get_deposit_for_asset(offer.collateral_asset).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(offer.collateral_asset).unwrap()
     require(dep >= offer.collateral_amount, "insdep")
     if dep > offer.collateral_amount {
-        let _ = transfer(caller, dep - offer.collateral_amount, offer.collateral_asset)
+        transfer(caller, dep - offer.collateral_amount, offer.collateral_asset)
     }
 
-
-    let _ = transfer(caller, offer.amount, offer.asset_lent)
-
+    transfer(caller, offer.amount, offer.asset_lent)
 
     let fee: u64 = (offer.amount as u128 * PROTOCOL_FEE_BPS as u128 / 10000u128) as u64
     if fee > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
-
-
+        let treasury: Address = s.load(TREASURY_KEY).unwrap()
 
     }
 
@@ -174,41 +158,33 @@ entry accept_offer(offer_id: u64) -> u64 {
     return 0
 }
 
-
-
-
 entry repay(offer_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("onf")
+    let caller: Address = get_caller().unwrap()
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).unwrap()
     require(offer.status == 1, "notaccepted")
     require(offer.borrower.unwrap() == caller, "notborrower")
-
 
     let interest: u64 = (offer.amount as u128 * offer.interest_bps as u128 / 10000u128) as u64
     let total_repay: u64 = offer.amount + interest
     require(total_repay >= offer.amount, "ovf")
 
-
-    let dep: u64 = get_deposit_for_asset(offer.asset_lent).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(offer.asset_lent).unwrap()
     require(dep >= total_repay, "insdep")
     if dep > total_repay {
-        let _ = transfer(caller, dep - total_repay, offer.asset_lent)
+        transfer(caller, dep - total_repay, offer.asset_lent)
     }
 
+    transfer(offer.lender, total_repay, offer.asset_lent)
 
-    let _ = transfer(offer.lender, total_repay, offer.asset_lent)
-
-
-    let _ = transfer(caller, offer.collateral_amount, offer.collateral_asset)
-
+    transfer(caller, offer.collateral_amount, offer.collateral_asset)
 
     let fee: u64 = (offer.amount as u128 * PROTOCOL_FEE_BPS as u128 / 10000u128) as u64
     if fee > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+        let treasury: Address = s.load(TREASURY_KEY).unwrap()
         let treasury_asset: Hash = offer.asset_lent
-        let _ = transfer(treasury, fee, treasury_asset)
+        transfer(treasury, fee, treasury_asset)
     }
 
     offer.repaid = true
@@ -217,24 +193,19 @@ entry repay(offer_id: u64) -> u64 {
     return 0
 }
 
-
-
-
 entry claim_collateral(offer_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("onf")
+    let caller: Address = get_caller().unwrap()
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).unwrap()
     require(offer.status == 1, "notaccepted")
     require(offer.lender == caller, "notlender")
     require(!offer.repaid, "alreadyrepaid")
 
-
     let current_topo: u64 = get_current_topoheight()
     require(current_topo > offer.due_at, "notdue")
 
-
-    let _ = transfer(caller, offer.collateral_amount, offer.collateral_asset)
+    transfer(caller, offer.collateral_amount, offer.collateral_asset)
 
     offer.claimed = true
     offer.status = 3
@@ -242,11 +213,8 @@ entry claim_collateral(offer_id: u64) -> u64 {
     return 0
 }
 
-
-
-
-pub fn get_offer(offer_id: u64) -> (Address, optional, Hash, u64, u64, u64, Hash, u64, u64, u64, u8) {
-    let o: Offer = Storage::new().load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("onf")
+pub fn get_offer(offer_id: u64) -> (Address, optional<Address>, Hash, u64, u64, u64, Hash, u64, u64, u64, u8) {
+    let o: Offer = Storage::new().load(OFFER_PREFIX + offer_id.to_string(10u32)).unwrap()
     return (
         o.lender,
         o.borrower,
@@ -265,9 +233,6 @@ pub fn get_offer(offer_id: u64) -> (Address, optional, Hash, u64, u64, u64, Hash
 pub fn get_offers_count() -> u64 {
     return Storage::new().load(OFFERS_COUNT_KEY).unwrap_or(0)
 }
-
-
-
 
 entry pause(reason: string) -> u64 {
     only_guardian_or_admin()
@@ -319,8 +284,8 @@ entry set_guardian(g: Address) -> u64 {
 
 entry set_emergency(e: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let current: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == current, "notemg")
     s.store(EMERGENCY_KEY, e)
     return 0

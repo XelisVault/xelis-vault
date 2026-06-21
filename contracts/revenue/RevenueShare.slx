@@ -13,7 +13,7 @@ const LAST_CLAIM_PREFIX: string = "lc_"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     return 0
@@ -21,13 +21,13 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
@@ -42,29 +42,29 @@ entry deposit_revenue(asset: Hash, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let share_token: Hash = s.load(SHARE_TOKEN_KEY).expect("stnoset")
+    let share_token: Hash = s.load(SHARE_TOKEN_KEY).unwrap()
     let total_supply: u64 = s.load(TOTAL_SUPPLY_KEY).unwrap_or(0)
     require(total_supply > 0, "noshares")
 
-    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(asset).unwrap()
     require(dep >= amount, "insdep")
     if dep > amount {
-        let caller: Address = get_caller().expect("nocaller")
-        let _ = transfer(caller, dep - amount, asset)
+        let caller: Address = get_caller().unwrap()
+        transfer(caller, dep - amount, asset)
     }
 
-    let key: string = DISTRIBUTION_PREFIX + asset.to_string()
-    let existing: optional = s.load(key)
-    let mut total_distributed: u64 = 0
-    let mut accum_per_token: u64 = 0
+    let key: string = DISTRIBUTION_PREFIX + asset.to_hex()
+    let existing: optional<Hash> = s.load(key)
+    let total_distributed: u64 = 0
+    let accum_per_token: u64 = 0
     if existing.is_some() {
-        total_distributed = s.load("td_" + asset.to_string()).unwrap_or(0)
-        accum_per_token = s.load("at_" + asset.to_string()).unwrap_or(0)
+        total_distributed = s.load("td_" + asset.to_hex()).unwrap_or(0)
+        accum_per_token = s.load("at_" + asset.to_hex()).unwrap_or(0)
     }
     let increment: u64 = (amount as u128 * 1000000000000u128 / total_supply as u128) as u64
     let new_accum: u64 = accum_per_token + increment
-    s.store("td_" + asset.to_string(), total_distributed + amount)
-    s.store("at_" + asset.to_string(), new_accum)
+    s.store("td_" + asset.to_hex(), total_distributed + amount)
+    s.store("at_" + asset.to_hex(), new_accum)
 
     return 0
 }
@@ -72,18 +72,23 @@ entry deposit_revenue(asset: Hash, amount: u64) -> u64 {
 entry claim(asset: Hash) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let share_token: Hash = s.load(SHARE_TOKEN_KEY).expect("stnoset")
+    let caller: Address = get_caller().unwrap()
+    let share_token: Hash = s.load(SHARE_TOKEN_KEY).unwrap()
 
     let shares: u64 = get_deposit_for_asset(share_token).unwrap_or(0)
     require(shares > 0, "noshares")
 
-    let _ = transfer(caller, shares, share_token)
+    transfer(caller, shares, share_token)
 
-    let accum_per_token: u64 = s.load("at_" + asset.to_string()).unwrap_or(0)
-    let last_claim_key: string = LAST_CLAIM_PREFIX + caller.to_string() + "_" + asset.to_string()
+    let accum_per_token: u64 = s.load("at_" + asset.to_hex()).unwrap_or(0)
+    let last_claim_key: string = LAST_CLAIM_PREFIX + caller.to_string() + "_" + asset.to_hex()
     let last_accum: u64 = s.load(last_claim_key).unwrap_or(0)
-    let delta: u64 = if accum_per_token > last_accum { accum_per_token - last_accum } else { 0 }
+    let delta: u64 = 0
+    if accum_per_token > last_accum {
+        delta = accum_per_token - last_accum
+    } else {
+        delta = 0
+    }
     let claimable: u64 = (shares as u128 * delta as u128 / 1000000000000u128) as u64
 
     if claimable == 0 {
@@ -91,9 +96,14 @@ entry claim(asset: Hash) -> u64 {
     }
 
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
-    let actual: u64 = if claimable > bal { bal } else { claimable }
+    let actual: u64 = 0
+    if claimable > bal {
+        actual = bal
+    } else {
+        actual = claimable
+    }
     if actual > 0 {
-        let _ = transfer(caller, actual, asset)
+        transfer(caller, actual, asset)
     }
 
     s.store(last_claim_key, accum_per_token)
@@ -105,11 +115,11 @@ pub fn get_claimable(addr: Address, asset: Hash) -> u64 {
 }
 
 pub fn get_total_distributed(asset: Hash) -> u64 {
-    return Storage::new().load("td_" + asset.to_string()).unwrap_or(0)
+    return Storage::new().load("td_" + asset.to_hex()).unwrap_or(0)
 }
 
 pub fn get_accum_per_token(asset: Hash) -> u64 {
-    return Storage::new().load("at_" + asset.to_string()).unwrap_or(0)
+    return Storage::new().load("at_" + asset.to_hex()).unwrap_or(0)
 }
 
 entry set_share_token(st: Hash) -> u64 {

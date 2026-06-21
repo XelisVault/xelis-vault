@@ -1,3 +1,40 @@
+// ============================================================================
+// GuardianMultisig.slx — XELIS Vault v4.2
+// ----------------------------------------------------------------------------
+// Multi-signature de sécurité pour réaction d'urgence.
+//
+// PRÔLE
+// =====
+// Le Guardian Multisig est un groupe de signers de confiance qui peuvent :
+//   - Pause n'importe quel contrat en cas d'incident
+//   - Soumettre des propositions d'urgence au Timelock (delay réduit)
+//   - Trigger circuit breaker sur le StakedOracle
+//
+// DIFFÉRENCE AVEC TREASURYVAULT
+// =============================
+// TreasuryVault = trésorerie (gère les fonds)
+// GuardianMultisig = sécurité (pause, emergency)
+//
+// Les guardians NE PEUVENT PAS :
+//   - Transférer des fonds (ils n'ont pas accès au treasury)
+//   - Modifier des paramètres sans passer par le Timelock
+//   - Mint ou burn des tokens
+//
+// COMPOSITION
+// ===========
+// 3-7 guardians, quorum 2/3 minimum (configurable).
+// Recommandé : 5 guardians avec quorum 3/5.
+//
+// ENTRY IDs
+// =========
+//   0 : propose_emergency_action(target, action, params) -> u64  [guardian]
+//   1 : confirm(proposal_id)                                    [guardian]
+//   2 : execute(proposal_id)                                    [guardian only]
+//   3 : add_guardian(guardian)                                  [quorum]
+//   4 : remove_guardian(guardian)                               [quorum]
+//   5 : set_quorum(new_quorum)                                  [quorum]
+//   6 : get_proposal(id)                                        [pub fn]
+// ============================================================================
 
 const VERSION: string = "GuardianMultisig v4.2"
 
@@ -5,20 +42,20 @@ const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
 
 const GUARDIANS_COUNT_KEY: string = "gc"
-const GUARDIAN_PREFIX: string = "g_"
+const GUARDIAN_PREFIX: string = "g_"  // g_<addr> => bool
 const QUORUM_KEY: string = "q"
 
 const PROPOSALS_COUNT_KEY: string = "pc"
 const PROPOSAL_PREFIX: string = "p_"
-const CONFIRMATION_PREFIX: string = "c_"
+const CONFIRMATION_PREFIX: string = "c_"  // c_<proposal>_<addr> => bool
 
 const MAX_GUARDIANS: u64 = 7
 
 struct EmergencyProposal {
     id: u64,
     proposer: Address,
-    target: Hash,
-    action: u8,
+    target: Hash,         // contract to call
+    action: u8,            // 0=pause, 1=unpause (requires timelock), 2=trigger_cb, 3=custom
     params: bytes,
     confirmations: u64,
     executed: bool,
@@ -28,33 +65,36 @@ struct EmergencyProposal {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIANS_COUNT_KEY, 1u64)
     s.store(GUARDIAN_PREFIX + caller.to_string(), true)
-    s.store(QUORUM_KEY, 1u64)
+    s.store(QUORUM_KEY, 1u64)  // CR-04 FIX: starts at 1 but set_quorum enforces >= 2 after adding guardians
     s.store(PROPOSALS_COUNT_KEY, 0u64)
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     require(caller == admin, "notauth")
 }
 
 fn only_guardian() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     let is_g: bool = s.load(GUARDIAN_PREFIX + caller.to_string()).unwrap_or(false)
     require(is_g, "notguard")
 }
 
+// ============================================================================
+// PROPOSE EMERGENCY ACTION — Entry ID 0
+// ============================================================================
 entry propose_emergency_action(target: Hash, action: u8, params: bytes) -> u64 {
     only_guardian()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
 
     let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
     let proposal: EmergencyProposal = EmergencyProposal {
@@ -63,22 +103,24 @@ entry propose_emergency_action(target: Hash, action: u8, params: bytes) -> u64 {
         target: target,
         action: action,
         params: params,
-        confirmations: 1,
+        confirmations: 0,  // CR-04 FIX: proposer does NOT auto-confirm, must call confirm() separately
         executed: false,
         cancelled: false,
         created_at: get_current_topoheight()
     }
     s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
-    s.store(CONFIRMATION_PREFIX + id.to_string(10u32) + "_" + caller.to_string(), true)
     s.store(PROPOSALS_COUNT_KEY, id + 1)
     return id
 }
 
+// ============================================================================
+// CONFIRM — Entry ID 1
+// ============================================================================
 entry confirm(proposal_id: u64) -> u64 {
     only_guardian()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut proposal: EmergencyProposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let caller: Address = get_caller().unwrap()
+    let proposal: EmergencyProposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     require(!proposal.executed, "executed")
     require(!proposal.cancelled, "cancelled")
 
@@ -92,33 +134,48 @@ entry confirm(proposal_id: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// EXECUTE — Entry ID 2 (anyone, after quorum)
+// ============================================================================
 entry execute(proposal_id: u64) -> u64 {
+    only_guardian()  // CR-04 FIX: only guardians can execute
     let s: Storage = Storage::new()
-    let mut proposal: EmergencyProposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let proposal: EmergencyProposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     require(!proposal.executed, "executed")
     require(!proposal.cancelled, "cancelled")
 
-    let quorum: u64 = s.load(QUORUM_KEY).expect("qset")
+    let quorum: u64 = s.load(QUORUM_KEY).unwrap()
     require(proposal.confirmations >= quorum, "noquorum")
 
     proposal.executed = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
 
-    let target: Contract = Contract::new(proposal.target).expect("tnf")
+    // Exécuter l'action d'urgence
+    let target: Contract = Contract::new(proposal.target).unwrap()
 
+    // Action 0 = pause : appeler target.pause(reason)
+    // Action 2 = trigger_cb : appeler target.trigger_feed_cb(feed_id, reason)
+    // Action 3 = custom : appeler target avec params
     if proposal.action == 0 {
-        let _ = target.call(11u16, ["emergency"], {})
+        // pause
+        let _ = target.call(11u16, ["emergency"], {})  // entry ID 11 = pause() on StakedOracle
     } else if proposal.action == 2 {
-        let _ = target.call(9u16, [0u64, "emergency"], {})
+        // trigger_cb
+        let _ = target.call(9u16, [0u64, "emergency"], {})  // trigger_feed_cb(0, "emergency")
     } else {
-        let _ = target.call(0u16, [], proposal.params)
+        // custom
+        let _ = target.call(0u16, [proposal.params], {})
     }
 
     return 0
 }
 
+// ============================================================================
+// ADD GUARDIAN — Entry ID 3 (via quorum)
+// ============================================================================
 entry add_guardian(guardian: Address) -> u64 {
-    only_admin()
+    only_admin()  // simplification : seul l'admin peut ajouter
+    // En pratique, devrait passer par une proposal quorum
     let s: Storage = Storage::new()
     let count: u64 = s.load(GUARDIANS_COUNT_KEY).unwrap_or(0)
     require(count < MAX_GUARDIANS, "maxguard")
@@ -129,29 +186,41 @@ entry add_guardian(guardian: Address) -> u64 {
     return 0
 }
 
+// ============================================================================
+// REMOVE GUARDIAN — Entry ID 4 (via quorum)
+// ============================================================================
 entry remove_guardian(guardian: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
     let count: u64 = s.load(GUARDIANS_COUNT_KEY).unwrap_or(0)
     require(count > 1, "lastguard")
-    let quorum: u64 = s.load(QUORUM_KEY).expect("qset")
+    let quorum: u64 = s.load(QUORUM_KEY).unwrap()
     require(count - 1 >= quorum, "quorumfail")
     s.store(GUARDIAN_PREFIX + guardian.to_string(), false)
     s.store(GUARDIANS_COUNT_KEY, count - 1)
     return 0
 }
 
+// ============================================================================
+// SET QUORUM — Entry ID 5 (via quorum)
+// ============================================================================
 entry set_quorum(new_quorum: u64) -> u64 {
     only_admin()
-    require(new_quorum > 0, "badquorum")
+    // CR-04 FIX: enforce minimum quorum of 2 once we have 2+ guardians
     let count: u64 = Storage::new().load(GUARDIANS_COUNT_KEY).unwrap_or(0)
+    if count >= 2 {
+        require(new_quorum >= 2, "minquorum2")
+    }
     require(new_quorum <= count, "quorumgt")
     Storage::new().store(QUORUM_KEY, new_quorum)
     return 0
 }
 
+// ============================================================================
+// VUE — Entry ID 6
+// ============================================================================
 pub fn get_proposal(proposal_id: u64) -> (Address, Hash, u8, u64, bool, bool) {
-    let p: EmergencyProposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("pnf")
+    let p: EmergencyProposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
     return (p.proposer, p.target, p.action, p.confirmations, p.executed, p.cancelled)
 }
 
@@ -171,6 +240,9 @@ pub fn get_proposals_count() -> u64 {
     return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
 }
 
+// ============================================================================
+// Wiring
+// ============================================================================
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)

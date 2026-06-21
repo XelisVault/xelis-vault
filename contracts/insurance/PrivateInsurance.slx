@@ -11,7 +11,7 @@ const POLICY_PREFIX: string = "p_"
 struct Policy {
     id: u64,
     insurer: Address,
-    insured: optional,
+    insured: optional<Address>,
     asset: Hash,
     coverage_amount: u64,
     premium: u64,
@@ -25,7 +25,7 @@ struct Policy {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(POLICIES_COUNT_KEY, 0u64)
@@ -34,13 +34,13 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
@@ -62,12 +62,12 @@ entry create_policy(
     require(duration_blocks >= 1440, "baddur")
 
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
 
-    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(asset).unwrap()
     require(dep >= coverage_amount, "insdep")
     if dep > coverage_amount {
-        let _ = transfer(caller, dep - coverage_amount, asset)
+        transfer(caller, dep - coverage_amount, asset)
     }
 
     let id: u64 = s.load(POLICIES_COUNT_KEY).unwrap_or(0)
@@ -93,18 +93,18 @@ entry create_policy(
 entry buy_policy(policy_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    let caller: Address = get_caller().unwrap()
+    let policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     require(policy.status == 0, "notopen")
     require(policy.insurer != caller, "selfbuy")
 
-    let dep: u64 = get_deposit_for_asset(policy.asset).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(policy.asset).unwrap()
     require(dep >= policy.premium, "insdep")
     if dep > policy.premium {
-        let _ = transfer(caller, dep - policy.premium, policy.asset)
+        transfer(caller, dep - policy.premium, policy.asset)
     }
 
-    let _ = transfer(policy.insurer, policy.premium, policy.asset)
+    transfer(policy.insurer, policy.premium, policy.asset)
 
     policy.insured = caller
     policy.activated_at = get_current_topoheight()
@@ -117,14 +117,13 @@ entry buy_policy(policy_id: u64) -> u64 {
 entry claim(policy_id: u64, evidence_hash: Hash) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    let caller: Address = get_caller().unwrap()
+    let policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     require(policy.status == 1, "notactive")
     require(policy.insured.unwrap() == caller, "notinsured")
     require(policy.trigger_hash == evidence_hash, "trigmatch")
 
-
-    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    transfer(caller, policy.coverage_amount, policy.asset)
     policy.status = 2
     s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
     return 0
@@ -132,13 +131,13 @@ entry claim(policy_id: u64, evidence_hash: Hash) -> u64 {
 
 entry approve_claim(policy_id: u64) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    let caller: Address = get_caller().unwrap()
+    let policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     require(policy.status == 1, "notactive")
     require(policy.insurer == caller, "notinsurer")
     require(policy.insured.is_some(), "noinsured")
 
-    let _ = transfer(policy.insured.unwrap(), policy.coverage_amount, policy.asset)
+    transfer(policy.insured.unwrap(), policy.coverage_amount, policy.asset)
     policy.status = 2
     s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
     return 0
@@ -147,12 +146,12 @@ entry approve_claim(policy_id: u64) -> u64 {
 entry cancel_policy(policy_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    let caller: Address = get_caller().unwrap()
+    let policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     require(policy.status == 0, "notopen")
     require(policy.insurer == caller, "notinsurer")
 
-    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    transfer(caller, policy.coverage_amount, policy.asset)
     policy.status = 4
     s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
     return 0
@@ -160,19 +159,19 @@ entry cancel_policy(policy_id: u64) -> u64 {
 
 entry expire_policy(policy_id: u64) -> u64 {
     let s: Storage = Storage::new()
-    let mut policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+    let policy: Policy = s.load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     require(policy.status == 1, "notactive")
     let current_topo: u64 = get_current_topoheight()
     require(current_topo > policy.expires_at, "notexpired")
 
-    let _ = transfer(policy.insurer, policy.coverage_amount, policy.asset)
+    transfer(policy.insurer, policy.coverage_amount, policy.asset)
     policy.status = 3
     s.store(POLICY_PREFIX + policy_id.to_string(10u32), policy)
     return 0
 }
 
-pub fn get_policy(policy_id: u64) -> (Address, optional, Hash, u64, u64, u64, u64, u8) {
-    let p: Policy = Storage::new().load(POLICY_PREFIX + policy_id.to_string(10u32)).expect("pnf")
+pub fn get_policy(policy_id: u64) -> (Address, optional<Address>, Hash, u64, u64, u64, u64, u8) {
+    let p: Policy = Storage::new().load(POLICY_PREFIX + policy_id.to_string(10u32)).unwrap()
     return (
         p.insurer, p.insured, p.asset, p.coverage_amount, p.premium,
         p.duration_blocks, p.expires_at, p.status

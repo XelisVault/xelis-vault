@@ -16,7 +16,7 @@ const DAILY_REDEEM_CAP_KEY: string = "drc"
 const DAILY_MINT_USED_KEY: string = "dmu"
 const DAILY_REDEEM_USED_KEY: string = "dru"
 const DAILY_RESET_TOPO_KEY: string = "drt"
-const XEL_ASSET: Hash = Hash::zero()
+fn get_xel_asset() -> Hash { return Hash::zero() }
 const DEFAULT_MINT_FEE_BPS: u64 = 50
 const DEFAULT_REDEEM_FEE_BPS: u64 = 10
 const DEFAULT_DAILY_MINT_CAP: u64 = 100000000000000
@@ -25,7 +25,7 @@ const DAILY_RESET_BLOCKS: u64 = 17280
 const PRICE_DECIMALS: u64 = 100000000
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -41,21 +41,21 @@ hook constructor() -> u64 {
 }
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin {
         return
     }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let caller: Address = get_caller().unwrap()
+    let g: Address = s.load(GUARDIAN_KEY).unwrap()
     if caller == g {
         return
     }
@@ -63,8 +63,8 @@ fn only_guardian_or_admin() {
 }
 fn only_emergency() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let e: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == e, "notemg")
 }
 fn when_not_paused() {
@@ -83,8 +83,8 @@ fn maybe_reset_daily() {
 }
 fn get_xel_price() -> u64 {
     let s: Storage = Storage::new()
-    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("ornoset")
-    let oracle: Contract = Contract::new(oracle_hash).expect("ornf")
+    let oracle_hash: Hash = s.load(ORACLE_KEY).unwrap()
+    let oracle: Contract = Contract::new(oracle_hash).unwrap()
     let price: u64 = oracle.call(0u16, ["XEL/USD"], {})
     require(price > 0, "noprice")
     return price
@@ -95,14 +95,14 @@ entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     require(min_xusd_out > 0, "noslippage")
     maybe_reset_daily()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     let daily_mint_used: u64 = s.load(DAILY_MINT_USED_KEY).unwrap_or(0)
     let daily_mint_cap: u64 = s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP)
     require(daily_mint_used + xel_amount <= daily_mint_cap, "dailycap")
-    let dep: u64 = get_deposit_for_asset(XEL_ASSET).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(get_xel_asset()).unwrap()
     require(dep >= xel_amount, "insdep")
     if dep > xel_amount {
-        let _ = transfer(caller, dep - xel_amount, XEL_ASSET)
+        transfer(caller, dep - xel_amount, get_xel_asset())
     }
     let price: u64 = get_xel_price()
     let gross_xusd: u64 = (xel_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
@@ -110,9 +110,9 @@ entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     let fee: u64 = (gross_xusd as u128 * mint_fee_bps as u128 / 10000u128) as u64
     let net_xusd: u64 = gross_xusd - fee
     require(net_xusd >= min_xusd_out, "slippage")
-    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcnoset")
-    let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
-    let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).unwrap()
+    let xusd: Contract = Contract::new(xusd_hash).unwrap()
+    let treasury: Address = s.load(TREASURY_KEY).unwrap()
     let _ = xusd.call(2u16, [caller, net_xusd, treasury, fee], {})
     s.store(DAILY_MINT_USED_KEY, daily_mint_used + xel_amount)
     return 0
@@ -123,7 +123,7 @@ entry redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
     require(min_xel_out > 0, "noslippage")
     maybe_reset_daily()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     let daily_redeem_used: u64 = s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0)
     let daily_redeem_cap: u64 = s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
     require(daily_redeem_used + xusd_amount <= daily_redeem_cap, "dailycap")
@@ -133,24 +133,24 @@ entry redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
     let fee_xel: u64 = (gross_xel as u128 * redeem_fee_bps as u128 / 10000u128) as u64
     let net_xel: u64 = gross_xel - fee_xel
     require(net_xel >= min_xel_out, "slippage")
-    let xel_balance: u64 = get_balance_for_asset(XEL_ASSET).unwrap_or(0)
+    let xel_balance: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
     require(xel_balance >= net_xel, "insreserve")
-    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("xcnoset")
-    let xusd: Contract = Contract::new(xusd_hash).expect("xcnf")
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).unwrap()
+    let xusd: Contract = Contract::new(xusd_hash).unwrap()
     let _ = xusd.call(3u16, [xusd_amount], {})
-    let ok: bool = transfer(caller, net_xel, XEL_ASSET)
+    let ok: bool = transfer(caller, net_xel, get_xel_asset())
     require(ok, "txfail")
     if fee_xel > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
-        let _ = transfer(treasury, fee_xel, XEL_ASSET)
+        let treasury: Address = s.load(TREASURY_KEY).unwrap()
+        transfer(treasury, fee_xel, get_xel_asset())
     }
     s.store(DAILY_REDEEM_USED_KEY, daily_redeem_used + xusd_amount)
     return 0
 }
 pub fn get_reserves() -> (u64, u64) {
     let s: Storage = Storage::new()
-    let xel_reserve: u64 = get_balance_for_asset(XEL_ASSET).unwrap_or(0)
-    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("xanoset")
+    let xel_reserve: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).unwrap()
     let xusd_balance: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
     return (xel_reserve, xusd_balance)
 }
@@ -202,17 +202,17 @@ entry unpause() -> u64 {
 entry emergency_withdraw() -> u64 {
     only_emergency()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let xel_bal: u64 = get_balance_for_asset(XEL_ASSET).unwrap_or(0)
+    let caller: Address = get_caller().unwrap()
+    let xel_bal: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
     if xel_bal > 0 {
-        let _ = transfer(caller, xel_bal, XEL_ASSET)
+        transfer(caller, xel_bal, get_xel_asset())
     }
-    let xusd_asset_opt: optional = s.load(XUSD_ASSET_KEY)
+    let xusd_asset_opt: optional<Hash> = s.load(XUSD_ASSET_KEY)
     if xusd_asset_opt.is_some() {
         let xusd_asset: Hash = xusd_asset_opt.unwrap()
         let xusd_bal: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
         if xusd_bal > 0 {
-            let _ = transfer(caller, xusd_bal, xusd_asset)
+            transfer(caller, xusd_bal, xusd_asset)
         }
     }
     return 0

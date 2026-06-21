@@ -20,7 +20,7 @@ struct Auction {
     min_bid: u64,
     commit_end: u64,
     reveal_end: u64,
-    winning_bidder: optional,
+    winning_bidder: optional<Address>,
     winning_bid: u64,
     settled: bool,
     claimed_asset: bool,
@@ -29,7 +29,7 @@ struct Auction {
 }
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -39,19 +39,19 @@ hook constructor() -> u64 {
 }
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let caller: Address = get_caller().unwrap()
+    let g: Address = s.load(GUARDIAN_KEY).unwrap()
     if caller == g { return }
     only_admin()
 }
@@ -73,11 +73,11 @@ entry create_auction(
     require(commit_duration >= 1440 && commit_duration <= 43200, "badcdur")
     require(reveal_duration >= 1440 && reveal_duration <= 43200, "badrdur")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let dep: u64 = get_deposit_for_asset(asset).expect("nodep")
+    let caller: Address = get_caller().unwrap()
+    let dep: u64 = get_deposit_for_asset(asset).unwrap()
     require(dep >= amount, "insdep")
     if dep > amount {
-        let _ = transfer(caller, dep - amount, asset)
+        transfer(caller, dep - amount, asset)
     }
     let current_topo: u64 = get_current_topoheight()
     let id: u64 = s.load(AUCTIONS_COUNT_KEY).unwrap_or(0)
@@ -104,12 +104,12 @@ entry create_auction(
 entry commit(auction_id: u64, bid_hash: Hash) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let caller: Address = get_caller().unwrap()
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     let current_topo: u64 = get_current_topoheight()
     require(current_topo <= auction.commit_end, "commitend")
     let key: string = COMMIT_PREFIX + auction_id.to_string(10u32) + "_" + caller.to_string()
-    let existing: optional = s.load(key)
+    let existing: optional<Hash> = s.load(key)
     require(existing.is_none(), "alreadycommitted")
     s.store(key, bid_hash)
     return 0
@@ -117,21 +117,21 @@ entry commit(auction_id: u64, bid_hash: Hash) -> u64 {
 entry reveal(auction_id: u64, bid_amount: u64, nonce: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let caller: Address = get_caller().unwrap()
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     let current_topo: u64 = get_current_topoheight()
     require(current_topo > auction.commit_end, "notreveal")
     require(current_topo <= auction.reveal_end, "revealend")
     require(bid_amount >= auction.min_bid, "lowbid")
     let commit_key: string = COMMIT_PREFIX + auction_id.to_string(10u32) + "_" + caller.to_string()
-    let committed_hash: Hash = s.load(commit_key).expect("nocommit")
+    let committed_hash: Hash = s.load(commit_key).unwrap()
     let reveal_data: string = bid_amount.to_string(10u32) + "_" + nonce.to_string(10u32) + "_" + caller.to_string()
     let computed_hash: Hash = Hash::blake3(reveal_data.to_bytes())
     require(computed_hash == committed_hash, "hashmismatch")
-    let dep: u64 = get_deposit_for_asset(auction.bid_asset).expect("nodep")
+    let dep: u64 = get_deposit_for_asset(auction.bid_asset).unwrap()
     require(dep >= bid_amount, "insdep")
     if dep > bid_amount {
-        let _ = transfer(caller, dep - bid_amount, auction.bid_asset)
+        transfer(caller, dep - bid_amount, auction.bid_asset)
     }
     let reveal_key: string = REVEAL_PREFIX + auction_id.to_string(10u32) + "_" + caller.to_string()
     s.store(reveal_key, bid_amount)
@@ -140,7 +140,7 @@ entry reveal(auction_id: u64, bid_amount: u64, nonce: u64) -> u64 {
 entry settle(auction_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let mut auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     require(!auction.settled, "alreadys ettled")
     let current_topo: u64 = get_current_topoheight()
     require(current_topo > auction.reveal_end, "notended")
@@ -151,7 +151,7 @@ entry settle(auction_id: u64) -> u64 {
 entry declare_winner(auction_id: u64, winner: Address, winning_bid: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let mut auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     require(!auction.settled, "alreadys ettled")
     let current_topo: u64 = get_current_topoheight()
     require(current_topo > auction.reveal_end, "notended")
@@ -167,13 +167,13 @@ entry declare_winner(auction_id: u64, winner: Address, winning_bid: u64) -> u64 
 entry claim_asset(auction_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let caller: Address = get_caller().unwrap()
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     require(auction.settled, "notsettled")
     require(auction.winning_bidder.is_some(), "nowinner")
     require(auction.winning_bidder.unwrap() == caller, "notwinner")
     require(!auction.claimed_asset, "alreadyclaimed")
-    let _ = transfer(caller, auction.amount, auction.asset)
+    transfer(caller, auction.amount, auction.asset)
     auction.claimed_asset = true
     s.store(AUCTION_PREFIX + auction_id.to_string(10u32), auction)
     return 0
@@ -181,24 +181,24 @@ entry claim_asset(auction_id: u64) -> u64 {
 entry claim_proceeds(auction_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+    let caller: Address = get_caller().unwrap()
+    let auction: Auction = s.load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     require(auction.settled, "notsettled")
     require(auction.seller == caller, "notseller")
     require(!auction.claimed_proceeds, "alreadyclaimed")
     let fee: u64 = (auction.winning_bid as u128 * PROTOCOL_FEE_BPS as u128 / 10000u128) as u64
     let proceeds: u64 = auction.winning_bid - fee
-    let _ = transfer(caller, proceeds, auction.bid_asset)
+    transfer(caller, proceeds, auction.bid_asset)
     if fee > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
-        let _ = transfer(treasury, fee, auction.bid_asset)
+        let treasury: Address = s.load(TREASURY_KEY).unwrap()
+        transfer(treasury, fee, auction.bid_asset)
     }
     auction.claimed_proceeds = true
     s.store(AUCTION_PREFIX + auction_id.to_string(10u32), auction)
     return 0
 }
-pub fn get_auction(auction_id: u64) -> (Address, Hash, u64, Hash, u64, u64, u64, optional, u64, bool) {
-    let a: Auction = Storage::new().load(AUCTION_PREFIX + auction_id.to_string(10u32)).expect("anf")
+pub fn get_auction(auction_id: u64) -> (Address, Hash, u64, Hash, u64, u64, u64, optional<Address>, u64, bool) {
+    let a: Auction = Storage::new().load(AUCTION_PREFIX + auction_id.to_string(10u32)).unwrap()
     return (
         a.seller, a.asset, a.amount, a.bid_asset, a.min_bid,
         a.commit_end, a.reveal_end, a.winning_bidder, a.winning_bid, a.settled
@@ -244,8 +244,8 @@ entry set_guardian(g: Address) -> u64 {
 }
 entry set_emergency(e: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
+    let caller: Address = get_caller().unwrap()
+    let current: Address = s.load(EMERGENCY_KEY).unwrap()
     require(caller == current, "notemg")
     s.store(EMERGENCY_KEY, e)
     return 0

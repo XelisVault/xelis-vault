@@ -14,7 +14,7 @@ const COMPLIANT_PREFIX: string = "co_"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(VERIFIERS_COUNT_KEY, 0u64)
@@ -24,26 +24,26 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
 fn only_verifier() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     let is_verifier: bool = s.load(VERIFIER_PREFIX + caller.to_string()).unwrap_or(false)
     require(is_verifier, "notverifier")
 }
 
 pub fn check_transfer(from: Address, to: Address, asset: Hash, amount: u64) -> bool {
     let s: Storage = Storage::new()
-    let required: bool = s.load(ASSET_COMPLIANCE_PREFIX + asset.to_string()).unwrap_or(false)
+    let required: bool = s.load(ASSET_COMPLIANCE_PREFIX + asset.to_hex()).unwrap_or(false)
     if !required {
         return true
     }
@@ -95,7 +95,7 @@ entry remove_verifier(verifier: Address) -> u64 {
 
 entry set_compliance_required(asset: Hash, required: bool) -> u64 {
     only_admin()
-    Storage::new().store(ASSET_COMPLIANCE_PREFIX + asset.to_string(), required)
+    Storage::new().store(ASSET_COMPLIANCE_PREFIX + asset.to_hex(), required)
     return 0
 }
 

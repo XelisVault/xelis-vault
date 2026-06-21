@@ -1,3 +1,33 @@
+// ============================================================================
+// GovernanceVault.slx — XELIS Vault v4.2
+// ----------------------------------------------------------------------------
+// Staking VLT pour le voting power + rewards.
+//
+// PRINCIPE
+// =========
+// Les holders VLT stake leurs tokens ici pour :
+//   - Obtenir du voting power (1 VLT = 1 vote, boosté x2 si locked > 90 jours)
+//   - Earn des rewards (en VLT, distribué par le protocole)
+//
+// Le voting power est utilisé par OracleGovernance et autres contrats de
+// gouvernance pour déterminer le poids des votes.
+//
+// ADAPTATION v4.2
+// ===============
+// - Compatible avec VLTToken v4.2
+// - Rewards distribués depuis le treasury du protocole
+// - Lock boost configurable
+//
+// ENTRY IDs
+// =========
+//   0 : stake(amount, lock_days)            [staker]
+//   1 : unstake(stake_id)                   [staker]
+//   2 : claim_rewards()                     [staker]
+//   3 : get_voting_power(addr) -> u64       [pub fn]
+//   4 : get_stake(stake_id)                 [pub fn]
+//   5 : get_total_staked() -> u64           [pub fn]
+//   6 : notify_reward_amount(amount)        [reward distributor]
+// ============================================================================
 
 const VERSION: string = "GovernanceVault v4.2"
 
@@ -10,9 +40,9 @@ const VLT_CONTRACT_KEY: string = "vc"
 const VLT_ASSET_KEY: string = "va"
 
 const STAKES_COUNT_KEY: string = "sc"
-const STAKE_PREFIX: string = "s_"
-const USER_STAKES_PREFIX: string = "us_"
-const USER_VP_PREFIX: string = "uvp_"
+const STAKE_PREFIX: string = "s_"   // s_<id> => StakePosition
+const USER_STAKES_PREFIX: string = "us_"  // us_<addr> => u64 (total staked)
+const USER_VP_PREFIX: string = "uvp_"     // uvp_<addr> => u64 (total voting power)
 
 const TOTAL_STAKED_KEY: string = "ts"
 const TOTAL_VP_KEY: string = "tvp"
@@ -21,11 +51,11 @@ const REWARD_RATE_KEY: string = "rr"
 const PERIOD_FINISH_KEY: string = "pf"
 const LAST_UPDATE_KEY: string = "lu"
 const REWARD_PER_TOKEN_KEY: string = "rpt"
-const USER_REWARD_PREFIX: string = "ur_"
+const USER_REWARD_PREFIX: string = "ur_"  // ur_<addr> => RewardInfo
 
 const BLOCKS_PER_DAY: u64 = 17280
-const LOCK_BOOST_MAX_BPS: u64 = 20000
-const LOCK_BOOST_DAYS: u64 = 365
+const LOCK_BOOST_MAX_BPS: u64 = 20000   // max 2x voting power
+const LOCK_BOOST_DAYS: u64 = 365        // 1 year for max boost
 
 struct StakePosition {
     id: u64,
@@ -44,26 +74,26 @@ struct RewardInfo {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(STAKES_COUNT_KEY, 0u64)
     s.store(TOTAL_STAKED_KEY, 0u64)
     s.store(TOTAL_VP_KEY, 0u64)
     s.store(LAST_UPDATE_KEY, get_current_topoheight())
-    s.store(REWARD_PER_TOKEN_KEY, 1000000000000u64)
+    s.store(REWARD_PER_TOKEN_KEY, 1000000000000u64)  // 1e12 scaling
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    let caller: Address = get_caller().unwrap()
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
     if caller == admin { return }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
     let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().expect("nocc")
+    let cc: Hash = get_contract_caller().unwrap()
     require(cc == tl, "notauth")
 }
 
@@ -72,26 +102,43 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
+// ============================================================================
+// CALC VOTING POWER — boost based on lock duration
+// ============================================================================
 fn calc_voting_power(amount: u64, lock_days: u64) -> u64 {
+    // CR-01 FIX: lock_days=0 is no longer allowed (enforced in stake()),
+    // but we keep this check for safety
     if lock_days == 0 {
-        return amount
+        return amount  // no boost, but stake() enforces min 7 days
     }
+    // boost = 1 + (lock_days / LOCK_BOOST_DAYS) * (LOCK_BOOST_MAX_BPS - 10000) / 10000
+    // Capped at LOCK_BOOST_MAX_BPS = 2x
     let boost_bps: u64 = 10000 + (lock_days * (LOCK_BOOST_MAX_BPS - 10000) / LOCK_BOOST_DAYS)
-    let capped_boost: u64 = if boost_bps > LOCK_BOOST_MAX_BPS { LOCK_BOOST_MAX_BPS } else { boost_bps }
+    let capped_boost: u64 = 0
+    if boost_bps > LOCK_BOOST_MAX_BPS {
+        capped_boost = LOCK_BOOST_MAX_BPS
+    } else {
+        capped_boost = boost_bps
+    }
     return (amount as u128 * capped_boost as u128 / 10000u128) as u64
 }
 
+// ============================================================================
+// STAKE — Entry ID 0
+// ============================================================================
 entry stake(amount: u64, lock_days: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
+    // CR-01 FIX: require minimum 7 days lock to prevent instant unstake/restake vote cycling
+    require(lock_days >= 7, "min7d")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
 
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
-    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("nodep")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
+    let dep: u64 = get_deposit_for_asset(vlt_asset).unwrap()
     require(dep >= amount, "insdep")
     if dep > amount {
-        let _ = transfer(caller, dep - amount, vlt_asset)
+        transfer(caller, dep - amount, vlt_asset)
     }
 
     let id: u64 = s.load(STAKES_COUNT_KEY).unwrap_or(0)
@@ -111,11 +158,13 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     s.store(STAKE_PREFIX + id.to_string(10u32), stake_pos)
     s.store(STAKES_COUNT_KEY, id + 1)
 
+    // Update totals
     let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
     s.store(TOTAL_STAKED_KEY, total_staked + amount)
     let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
     s.store(TOTAL_VP_KEY, total_vp + vp)
 
+    // Update user's total staked and voting power
     let user_staked: u64 = s.load(USER_STAKES_PREFIX + caller.to_string()).unwrap_or(0)
     s.store(USER_STAKES_PREFIX + caller.to_string(), user_staked + amount)
     let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
@@ -124,28 +173,33 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     return id
 }
 
+// ============================================================================
+// UNSTAKE — Entry ID 1
+// ============================================================================
 entry unstake(stake_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let mut stake_pos: StakePosition = s.load(STAKE_PREFIX + stake_id.to_string(10u32)).expect("snf")
+    let caller: Address = get_caller().unwrap()
+    let stake_pos: StakePosition = s.load(STAKE_PREFIX + stake_id.to_string(10u32)).unwrap()
     require(stake_pos.owner == caller, "notowner")
     require(!stake_pos.unstaked, "alreadyunstaked")
 
     let current_topo: u64 = get_current_topoheight()
     require(current_topo >= stake_pos.locked_until_topo, "locked")
 
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
-    let _ = transfer(caller, stake_pos.amount, vlt_asset)
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
+    transfer(caller, stake_pos.amount, vlt_asset)
 
     stake_pos.unstaked = true
     s.store(STAKE_PREFIX + stake_id.to_string(10u32), stake_pos)
 
+    // Update totals
     let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
     s.store(TOTAL_STAKED_KEY, total_staked - stake_pos.amount)
     let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
     s.store(TOTAL_VP_KEY, total_vp - stake_pos.voting_power)
 
+    // Update user totals
     let user_staked: u64 = s.load(USER_STAKES_PREFIX + caller.to_string()).unwrap_or(0)
     s.store(USER_STAKES_PREFIX + caller.to_string(), user_staked - stake_pos.amount)
     let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
@@ -154,10 +208,13 @@ entry unstake(stake_id: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// CLAIM REWARDS — Entry ID 2
+// ============================================================================
 entry claim_rewards() -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
+    let caller: Address = get_caller().unwrap()
 
     let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
     if user_vp == 0 {
@@ -166,40 +223,50 @@ entry claim_rewards() -> u64 {
 
     let current_rpt: u64 = s.load(REWARD_PER_TOKEN_KEY).unwrap_or(1000000000000u64)
     let key: string = USER_REWARD_PREFIX + caller.to_string()
-    let mut info: RewardInfo = s.load(key).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 })
+    let info: RewardInfo = s.load(key).unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 })
 
-    let delta_rpt: u64 = if current_rpt > info.reward_per_token_paid {
-        current_rpt - info.reward_per_token_paid
+    let delta_rpt: u64 = 0
+    if current_rpt > info.reward_per_token_paid {
+        delta_rpt = current_rpt - info.reward_per_token_paid
     } else {
-        0
+        delta_rpt = 0
     }
     let earned: u64 = (user_vp as u128 * delta_rpt as u128 / 1000000000000u128) as u64
-    let total_pending: u64 = info.rewards_pending + earned
-
-    if total_pending == 0 {
-        return 0
+        let total_pending: u64 = info.rewards_pending + earned
+        
+        if total_pending == 0 {
+        0
+        }
+        
+        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
+        let bal: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
+        let actual: u64 = total_pending
+        if total_pending > bal {
+            actual = bal
+        }
+        if actual > 0 {
+        transfer(caller, actual, vlt_asset)
+        }
+        
+        info.reward_per_token_paid = current_rpt
+        info.rewards_pending = total_pending - actual
+        s.store(key, info)
+        
+        return actual
     }
 
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("vanoset")
-    let bal: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
-    let actual: u64 = if total_pending > bal { bal } else { total_pending }
-    if actual > 0 {
-        let _ = transfer(caller, actual, vlt_asset)
-    }
-
-    info.reward_per_token_paid = current_rpt
-    info.rewards_pending = total_pending - actual
-    s.store(key, info)
-
-    return actual
-}
-
+// ============================================================================
+// GET VOTING POWER — Entry ID 3 (pub fn)
+// ============================================================================
 pub fn get_voting_power(addr: Address) -> u64 {
     return Storage::new().load(USER_VP_PREFIX + addr.to_string()).unwrap_or(0)
 }
 
+// ============================================================================
+// VUES — Entry IDs 4-5
+// ============================================================================
 pub fn get_stake(stake_id: u64) -> (Address, u64, u64, u64, bool) {
-    let s: StakePosition = Storage::new().load(STAKE_PREFIX + stake_id.to_string(10u32)).expect("snf")
+    let s: StakePosition = Storage::new().load(STAKE_PREFIX + stake_id.to_string(10u32)).unwrap()
     return (s.owner, s.amount, s.locked_until_topo, s.voting_power, s.unstaked)
 }
 
@@ -215,16 +282,25 @@ pub fn get_user_staked(addr: Address) -> u64 {
     return Storage::new().load(USER_STAKES_PREFIX + addr.to_string()).unwrap_or(0)
 }
 
+// ============================================================================
+// NOTIFY REWARD AMOUNT — Entry ID 6 (reward distributor)
+// ============================================================================
+// Appelé par le contrat qui distribue les rewards (ex: TreasuryVault)
+// pour notifier qu'un montant de rewards est disponible pour la période.
 entry notify_reward_amount(amount: u64) -> u64 {
     let s: Storage = Storage::new()
-    let cc: Hash = get_contract_caller().expect("nocc")
-    let admin: Address = s.load(ADMIN_KEY).expect("anset")
-    let caller: Address = get_caller().expect("nocaller")
+    let cc: Hash = get_contract_caller().unwrap()
+    // Vérifier que l'appelant est autorisé (admin ou contrat de distribution)
+    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().unwrap()
     if caller != admin {
+        // Si ce n'est pas l'admin direct, ce doit être un contrat autorisé
+        // (en pratique, on devrait avoir une liste de distributeurs autorisés)
         require(false, "notauth")
     }
     require(amount > 0, "amtgt0")
 
+    // Update reward rate
     let current_topo: u64 = get_current_topoheight()
     let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
     if total_vp > 0 {
@@ -236,6 +312,9 @@ entry notify_reward_amount(amount: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// Wiring
+// ============================================================================
 entry set_vlt_contract(vc: Hash) -> u64 {
     only_admin()
     Storage::new().store(VLT_CONTRACT_KEY, vc)
