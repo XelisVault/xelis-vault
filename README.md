@@ -267,7 +267,7 @@ The easiest way to get started — the installer does everything for you:
 
 **Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/install.py | python3
+curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/install.py -o install.py && python3 install.py
 ```
 
 **Windows (PowerShell):**
