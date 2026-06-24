@@ -1,4 +1,10 @@
-const VERSION: string = "XelisVaultMiner v4.2"
+// ============================================================================
+// StakedOracle.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Oracle décentralisé basé sur XelisVaultMiner v5.0.
+// Tous les entry IDs ont été réalignés avec XelisVaultMiner v5.0.
+// ============================================================================
+const VERSION: string = "StakedOracle v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -6,132 +12,91 @@ const GUARDIAN_KEY: string = "gd"
 const EMERGENCY_KEY: string = "ea"
 const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
-const VLT_CONTRACT_KEY: string = "vc"
-const VLT_ASSET_KEY: string = "va"
-const TREASURY_KEY: string = "tr"
+const MINER_CONTRACT_KEY: string = "mc"
 
-const MIN_STAKE_KEY: string = "ms"
-const HEARTBEAT_INTERVAL_KEY: string = "hi"
-const HEARTBEAT_TIMEOUT_KEY: string = "ht"
+const FEEDS_COUNT_KEY: string = "fc"
+const FEED_PREFIX: string = "fd_"
+const FEED_ACTIVE_PREFIX: string = "fa_"
+const FEED_NAME_PREFIX: string = "fn_"
+const FEED_AGG_PREFIX: string = "fg_"
+const FEED_CB_PAUSED_PREFIX: string = "cb_"
 
-const TOTAL_BUDGET_KEY: string = "tb"            
-const DISTRIBUTED_KEY: string = "dist"            
-const LAUNCH_TOPO_KEY: string = "lt"              
-const TARGET_DURATION_BLOCKS_KEY: string = "td"   
-const BUDGET_FACTOR_KEY: string = "bf"            
-const LAST_BUDGET_ADJUST_KEY: string = "lba"      
-const BUDGET_ADJUST_INTERVAL_KEY: string = "bai"  
+const SUB_COUNT_PREFIX: string = "sc_"
+const SUB_ENTRY_PREFIX: string = "se_"
+const SUB_PROVIDED_PREFIX: string = "sp_"
+const CYCLE_PREFIX: string = "cy_"
+const LAST_AGG_PREFIX: string = "la_"
 
-const BASE_REWARD_ORACLE_KEY: string = "bro"      
-const BASE_REWARD_CHAT_KEY: string = "brc"        
+const MAX_DEVIATION_BPS_KEY: string = "mdb"
+const CB_THRESHOLD_BPS_KEY: string = "cbt"
+const AGGREGATION_BLOCKS_KEY: string = "ab"
+const MAX_STALE_BLOCKS_KEY: string = "msb"
+const HARD_STALE_BLOCKS_KEY: string = "hsb"
 
-const SERVICE_PREFIX: string = "svc_"
+const BOOTSTRAP_MODE_KEY: string = "bsm"
+const BOOTSTRAP_MIN_PROVIDERS_KEY: string = "bsmp"
+const DEFAULT_BOOTSTRAP_MIN_PROVIDERS: u64 = 3
+const MIN_PROVIDERS_FOR_ORACLE_KEY: string = "mpo"
+const DEFAULT_MIN_PROVIDERS: u64 = 10
 
-const MINERS_COUNT_KEY: string = "mc"
-const MINER_PREFIX: string = "miner_"
-const MINER_LIST_PREFIX: string = "ml_"
-const SERVICE_MINERS_PREFIX: string = "sm_"
-const TOTAL_STAKED_KEY: string = "ts"
+const DEFAULT_MAX_DEV: u64 = 500
+const DEFAULT_CB_THRESH: u64 = 2000
+const DEFAULT_AGG_BLOCKS: u64 = 5
+const DEFAULT_MAX_STALE: u64 = 30
+const DEFAULT_HARD_STALE: u64 = 100
+const MAX_FEEDS: u64 = 32
+const MAX_SUBMISSIONS_PER_CYCLE: u64 = 256
 
-const DEFAULT_MIN_STAKE: u64 = 10000000000          
-const DEFAULT_HEARTBEAT_INTERVAL: u64 = 100          
-const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 300           
+struct Feed {
+    id: u64, name: string, asset: Hash, decimals: u8,
+    min_price: u64, max_price: u64, created_at: u64
+}
 
-const DEFAULT_TOTAL_BUDGET: u64 = 600000000000000    
-const DEFAULT_TARGET_DURATION: u64 = 63072000         
-const DEFAULT_BUDGET_FACTOR: u64 = 10000              
-const DEFAULT_BUDGET_ADJUST_INTERVAL: u64 = 2016      
+struct PriceSubmission {
+    price: u64, topo: u64, provider: Address, feed_id: u64, cycle: u64
+}
 
-const DEFAULT_BASE_REWARD_ORACLE: u64 = 47564687     
-const DEFAULT_BASE_REWARD_CHAT: u64 = 50000000        
-
-const REP_MAX: u64 = 10000
-const REP_EXCELLENT: u64 = 8000    
-const REP_GOOD: u64 = 5000         
-const REP_WARNING: u64 = 2000      
-const REP_CRITICAL: u64 = 1000     
-const REP_BANNED: u64 = 0          
-
-const REP_GAIN_PRICE: u64 = 1
-const REP_GAIN_ANCHOR: u64 = 5
-const REP_GAIN_HEARTBEAT: u64 = 1
-const REP_LOSS_OUTLIER: u64 = 50
-const REP_LOSS_OFFLINE: u64 = 200
-const REP_LOSS_DATA_LOSS: u64 = 500
-const REP_LOSS_CENSORSHIP: u64 = 1000
-const REP_LOSS_MALICIOUS: u64 = 5000
-
-struct Miner {
-    addr: Address,
-    endpoint_url: string,
-    miner_pubkey: Hash,
-    stake: u64,
-    services_mask: u8,
-    registered_at: u64,
-    last_heartbeat: u64,
-    total_rewards_earned: u64,
-    total_slashed: u64,
-    reputation: u64,              
-    valid_submissions: u64,       
-    successful_anchors: u64,      
-    total_submissions: u64,       
-    last_infraction_topo: u64,    
-    active: bool
+struct AggregatedPrice {
+    price: u64, topo: u64, deviation_bps: u64, sources_count: u64, cycle: u64
 }
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("nocaller")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
     s.store(PAUSED_KEY, false)
-    s.store(MINERS_COUNT_KEY, 0u64)
-    s.store(TOTAL_STAKED_KEY, 0u64)
-    s.store(MIN_STAKE_KEY, DEFAULT_MIN_STAKE)
-    s.store(HEARTBEAT_INTERVAL_KEY, DEFAULT_HEARTBEAT_INTERVAL)
-    s.store(HEARTBEAT_TIMEOUT_KEY, DEFAULT_HEARTBEAT_TIMEOUT)
-    
-    s.store(TOTAL_BUDGET_KEY, DEFAULT_TOTAL_BUDGET)
-    s.store(DISTRIBUTED_KEY, 0u64)
-    s.store(LAUNCH_TOPO_KEY, get_current_topoheight())
-    s.store(TARGET_DURATION_BLOCKS_KEY, DEFAULT_TARGET_DURATION)
-    s.store(BUDGET_FACTOR_KEY, DEFAULT_BUDGET_FACTOR)
-    s.store(LAST_BUDGET_ADJUST_KEY, get_current_topoheight())
-    s.store(BUDGET_ADJUST_INTERVAL_KEY, DEFAULT_BUDGET_ADJUST_INTERVAL)
-    
-    s.store(BASE_REWARD_ORACLE_KEY, DEFAULT_BASE_REWARD_ORACLE)
-    s.store(BASE_REWARD_CHAT_KEY, DEFAULT_BASE_REWARD_CHAT)
+    s.store(FEEDS_COUNT_KEY, 0u64)
+    s.store(MAX_DEVIATION_BPS_KEY, DEFAULT_MAX_DEV)
+    s.store(CB_THRESHOLD_BPS_KEY, DEFAULT_CB_THRESH)
+    s.store(AGGREGATION_BLOCKS_KEY, DEFAULT_AGG_BLOCKS)
+    s.store(MAX_STALE_BLOCKS_KEY, DEFAULT_MAX_STALE)
+    s.store(HARD_STALE_BLOCKS_KEY, DEFAULT_HARD_STALE)
+    s.store(BOOTSTRAP_MODE_KEY, true)
+    s.store(BOOTSTRAP_MIN_PROVIDERS_KEY, DEFAULT_BOOTSTRAP_MIN_PROVIDERS)
+    s.store(MIN_PROVIDERS_FOR_ORACLE_KEY, DEFAULT_MIN_PROVIDERS)
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("nocc")
     require(cc == tl, "notauth")
 }
 
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
     if caller == g { return }
     only_admin()
-}
-
-fn only_authorized_service() {
-    let s: Storage = Storage::new()
-    let cc_opt: optional<Hash> = get_contract_caller()
-    require(cc_opt.is_some(), "noservice")
-    let cc: Hash = cc_opt.unwrap()
-    let service_id: u8 = s.load(SERVICE_PREFIX + cc.to_hex()).unwrap_or(0)
-    require(service_id > 0, "notauth")
 }
 
 fn when_not_paused() {
@@ -139,639 +104,517 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
-fn get_reputation_multiplier(rep: u64) -> u64 {
-    
-    if rep >= REP_EXCELLENT {
-        return 15000  
-    }
-    if rep >= REP_GOOD {
-        return 10000  
-    }
-    if rep >= REP_WARNING {
-        return 5000   
-    }
-    if rep >= REP_CRITICAL {
-        return 2500   
-    }
-    return 0  
+fn get_miner_contract() -> Contract {
+    let s: Storage = Storage::new()
+    let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+    return Contract::new(mc_hash).expect("mcnf")
 }
 
-fn add_reputation(addr: Address, points: u64) {
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return }
-    let miner: Miner = miner_opt.unwrap()
-    miner.reputation += points
-    if miner.reputation > REP_MAX {
-        miner.reputation = REP_MAX
-    }
-    
-    if miner.reputation >= REP_CRITICAL && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
-        miner.active = true
-    }
-    s.store(MINER_PREFIX + addr.to_string(), miner)
+// ============================================================================
+// FIX #1: Updated entry IDs to match XelisVaultMiner v5.0
+// - is_miner_active_entry = ID 9
+// - distribute_reward      = ID 8
+// - slash_miner            = ID 7
+// - get_active_miners_for_service_entry = ID 12
+// ============================================================================
+fn check_miner(addr: Address) -> bool {
+    let mc: Contract = get_miner_contract()
+    let result: u64 = mc.call(9u16, [addr, 1u64], {})
+    return result == 1
 }
 
-fn remove_reputation(addr: Address, points: u64) {
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return }
-    let miner: Miner = miner_opt.unwrap()
-    if miner.reputation > points {
-        miner.reputation -= points
-    } else {
-        miner.reputation = 0
-    }
-    miner.last_infraction_topo = get_current_topoheight()
-    
-    if miner.reputation < REP_CRITICAL {
-        miner.active = false
-    }
-    s.store(MINER_PREFIX + addr.to_string(), miner)
+fn reward_miner(addr: Address, is_valid: bool) {
+    let mc: Contract = get_miner_contract()
+    let _ = mc.call(8u16, [addr, 1u64, is_valid], {})
 }
 
-fn get_dynamic_reward(base_reward: u64, miner_addr: Address) -> u64 {
+fn slash_miner(addr: Address) {
+    let mc: Contract = get_miner_contract()
     let s: Storage = Storage::new()
-
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
-    if miner_opt.is_none() { return 0 }
-    let miner: Miner = miner_opt.unwrap()
-    let rep_mult: u64 = get_reputation_multiplier(miner.reputation)
-    if rep_mult == 0 { return 0 }  
-
-    let budget_factor: u64 = s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR)
-
-    let reward: u64 = (base_reward as u128 * rep_mult as u128 * budget_factor as u128 / 100000000u128) as u64
-    return reward
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let _ = mc.call(7u16, [addr, 0u64, guardian], {})
 }
 
-fn maybe_adjust_budget() {
+fn aggregate(feed_id: u64) {
     let s: Storage = Storage::new()
-    let last_adjust: u64 = s.load(LAST_BUDGET_ADJUST_KEY).unwrap_or(0)
-    let interval: u64 = s.load(BUDGET_ADJUST_INTERVAL_KEY).unwrap_or(DEFAULT_BUDGET_ADJUST_INTERVAL)
     let current_topo: u64 = get_current_topoheight()
+    let max_stale: u64 = s.load(MAX_STALE_BLOCKS_KEY).unwrap_or(DEFAULT_MAX_STALE)
+    let cycle: u64 = s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let max_dev: u64 = s.load(MAX_DEVIATION_BPS_KEY).unwrap_or(DEFAULT_MAX_DEV)
 
-    if current_topo < last_adjust + interval {
+    let count_key: string = SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)
+    let sub_count: u64 = s.load(count_key).unwrap_or(0)
+
+    if sub_count == 0 {
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
         return
     }
 
-    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
-    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
-    let remaining_budget: u64 = 0
-    if total_budget > distributed {
-        remaining_budget = total_budget - distributed
-    } else {
-        remaining_budget = 0
+    let collected_prices: u64[] = []
+    let collected_providers: Address[] = []
+    let j: u64 = 0
+    while j < sub_count {
+        let entry_key: string = SUB_ENTRY_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + j.to_string(10u32)
+        let entry_opt: optional<PriceSubmission> = s.load(entry_key)
+        if entry_opt.is_none() { j += 1 }
+        else {
+            let entry: PriceSubmission = entry_opt.expect("err")
+            if current_topo > entry.topo && current_topo - entry.topo > max_stale {
+                j += 1
+            } else {
+                collected_prices.push(entry.price)
+                collected_providers.push(entry.provider)
+                s.delete(entry_key)
+                j += 1
+            }
+        }
+    }
+    s.delete(count_key)
+
+    let n_sub: u64 = collected_prices.len() as u64
+    if n_sub == 0 {
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+        return
     }
 
-    let launch_topo: u64 = s.load(LAUNCH_TOPO_KEY).unwrap_or(current_topo)
-    let elapsed: u64 = 0
-    if current_topo > launch_topo {
-        elapsed = current_topo - launch_topo
-    } else {
-        elapsed = 1
-    }
-    let target_duration: u64 = s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
-    let remaining_time: u64 = 0
-    if target_duration > elapsed {
-        remaining_time = target_duration - elapsed
-    } else {
-        remaining_time = 1
-    }
-
-    let target_rate: u64 = (remaining_budget as u128 / remaining_time as u128) as u64
-
-    let actual_rate: u64 = (distributed as u128 / elapsed as u128) as u64
-    let current_factor: u64 = s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR)
-    let token_count: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    let target_rate: u64 = (total_budget as u128 * 1000000u128 / token_count as u128) as u64
-    let new_factor: u64 = current_factor
-    if actual_rate > target_rate {
-        new_factor = (current_factor * target_rate / actual_rate + current_factor) / 2
-    }
-    if actual_rate < target_rate / 2 && actual_rate > 0 {
-        let ratio: u64 = (target_rate as u128 * 10000u128 / actual_rate as u128) as u64
-        new_factor = (current_factor + ratio) / 2
-    }
-    if actual_rate == 0 {
-        new_factor = current_factor * 110 / 100
-    }
-    let clamped: u64 = new_factor
-    if new_factor < 5000 {
-        clamped = 5000
-    }
-    if new_factor > 20000 {
-        clamped = 20000
-    }
-    s.store(BUDGET_FACTOR_KEY, clamped)
+    // Bubble sort
+    let a: u64 = 0
+    while a < n_sub {
+        let b: u64 = 0
+        let limit: u64 = n_sub - 1 - a
+        while b < limit {
+            let b_idx: u32 = b as u32
+            let next_idx: u32 = (b + 1) as u32
+            let current: u64 = collected_prices[b_idx]
+            let next: u64 = collected_prices[next_idx]
+            if current > next {
+                let tmp_p: u64 = collected_prices[b_idx]
+                collected_prices[b_idx] = collected_prices[next_idx]
+                collected_prices[next_idx] = tmp_p
+                let tmp_a: Address = collected_providers[b_idx]
+                collected_providers[b_idx] = collected_providers[next_idx]
+                collected_providers[next_idx] = tmp_a
+            }
+            b += 1
+        }
+        a += 1
     }
 
-
-
-
-
-
-
-entry register_miner(endpoint_url: string, miner_pubkey: Hash, services_mask: u8) -> u64 {
-    when_not_paused()
-    require(endpoint_url != "", "badurl")
-    require(miner_pubkey != Hash::zero(), "badpubkey")
-    require(services_mask > 0, "noservices")
-
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let existing: optional<Miner> = s.load(MINER_PREFIX + caller.to_string())
-    require(existing.is_none(), "already")
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-
-    let dep: u64 = get_deposit_for_asset(vlt_asset).unwrap()
-    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
-    require(dep >= min_stake, "insstake")
-    if dep > min_stake {
-        transfer(caller, dep - min_stake, vlt_asset)
+    let median_idx: u64 = (n_sub - 1) / 2
+    let median: u64 = collected_prices[median_idx as u32]
+    let min_p: u64 = collected_prices[0]
+    let last_idx: u32 = (n_sub - 1) as u32
+    let max_p: u64 = collected_prices[last_idx]
+    let deviation_bps: u64 = 0
+    if median > 0 {
+        deviation_bps = ((max_p - min_p) as u128 * 10000u128 / median as u128) as u64
     }
 
-    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
-    let miner: Miner = Miner {
-        addr: caller,
-        endpoint_url: endpoint_url,
-        miner_pubkey: miner_pubkey,
-        stake: min_stake,
-        services_mask: services_mask,
-        registered_at: get_current_topoheight(),
-        last_heartbeat: get_current_topoheight(),
-        total_rewards_earned: 0,
-        total_slashed: 0,
-        reputation: REP_MAX,  
-        valid_submissions: 0,
-        successful_anchors: 0,
-        total_submissions: 0,
-        last_infraction_topo: 0,
-        active: true
-    }
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-    s.store(MINER_LIST_PREFIX + count.to_string(10u32), caller)
-    s.store(MINERS_COUNT_KEY, count + 1)
-
-    if services_mask & 1 != 0 {
-        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
-        s.store(SERVICE_MINERS_PREFIX + "1", c + 1)
-    }
-    if services_mask & 2 != 0 {
-        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
-        s.store(SERVICE_MINERS_PREFIX + "2", c + 1)
+    // If global deviation too high -> slash all
+    if deviation_bps > max_dev {
+        let k: u64 = 0
+        while k < n_sub { slash_miner(collected_providers[k as u32]); k += 1 }
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+        return
     }
 
-    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    s.store(TOTAL_STAKED_KEY, total_staked + min_stake)
-    return 0
-}
-
-entry enable_service(service_id: u8) -> u64 {
-    when_not_paused()
-    require(service_id >= 1 && service_id <= 8, "badservice")
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    let bit: u8 = 1 << (service_id - 1)
-    require(miner.services_mask & bit == 0, "alreadyon")
-    miner.services_mask = miner.services_mask | bit
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
-    s.store(SERVICE_MINERS_PREFIX + service_id.to_string(10u32), c + 1)
-    return 0
-}
-
-entry disable_service(service_id: u8) -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    let bit: u8 = 1 << (service_id - 1)
-    require(miner.services_mask & bit != 0, "alreadyoff")
-    miner.services_mask = miner.services_mask & (255 - bit)
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
-    if c > 0 { s.store(SERVICE_MINERS_PREFIX + service_id.to_string(10u32), c - 1) }
-    return 0
-}
-
-entry increase_stake(amount: u64) -> u64 {
-    when_not_paused()
-    require(amount > 0, "amtgt0")
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-    let dep: u64 = get_deposit_for_asset(vlt_asset).unwrap()
-    require(dep >= amount, "insdep")
-    if dep > amount { transfer(caller, dep - amount, vlt_asset) }
-    miner.stake += amount
-    if !miner.active && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
-        miner.active = true
-    }
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    s.store(TOTAL_STAKED_KEY, total_staked + amount)
-    return 0
-}
-
-entry decrease_stake(amount: u64) -> u64 {
-    when_not_paused()
-    require(amount > 0, "amtgt0")
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    require(miner.stake >= amount, "insstake")
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-    transfer(caller, amount, vlt_asset)
-    miner.stake -= amount
-    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
-    if miner.stake < min_stake { miner.active = false }
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    if total_staked >= amount { s.store(TOTAL_STAKED_KEY, total_staked - amount) }
-    return 0
-}
-
-entry deregister_miner() -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-    transfer(caller, miner.stake, vlt_asset)
-    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    if total_staked >= miner.stake { s.store(TOTAL_STAKED_KEY, total_staked - miner.stake) }
-    if miner.services_mask & 1 != 0 {
-        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
-        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "1", c - 1) }
-    }
-    if miner.services_mask & 2 != 0 {
-        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
-        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "2", c - 1) }
-    }
-    s.delete(MINER_PREFIX + caller.to_string())
-    return 0
-}
-
-entry submit_heartbeat() -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).unwrap()
-    require(miner.active, "inactive")
-
-    let current_topo: u64 = get_current_topoheight()
-    let interval: u64 = s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
-    require(current_topo >= miner.last_heartbeat + interval, "toosoon")
-
-    miner.last_heartbeat = current_topo
-
-    if current_topo > miner.last_infraction_topo + 1000 {
-        if miner.reputation < REP_MAX {
-            miner.reputation += REP_GAIN_HEARTBEAT
-            if miner.reputation > REP_MAX {
-                miner.reputation = REP_MAX
+    // Circuit breaker vs previous aggregated price
+    let prev_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    if prev_opt.is_some() {
+        let prev: AggregatedPrice = prev_opt.expect("err")
+        if prev.price > 0 {
+            let diff: u64 = 0
+            if median > prev.price { diff = median - prev.price } else { diff = prev.price - median }
+            let pct_bps: u64 = (diff as u128 * 10000u128 / prev.price as u128) as u64
+            let cb_thresh: u64 = s.load(CB_THRESHOLD_BPS_KEY).unwrap_or(DEFAULT_CB_THRESH)
+            if pct_bps > cb_thresh {
+                s.store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), true)
+                return
             }
         }
     }
 
-    s.store(MINER_PREFIX + caller.to_string(), miner)
-
-    maybe_adjust_budget()
-    return 0
-}
-
-pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 {
-    only_authorized_service()
-
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
-    if miner_opt.is_none() { return 0 }
-    let miner: Miner = miner_opt.unwrap()
-
-    let slash_bps: u64 = 0
-    let rep_loss: u64 = 0
-
-    if severity == 0 {
-        
-        slash_bps = 100      
-        rep_loss = REP_LOSS_OUTLIER
-    } else if severity == 1 {
-        
-        slash_bps = 200      
-        rep_loss = REP_LOSS_OFFLINE
-    } else if severity == 2 {
-        
-        slash_bps = 500      
-        rep_loss = REP_LOSS_DATA_LOSS
-    } else if severity == 3 {
-        
-        slash_bps = 1000     
-        rep_loss = REP_LOSS_CENSORSHIP
-    } else {
-        
-        slash_bps = 5000     
-        rep_loss = REP_LOSS_MALICIOUS
-    }
-
-    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
-    if slash_amount > 0 {
-        let actual_slash: u64 = 0
-        if slash_amount > miner.stake {
-            actual_slash = miner.stake
+    // Identify valid vs outlier providers
+    let valid_providers: Address[] = []
+    let n_valid: u64 = 0
+    let k2: u64 = 0
+    while k2 < n_sub {
+        let diff: u64 = 0
+        if collected_prices[k2 as u32] > median {
+            diff = collected_prices[k2 as u32] - median
         } else {
-            actual_slash = slash_amount
+            diff = median - collected_prices[k2 as u32]
         }
-        miner.stake -= actual_slash
-        miner.total_slashed += actual_slash
-
-        let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
-        if miner.stake < min_stake { miner.active = false }
-    }
-
-    if miner.reputation > rep_loss {
-        miner.reputation -= rep_loss
-    } else {
-        miner.reputation = 0
-    }
-    miner.last_infraction_topo = get_current_topoheight()
-
-    if miner.reputation < REP_CRITICAL {
-        miner.active = false
-    }
-
-    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-
-    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    if total_staked >= slash_amount { s.store(TOTAL_STAKED_KEY, total_staked - slash_amount) }
-
-    let burn_amount: u64 = slash_amount / 2
-    let reporter_reward: u64 = slash_amount / 10
-    let treasury_amount: u64 = slash_amount - burn_amount - reporter_reward
-
-    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-    if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
-    if reporter_reward > 0 { transfer(reporter, reporter_reward, vlt_asset) }
-    if treasury_amount > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).unwrap()
-        transfer(treasury, treasury_amount, vlt_asset)
-    }
-
-    return slash_amount
-}
-
-pub fn distribute_reward(miner_addr: Address, service_id: u8, is_valid: bool) -> u64 {
-    only_authorized_service()
-
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
-    if miner_opt.is_none() { return 0 }
-    let miner: Miner = miner_opt.unwrap()
-    if !miner.active { return 0 }
-
-    miner.total_submissions += 1
-
-    if !is_valid {
-        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-        return 0
-    }
-
-    let base_reward: u64 = s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE)
-    if service_id == 2 {
-        base_reward = s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT)
-    }
-    if base_reward == 0 { return 0 }
-
-    let reward: u64 = get_dynamic_reward(base_reward, miner_addr)
-    if reward == 0 {
-        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-        return 0
-    }
-
-    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
-    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
-    if distributed + reward > total_budget {
-        
-        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-        return 0
-    }
-
-    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).unwrap()
-    let vlt: Contract = Contract::new(vlt_hash).unwrap()
-    let _ = vlt.call(0u16, [miner_addr, reward], {})
-
-    miner.total_rewards_earned += reward
-    miner.valid_submissions += 1
-    if service_id == 2 {
-        miner.successful_anchors += 1
-    }
-
-    let rep_gain: u64 = 0
-    if service_id == 1 {
-        rep_gain = REP_GAIN_PRICE
-    } else {
-        rep_gain = REP_GAIN_ANCHOR
-    }
-    if miner.reputation < REP_MAX {
-        miner.reputation += rep_gain
-        if miner.reputation > REP_MAX {
-            miner.reputation = REP_MAX
+        let pct_bps: u64 = 0
+        if median > 0 {
+            pct_bps = (diff as u128 * 10000u128 / median as u128) as u64
         }
+        if pct_bps <= max_dev {
+            valid_providers.push(collected_providers[k2 as u32])
+            n_valid += 1
+        } else {
+            slash_miner(collected_providers[k2 as u32])
+        }
+        k2 += 1
     }
 
-    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    let agg: AggregatedPrice = AggregatedPrice {
+        price: median, topo: current_topo, deviation_bps: deviation_bps,
+        sources_count: n_valid, cycle: cycle
+    }
+    s.store(FEED_AGG_PREFIX + feed_id.to_string(10u32), agg)
 
-    s.store(DISTRIBUTED_KEY, distributed + reward)
+    // Reward valid providers
+    let m: u64 = 0
+    while m < n_valid { reward_miner(valid_providers[m as u32], true); m += 1 }
 
-    maybe_adjust_budget()
-
-    return reward
+    s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+    s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
 }
 
-pub fn is_miner_active(addr: Address, service_id: u8) -> bool {
+fn maybe_aggregate(feed_id: u64) {
     let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return false }
-    let miner: Miner = miner_opt.unwrap()
-    if !miner.active { return false }
-    if miner.reputation < REP_CRITICAL { return false }
-    let bit: u8 = 1 << (service_id - 1)
-    return miner.services_mask & bit != 0
+    let last_agg: u64 = s.load(LAST_AGG_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    let agg_blocks: u64 = s.load(AGGREGATION_BLOCKS_KEY).unwrap_or(DEFAULT_AGG_BLOCKS)
+    if current_topo < last_agg + agg_blocks { return }
+    aggregate(feed_id)
 }
 
-pub fn get_miner_stake(addr: Address) -> u64 {
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: add_feed
+entry add_feed(name: string, asset: Hash, decimals: u8, min_price: u64, max_price: u64) -> u64 {
+    only_admin()
+    require(name != "", "emptyname")
+    require(max_price > min_price, "badrange")
     let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return 0 }
-    let miner: Miner = miner_opt.unwrap()
-    return miner.stake
-}
-
-pub fn get_miner_reputation(addr: Address) -> u64 {
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return 0 }
-    let miner: Miner = miner_opt.unwrap()
-    return miner.reputation
-}
-
-pub fn get_reputation_tier(rep: u64) -> u8 {
-    
-    if rep >= REP_EXCELLENT { return 4 }
-    if rep >= REP_GOOD { return 3 }
-    if rep >= REP_WARNING { return 2 }
-    if rep >= REP_CRITICAL { return 1 }
-    return 0
-}
-
-pub fn get_miner(addr: Address) -> (string, Hash, u64, u8, u64, u64, u64, u64, u64, u64, bool) {
-    let s: Storage = Storage::new()
-    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
-    if miner_opt.is_none() { return ("", Hash::zero(), 0, 0, 0, 0, 0, 0, 0, 0, false) }
-    let miner: Miner = miner_opt.unwrap()
-    return (
-        miner.endpoint_url,
-        miner.miner_pubkey,
-        miner.stake,
-        miner.services_mask,
-        miner.reputation,
-        miner.valid_submissions,
-        miner.successful_anchors,
-        miner.total_submissions,
-        miner.total_rewards_earned,
-        miner.total_slashed,
-        miner.active
-    )
-}
-
-pub fn get_miners_count() -> u64 { return Storage::new().load(MINERS_COUNT_KEY).unwrap_or(0) }
-
-pub fn get_miner_at(index: u64) -> Address {
-    let s: Storage = Storage::new()
-    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
-    require(index < count, "oob")
-    return s.load(MINER_LIST_PREFIX + index.to_string(10u32)).unwrap()
-}
-
-pub fn get_total_staked() -> u64 { return Storage::new().load(TOTAL_STAKED_KEY).unwrap_or(0) }
-
-pub fn get_active_miners_count() -> u64 {
-    let s: Storage = Storage::new()
-    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
-    let active: u64 = 0
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    require(count < MAX_FEEDS, "maxfeeds")
     let i: u64 = 0
     while i < count {
-        let addr: Address = s.load(MINER_LIST_PREFIX + i.to_string(10u32)).unwrap()
-        let miner: Miner = s.load(MINER_PREFIX + addr.to_string()).unwrap()
-        if miner.active { active += 1 }
+        let existing: string = s.load(FEED_NAME_PREFIX + i.to_string(10u32)).expect("nnf")
+        require(existing != name, "exists")
         i += 1
     }
-    return active
+    let id: u64 = count
+    let feed: Feed = Feed {
+        id: id, name: name, asset: asset, decimals: decimals,
+        min_price: min_price, max_price: max_price, created_at: get_current_topoheight()
+    }
+    s.store(FEED_PREFIX + id.to_string(10u32), feed)
+    s.store(FEED_NAME_PREFIX + id.to_string(10u32), name)
+    s.store(FEED_ACTIVE_PREFIX + id.to_string(10u32), true)
+    s.store(FEED_CB_PAUSED_PREFIX + id.to_string(10u32), false)
+    s.store(CYCLE_PREFIX + id.to_string(10u32), 0u64)
+    s.store(LAST_AGG_PREFIX + id.to_string(10u32), 0u64)
+    s.store(FEEDS_COUNT_KEY, id + 1)
+    return 0
 }
 
-pub fn get_active_miners_for_service(service_id: u8) -> u64 {
-    return Storage::new().load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
-}
-
-pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+// ID 1: update_feed
+entry update_feed(feed_id: u64, min_price: u64, max_price: u64, decimals: u8) -> u64 {
+    only_admin()
+    require(max_price > min_price, "badrange")
     let s: Storage = Storage::new()
-    return (
-        s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE),
-        s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL),
-        s.load(HEARTBEAT_TIMEOUT_KEY).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
-        s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE),
-        s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT),
-        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
-        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
-        s.load(DISTRIBUTED_KEY).unwrap_or(0)
-    )
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    feed.min_price = min_price
+    feed.max_price = max_price
+    feed.decimals = decimals
+    s.store(FEED_PREFIX + feed_id.to_string(10u32), feed)
+    return 0
 }
 
-pub fn get_budget_info() -> (u64, u64, u64, u64, u64) {
+// ID 2: set_feed_active
+entry set_feed_active(feed_id: u64, active: bool) -> u64 {
+    only_admin()
+    Storage::new().store(FEED_ACTIVE_PREFIX + feed_id.to_string(10u32), active)
+    return 0
+}
+
+// ID 3: trigger_feed_cb
+entry trigger_feed_cb(feed_id: u64, reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), true)
+    return 0
+}
+
+// ID 4: reset_feed_cb
+entry reset_feed_cb(feed_id: u64) -> u64 {
+    only_admin()
+    Storage::new().store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), false)
+    return 0
+}
+
+// ID 5: submit_price
+entry submit_price(feed_id: u64, price: u64) -> u64 {
+    when_not_paused()
     let s: Storage = Storage::new()
-    return (
-        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
-        s.load(DISTRIBUTED_KEY).unwrap_or(0),
-        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
-        s.load(LAUNCH_TOPO_KEY).unwrap_or(0),
-        s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
-    )
-}
+    let caller: Address = get_caller().expect("nocaller")
+    require(check_miner(caller), "notminer")
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    let active: bool = s.load(FEED_ACTIVE_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    require(active, "feedinactive")
+    let cb_paused: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    require(!cb_paused, "feedcb")
+    require(price > 0, "zero")
+    require(price >= feed.min_price && price <= feed.max_price, "oorange")
 
-pub fn is_authorized_service(contract_hash: Hash) -> bool {
-    let service_id: u8 = Storage::new().load(SERVICE_PREFIX + contract_hash.to_hex()).unwrap_or(0)
-    return service_id > 0
-}
+    let cycle: u64 = s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let provided_key: string = SUB_PROVIDED_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + caller.to_string()
+    require(s.load(provided_key).is_none(), "alreadysub")
 
-entry register_service(service_id: u8, contract_hash: Hash) -> u64 {
-    only_admin()
-    require(service_id >= 1 && service_id <= 8, "badservice")
-    Storage::new().store(SERVICE_PREFIX + contract_hash.to_hex(), service_id)
+    let count_key: string = SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)
+    let sub_count: u64 = s.load(count_key).unwrap_or(0)
+    require(sub_count < MAX_SUBMISSIONS_PER_CYCLE, "maxsub")
+
+    let entry_key: string = SUB_ENTRY_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + sub_count.to_string(10u32)
+    let submission: PriceSubmission = PriceSubmission {
+        price: price, topo: get_current_topoheight(),
+        provider: caller, feed_id: feed_id, cycle: cycle
+    }
+    s.store(entry_key, submission)
+    s.store(provided_key, true)
+    s.store(count_key, sub_count + 1)
+    maybe_aggregate(feed_id)
     return 0
 }
 
-entry unregister_service(contract_hash: Hash) -> u64 {
-    only_admin()
-    Storage::new().delete(SERVICE_PREFIX + contract_hash.to_hex())
+// ID 6: aggregate_now
+entry aggregate_now(feed_id: u64) -> u64 {
+    maybe_aggregate(feed_id)
     return 0
 }
 
-entry set_min_stake(amount: u64) -> u64 {
-    only_admin()
-    require(amount >= 1000000000, "badval")  
-    Storage::new().store(MIN_STAKE_KEY, amount)
+// ============================================================================
+// pub fn (read-only) — usable internally and via entry wrappers above
+// ============================================================================
+
+fn get_price_by_feed_impl(feed_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+    let cb_paused: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    require(!cb_paused, "cbpaused")
+
+    let bootstrap: bool = s.load(BOOTSTRAP_MODE_KEY).unwrap_or(true)
+    let min_providers: u64 = 0
+    if bootstrap {
+        min_providers = s.load(BOOTSTRAP_MIN_PROVIDERS_KEY).unwrap_or(DEFAULT_BOOTSTRAP_MIN_PROVIDERS)
+    } else {
+        min_providers = s.load(MIN_PROVIDERS_FOR_ORACLE_KEY).unwrap_or(DEFAULT_MIN_PROVIDERS)
+    }
+    let mc: Contract = get_miner_contract()
+    let active_count: u64 = mc.call(12u16, [1u64], {})
+    require(active_count >= min_providers, "notenoughproviders")
+
+    let agg_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    require(agg_opt.is_some(), "noprice")
+    let agg: AggregatedPrice = agg_opt.expect("err")
+    require(agg.price > 0, "zero")
+
+    let current_topo: u64 = get_current_topoheight()
+    let hard_stale: u64 = s.load(HARD_STALE_BLOCKS_KEY).unwrap_or(DEFAULT_HARD_STALE)
+    if current_topo > agg.topo {
+        require(current_topo - agg.topo <= hard_stale, "stale")
+    }
+    return agg.price
+}
+
+fn get_feed_id_impl(name: string) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let n: string = s.load(FEED_NAME_PREFIX + i.to_string(10u32)).expect("nnf")
+        if n == name { return i }
+        i += 1
+    }
+    require(false, "feednotfound")
     return 0
 }
 
-entry set_heartbeat_interval(blocks: u64) -> u64 {
-    only_admin()
-    require(blocks >= 10 && blocks <= 1000, "badval")
-    Storage::new().store(HEARTBEAT_INTERVAL_KEY, blocks)
+pub fn get_price_by_feed(feed_id: u64) -> u64 { return get_price_by_feed_impl(feed_id) }
+pub fn get_price(name: string) -> u64 { return get_price_by_feed_impl(get_feed_id_impl(name)) }
+pub fn get_price_for_asset(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let feed: Feed = s.load(FEED_PREFIX + i.to_string(10u32)).expect("fnf")
+        if feed.asset == asset { return get_price_by_feed_impl(i) }
+        i += 1
+    }
+    require(false, "assetnofeed")
     return 0
 }
+pub fn get_feed_id(name: string) -> u64 { return get_feed_id_impl(name) }
 
-entry set_heartbeat_timeout(blocks: u64) -> u64 {
-    only_admin()
-    require(blocks >= 100 && blocks <= 10000, "badval")
-    Storage::new().store(HEARTBEAT_TIMEOUT_KEY, blocks)
-    return 0
+pub fn get_feeds_count() -> u64 { return Storage::new().load(FEEDS_COUNT_KEY).unwrap_or(0) }
+pub fn get_feed(feed_id: u64) -> (string, Hash, u8, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    let active: bool = s.load(FEED_ACTIVE_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    let cb_paused: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    return (feed.name, feed.asset, feed.decimals, feed.min_price, feed.max_price, active, cb_paused)
+}
+pub fn get_price_meta(feed_id: u64) -> (u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let cb: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    let agg_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    if agg_opt.is_none() { return (0, 0, 0, 0, cb) }
+    let agg: AggregatedPrice = agg_opt.expect("err")
+    return (agg.price, agg.topo, agg.deviation_bps, agg.sources_count, cb)
+}
+pub fn get_cycle(feed_id: u64) -> u64 { return Storage::new().load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0) }
+pub fn get_submissions_count(feed_id: u64, cycle: u64) -> u64 {
+    return Storage::new().load(SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)).unwrap_or(0)
 }
 
-entry set_base_reward_oracle(amount: u64) -> u64 {
-    only_admin()
-    require(amount <= 1000000000, "badval")
-    Storage::new().store(BASE_REWARD_ORACLE_KEY, amount)
-    return 0
-}
-
-entry set_base_reward_chat(amount: u64) -> u64 {
-    only_admin()
-    require(amount <= 1000000000, "badval")
-    Storage::new().store(BASE_REWARD_CHAT_KEY, amount)
-    return 0
-}
-
-entry set_total_budget(amount: u64) -> u64 {
-    only_admin()
-    Storage::new().store(TOTAL_BUDGET_KEY, amount)
-    return 0
-}
-
-entry set_target_duration(blocks: u64) -> u64 {
-    only_admin()
-    require(blocks >= 6307200, "badval")  
-    Storage::new().store(TARGET_DURATION_BLOCKS_KEY, blocks)
-    return 0
-}
-
-entry set_vlt_contract(vc: Hash) -> u64 { only_admin() Storage::new().store(VLT_CONTRACT_KEY, vc) return 0 }
-entry set_vlt_asset(va: Hash) -> u64 { only_admin() Storage::new().store(VLT_ASSET_KEY, va) return 0 }
-entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
-entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
-entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
 pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ============================================================================
+// FIX #3 + #12: New entry wrappers for pub fn so they're callable
+// cross-contract via Contract::call.
+// ============================================================================
+
+// ID 7: get_price_by_feed_entry
+entry get_price_by_feed_entry(feed_id: u64) -> u64 {
+    return get_price_by_feed_impl(feed_id)
+}
+
+// ID 8: get_price_entry
+entry get_price_entry(name: string) -> u64 {
+    return get_price_by_feed_impl(get_feed_id_impl(name))
+}
+
+// ID 9: get_price_for_asset_entry
+entry get_price_for_asset_entry(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let feed: Feed = s.load(FEED_PREFIX + i.to_string(10u32)).expect("fnf")
+        if feed.asset == asset { return get_price_by_feed_impl(i) }
+        i += 1
+    }
+    require(false, "assetnofeed")
+    return 0
+}
+
+// ID 10: get_feed_id_entry
+entry get_feed_id_entry(name: string) -> u64 {
+    return get_feed_id_impl(name)
+}
+
+// ID 11: pause
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 12: unpause
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 13: set_max_deviation_bps
+entry set_max_deviation_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(MAX_DEVIATION_BPS_KEY, bps)
+    return 0
+}
+
+// ID 14: set_cb_threshold_bps
+entry set_cb_threshold_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 500 && bps <= 5000, "badval")
+    Storage::new().store(CB_THRESHOLD_BPS_KEY, bps)
+    return 0
+}
+
+// ID 15: set_aggregation_blocks
+entry set_aggregation_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 1 && n <= 100, "badval")
+    Storage::new().store(AGGREGATION_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 16: set_max_stale_blocks
+entry set_max_stale_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 5 && n <= 500, "badval")
+    Storage::new().store(MAX_STALE_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 17: set_hard_stale_blocks
+entry set_hard_stale_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 20 && n <= 500, "badval")
+    Storage::new().store(HARD_STALE_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 18: disable_bootstrap
+entry disable_bootstrap() -> u64 {
+    only_admin()
+    let mc: Contract = get_miner_contract()
+    let active_count: u64 = mc.call(12u16, [1u64], {})
+    require(active_count >= 20, "need20providers")
+    Storage::new().store(BOOTSTRAP_MODE_KEY, false)
+    return 0
+}
+
+// ID 19: set_bootstrap_min_providers
+entry set_bootstrap_min_providers(n: u64) -> u64 {
+    only_admin()
+    require(n >= 1 && n <= 10, "badval")
+    Storage::new().store(BOOTSTRAP_MIN_PROVIDERS_KEY, n)
+    return 0
+}
+
+// ID 20: set_min_providers
+entry set_min_providers(n: u64) -> u64 {
+    only_admin()
+    require(n >= 3 && n <= 100, "badval")
+    Storage::new().store(MIN_PROVIDERS_FOR_ORACLE_KEY, n)
+    return 0
+}
+
+// ID 21: set_miner_contract
+entry set_miner_contract(mc: Hash) -> u64 { only_admin() Storage::new().store(MINER_CONTRACT_KEY, mc) return 0 }
+
+// ID 22: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 23: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 24: set_guardian
 entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
-entry set_emergency(e: Address) -> u64 { let s: Storage = Storage::new() let caller: Address = get_caller().unwrap() let current: Address = s.load(EMERGENCY_KEY).unwrap() require(caller == current, "notemg") s.store(EMERGENCY_KEY, e) return 0 }
-entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
-entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// ID 25: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let c: Address = get_caller().expect("nocaller")
+    require(c == s.load(EMERGENCY_KEY).expect("easet"), "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 26: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 27: get_version
 entry get_version() -> string { return VERSION }

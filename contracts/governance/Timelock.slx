@@ -1,8 +1,40 @@
-const VERSION: string = "Timelock v4.2"
+// ============================================================================
+// Timelock.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #7: only_guardian() now accepts BOTH an EOA (caller == GUARDIAN_KEY)
+//         AND a contract caller (get_contract_caller() == GUARDIAN_CONTRACT_KEY)
+//         so GuardianMultisig can invoke submit_emergency_proposal /
+//         cancel_proposal directly. A new GUARDIAN_CONTRACT_KEY storage key
+//         (string "gc") is introduced and a set_guardian_contract entry is
+//         exposed (ID 8). only_guardian_or_admin() mirrors the same rule.
+//
+// Two-step emergency_withdraw pattern (entries 12 & 13) with a 17280-block
+// (~1 day) delay. Request topo is stored under the "ert" key.
+//
+// ENTRY IDs (sequential, starting at 0):
+//   0  : submit_proposal(target, entry_id, params, delay) -> u64
+//   1  : execute_proposal(proposal_id) -> u64
+//   2  : cancel_proposal(proposal_id) -> u64
+//   3  : submit_emergency_proposal(target, entry_id, params) -> u64
+//   4  : set_min_delay(delay) -> u64
+//   5  : set_max_delay(delay) -> u64
+//   6  : set_governor(gov: Hash) -> u64
+//   7  : set_guardian(g: Address) -> u64
+//   8  : set_guardian_contract(gc: Hash) -> u64
+//   9  : set_emergency(e: Address) -> u64
+//   10 : transfer_admin(new_admin: Address) -> u64
+//   11 : get_version() -> string
+//   12 : request_emergency_withdraw() -> u64
+//   13 : execute_emergency_withdraw(asset: Hash) -> u64
+// ============================================================================
+
+const VERSION: string = "Timelock v5.0"
 
 const ADMIN_KEY: string = "a"
 const GOVERNOR_KEY: string = "gv"
 const GUARDIAN_KEY: string = "gd"
+// FIX #7: guardian contract (e.g. GuardianMultisig) hash key
+const GUARDIAN_CONTRACT_KEY: string = "gc"
 const EMERGENCY_KEY: string = "ea"
 
 const MIN_DELAY_KEY: string = "md"
@@ -10,6 +42,10 @@ const MAX_DELAY_KEY: string = "xd"
 const EMERGENCY_DELAY_KEY: string = "ed"
 const PROPOSALS_COUNT_KEY: string = "pc"
 const PROPOSAL_PREFIX: string = "p_"
+
+// Two-step emergency withdraw
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_WITHDRAW_DELAY_BLOCKS: u64 = 17280
 
 const DEFAULT_MIN_DELAY: u64 = 720
 const DEFAULT_MAX_DELAY: u64 = 604800
@@ -29,7 +65,7 @@ struct Proposal {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -40,38 +76,80 @@ hook constructor() -> u64 {
     return 0
 }
 
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+}
+
 fn only_admin_or_governor() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
 
     let gov_opt: optional<Hash> = s.load(GOVERNOR_KEY)
     if gov_opt.is_some() {
-        let gov: Hash = gov_opt.unwrap()
+        let gov: Hash = gov_opt.expect("err")
         let cc_opt: optional<Hash> = get_contract_caller()
         if cc_opt.is_some() {
-            let cc: Hash = cc_opt.unwrap()
+            let cc: Hash = cc_opt.expect("err")
             if cc == gov { return }
         }
     }
     require(false, "notauth")
 }
 
+// ============================================================================
+// FIX #7: only_guardian() accepts guardian EOA OR guardian contract.
+// ============================================================================
 fn only_guardian() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
-    require(caller == g, "notguard")
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+
+    // Accept contract caller matching the guardian contract (e.g. GuardianMultisig)
+    let gc_opt: optional<Hash> = s.load(GUARDIAN_CONTRACT_KEY)
+    if gc_opt.is_some() {
+        let gc: Hash = gc_opt.expect("err")
+        let cc_opt: optional<Hash> = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.expect("err")
+            if cc == gc { return }
+        }
+    }
+    require(false, "notguard")
 }
 
-fn only_admin() {
+// ============================================================================
+// FIX #7: only_guardian_or_admin() — admin OR guardian EOA OR guardian contract.
+// ============================================================================
+fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    require(caller == admin, "notauth")
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+
+    let gc_opt: optional<Hash> = s.load(GUARDIAN_CONTRACT_KEY)
+    if gc_opt.is_some() {
+        let gc: Hash = gc_opt.expect("err")
+        let cc_opt: optional<Hash> = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.expect("err")
+            if cc == gc { return }
+        }
+    }
+    require(false, "notauth")
 }
 
+// ============================================================================
+// ID 0: submit_proposal
+// ============================================================================
 entry submit_proposal(
     target: Hash,
     entry_id: u16,
@@ -102,9 +180,12 @@ entry submit_proposal(
     return id
 }
 
+// ============================================================================
+// ID 1: execute_proposal
+// ============================================================================
 entry execute_proposal(proposal_id: u64) -> u64 {
     let s: Storage = Storage::new()
-    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     require(!proposal.executed, "executed")
     require(!proposal.cancelled, "cancelled")
 
@@ -114,22 +195,30 @@ entry execute_proposal(proposal_id: u64) -> u64 {
     proposal.executed = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
 
-    let target: Contract = Contract::new(proposal.target_contract).unwrap()
+    let target: Contract = Contract::new(proposal.target_contract).expect("err")
     let _ = target.call(proposal.entry_id, [proposal.params], {})
 
     return 0
 }
 
+// ============================================================================
+// ID 2: cancel_proposal (FIX #7: also accepts guardian EOA/contract)
+// ============================================================================
 entry cancel_proposal(proposal_id: u64) -> u64 {
-    only_admin_or_governor()
+    only_guardian_or_admin()
     let s: Storage = Storage::new()
-    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     require(!proposal.executed, "executed")
     proposal.cancelled = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
     return 0
 }
 
+// ============================================================================
+// ID 3: submit_emergency_proposal
+// ----------------------------------------------------------------------------
+// FIX #7: only_guardian() now accepts the GuardianMultisig contract caller.
+// ============================================================================
 entry submit_emergency_proposal(
     target: Hash,
     entry_id: u16,
@@ -156,6 +245,9 @@ entry submit_emergency_proposal(
     return id
 }
 
+// ============================================================================
+// ID 4: set_min_delay
+// ============================================================================
 entry set_min_delay(delay: u64) -> u64 {
     only_admin()
     require(delay >= 144 && delay <= 43200, "badval")
@@ -163,6 +255,9 @@ entry set_min_delay(delay: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// ID 5: set_max_delay
+// ============================================================================
 entry set_max_delay(delay: u64) -> u64 {
     only_admin()
     require(delay >= 1440 && delay <= 2592000, "badval")
@@ -170,29 +265,99 @@ entry set_max_delay(delay: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// ID 6: set_governor
+// ============================================================================
 entry set_governor(gov: Hash) -> u64 {
     only_admin()
     Storage::new().store(GOVERNOR_KEY, gov)
     return 0
 }
 
+// ============================================================================
+// ID 7: set_guardian
+// ============================================================================
 entry set_guardian(g: Address) -> u64 {
     only_admin()
     Storage::new().store(GUARDIAN_KEY, g)
     return 0
 }
 
+// ============================================================================
+// ID 8: set_guardian_contract  (FIX #7 — new entry)
+// ============================================================================
+entry set_guardian_contract(gc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_CONTRACT_KEY, gc)
+    return 0
+}
+
+// ============================================================================
+// ID 9: set_emergency
+// ============================================================================
 entry set_emergency(e: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let current: Address = s.load(EMERGENCY_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let current: Address = s.load(EMERGENCY_KEY).expect("err")
     require(caller == current, "notemg")
     s.store(EMERGENCY_KEY, e)
     return 0
 }
 
+// ============================================================================
+// ID 10: transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ============================================================================
+// ID 11: get_version
+// ============================================================================
+entry get_version() -> string {
+    return VERSION
+}
+
+// ============================================================================
+// ID 12: request_emergency_withdraw
+// ----------------------------------------------------------------------------
+// Two-step pattern: emergency role requests, then must wait
+// EMERGENCY_WITHDRAW_DELAY_BLOCKS before executing.
+// ============================================================================
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ============================================================================
+// ID 13: execute_emergency_withdraw
+// ============================================================================
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_WITHDRAW_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// ----------------------------------------------------------------------------
+// Read-only helpers (do NOT count toward entry IDs)
+// ----------------------------------------------------------------------------
 pub fn get_proposal(proposal_id: u64) -> (Hash, u16, u64, u64, bool, bool, bool) {
-    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     return (p.target_contract, p.entry_id, p.submitted_at, p.delay, p.executed, p.cancelled, p.is_emergency)
 }
 
@@ -207,14 +372,4 @@ pub fn get_delays() -> (u64, u64, u64) {
         s.load(MAX_DELAY_KEY).unwrap_or(DEFAULT_MAX_DELAY),
         s.load(EMERGENCY_DELAY_KEY).unwrap_or(DEFAULT_EMERGENCY_DELAY)
     )
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-
-entry get_version() -> string {
-    return VERSION
 }

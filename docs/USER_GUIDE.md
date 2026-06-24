@@ -1,378 +1,647 @@
-# User Guide — XELIS Vault v4.2
+# User Guide — XELIS Vault v5.0
 
-> Complete guide for end users of XELIS Vault (deposit, borrow, swap).
-
----
-
-## Prerequisites
-
-### Option 1: Use the Installer (recommended)
-
-```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/install.py | python3
-
-# Windows PowerShell
-iwr -useb https://raw.githubusercontent.com/XelisVault/xelis-vault/main/install.py | python
-```
-
-The installer handles everything automatically.
-
-### Option 2: Manual Setup
-
-1. Install XELIS daemon + wallet (see https://docs.xelis.io)
-2. Sync daemon on testnet: `xelis_daemon --network testnet`
-3. Create wallet: `xelis_wallet --network testnet`
-4. Continue with this guide
+> Complete guide for end users of XELIS Vault: lending, swap, governance,
+> mixer, chat, flash loans, auctions, savings, insurance.
 
 ---
 
-## Step 1: Get Testnet Funds from Faucet
+## 1. Introduction
 
-The Faucet contract distributes free testnet funds to anyone:
+XELIS Vault is a decentralized financial protocol built on the XELIS
+BlockDAG. It is composed of 33 Silex contracts that together provide:
 
-- **100 XEL testnet** per 24h (enough for ~1000 transactions)
-- **200 VLT** per 24h (enough to stake as provider)
+- **Lending** (over-collateralized CDP + multi-asset pools)
+- **Swap** (constant-product AMM + Peg Stability Module)
+- **Governance** (VLT staking with lock boost + timelocked proposals)
+- **PrivacyMixer** (ZK-backed anonymity for XEL / VLT / xUSD)
+- **VaultChat** (end-to-end-encrypted on-chain anchored chat)
+- **FlashLoan** (uncollateralized 1-tx loans, 9 bps fee)
+- **SealedBidAuction** (commit/reveal auction for RWA sales)
+- **SavingsRate** (xUSD savings, 4 % APR)
+- **InsurancePool** (XEL-staked coverage, earns premiums)
 
-### Claim via Wallet CLI
+All on XELIS — a privacy-first BlockDAG with sub-second finality.
+
+### Privacy on XELIS
+
+XELIS uses Twisted ElGamal confidential transactions. Your **balances** and
+**transfer amounts** are encrypted on-chain; only you (with your viewing
+key) can decrypt them. The protocol layer (XELIS Vault) inherits this
+privacy for VLT, xUSD and all assets minted through the protocol.
+
+---
+
+## 2. Wallet setup
+
+### 2.1 XELIS wallet (CLI)
+
+Recommended for power users and miners.
 
 ```bash
+# Build from source
+git clone https://github.com/xelis-project/xelis-blockchain.git
+cd xelis-blockchain && cargo build --release --bin xelis_wallet
+sudo cp target/release/xelis_wallet /usr/local/bin/
+
+# Or download a release: https://github.com/xelis-project/xelis-blockchain/releases
+
+# Start with RPC server (needed for the miner / provider scripts)
+xelis_wallet --network testnet --rpc-server &
+
+# Attach and create a wallet
 xelis_wallet --network testnet
-
-# Check if faucet is configured
-> call-contract <FaucetContract> get_faucet_info
-# Returns: (claim_xel_amount, claim_vlt_amount, cooldown, daily_caps, ...)
-
-# Claim both XEL and VLT in one transaction
-> call-contract <FaucetContract> claim_both --signer mywallet
-
-# Or claim separately
-> call-contract <FaucetContract> claim_xel --signer mywallet
-> call-contract <FaucetContract> claim_vlt --signer mywallet
-
-# Check your claim history
-> call-contract <FaucetContract> get_user_claims xet1abc...
-# Returns: (last_xel_claim, last_vlt_claim, total_xel_claimed, total_vlt_claimed)
+> create-wallet mywallet
+> get-address   # → xet1abc...
 ```
 
-### Faucet Limits (Anti-Abuse)
+### 2.2 Genesix wallet (GUI)
 
-| Limit | Value | Purpose |
-|-------|-------|---------|
-| Cooldown per address | 24 hours | Prevent spam claims |
-| Daily cap (total) | 5000 XEL / 10000 VLT | 50 users/day max |
-| Lifetime cap per address | 1000 XEL / 2000 VLT | Prevent one user draining faucet |
-| Pause | Guardian can pause | Emergency stop |
+Recommended for end users. Available for Windows, macOS, Linux at
+https://genesix.app. Full XELIS Vault integration (deposit, borrow, swap,
+governance, mixer UI) is included.
 
-If you hit a limit, the contract reverts with a clear error message:
-- `"cooldown"` — wait 24h since your last claim
-- `"dailycap"` — daily cap reached, wait for reset (24h)
-- `"lifetimecap"` — you've claimed your lifetime max
-- `"faucetempty"` — faucet needs refill (admin will refill)
+### 2.3 Hardware wallet
+
+XELIS supports Ledger Nano S/X and Trezor Safe 5 via the
+`xelis_wallet --hardware` flag. Use this for large holdings — your mnemonic
+never touches a general-purpose computer.
 
 ---
 
-## Step 2: Check Your Balances
+## 3. Getting VLT
+
+### Testnet faucet
 
 ```bash
-xelis_wallet --network testnet
-
-# Check XEL balance
-> get-balance
-
-# Check all asset balances (XEL, VLT, xUSD)
-> get-balances
+xelis_wallet call-contract <FaucetContract> claim_both --signer mywallet
+# → 100 XEL (testnet gas) + 200 VLT (more than enough to start)
 ```
+
+Limits: 24 h cooldown per address, 1,000 XEL / 2,000 VLT lifetime cap.
+
+### Mainnet DEX (VaultSwap)
+
+```bash
+# Swap 100 XEL → VLT on VaultSwapV2
+xelis_wallet call-contract <VaultSwapV2> swap \
+    0x0000000000000000000000000000000000000000000000000000000000000000 \  # XEL
+    <VLT_ASSET_HASH> \                                                    # VLT
+    10000000000 \                                                         # 100 XEL in
+    1000000000 \                                                          # min 10 VLT out
+    --signer mywallet \
+    --deposit 0x0000...0000 10000000000
+```
+
+### OTC
+
+For large amounts, contact the team at `otc@xelisvault.io` for an
+over-the-counter trade.
 
 ---
 
-## Step 3: Deposit XEL as Collateral
+## 4. Lending — VaultEngine
 
-To borrow xUSD, you need to deposit XEL as collateral first.
+`VaultEngineV3` is the over-collateralized CDP engine. Deposit XEL, borrow
+xUSD, repay, withdraw.
+
+### 4.1 Deposit XEL collateral
 
 ```bash
-# Check current XEL price from oracle
-> call-contract <StakedOracle> get_price "XEL/USD"
-# Returns: 32000000 (= $0.32 in 8-decimals atomic)
-
-# Deposit 100 XEL as collateral (100 XEL = 10,000,000,000 atomic)
-> call-contract <VaultEngine> deposit \
+# Deposit 100 XEL (= 10,000,000,000 atomic) as collateral
+xelis_wallet call-contract <VaultEngineV3> deposit \
     0x0000000000000000000000000000000000000000000000000000000000000000 \
     10000000000 \
     --signer mywallet \
-    --deposit 0x0000000000000000000000000000000000000000000000000000000000000000 10000000000
-
-# Your deposit creates a vault with ID 1 (or higher)
-# You can check your vault:
-> call-contract <VaultEngine> get_health_factor 1
-# Returns health factor in bps (10000 = 1.0x). Should be u64::MAX (no debt yet)
+    --deposit 0x0000...0000 10000000000
+# → creates vault ID 1
 ```
 
----
+### 4.2 Borrow xUSD
 
-## Step 4: Borrow xUSD
-
-Once you have collateral, you can borrow xUSD up to 50% of your collateral value.
+Max LTV is 50 % (collateral ratio 200 %). At XEL = $0.32, 100 XEL gives
+$32 collateral → max borrow $16 xUSD.
 
 ```bash
-# Collateral: 100 XEL @ $0.32 = $32
-# Max borrow (50% LTV): $16 = 1,600,000,000 xUSD atomic
-
-# Borrow 10 xUSD (1,000,000,000 atomic)
-> call-contract <VaultEngine> borrow 1 1000000000 --signer mywallet
-
-# Check your health factor (should be > 20000 = 2.0x)
-> call-contract <VaultEngine> get_health_factor 1
-
-# Check your xUSD balance
-> get-balances
-# Should show 10 xUSD (minus 0.5% borrow fee = 9.95 xUSD)
+xelis_wallet call-contract <VaultEngineV3> borrow 1 1000000000 --signer mywallet
+# Borrow 10 xUSD (minus 0.5 % borrow fee = 9.95 xUSD received)
 ```
 
-### Borrowing Math
-
-| Parameter | Value |
-|-----------|-------|
-| Min Collateral Ratio (MCR) | 200% (10,000 bps) |
-| Max LTV | 50% (1/MCR) |
-| Borrow fee | 0.5% (50 bps) — goes to treasury |
-| Insurance fee | 0.1% (10 bps) — goes to insurance pool |
-
-Example: deposit 100 XEL at $0.32 → collateral value $32 → max borrow $16 (50% LTV).
-
----
-
-## Step 5: Use xUSD
-
-xUSD is a stablecoin pegged to $1 USD. You can:
-
-### Transfer xUSD to another user
+### 4.3 Repay
 
 ```bash
-> call-contract <xUSD> transfer_tokens xet1friend... 500000000 \
+xelis_wallet call-contract <VaultEngineV3> repay 1 1000000000 \
     --signer mywallet \
-    --deposit <xUSD_ASSET_HASH> 500000000
-# Sends 5 xUSD to your friend
+    --deposit <xUSD_ASSET_HASH> 1000000000
+# Burns 10 xUSD to clear your debt (plus accrued stability fee)
 ```
 
-### Swap xUSD for XEL on VaultSwap
+### 4.4 Withdraw collateral
 
 ```bash
-# Swap 10 xUSD for XEL (with min 30 XEL output at $0.32)
-> call-contract <VaultSwap> swap \
-    <xUSD_ASSET_HASH> \
-    0x0000000000000000000000000000000000000000000000000000000000000000 \
-    1000000000 \
-    3000000000 \
+xelis_wallet call-contract <VaultEngineV3> withdraw 1 5000000000 --signer mywallet
+# Withdraw 50 XEL — must keep health factor > 200 %
+```
+
+### 4.5 Liquidation
+
+If your health factor drops below 200 % (20,000 bps) for 10 blocks (~50 s),
+anyone can call:
+
+```bash
+xelis_wallet call-contract <VaultEngineV3> liquidate 1 1000000000 \
+    --signer liquidator \
+    --deposit <xUSD_ASSET_HASH> 1000000000
+# Liquidator repays your debt, receives XEL collateral + 10 % liquidation penalty
+```
+
+### 4.6 Stability fee
+
+A per-vault stability fee accrues on every borrow (variable rate set by
+governance, default 2 % APR). The fee is charged in xUSD when you repay or
+when the vault is liquidated. Check the current rate via the
+`VaultEngineV3.get_stability_fee_index` pub fn.
+
+---
+
+## 5. Lending — LendingMarket
+
+`LendingMarket` is a multi-asset interest-rate pool: supply any asset to
+earn interest, or borrow against your supplied assets. Uses an
+`InterestRateModel` (utilization-based curve).
+
+### 5.1 Supply
+
+```bash
+# Supply 1,000 VLT to the VLT pool
+xelis_wallet call-contract <LendingMarket> supply \
+    <VLT_ASSET_HASH> 100000000000 \
+    --signer mywallet \
+    --deposit <VLT_ASSET_HASH> 100000000000
+# → you receive cVLT (collateral token) representing your share
+```
+
+### 5.2 Borrow against collateral
+
+```bash
+# Borrow 100 xUSD against your supplied VLT (must keep health factor > 150 %)
+xelis_wallet call-contract <LendingMarket> borrow \
+    <xUSD_ASSET_HASH> 10000000000 \
+    --signer mywallet
+```
+
+### 5.3 Repay & withdraw
+
+```bash
+# Repay 50 xUSD
+xelis_wallet call-contract <LendingMarket> repay \
+    <xUSD_ASSET_HASH> 5000000000 \
+    --signer mywallet \
+    --deposit <xUSD_ASSET_HASH> 5000000000
+
+# Withdraw 500 VLT
+xelis_wallet call-contract <LendingMarket> withdraw \
+    <VLT_ASSET_HASH> 50000000000 \
+    --signer mywallet
+```
+
+---
+
+## 6. PSM (Peg Stability Module)
+
+`PSM` is a dedicated contract that mints/redeems xUSD 1:1 at the oracle
+XEL/USD price, with a small fee.
+
+### 6.1 Mint xUSD with XEL
+
+```bash
+# At XEL = $0.32 (atomic price 32000000):
+# 100 XEL → $32 → 31.84 xUSD (after 0.5 % mint fee)
+xelis_wallet call-contract <PSM> mint 10000000000 3180000000 \
+    --signer mywallet \
+    --deposit 0x0000...0000 10000000000
+```
+
+### 6.2 Redeem xUSD for XEL
+
+```bash
+# 10 xUSD → ~31 XEL (after 0.1 % redeem fee)
+xelis_wallet call-contract <PSM> redeem 1000000000 3100000000 \
     --signer mywallet \
     --deposit <xUSD_ASSET_HASH> 1000000000
 ```
 
-### Use the PSM (Peg Stability Module) for instant mint/redeem
+### 6.3 Daily caps
 
-The PSM is a **dedicated contract** (`PSM.slx`) that guarantees xUSD is always worth ~$1. It allows anyone to mint or redeem xUSD directly at the oracle price, **without needing liquidity providers**.
+The PSM enforces daily mint/redeem caps (default 1,000,000 xUSD/day each)
+to limit oracle attack surface. Check via the `get_daily_usage_entry` (entry
+ID 5 on `PSM`).
 
-**How it works**:
-- The PSM holds a reserve of XEL
-- When you mint xUSD: you deposit XEL → PSM keeps the XEL → mints fresh xUSD to you at oracle price
-- When you redeem xUSD: you deposit xUSD → PSM burns it → sends you XEL from the reserve at oracle price
-- The peg is maintained by arbitrage: if xUSD > $1 on secondary markets, arbitrageurs mint and sell; if xUSD < $1, they buy and redeem
+| Fee                | Default |
+|--------------------|---------|
+| Mint fee           | 0.5 %   (50 bps) |
+| Redeem fee         | 0.1 %   (10 bps) |
+| Daily mint cap     | 1,000,000 xUSD |
+| Daily redeem cap   | 1,000,000 xUSD |
+
+---
+
+## 7. VaultSwap
+
+`VaultSwapV2` is a constant-product AMM with TWAP-based fees and an
+integrated PSM route for xUSD/XEL.
+
+### 7.1 Swap
 
 ```bash
-# Mint xUSD with 100 XEL (at $0.32 = 32000000 atomic price)
-# You'll get ~$32 of xUSD minus 0.5% mint fee = 31.84 xUSD
-> call-contract <PSM> mint 10000000000 3180000000 \
+# Swap 100 XEL → VLT (min 200 VLT out)
+xelis_wallet call-contract <VaultSwapV2> swap \
+    0x0000...0000 \
+    <VLT_ASSET_HASH> \
+    10000000000 \
+    20000000000 \
     --signer mywallet \
-    --deposit 0x0000000000000000000000000000000000000000000000000000000000000000 10000000000
+    --deposit 0x0000...0000 10000000000
+```
 
-# Redeem xUSD for XEL
-# 10 xUSD → ~31 XEL minus 0.1% redeem fee
-> call-contract <PSM> redeem 1000000000 3100000000 \
+### 7.2 Add liquidity
+
+```bash
+# Create a new pool (XEL/VLT) — first time only
+xelis_wallet call-contract <VaultSwapV2> create_pool \
+    0x0000...0000 \
+    <VLT_ASSET_HASH> \
+    false \    # is_psm = false (regular AMM pool)
+    --signer mywallet
+
+# Add 100 XEL + 200 VLT as liquidity
+xelis_wallet call-contract <VaultSwapV2> add_liquidity \
+    0x0000...0000 <VLT_ASSET_HASH> 10000000000 20000000000 0 \
     --signer mywallet \
-    --deposit <xUSD_ASSET_HASH> 1000000000
-
-# Check PSM reserves
-> call-contract <PSM> get_reserves
-# Returns: (xel_reserve, xusd_balance_in_psm)
+    --deposit 0x0000...0000 10000000000 \
+    --deposit <VLT_ASSET_HASH> 20000000000
 ```
 
-**Why the PSM doesn't need bootstrap liquidity**:
-- At launch: 0 XEL in PSM, 0 xUSD in circulation
-- First user mints 100 XEL worth of xUSD → PSM has 100 XEL, 32 xUSD in circulation
-- The xUSD supply grows naturally as users mint it
-- The XEL reserve also grows, ensuring reddemeers always have XEL to withdraw
-- Self-balancing system ✅
+### 7.3 Fees
+
+- Swap fee: **0.30 %** (30 bps), of which 5 bps goes to the treasury.
+- TWAP-based: the fee can be raised during high volatility (governance
+  control).
 
 ---
 
-## Step 6: Repay xUSD and Withdraw Collateral
+## 8. Governance
 
-### Repay borrowed xUSD
+`GovernanceVault` lets you stake VLT to receive voting power (with a lock
+boost up to 2×) and earn staking rewards (Synthetix-style RPT).
+
+### 8.1 Stake VLT
 
 ```bash
-# Repay 10 xUSD (the burn happens from the contract's balance)
-> call-contract <VaultEngine> repay 1 1000000000 \
+# Stake 1,000 VLT for 1 year (lock boost = 1.5×)
+xelis_wallet call-contract <GovernanceVault> stake 100000000000 31536000 \
     --signer mywallet \
-    --deposit <xUSD_ASSET_HASH> 1000000000
-
-# Check health factor (should be u64::MAX now = no debt)
-> call-contract <VaultEngine> get_health_factor 1
+    --deposit <VLT_ASSET_HASH> 100000000000
 ```
 
-### Withdraw collateral
+### 8.2 Voting power boost
+
+| Lock duration | Boost |
+|---------------|-------|
+| 0 (no lock)   | 1.0×  |
+| 3 months      | 1.125×|
+| 1 year        | 1.5×  |
+| 4 years (max) | 2.0×  |
+
+### 8.3 Vote on proposals
+
+`Governor` is the proposal engine. Anyone with ≥ 1 % of voting power can
+propose.
 
 ```bash
-# Withdraw 50 XEL from your vault (must keep health factor healthy)
-> call-contract <VaultEngine> withdraw 1 5000000000 --signer mywallet
+# Vote YES on proposal 7
+xelis_wallet call-contract <Governor> vote 7 1 --signer mywallet
+# vote_value: 0=against, 1=for, 2=abstain
+```
 
-# Verify your XEL balance
-> get-balance
+### 8.4 Queue & execute
+
+If a proposal passes, it enters a **timelock** (default 48 h) before
+execution.
+
+```bash
+# Queue (after vote succeeds)
+xelis_wallet call-contract <Governor> queue 7 --signer mywallet
+
+# Execute (after timelock elapses)
+xelis_wallet call-contract <Governor> execute 7 --signer mywallet
+```
+
+### 8.5 Unstake & claim rewards
+
+```bash
+# Unstake (after lock expires)
+xelis_wallet call-contract <GovernanceVault> unstake --signer mywallet
+
+# Claim accrued staking rewards
+xelis_wallet call-contract <GovernanceVault> claim_rewards --signer mywallet
 ```
 
 ---
 
-## Step 7: Monitor Your Position
+## 9. PrivacyMixer
 
-### Check Vault Health
+`PrivacyMixer` lets you deposit XEL / VLT / xUSD and later withdraw to a
+fresh address using a ZK proof, breaking the on-chain link.
 
-```bash
-# Get health factor (10000 = 1.0x, 20000 = 2.0x required minimum)
-> call-contract <VaultEngine> get_health_factor 1
-
-# If health factor < 20000, you're at risk of liquidation
-# Add more collateral or repay debt immediately
-```
-
-### Get Total Stats
+### 9.1 Deposit
 
 ```bash
-# Total vaults created
-> call-contract <VaultEngine> total_vaults
-
-# Redemption queue size (vaults available for redemption)
-> call-contract <VaultEngine> redemption_queue_size
-
-# Oracle price for XEL/USD
-> call-contract <StakedOracle> get_price "XEL/USD"
-
-# VLT circulating supply (should decrease over time = deflation)
-> call-contract <VLTToken> get_circulating_supply
-> call-contract <VLTToken> get_total_burned
-```
-
----
-
-## Liquidation
-
-If your health factor drops below 200% (20000 bps), your vault becomes liquidatable after a 10-block grace period (~50 seconds).
-
-### What happens during liquidation?
-
-1. Anyone can call `liquidate(vault_id, max_borrow_to_repay)` on your vault
-2. The liquidator burns xUSD to repay your debt
-3. The liquidator receives XEL collateral + 10% liquidation penalty
-4. You lose part of your collateral
-
-### How to avoid liquidation?
-
-- **Monitor your health factor** regularly
-- **Add collateral** if XEL price drops: `deposit(0x0, amount)`
-- **Repay debt** to reduce borrow: `repay(vault_id, amount)`
-- The 10-block grace period gives you ~50s to react
-
----
-
-## Stake VLT as Price Provider (optional)
-
-If you want to earn VLT rewards by providing price data:
-
-```bash
-# 1. Get 100 VLT (minimum stake) from faucet or VaultSwap
-# 2. Register as provider
-> call-contract <StakedOracle> register_provider \
+# Deposit 100 XEL into the XEL mixer (denomination = 100 XEL)
+xelis_wallet call-contract <PrivacyMixer> deposit \
+    0x0000...0000 \         # asset
+    10000000000 \           # amount
+    <commitment_hash> \     # hash of your secret + nullifier
     --signer mywallet \
-    --deposit <VLT_ASSET_HASH> 10000000000
+    --deposit 0x0000...0000 10000000000
+```
 
-# 3. Run the price provider script on your server
-# (See PROVIDER_GUIDE.md for full setup)
-python3 scripts/price_provider.py
+`commitment_hash = H(secret, nullifier)`. Generate the secret + nullifier
+locally with a cryptographically secure RNG — save them offline.
 
-# 4. Monitor your rewards
-> call-contract <StakedOracle> get_provider xet1abc...
-# Returns: (stake, registered_at, rewards_earned, total_slashed, active)
+### 9.2 Withdraw
+
+```bash
+# Generate a ZK proof off-chain (use xelis-zk CLI)
+xelis-zk prove-withdraw \
+    --asset 0x0000...0000 \
+    --amount 10000000000 \
+    --secret <your_secret> \
+    --nullifier <your_nullifier> \
+    --recipient xet1fresh... \
+    --output proof.json
+
+# Submit the proof on-chain
+xelis_wallet call-contract <PrivacyMixer> withdraw \
+    0x0000...0000 \
+    10000000000 \
+    xet1fresh... \
+    <merkle_root> \
+    <nullifier_hash> \
+    <proof_bytes> \
+    --signer fresh_wallet
+```
+
+The recipient address must be a fresh wallet with no prior history, to
+maintain anonymity.
+
+### 9.3 Denominations
+
+The mixer supports fixed denominations per asset (e.g. 1, 10, 100, 1000
+XEL). Larger denominations have larger anonymity sets but take longer to
+confirm.
+
+---
+
+## 10. VaultChat
+
+`VaultChat` is an end-to-end-encrypted chat with Merkle-root anchoring
+on-chain every hour.
+
+### 10.1 Register your chat pubkey
+
+```bash
+xelis_wallet call-contract <VaultChat> register_session \
+    <your_x25519_pubkey> \
+    --signer mywallet
+```
+
+### 10.2 Create a group
+
+```bash
+xelis_wallet call-contract <VaultChat> create_group \
+    "My private group" \
+    <merkle_root_of_initial_member_set> \
+    --signer mywallet
+```
+
+### 10.3 Anchor messages
+
+Messages are stored off-chain by relayers (miners running service ID 2).
+Every hour the relayer computes a Merkle root of all messages received and
+anchors it on-chain:
+
+```bash
+xelis_wallet call-contract <VaultChat> anchor_messages \
+    <group_id> \
+    <merkle_root> \
+    <first_msg_id> \
+    <last_msg_id> \
+    --signer relayer_wallet
+```
+
+The anchor earns the relayer a chat reward (BASE_REWARD_CHAT × reputation ×
+budget_factor).
+
+---
+
+## 11. FlashLoan
+
+`FlashLoan` lets you borrow any asset without collateral, as long as you
+repay (plus 9 bps fee) **within the same transaction**.
+
+### 11.1 Borrow + repay in one tx
+
+Implement a `FlashCallback` contract that receives the funds, does your
+arbitrage / liquidation, and repays. Then:
+
+```bash
+xelis_wallet call-contract <FlashLoan> flash_loan \
+    <asset> \
+    <amount> \
+    <your_callback_contract> \
+    <callback_data> \
+    --signer mywallet
+```
+
+The fee is **9 bps** (0.09 %). If your callback doesn't repay in full, the
+whole transaction reverts.
+
+---
+
+## 12. SealedBidAuction
+
+`SealedBidAuction` is a commit/reveal auction used for RWA (real-world
+asset) sales.
+
+### 12.1 Create auction (seller)
+
+```bash
+xelis_wallet call-contract <SealedBidAuction> create_auction \
+    <asset> <amount> <min_bid> <commit_phase_end> <reveal_phase_end> \
+    --signer seller
+```
+
+### 12.2 Commit a bid (bidder)
+
+```bash
+# hash(bid_amount, salt) — keep salt secret until reveal
+xelis_wallet call-contract <SealedBidAuction> commit_bid \
+    <auction_id> <commitment_hash> \
+    --signer bidder \
+    --deposit <asset> <min_bid>
+```
+
+### 12.3 Reveal (bidder)
+
+```bash
+xelis_wallet call-contract <SealedBidAuction> reveal_bid \
+    <auction_id> <bid_amount> <salt> \
+    --signer bidder \
+    --deposit <asset> <bid_amount>
+```
+
+### 12.4 Settle & claim
+
+After the reveal phase, anyone calls `settle_auction`. The winner receives
+the asset; losers get their deposit back.
+
+```bash
+xelis_wallet call-contract <SealedBidAuction> settle_auction <auction_id> --signer anyone
+xelis_wallet call-contract <SealedBidAuction> claim_asset <auction_id> --signer winner
+xelis_wallet call-contract <SealedBidAuction> refund_bid <auction_id> --signer loser
 ```
 
 ---
 
-## FAQ
+## 13. SavingsRate
 
-### How is xUSD kept at $1?
+`SavingsRate` pays xUSD holders a fixed 4 % APR, sourced from PSM fees and
+VaultEngine stability fees.
 
+### 13.1 Deposit xUSD
+
+```bash
+xelis_wallet call-contract <SavingsRate> deposit 100000000000 \
+    --signer mywallet \
+    --deposit <xUSD_ASSET_HASH> 100000000000
+# → 100 xUSD deposited, accrues interest continuously
+```
+
+### 13.2 Withdraw
+
+```bash
+xelis_wallet call-contract <SavingsRate> withdraw 100000000000 \
+    --signer mywallet
+# Withdraws your principal + accrued interest
+```
+
+The 4 % rate is set by governance via `set_rate` and can be changed
+through a Governor proposal.
+
+---
+
+## 14. InsurancePool
+
+`InsurancePool` lets you stake XEL to backstop the protocol against hacks
+and bugs. In return you earn premiums (paid in VLT).
+
+### 14.1 Stake
+
+```bash
+xelis_wallet call-contract <InsurancePool> stake 10000000000 \
+    --signer mywallet \
+    --deposit 0x0000...0000 10000000000
+# Stake 100 XEL into the insurance pool
+```
+
+### 14.2 Earn premiums
+
+Premiums are funded by a portion of VaultEngine liquidation penalties (10
+bps per liquidation) and PSM fees. They are distributed pro-rata to stakers
+every 2,016 blocks (~1 week).
+
+### 14.3 Unstake
+
+```bash
+xelis_wallet call-contract <InsurancePool> unstake 10000000000 --signer mywallet
+# Subject to a 7-day withdrawal delay (in case of active payouts)
+```
+
+### 14.4 Risk
+
+If a hack is proven (via Governor vote + GuardianMultisig execution), up
+to 30 % of the pool can be slashed to compensate victims. Understand this
+risk before staking.
+
+---
+
+## 15. FAQ
+
+### Q1. Is my data private on XELIS Vault?
+Yes. XELIS uses Twisted ElGamal confidential transactions — your balances
+and transfer amounts are encrypted. Only the protocol events (deposits,
+borrows, votes) are visible on-chain, and even those are tied to your
+address, not your identity. Use PrivacyMixer to break the address link.
+
+### Q2. How is xUSD kept at $1?
 Three mechanisms:
-1. **PSM (Peg Stability Module)**: Anyone can mint/redeem xUSD at oracle price ($1 ± 0.5% fee)
-2. **Overcollateralization**: Every xUSD is backed by >= $2 of XEL collateral
-3. **Redemption queue**: If xUSD < $1, anyone can burn xUSD and claim XEL at face value
+1. **PSM** — anyone can mint/redeem xUSD at oracle price ±0.5 % fee.
+2. **Over-collateralization** — every xUSD is backed by ≥ $2 of XEL.
+3. **Redemption queue** — if xUSD < $1, anyone can burn xUSD and claim
+   XEL at face value from `VaultEngineV3`.
 
-### Can I lose my collateral?
+### Q3. Can I lose my collateral?
+Only if your health factor drops below 200 % for 10+ blocks (~50 s grace
+period). Add collateral or repay debt to stay safe.
 
-Only if your health factor drops below 200% for 10+ blocks. The system gives you a 50-second grace period to add collateral or repay debt. After that, your vault can be liquidated.
+### Q4. What happens if the oracle goes down?
+After 100 blocks (~500 s) without a price update, `get_price` reverts.
+Borrowing, withdrawing, and swapping are paused. Existing positions are
+safe (no automatic liquidation). The guardian multisig can set a fallback
+price.
 
-### Is xUSD really private?
+### Q5. Can I run multiple vaults?
+Yes — each `deposit` creates a new vault with a unique ID.
 
-Yes. xUSD is a XELIS Confidential Asset — balances and transfers are encrypted with Twisted ElGamal. Only you can see your xUSD balance (with your viewing key).
+### Q6. How do I get testnet funds?
+Claim from the FaucetContract (see §3). Wait 24 h between claims.
 
-### Can I run multiple vaults?
+### Q7. What's the difference between VaultEngine and LendingMarket?
+- **VaultEngine** — CDP: you deposit XEL only, borrow xUSD only.
+- **LendingMarket** — multi-asset: supply any asset, borrow any asset
+  against your supplied portfolio.
 
-Yes, each `deposit()` creates a new vault with a unique ID. You can have as many vaults as you want.
+### Q8. Are there gas fees?
+Yes — every transaction pays a small XEL fee to the BlockDAG miners. On
+testnet this is free (faucet-funded). On mainnet expect ~0.001 XEL per
+tx.
 
-### What happens if the oracle goes down?
+### Q9. Can I use a hardware wallet?
+Yes — see §2.3.
 
-If no price update for 100 blocks (~500s), `get_price()` reverts. This means:
-- You cannot borrow or withdraw (health factor can't be checked)
-- You cannot swap on VaultSwap
-- Your existing positions are safe (no automatic liquidation)
+### Q10. How are rewards taxed?
+XELIS Vault is a protocol, not a tax authority. Track your own rewards
+(see `get_miner` for miners, or `claim_rewards` history for stakers) and
+consult a tax professional.
 
-The guardian multisig can manually set a fallback price if needed.
-
-### How do I get more testnet funds?
-
-- Wait 24h and claim from faucet again (up to lifetime cap)
-- Ask in [Discord](https://discord.gg/xelisvault) `#testnet-faucet` channel
-- On mainnet: buy XEL on MEXC/CoinEx, swap for VLT/xUSD on VaultSwap
-
----
-
-## Troubleshooting
-
-### "insstake" error when registering as provider
-You need to deposit at least 100 VLT (10,000,000,000 atomic) with the `register_provider` call. Make sure you have VLT in your wallet and the `--deposit` flag is set.
-
-### "paused" error
-The contract is paused (emergency). Check Discord for announcements.
-
-### "cbpaused" error
-The feed is in circuit breaker (price moved >20%). Wait for the team to reset it.
-
-### "stale" error when getting price
-The oracle hasn't updated in >100 blocks. Make sure providers are running. Check `get_cycle 0` — should increment every 25s.
-
-### "oorange" error when submitting price
-Your price is outside the [min, max] range for the feed. Check that your price sources are working: `python3 scripts/price_provider.py --test-sources`.
-
-### Transaction not confirming
-- Check daemon is synced: `curl -X POST http://127.0.0.1:8080 -d '{"method":"get_info","params":{},"jsonrpc":"2.0","id":1}'`
-- Check your wallet has enough XEL for gas fees
-- Check mempool: `curl -X POST http://127.0.0.1:8080 -d '{"method":"get_mempool","params":{},"jsonrpc":"2.0","id":1}'`
+### Q11. Where do I get help?
+- Discord: https://discord.gg/UHpYAWbG — `#support` channel
+- Email: `support@xelisvault.io`
+- GitHub Issues: https://github.com/XelisVault/xelis-vault/issues
+- Documentation: [docs/](.)
 
 ---
 
-## Support
+## 16. References
 
-- **Discord**: [XELIS Vault Discord](https://discord.gg/xelisvault) — `#support` channel
-- **Email**: `support@xelisvault.io`
-- **GitHub Issues**: [XelisVault/xelis-vault/issues](https://github.com/XelisVault/xelis-vault/issues)
-- **Documentation**: [docs/](../docs/)
+- [Whitepaper v5.0](WHITEPAPER.md)
+- [Architecture / README](../README.md)
+- [Entry IDs v5.0](ENTRY_IDS.md) — canonical entry ID list (630 entries)
+- [Miner Guide](MINER_GUIDE.md) — if you want to become a miner
+- [Provider Guide](PROVIDER_GUIDE.md) — if you want to run a price provider
+- [Reward System](REWARD_SYSTEM.md) — full reward math
+- [Roadmap](ROADMAP.md)
 
 ---
 
-*Last updated: June 2026 — v4.2*
+*Last updated: July 2026 — v5.0*

@@ -1,20 +1,33 @@
-const VERSION: string = "Upgradeable v4.2"
+// ============================================================================
+// Upgradeable.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Trivial mixin preserved from v4.2: tracks admin + migration flag, exposes
+// migrate_from + get_version. Kept as-is per task spec (no emergency_withdraw
+// because this mixin holds no funds).
+//
+// Entry IDs (sequential, starting at 0):
+//   0 : migrate_from
+//   1 : get_version
+// ============================================================================
+
+const VERSION: string = "Upgradeable v5.0"
 
 const ADMIN_KEY: string = "a"
 const MIGRATED_KEY: string = "mg"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(MIGRATED_KEY, false)
     return 0
 }
 
+// ID 0: migrate_from
 entry migrate_from(prev_hash: Hash) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     require(caller == admin, "notauth")
     let migrated: bool = s.load(MIGRATED_KEY).unwrap_or(false)
     require(!migrated, "alreadymigrated")
@@ -22,6 +35,7 @@ entry migrate_from(prev_hash: Hash) -> u64 {
     return 0
 }
 
+// ID 1: get_version
 entry get_version() -> string {
     return VERSION
 }

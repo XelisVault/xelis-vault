@@ -1,417 +1,498 @@
-# Provider Guide — Become a Price Provider
+# Provider Guide — XELIS Vault v5.0
 
 > Earn VLT rewards by providing accurate price data to the XELIS Vault oracle.
+> Aimed at technical operators running `price_provider.py` and
+> `aggregation_keeper.py`.
 
 ---
 
-## What is a Price Provider?
+## 1. Overview
 
-A price provider is anyone who stakes VLT and submits price data to the StakedOracle contract. Providers earn VLT rewards for valid prices (within 5% of the median) and are slashed for outliers (1% of stake per outlier).
+### 1.1 What is a price provider?
 
-**Anyone can become a provider** — you don't need to be a miner or have any special permission. You just need:
-- 1,000 VLT (testnet: get from faucet / mainnet: buy on VaultSwap)
-- A server with internet access (VPS $5/month is enough)
-- The `price_provider.py` script
+A price provider is anyone who runs the `price_provider.py` script, fetches
+XEL prices from external exchanges, computes a median locally, and submits
+it on-chain via `StakedOracle.submit_price(feed_id, price)` (entry ID **5**).
 
----
+### 1.2 Provider vs miner
 
-## Economics Summary
+In v5.0 the terminology is:
 
-| Active Providers | Reward per Provider/Day | ROI on 1,000 VLT Stake |
-|------------------|-------------------------|-------------------------|
-| 10 | 165 VLT | 6 days |
-| 25 | 66 VLT | 15 days |
-| 50 | 33 VLT | 30 days |
-| 100 | 16 VLT | 61 days |
-| 200 | 8 VLT | 122 days |
+- **Miner** — registered on `XelisVaultMiner` (entry ID 0), locks 100 VLT
+  stake, sends heartbeats (entry ID 6), can be slashed (entry ID 7). Earns
+  rewards through `distribute_reward` (entry ID 8) which is called by the
+  oracle / chat contracts.
+- **Provider** — runs `price_provider.py`. The provider's wallet address
+  **must** be a registered miner (otherwise `submit_price` reverts with
+  `notreg`). The provider is the **source of price data**, the miner is the
+  **on-chain identity** that earns the reward.
 
-**Risk**: 1% of stake slashed per outlier. If you use the recommended sources (MEXC + CoinEx + CoinGecko), the risk of being an outlier is very low (<1% of cycles).
+In practice: a miner runs the daemon (`xelis_vault_miner.py`) for
+heartbeats + reputation, **and** runs `price_provider.py` to actually submit
+prices. The two scripts share the same wallet.
 
----
+### 1.3 Why this matters
 
-## Step 1: Get VLT Tokens
-
-### On Testnet
-1. Join the XELIS Discord: https://discord.gg/xelis
-2. Go to `#testnet-faucet` channel
-3. Request testnet XEL to your address
-4. Once XELIS Vault is deployed, swap XEL for VLT on VaultSwap, OR
-5. Ask the team in `#xelis-vault` for testnet VLT (we distribute free for testing)
-
-### On Mainnet
-1. Buy XEL on MEXC or CoinEx
-2. Transfer to your XELIS wallet
-3. Swap XEL → VLT on VaultSwap
-
-You need at least **1,000 VLT** (1,000,000,000,000 atomic units with 8 decimals).
+Every swap, loan, liquidation and PSM mint reads the price from
+`StakedOracle.get_price_for_asset_entry(asset)` (entry ID 9). A wrong price
+moves money incorrectly. The more providers, the harder it is to push a bad
+median — the oracle rejects any submission >5 % from the median of the
+current cycle.
 
 ---
 
-## Step 2: Set Up Your Server
+## 2. Supported price sources
 
-### Requirements
-- Linux VPS (Ubuntu 22.04+ recommended)
-- 2 GB RAM minimum
-- 50 GB disk space (for XELIS daemon)
-- Stable internet connection (>99% uptime)
-- Python 3.10+
+Built into `price_provider.py`:
 
-### Install XELIS Daemon
+| Source       | URL                                       | Auth needed? | Symbols supported |
+|--------------|-------------------------------------------|--------------|-------------------|
+| **CoinEx**   | `https://api.coinex.com/v2/spot/ticker`   | API key/secret (optional, raises rate limit) | `XEL/USDT`, `XEL/BTC` |
+| **MEXC**     | `https://api.mexc.com/api/v3/ticker/price`| API key/secret (optional) | `XEL/USDT` |
+| **XELIS daemon** | `http://127.0.0.1:8080` (your local node) | None — uses `get_info` + DEX pool price | Native XEL/USDT implied price |
+| **Custom HTTP** | Any URL returning JSON                | Bearer token, headers, etc. | Any |
+| **Custom command** | Any local executable returning JSON  | None | Any |
 
-```bash
-# Build from source (recommended)
-sudo apt install -y build-essential cmake clang rustup
-rustup default stable
-
-git clone https://github.com/xelis-project/xelis-blockchain.git
-cd xelis-blockchain
-cargo build --release --bin xelis_daemon
-sudo cp target/release/xelis_daemon /usr/local/bin/
-
-# Or download precompiled binary from https://github.com/xelis-project/xelis-blockchain/releases
-```
-
-### Install XELIS Wallet
-
-```bash
-cd xelis-blockchain
-cargo build --release --bin xelis_wallet
-sudo cp target/release/xelis_wallet /usr/local/bin/
-```
-
-### Start the Daemon (testnet)
-
-```bash
-# Create data directory
-mkdir -p ~/.xelis/testnet
-
-# Start daemon (sync with testnet)
-xelis_daemon --network testnet &
-
-# Wait for sync (check every 30s)
-while true; do
-    STATUS=$(curl -s -X POST http://127.0.0.1:8080 \
-        -H "Content-Type: application/json" \
-        -d '{"method":"get_info","params":{},"jsonrpc":"2.0","id":1}' | jq -r '.result.synced')
-    if [ "$STATUS" = "true" ]; then
-        echo "Daemon synced!"
-        break
-    fi
-    echo "Waiting for sync..."
-    sleep 30
-done
-```
-
-### Create Wallet
-
-```bash
-xelis_wallet --network testnet --rpc-server &
-sleep 2
-
-# In a new terminal, attach to wallet
-xelis_wallet --network testnet
-
-# Inside wallet prompt:
-> create-wallet my-provider-wallet
-# Set a strong password (save it!)
-# Save the seed phrase (12-24 words) — CRITICAL
-
-> get-address
-# Note: xet1abc... (this is your PROVIDER_ADDRESS)
-
-> get-balance
-# Should show your testnet XEL balance
-```
+See [`scripts/custom_sources.example.json`](../scripts/custom_sources.example.json)
+for a fully-commented example with all source types.
 
 ---
 
-## Step 3: Get VLT and Register as Provider
+## 3. Custom source format
 
-### Get VLT
+The config file is `~/.xelis-vault/config/custom_sources.json`. It is a JSON
+object with a single `sources` array. Each entry is one of:
 
-On testnet, ask the team for VLT tokens. On mainnet, swap XEL → VLT on VaultSwap.
+### 3.1 Schema
 
-### Send VLT to Your Provider Address
-
-Send at least 1,000 VLT to your `xet1...` address.
-
-### Register as Provider
-
-```bash
-# Call register_provider on the StakedOracle contract
-# This will stake exactly 1,000 VLT (MIN_STAKE)
-# You must include 1,000 VLT in the transaction as deposit
-
-xelis_wallet --network testnet
-> call-contract <STAKED_ORACLE_HASH> register_provider \
-    --signer my-provider-wallet \
-    --deposit <VLT_ASSET_HASH> 100000000000
-
-# Verify registration
-> call-contract <STAKED_ORACLE_HASH> get_provider xet1abc...
-# Should return: (100000000000, <topoheight>, 0, 0, true)
-#                  ^stake         ^registered   ^rewards ^slashed ^active
+```json
+{
+  "sources": [
+    {
+      "name": "coinex",
+      "type": "http",
+      "enabled": true,
+      "api_key": "YOUR_API_KEY",
+      "api_secret": "YOUR_API_SECRET",
+      "symbols": ["XEL/USDT", "XEL/BTC"],
+      "poll_interval_seconds": 5,
+      "url": "https://api.coinex.com/v2/spot/ticker",
+      "params": { "market": "XELUSDT" },
+      "json_path": "data.0.last",
+      "headers": { "X-CoinEx-Key": "YOUR_API_KEY" },
+      "timeout": 10
+    },
+    {
+      "name": "mexc",
+      "type": "http",
+      "enabled": true,
+      "api_key": "YOUR_MEXC_API_KEY",
+      "api_secret": "YOUR_MEXC_API_SECRET",
+      "symbols": ["XEL/USDT"],
+      "poll_interval_seconds": 5,
+      "url": "https://api.mexc.com/api/v3/ticker/price",
+      "params": { "symbol": "XELUSDT" },
+      "json_path": "price",
+      "timeout": 10
+    },
+    {
+      "name": "xelis_daemon",
+      "type": "daemon",
+      "enabled": true,
+      "rpc_url": "http://127.0.0.1:8080",
+      "poll_interval_seconds": 5
+    },
+    {
+      "name": "custom_api",
+      "type": "http",
+      "enabled": false,
+      "url": "https://api.my-price.com/xel",
+      "json_path": "price",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" },
+      "timeout": 10
+    },
+    {
+      "name": "my_script",
+      "type": "command",
+      "enabled": false,
+      "command": "/usr/local/bin/fetch_xel_price.sh",
+      "args": ["--json"],
+      "timeout": 15
+    }
+  ]
+}
 ```
 
-If you want to stake more (lower slashing risk, same rewards):
+### 3.2 Fields
 
-```bash
-> call-contract <STAKED_ORACLE_HASH> increase_stake 500000000000 \
-    --signer my-provider-wallet \
-    --deposit <VLT_ASSET_HASH> 500000000000
-# Now stake = 1500 VLT
-```
+| Field                   | Required | Description                                              |
+|-------------------------|----------|----------------------------------------------------------|
+| `name`                  | yes      | Unique identifier used in logs (never logs API key)      |
+| `type`                  | yes      | `http` / `daemon` / `command`                            |
+| `enabled`               | yes      | If `false`, source is skipped                            |
+| `url`                   | http     | URL to fetch                                             |
+| `params`                | http     | Query-string params                                      |
+| `json_path`             | http     | Dot-separated path into the JSON (e.g. `data.0.last`)    |
+| `headers`               | http     | Extra HTTP headers (e.g. `Authorization: Bearer ...`)    |
+| `timeout`               | http/cmd | Seconds before the fetch is aborted                     |
+| `api_key` / `api_secret`| http     | Optional, used by built-in CoinEx/MEXC helpers          |
+| `symbols`               | http     | List of trading-pair symbols this source can fetch       |
+| `poll_interval_seconds` | all      | Per-source polling interval                              |
+| `rpc_url`               | daemon   | XELIS daemon JSON-RPC URL                                |
+| `command` + `args`      | command  | External command; stdout must be JSON with a `price` field |
 
 ---
 
-## Step 4: Install the Price Provider Script
+## 4. Price aggregation
 
-### Install Python Dependencies
+On each cycle (default every 5 seconds per source, then a 20-second submit
+window), `price_provider.py`:
 
-```bash
-sudo apt install -y python3 python3-pip
-pip3 install requests
-```
+1. **Polls each enabled source** for the configured symbol(s).
+2. **Sanity-checks** each price: must be within `0.001 < price < 10,000` USD
+   (configurable in the script).
+3. **Outlier rejection**: any price >5 % from the median of all collected
+   prices is discarded (and logged).
+4. **Staleness check**: any price older than 30 seconds is discarded (and
+   logged).
+5. **Median compute**: takes the median of remaining valid prices.
+6. **Submit** if there are ≥ 2 valid sources.
 
-### Download the Script
+### 4.1 Why median not mean?
 
-```bash
-mkdir -p /opt/xelis-vault
-cd /opt/xelis-vault
+Median is robust to a single bad source. With 5 sources, even if 2 are
+completely wrong (e.g. an exchange glitch), the median of the 3 good ones is
+still correct.
 
-# From the XELIS Vault repo
-curl -O https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/price_provider.py
-chmod +x price_provider.py
-```
+### 4.2 Why >5 % rejection?
 
-### Configure Environment
+The on-chain oracle itself rejects submissions >5 % from the on-chain median
+(severity 0 slash, -50 reputation). We pre-filter locally to avoid being
+flagged.
 
-```bash
-cat > /opt/xelis-vault/.env << EOF
-# Your provider XELIS address (must be registered in StakedOracle)
-PROVIDER_ADDRESS=xet1abc...
+### 4.3 Why >30 s staleness?
 
-# StakedOracle contract hash (from deployment)
-STAKED_ORACLE_CONTRACT=0x...
-
-# XELIS daemon RPC URL
-XELIS_RPC=http://127.0.0.1:8080
-
-# VLT asset hash (from VLTToken.get_asset_hash)
-VLT_ASSET_HASH=0x...
-
-# Optional: CoinMarketCap API key (for fallback source)
-# Get free key at https://pro.coinmarketcap.com/signup
-CMC_API_KEY=
-
-# Submit interval (seconds) — should be < 25s (1 cycle)
-SUBMIT_INTERVAL=20
-
-# Prometheus metrics port
-PROMETHEUS_PORT=9091
-
-# Log level (DEBUG, INFO, WARNING, ERROR)
-LOG_LEVEL=INFO
-EOF
-```
-
-### Test the Script
-
-```bash
-cd /opt/xelis-vault
-source .env
-
-# Test price sources
-python3 price_provider.py --test-sources
-
-# Expected output:
-# [INFO] Testing all price sources...
-# [INFO]   mexc         OK  $0.320000 (150ms)
-# [INFO]   coinex       OK  $0.321000 (80ms)
-# [INFO]   coingecko    OK  $0.318000 (270ms)
-# [WARNING] cmc          FAIL  (no API key)
-
-# List available sources
-python3 price_provider.py --list-sources
-```
+A price from 60 s ago can be drastically different from now in volatile
+markets. 30 s gives us a strict freshness bound without being too aggressive.
 
 ---
 
-## Step 5: Run as a Service
+## 5. Submission flow
 
-### Create systemd Service
+```
+                  ┌──────────────────────┐
+                  │  CoinEx  MEXC  Daemon │   (custom sources)
+                  └──────────┬───────────┘
+                             │ fetch every 5s
+                             ▼
+                  ┌──────────────────────┐
+                  │  price_provider.py   │
+                  │   - sanity check     │
+                  │   - outlier reject   │
+                  │   - staleness reject │
+                  │   - compute median   │
+                  └──────────┬───────────┘
+                             │ every ~20 s
+                             ▼
+                  ┌──────────────────────┐
+                  │ StakedOracle         │
+                  │ .submit_price(       │   ← entry ID 5
+                  │   feed_id, price)    │
+                  └──────────┬───────────┘
+                             │ on cycle boundary (5 blocks)
+                             ▼
+                  ┌──────────────────────┐
+                  │ StakedOracle         │
+                  │ .aggregate_now(fid)  │   ← entry ID 6 (called by keeper)
+                  └──────────┬───────────┘
+                             │
+                             ▼
+                  ┌──────────────────────┐
+                  │ XelisVaultMiner      │
+                  │ .distribute_reward(  │   ← entry ID 8 (called by oracle)
+                  │   miner, svc, true)  │
+                  └──────────────────────┘
+```
+
+The `submit_price` (entry ID 5) call is signed by your wallet — this is what
+links the price to your miner address. The on-chain oracle verifies you are
+registered (entry ID 9 must return 1) and not paused.
+
+---
+
+## 6. Privacy considerations
+
+### 6.1 What is public on-chain
+
+- Your **wallet address** (signs every `submit_price` transaction).
+- Your **submitted price** (visible in the tx payload).
+- The **timestamp / block height** of your submission.
+- Your **reputation** (entry ID 11 — readable by anyone).
+- Your **stake and rewards** (entries 10 and 11 of `XelisVaultMiner`).
+
+### 6.2 What is NOT logged on-chain
+
+- Your **IP address** (the daemon submits via JSON-RPC; the network only sees
+  the wallet's signed transaction).
+- Your **API keys** (CoinEx, MEXC, etc.) — these never leave your server.
+- Your **other wallet holdings** — only the stake is locked in the contract.
+- Other miners' IPs — the script never logs them either.
+
+### 6.3 Best practice: use a dedicated mining wallet
+
+Set up a fresh XELIS wallet **just for mining**. Send it exactly 100 VLT +
+a small XEL balance for gas. This way:
+
+- Your main holdings aren't linked to your miner identity.
+- If the miner server is compromised, only the mining wallet (small balance)
+  is at risk.
+- Your on-chain history as a miner doesn't leak your main wallet's
+  transaction graph.
+
+### 6.4 What `price_provider.py` logs
+
+```
+2026-07-15 14:32:11 INFO  source=coinex        price=0.4821  latency=80ms
+2026-07-15 14:32:11 INFO  source=mexc          price=0.4819  latency=150ms
+2026-07-15 14:32:11 INFO  source=xelis_daemon  price=0.4820  latency=12ms
+2026-07-15 14:32:11 INFO  median=0.4820  valid_sources=3  rejected=0
+2026-07-15 14:32:31 INFO  submit_price feed_id=0 price=48200000 atomic  tx=0x9f3a...c1
+```
+
+Note: API keys are **never** in the log. Source name + price + timestamp
+only. Wallet balances are masked with `****`.
+
+---
+
+## 7. Setting up the aggregation keeper
+
+The `aggregation_keeper.py` script triggers `StakedOracle.aggregate_now
+(feed_id)` (entry ID **6**) every 25 seconds. This is needed because
+aggregation only auto-triggers inside `submit_price` if the cycle has
+elapsed — but if no provider submits in a given window, aggregation never
+runs and the price goes stale.
+
+### 7.1 Install & run
 
 ```bash
-sudo cat > /etc/systemd/system/xelis-vault-provider.service << EOF
+python3 scripts/aggregation_keeper.py \
+    --feed-ids 0,1,2 \
+    --interval 25 \
+    --rpc http://localhost:8080
+```
+
+### 7.2 Run as a service
+
+```bash
+sudo tee /etc/systemd/system/xelis-vault-keeper.service <<EOF
 [Unit]
-Description=XELIS Vault Price Provider
+Description=XELIS Vault Aggregation Keeper v5.0
 After=network.target xelis-daemon.service
-Requires=xelis-daemon.service
 
 [Service]
 Type=simple
-User=xelis
-WorkingDirectory=/opt/xelis-vault
-EnvironmentFile=/opt/xelis-vault/.env
-ExecStart=/usr/bin/python3 /opt/xelis-vault/price_provider.py
+User=$(whoami)
+ExecStart=/home/$(whoami)/.xelis-vault/venv/bin/python3 \
+    /home/$(whoami)/xelis-vault-v5/scripts/aggregation_keeper.py \
+    --feed-ids 0 --interval 25
 Restart=always
 RestartSec=10
-StandardOutput=append:/var/log/xelis-vault-provider.log
-StandardError=append:/var/log/xelis-vault-provider.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable xelis-vault-provider
-sudo systemctl start xelis-vault-provider
+sudo systemctl enable --now xelis-vault-keeper
+```
 
-# Check status
-sudo systemctl status xelis-vault-provider
+> Anyone can run a keeper — no VLT stake needed. The community is encouraged
+> to run ≥ 3 keepers for redundancy.
 
-# View logs
-sudo tail -f /var/log/xelis-vault-provider.log
+### 7.3 CLI flags
+
+| Flag          | Default                  | Description                          |
+|---------------|--------------------------|--------------------------------------|
+| `--feed-ids`  | `0`                      | Comma-separated feed IDs to keep     |
+| `--interval`  | `25`                     | Seconds between aggregate calls      |
+| `--rpc`       | `http://localhost:8080`  | XELIS daemon JSON-RPC URL            |
+| `--dry-run`   | off                      | Log but don't submit                 |
+
+---
+
+## 8. Monitoring
+
+### 8.1 Log files
+
+| Process              | Log file                                |
+|----------------------|-----------------------------------------|
+| `xelis_vault_miner.py` | `~/.xelis-vault/logs/miner.log`       |
+| `price_provider.py`    | `~/.xelis-vault/logs/provider.log`    |
+| `aggregation_keeper.py`| `~/.xelis-vault/logs/keeper.log`      |
+
+All logs rotate at 100 MB and keep 5 archives.
+
+### 8.2 Live tail
+
+```bash
+tail -f ~/.xelis-vault/logs/provider.log
+```
+
+### 8.3 Grafana dashboard
+
+A ready-to-import Grafana JSON ships at `scripts/grafana_dashboard.json`
+(create it from the template below if it doesn't exist yet). It exposes:
+
+- `provider_prices_submitted_total` (counter)
+- `provider_last_price_xel_usd` (gauge)
+- `provider_estimated_rewards_vlt` (gauge)
+- `provider_sources_healthy` (gauge — number of sources returning valid data)
+- `keeper_aggregations_total` (counter)
+- `keeper_last_aggregation_topo` (gauge)
+
+To enable Prometheus, set `PROMETHEUS_PORT=9091` in
+`~/.xelis-vault/config/.env` and scrape it from your Prometheus instance.
+
+### 8.4 On-chain checks
+
+```bash
+# Current aggregated price for XEL/USD (entry ID 8)
+xelis_wallet call-contract <StakedOracle> get_price_entry "XEL/USD"
+
+# Current cycle for feed 0 (pub fn)
+xelis_wallet call-contract <StakedOracle> get_cycle 0
+
+# Number of submissions in the current cycle (pub fn)
+xelis_wallet call-contract <StakedOracle> get_cycle_submissions 0
 ```
 
 ---
 
-## Step 6: Monitor Your Provider
+## 9. Performance tuning
 
-### Check Service Status
+### 9.1 Poll interval
+
+Default is 5 s per source. Lowering to 2 s gives fresher data but increases
+API rate-limit risk. Recommended:
+
+- **CoinEx / MEXC** with API key: 2–3 s
+- **CoinEx / MEXC** without API key: 5 s
+- **CoinGecko**: 60 s (rate limit 30/min)
+- **Custom HTTP**: depends on the upstream — start at 5 s
+
+### 9.2 Max sources
+
+More sources = better median, but diminishing returns past 5. The script
+cap is 10 concurrent sources.
+
+### 9.3 Retry policy
+
+Each source has a built-in 3-retry with exponential backoff (1 s, 2 s, 4 s).
+After 3 failures the source is marked unhealthy for 60 s and skipped. The
+script logs every retry at DEBUG level.
+
+### 9.4 Submit interval
+
+Default: 20 s. The on-chain cycle is 5 blocks ≈ 25 s. Submitting every 20 s
+ensures you have a fresh submission in every cycle without being flagged for
+spam (`alreadysub` revert if you submit twice in the same cycle).
+
+### 9.5 Parallelism
+
+`price_provider.py` polls all sources concurrently using a thread pool
+(default 8 workers). If you have many sources, raise the pool size:
+
 ```bash
-sudo systemctl status xelis-vault-provider
-```
-
-### View Logs
-```bash
-sudo tail -f /var/log/xelis-vault-provider.log
-```
-
-Expected log output:
-```
-[INFO] Block 12345 was mined by us! Submitting prices...
-[INFO] Feed XEL/USD: median=$0.321000, sources=['mexc', 'coinex', 'coingecko'], ignored=[]
-[INFO] Submitting XEL/USD=$0.321000 (atomic=32100000) for block 12345
-[INFO]   -> tx=0xabc123...
-```
-
-### Prometheus Metrics
-```bash
-curl http://localhost:9091/metrics
-```
-
-Key metrics:
-- `provider_prices_submitted_total` — total prices submitted
-- `provider_estimated_rewards_vlt` — estimated VLT rewards earned
-- `provider_last_price_xel_usd` — last submitted price
-
-### On-Chain Verification
-
-```bash
-xelis_wallet --network testnet
-> call-contract <STAKED_ORACLE_HASH> get_provider xet1abc...
-# Returns: (stake, registered_at, rewards_earned, total_slashed, active)
-# rewards_earned should increase over time
-# total_slashed should stay low (0 if you're doing well)
+python3 scripts/price_provider.py --max-workers 16
 ```
 
 ---
 
-## Step 7: Manage Your Stake
+## 10. Disaster recovery
 
-### Check Your Stake
-```bash
-xelis_wallet --network testnet
-> call-contract <STAKED_ORACLE_HASH> get_provider xet1abc...
-```
+### 10.1 If your provider goes down
 
-### Add More Stake
-```bash
-> call-contract <STAKED_ORACLE_HASH> increase_stake 100000000000 \
-    --signer my-provider-wallet \
-    --deposit <VLT_ASSET_HASH> 100000000000
-# Adds 100 VLT to stake
-```
+- The on-chain oracle keeps working as long as **other** providers are
+  submitting — your absence just means you don't earn rewards.
+- No reputation penalty for being offline **as a provider** (the reputation
+  penalty for being offline applies to **miners**, triggered by missed
+  heartbeats — see [Miner Guide](MINER_GUIDE.md) §11.3).
+- When you come back, you simply resume submitting.
 
-### Withdraw Stake
-```bash
-> call-contract <STAKED_ORACLE_HASH> decrease_stake 50000000000 \
-    --signer my-provider-wallet
-# Withdraws 50 VLT (must keep >= MIN_STAKE = 1000 VLT)
-```
+### 10.2 Redundancy
 
-### Deregister Completely
-```bash
-# Stop the provider script first!
-sudo systemctl stop xelis-vault-provider
+Run two provider instances in different data centres, both signed by the
+**same** wallet. The second instance is a hot standby — it submits only if
+the primary hasn't submitted in the current cycle (use the `--standby` flag).
 
-> call-contract <STAKED_ORACLE_HASH> deregister_provider \
-    --signer my-provider-wallet
-# Returns your full stake
-```
+### 10.3 Failover sources
 
----
+If your primary source goes down, the script automatically falls back to
+the next enabled source. Keep at least **3 sources** enabled so a single
+outage doesn't drop you below the 2-source minimum.
 
-## Troubleshooting
+### 10.4 Backup config
 
-### "notprov" Error
-You're not registered. Run Step 3 first.
+Back up `~/.xelis-vault/config/` regularly to a secure location (encrypted
+off-site). It contains your API keys.
 
-### "lowstake" Error
-Your stake is below MIN_STAKE. Add more VLT via `increase_stake`.
+### 10.5 Wallet backup
 
-### "alreadysub" Error
-You're trying to submit twice in the same cycle. The script should not do this — check your `SUBMIT_INTERVAL` (should be ≥ 20s).
-
-### "oorange" Error
-Your price is outside the [min, max] range for the feed. Check that your price sources are working correctly:
-```bash
-python3 price_provider.py --test-sources
-```
-
-### No Rewards After Long Time
-- Verify oracle is aggregating: `get_cycle 0` should increment
-- Verify your prices are within 5% of median: monitor `provider_estimated_rewards_vlt`
-- Verify StakedOracle is minter: `call-contract <VLT_TOKEN> get_minter <STAKED_ORACLE_HASH>` (should be `true`)
-
-### High Slashing Rate
-- Run `--test-sources` and ensure all 3 main sources work
-- Check if your internet is unstable (latency > 5s can cause stale prices)
-- Consider increasing your outlier threshold: edit `OUTLIER_THRESHOLD_PCT = 0.10` in the script
+Back up your wallet's mnemonic offline (paper / hardware). If your server
+dies, you can restore the wallet on a new server and keep the same miner
+identity (reputation, stake, registration all persist on-chain).
 
 ---
 
-## FAQ
+## 11. FAQ
 
-### Can I run multiple providers?
-Yes, but each needs its own:
-- XELIS address (with 1,000 VLT stake)
-- Server (different IP recommended)
-- Running `price_provider.py` instance
+### Q1. Can I run provider without being a miner?
+No. `submit_price` reverts with `notreg` if your address isn't registered on
+`XelisVaultMiner`. Register first (see [Miner Guide](MINER_GUIDE.md) §7),
+then run `price_provider.py` with the same wallet.
 
-### What if my server goes offline?
-- No penalties for being offline (only for submitting wrong prices)
-- When you come back, you'll resume earning rewards
-- If you're offline for a long time, your stake remains safe
+### Q2. Do I get slashed for being offline?
+Only miners get slashed (via missed heartbeats). The provider script not
+running means no rewards, but no penalty.
 
-### Can I use different price sources?
-Yes — edit `PRICE_SOURCES` in `price_provider.py` to add/remove sources. Just make sure they're reliable.
+### Q3. Can I run the provider and the miner daemon on different machines?
+Yes, as long as both share the same wallet (same XELIS address). Use
+`xelis_wallet`'s remote RPC mode to share a single wallet across machines.
 
-### What happens if VLT supply reaches MAX_SUPPLY?
-The `mint_to` function will revert, and rewards won't be distributed for that cycle. The governance should lower `REWARD_PER_CYCLE` before this happens. With 6M VLT allocated to 10 years of rewards, this won't happen before 2036 at the earliest.
+### Q4. What's the minimum stake to be a provider?
+100 VLT (the miner minimum). There is no separate provider stake — your
+miner stake covers it.
 
-### Can I be a provider AND a miner?
-Yes! In fact, miners make great providers because they already have the infrastructure. If you also want to help keep the oracle healthy, run `aggregation_keeper.py` alongside (see Miner Guide).
+### Q5. How are rewards credited?
+`StakedOracle.aggregate_now` (entry ID 6) is called by the keeper every 25 s.
+If your submission was within 5 % of the median, `distribute_reward` (entry
+ID 8 on `XelisVaultMiner`) mints VLT to your wallet. The amount is
+`BASE_REWARD_ORACLE × reputation_mult × budget_factor`.
+
+### Q6. Can I submit for multiple feeds?
+Yes. Add multiple `--feed-id` flags or list them in the config. Each feed
+earns its own reward per cycle.
+
+### Q7. Why is my provider log showing `oorange` errors?
+Your submitted price is outside the `[min_price, max_price]` range set when
+the feed was created (entry ID 0 on `StakedOracle`). Check your sources and
+the feed config. For XEL/USD the default range is `[0.001 USD, 10,000 USD]`.
+
+### Q8. Where do I get help?
+- Discord: https://discord.gg/UHpYAWbG — `#providers` channel
+- Email: `providers@xelisvault.io`
+- GitHub Issues: https://github.com/XelisVault/xelis-vault/issues
 
 ---
 
-## Support
+## 12. References
 
-- **Discord**: [XELIS Vault Discord](https://discord.gg/xelisvault) — `#providers` channel
-- **Email**: `providers@xelisvault.io`
-- **GitHub Issues**: For script bugs only — [XelisVault/xelis-vault/issues](https://github.com/XelisVault/xelis-vault/issues)
+- [Miner Guide](MINER_GUIDE.md) — register as a miner, manage stake/reputation
+- [Reward System](REWARD_SYSTEM.md) — full reward math
+- [Entry IDs v5.0](ENTRY_IDS.md) — canonical entry ID list
+- [`scripts/custom_sources.example.json`](../scripts/custom_sources.example.json)
+  — fully-commented config example
 
 ---
 
-*Last updated: June 2026 — v4.2*
+*Last updated: July 2026 — v5.0*

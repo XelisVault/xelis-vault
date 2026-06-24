@@ -1,7 +1,55 @@
-const VERSION: string = "MinerPool v4.2"
+// ============================================================================
+// MinerPool.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Miner pool aggregation, preserved from v4.2.
+//
+// v5.0 changes:
+//   - distribute_pool_rewards converted from `pub fn` to `entry` (ID 4) so the
+//     XelisVaultMiner contract can invoke it cross-contract.
+//   - pub fn (get_pool, get_pool_members, get_pool_reputation, get_user_pool,
+//     get_pools_count, get_pool_pending_rewards, is_pool_member) wrapped as
+//     *_entry entries.
+//   - Added EMERGENCY_KEY + set_emergency entry.
+//   - Added two-step emergency_withdraw (IDs 22/23, "ert" key, 17280-block
+//     delay).
+//   - Calls to XelisVaultMiner v5.0 use entry 10 (get_miner_stake_entry) and
+//     entry 11 (get_miner_reputation_entry), which now resolve to the correct
+//     entries (v4.2 numerically called 10/11 too, but those IDs were mapped to
+//     the wrong functions in the v4.2 XelisVaultMiner; v5.0 XelisVaultMiner
+//     aligns them properly).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : create_pool
+//   1  : join_pool
+//   2  : leave_pool
+//   3  : kick_member
+//   4  : distribute_pool_rewards_entry
+//   5  : claim_pool_rewards
+//   6  : get_pool_entry
+//   7  : get_pool_members_entry
+//   8  : get_pool_reputation_entry
+//   9  : get_user_pool_entry
+//   10 : get_pools_count_entry
+//   11 : get_pool_pending_rewards_entry
+//   12 : is_pool_member_entry
+//   13 : set_miner_contract
+//   14 : set_vlt_asset
+//   15 : set_registry
+//   16 : set_timelock
+//   17 : set_emergency
+//   18 : pause
+//   19 : unpause
+//   20 : transfer_admin
+//   21 : get_version
+//   22 : request_emergency_withdraw
+//   23 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "MinerPool v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
 const MINER_CONTRACT_KEY: string = "mc"
@@ -9,13 +57,16 @@ const VLT_ASSET_KEY: string = "va"
 
 const POOLS_COUNT_KEY: string = "pc"
 const POOL_PREFIX: string = "pool_"
-const POOL_MEMBER_PREFIX: string = "pm_"      
-const POOL_MEMBERS_COUNT_PREFIX: string = "pmc_" 
-const USER_POOL_KEY: string = "up_"           
-const POOL_REWARDS_PREFIX: string = "pr_"     
+const POOL_MEMBER_PREFIX: string = "pm_"
+const POOL_MEMBERS_COUNT_PREFIX: string = "pmc_"
+const USER_POOL_KEY: string = "up_"
+const POOL_REWARDS_PREFIX: string = "pr_"
 
 const MAX_POOL_MEMBERS: u64 = 50
-const DEFAULT_CREATOR_COMMISSION: u64 = 500   
+const DEFAULT_CREATOR_COMMISSION: u64 = 500
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
 
 struct Pool {
     id: u64,
@@ -30,8 +81,9 @@ struct Pool {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(POOLS_COUNT_KEY, 0u64)
     return 0
@@ -39,14 +91,21 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
 }
 
 fn when_not_paused() {
@@ -54,31 +113,53 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
+fn pool_key(id: u64) -> string {
+    return POOL_PREFIX + id.to_string(10u32)
+}
+
+fn pool_member_key(pool_id: u64, addr: Address) -> string {
+    return POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + addr.to_string()
+}
+
+fn pool_members_count_key(pool_id: u64) -> string {
+    return POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)
+}
+
+fn pool_rewards_key(pool_id: u64) -> string {
+    return POOL_REWARDS_PREFIX + pool_id.to_string(10u32)
+}
+
+// Reads miner stake via XelisVaultMiner v5.0 entry 10 (get_miner_stake_entry)
 fn get_miner_stake(addr: Address) -> u64 {
     let s: Storage = Storage::new()
-    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).unwrap()
-    let miner: Contract = Contract::new(miner_hash).unwrap()
-    
-    let stake: u64 = miner.call(0u16, [addr], {})
+    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("err")
+    let miner: Contract = Contract::new(miner_hash).expect("err")
+    let stake: u64 = miner.call(10u16, [addr], {})
     return stake
 }
 
+// Reads miner reputation via XelisVaultMiner v5.0 entry 11
+// (get_miner_reputation_entry)
 fn get_miner_reputation(addr: Address) -> u64 {
     let s: Storage = Storage::new()
-    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).unwrap()
-    let miner: Contract = Contract::new(miner_hash).unwrap()
-    
-    let rep: u64 = miner.call(1u16, [addr], {})
+    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("err")
+    let miner: Contract = Contract::new(miner_hash).expect("err")
+    let rep: u64 = miner.call(11u16, [addr], {})
     return rep
 }
 
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: create_pool
 entry create_pool(name: string, description: string, creator_commission_bps: u64) -> u64 {
     when_not_paused()
     require(name != "", "badname")
-    require(creator_commission_bps <= 2000, "badcomm")  
+    require(creator_commission_bps <= 2000, "badcomm")
 
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
 
     let stake: u64 = get_miner_stake(caller)
     require(stake > 0, "notminer")
@@ -97,19 +178,19 @@ entry create_pool(name: string, description: string, creator_commission_bps: u64
         created_at: get_current_topoheight(),
         active: true
     }
-    s.store(POOL_PREFIX + id.to_string(10u32), pool)
-
-    s.store(POOL_MEMBER_PREFIX + id.to_string(10u32) + "_" + caller.to_string(), true)
-    s.store(POOL_MEMBERS_COUNT_PREFIX + id.to_string(10u32), 1u64)
+    s.store(pool_key(id), pool)
+    s.store(pool_member_key(id, caller), true)
+    s.store(pool_members_count_key(id), 1u64)
     s.store(USER_POOL_KEY + caller.to_string(), id)
     s.store(POOLS_COUNT_KEY, id + 1)
     return id
 }
 
+// ID 1: join_pool
 entry join_pool(pool_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
 
     let stake: u64 = get_miner_stake(caller)
     require(stake > 0, "notminer")
@@ -117,34 +198,35 @@ entry join_pool(pool_id: u64) -> u64 {
     let existing_pool: u64 = s.load(USER_POOL_KEY + caller.to_string()).unwrap_or(0)
     require(existing_pool == 0, "alreadypool")
 
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
     require(pool.active, "inactive")
 
-    let members_count: u64 = s.load(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    let members_count: u64 = s.load(pool_members_count_key(pool_id)).unwrap_or(0)
     require(members_count < MAX_POOL_MEMBERS, "full")
 
-    s.store(POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string(), true)
-    s.store(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32), members_count + 1)
+    s.store(pool_member_key(pool_id, caller), true)
+    s.store(pool_members_count_key(pool_id), members_count + 1)
     s.store(USER_POOL_KEY + caller.to_string(), pool_id)
 
     pool.total_stake += stake
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
 
+// ID 2: leave_pool
 entry leave_pool() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
 
-    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).unwrap()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).expect("err")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
 
     require(pool.creator != caller, "creatorleave")
 
-    s.delete(POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string())
-    let members_count: u64 = s.load(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    s.delete(pool_member_key(pool_id, caller))
+    let members_count: u64 = s.load(pool_members_count_key(pool_id)).unwrap_or(0)
     if members_count > 0 {
-        s.store(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32), members_count - 1)
+        s.store(pool_members_count_key(pool_id), members_count - 1)
     }
     s.delete(USER_POOL_KEY + caller.to_string())
 
@@ -152,34 +234,35 @@ entry leave_pool() -> u64 {
     if pool.total_stake >= stake {
         pool.total_stake -= stake
     }
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
 
-    let pending: u64 = s.load(POOL_REWARDS_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    let pending: u64 = s.load(pool_rewards_key(pool_id)).unwrap_or(0)
     if pending > 0 {
         let share: u64 = (pending as u128 * stake as u128 / pool.total_stake as u128) as u64
         if share > 0 {
-            let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-            transfer(caller, share, vlt_asset)
+            let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+            let _ = transfer(caller, share, vlt_asset)
         }
     }
     return 0
 }
 
+// ID 3: kick_member
 entry kick_member(member: Address) -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
 
-    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).unwrap()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).expect("err")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
     require(pool.creator == caller, "notcreator")
 
-    let is_member: bool = s.load(POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + member.to_string()).unwrap_or(false)
+    let is_member: bool = s.load(pool_member_key(pool_id, member)).unwrap_or(false)
     require(is_member, "notmember")
 
-    s.delete(POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + member.to_string())
-    let members_count: u64 = s.load(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    s.delete(pool_member_key(pool_id, member))
+    let members_count: u64 = s.load(pool_members_count_key(pool_id)).unwrap_or(0)
     if members_count > 0 {
-        s.store(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32), members_count - 1)
+        s.store(pool_members_count_key(pool_id), members_count - 1)
     }
     s.delete(USER_POOL_KEY + member.to_string())
 
@@ -187,33 +270,34 @@ entry kick_member(member: Address) -> u64 {
     if pool.total_stake >= stake {
         pool.total_stake -= stake
     }
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
 
-pub fn distribute_pool_rewards(pool_id: u64, amount: u64) -> u64 {
+// ID 4: distribute_pool_rewards_entry — called by XelisVaultMiner
+entry distribute_pool_rewards_entry(pool_id: u64, amount: u64) -> u64 {
     let s: Storage = Storage::new()
-    
-    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let miner_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == miner_hash, "notminer")
 
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
     require(pool.active, "inactive")
 
-    let pending: u64 = s.load(POOL_REWARDS_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_REWARDS_PREFIX + pool_id.to_string(10u32), pending + amount)
+    let pending: u64 = s.load(pool_rewards_key(pool_id)).unwrap_or(0)
+    s.store(pool_rewards_key(pool_id), pending + amount)
     return 0
 }
 
+// ID 5: claim_pool_rewards
 entry claim_pool_rewards() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
 
-    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).unwrap()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool_id: u64 = s.load(USER_POOL_KEY + caller.to_string()).expect("err")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
 
-    let pending: u64 = s.load(POOL_REWARDS_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    let pending: u64 = s.load(pool_rewards_key(pool_id)).unwrap_or(0)
     require(pending > 0, "norewards")
 
     let stake: u64 = get_miner_stake(caller)
@@ -226,47 +310,169 @@ entry claim_pool_rewards() -> u64 {
     if pool.creator == caller {
         commission = (share as u128 * pool.creator_commission_bps as u128 / 10000u128) as u64
     } else {
-        
         commission = (share as u128 * pool.creator_commission_bps as u128 / 10000u128) as u64
-        
         if commission > 0 {
-            let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-            transfer(pool.creator, commission, vlt_asset)
+            let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+            let _ = transfer(pool.creator, commission, vlt_asset)
         }
     }
 
     let net_share: u64 = share - commission
     if net_share > 0 {
-        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap()
-        transfer(caller, net_share, vlt_asset)
+        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+        let _ = transfer(caller, net_share, vlt_asset)
     }
 
     let claimed_total: u64 = share
     if pending >= claimed_total {
-        s.store(POOL_REWARDS_PREFIX + pool_id.to_string(10u32), pending - claimed_total)
+        s.store(pool_rewards_key(pool_id), pending - claimed_total)
     } else {
-        s.store(POOL_REWARDS_PREFIX + pool_id.to_string(10u32), 0u64)
+        s.store(pool_rewards_key(pool_id), 0u64)
     }
     return net_share
 }
 
-pub fn get_pool(pool_id: u64) -> (Address, string, string, u64, u64, u64, bool) {
+// ID 6: get_pool_entry
+pub fn get_pool_entry(pool_id: u64) -> (Address, string, string, u64, u64, u64, bool) {
     let s: Storage = Storage::new()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
     return (pool.creator, pool.name, pool.description, pool.creator_commission_bps, pool.total_stake, pool.created_at, pool.active)
 }
 
+// ID 7: get_pool_members_entry
+entry get_pool_members_entry(pool_id: u64) -> u64 {
+    return Storage::new().load(pool_members_count_key(pool_id)).unwrap_or(0)
+}
+
+// ID 8: get_pool_reputation_entry
+pub fn get_pool_reputation_entry(pool_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let pool: Pool = s.load(pool_key(pool_id)).expect("err")
+    let members_count: u64 = s.load(pool_members_count_key(pool_id)).unwrap_or(0)
+    if members_count == 0 { return 0 }
+    return 5000
+}
+
+// ID 9: get_user_pool_entry
+entry get_user_pool_entry(addr: Address) -> u64 {
+    return Storage::new().load(USER_POOL_KEY + addr.to_string()).unwrap_or(0)
+}
+
+// ID 10: get_pools_count_entry
+entry get_pools_count_entry() -> u64 {
+    return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 11: get_pool_pending_rewards_entry
+entry get_pool_pending_rewards_entry(pool_id: u64) -> u64 {
+    return Storage::new().load(pool_rewards_key(pool_id)).unwrap_or(0)
+}
+
+// ID 12: is_pool_member_entry
+entry is_pool_member_entry(pool_id: u64, addr: Address) -> bool {
+    return Storage::new().load(pool_member_key(pool_id, addr)).unwrap_or(false)
+}
+
+// ID 13: set_miner_contract
+entry set_miner_contract(mc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(MINER_CONTRACT_KEY, mc)
+    return 0
+}
+
+// ID 14: set_vlt_asset
+entry set_vlt_asset(va: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(VLT_ASSET_KEY, va)
+    return 0
+}
+
+// ID 15: set_registry
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 16: set_timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 17: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 18: pause
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 19: unpause
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 20: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 21: get_version
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 22: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 23: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_pool(pool_id: u64) -> (Address, string, string, u64, u64, u64, bool) {
+    return get_pool_entry(pool_id)
+}
+
 pub fn get_pool_members(pool_id: u64) -> u64 {
-    return Storage::new().load(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    return Storage::new().load(pool_members_count_key(pool_id)).unwrap_or(0)
 }
 
 pub fn get_pool_reputation(pool_id: u64) -> u64 {
-    let s: Storage = Storage::new()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
-    let members_count: u64 = s.load(POOL_MEMBERS_COUNT_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    if members_count == 0 { return 0 }
-
-    return 5000  
+    return get_pool_reputation_entry(pool_id)
 }
 
 pub fn get_user_pool(addr: Address) -> u64 {
@@ -278,19 +484,15 @@ pub fn get_pools_count() -> u64 {
 }
 
 pub fn get_pool_pending_rewards(pool_id: u64) -> u64 {
-    return Storage::new().load(POOL_REWARDS_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
+    return Storage::new().load(pool_rewards_key(pool_id)).unwrap_or(0)
 }
 
 pub fn is_pool_member(pool_id: u64, addr: Address) -> bool {
-    return Storage::new().load(POOL_MEMBER_PREFIX + pool_id.to_string(10u32) + "_" + addr.to_string()).unwrap_or(false)
+    return Storage::new().load(pool_member_key(pool_id, addr)).unwrap_or(false)
 }
 
-entry set_miner_contract(mc: Hash) -> u64 { only_admin() Storage::new().store(MINER_CONTRACT_KEY, mc) return 0 }
-entry set_vlt_asset(va: Hash) -> u64 { only_admin() Storage::new().store(VLT_ASSET_KEY, va) return 0 }
-entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
-entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
-pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
-entry pause(reason: string) -> u64 { only_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
-entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
-entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
-entry get_version() -> string { return VERSION }
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}

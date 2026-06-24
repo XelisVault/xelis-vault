@@ -1,4 +1,30 @@
-const VERSION: string = "FlashCallback v4.2"
+// ============================================================================
+// FlashCallback.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Trivial flash-loan callback interface, preserved from v4.2.
+//
+// v5.0 changes:
+//   - on_flash_loan converted from `pub fn` to `entry` (ID 0) so the FlashLoan
+//     v5.0 contract can invoke it via cb.call(0u16, [asset, amount, fee,
+//     caller, callback_data], {}). FlashLoan v5.0 documents this exact entry
+//     signature.
+//   - FIX: the v4.2 `fl.call(1u16, [total_repay], { asset: total_repay })`
+//     used an invalid JS-object kwargs literal. Per the Silex API constraint
+//     ("The 3rd argument to Contract::call must be `{}`"), the kwargs are now
+//     `{}`. The callback still verifies the contract's own balance covers the
+//     total repayment and calls back into the FlashLoan contract before
+//     returning 0.
+//
+// Entry IDs (sequential, starting at 0):
+//   0 : on_flash_loan
+//   1 : claim_profit
+//   2 : set_flash_loan
+//   3 : set_registry
+//   4 : transfer_admin
+//   5 : get_version
+// ============================================================================
+
+const VERSION: string = "FlashCallback v5.0"
 
 const ADMIN_KEY: string = "a"
 const FLASH_LOAN_KEY: string = "fl"
@@ -6,19 +32,26 @@ const REGISTRY_KEY: string = "reg"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     require(caller == admin, "notauth")
 }
 
-pub fn on_flash_loan(
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: on_flash_loan — invoked by FlashLoan v5.0 entry 0 (flash_loan)
+// Signature MUST be (asset: Hash, amount: u64, fee: u64, caller: Address,
+// data: bytes) -> u64 per FlashLoan v5.0's documented callback contract.
+entry on_flash_loan(
     asset: Hash,
     amount: u64,
     fee: u64,
@@ -26,7 +59,7 @@ pub fn on_flash_loan(
     data: bytes
 ) -> u64 {
     let s: Storage = Storage::new()
-    let flash_loan_hash: Hash = s.load(FLASH_LOAN_KEY).unwrap()
+    let flash_loan_hash: Hash = s.load(FLASH_LOAN_KEY).expect("err")
 
     let total_repay: u64 = amount + fee
     require(total_repay >= amount, "ovf")
@@ -34,39 +67,45 @@ pub fn on_flash_loan(
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
     require(bal >= total_repay, "insrepay")
 
-    let fl: Contract = Contract::new(flash_loan_hash).unwrap()
-    let _ = fl.call(1u16, [total_repay], { asset: total_repay })
+    let fl: Contract = Contract::new(flash_loan_hash).expect("err")
+    // FIX: kwargs must be `{}` (empty), not a JS object literal.
+    let _ = fl.call(1u16, [total_repay], {})
 
     return 0
 }
 
+// ID 1: claim_profit
 entry claim_profit(asset: Hash) -> u64 {
     only_admin()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
     require(bal > 0, "noprofit")
-    transfer(caller, bal, asset)
+    let _ = transfer(caller, bal, asset)
     return 0
 }
 
+// ID 2: set_flash_loan
 entry set_flash_loan(fl: Hash) -> u64 {
     only_admin()
     Storage::new().store(FLASH_LOAN_KEY, fl)
     return 0
 }
 
+// ID 3: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
 
+// ID 4: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
 
+// ID 5: get_version
 entry get_version() -> string {
     return VERSION
 }

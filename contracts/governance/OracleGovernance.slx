@@ -1,10 +1,63 @@
-const VERSION: string = "OracleGovernance v3.0"
+// ============================================================================
+// OracleGovernance.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #2:  Corrected StakedOracle v5.0 entry IDs in execute_proposal():
+//            TYPE_ADD_FEED      → oracle.call(0u16, [...], {})
+//            TYPE_UPDATE_FEED   → oracle.call(1u16, [...], {})
+//            TYPE_REMOVE_FEED   → oracle.call(2u16, [feed_id, false], {})
+//                                 (StakedOracle v5.0 entry 2 = set_feed_active)
+//            TYPE_SET_PARAM:
+//              PARAM_MAX_STALE    → oracle.call(16u16, [value], {})  set_max_stale_blocks
+//              PARAM_HARD_STALE   → oracle.call(17u16, [value], {})  set_hard_stale_blocks
+//              PARAM_MAX_DEV      → oracle.call(13u16, [value], {})  set_max_deviation_bps
+//              PARAM_CB_THRESH    → oracle.call(14u16, [value], {})  set_cb_threshold_bps
+//              PARAM_SUBMIT_WINDOW→ oracle.call(15u16, [value], {})  set_aggregation_blocks
+//            TYPE_EMERGENCY_CB  → oracle.call(3u16, [feed_id, "governance"], {})
+//                                 (StakedOracle v5.0 entry 3 = trigger_feed_cb)
+//            TYPE_RESET_FEED    → oracle.call(4u16, [feed_id], {})
+//                                 (StakedOracle v5.0 entry 4 = reset_feed_cb)
+//
+// FIX #11: get_voting_power() now calls gv.call(3u16, [addr], {}) —
+//          GovernanceVault v5.0 entry 3 = get_voting_power_entry.
+//
+// FIX #15: TYPE_SET_REWARD branch implemented — calls
+//          XelisVaultMiner v5.0 entry 21 (set_base_reward_oracle) with
+//          proposal.reward_amount. A new set_miner_contract entry (ID 16)
+//          and MINER_CONTRACT_KEY storage are introduced.
+//
+// ENTRY IDs (sequential, starting at 0):
+//   0  : propose_add_feed(name, asset, decimals, min_price, max_price, description) -> u64
+//   1  : propose_update_feed(feed_id, min_price, max_price, decimals, description) -> u64
+//   2  : propose_remove_feed(feed_id, description) -> u64
+//   3  : propose_set_param(param_key, param_value, description) -> u64
+//   4  : propose_set_reward(reward_amount, description) -> u64
+//   5  : propose_emergency_cb(feed_id, description) -> u64
+//   6  : propose_reset_feed(feed_id, description) -> u64
+//   7  : vote(proposal_id, support) -> u64
+//   8  : execute_proposal(proposal_id) -> u64
+//   9  : cancel_proposal(proposal_id) -> u64
+//   10 : set_voting_period(blocks) -> u64
+//   11 : set_quorum_bps(bps) -> u64
+//   12 : set_approval_bps(bps) -> u64
+//   13 : set_execution_delay(blocks) -> u64
+//   14 : set_oracle(oracle: Hash) -> u64
+//   15 : set_governance_vault(gv: Hash) -> u64
+//   16 : set_miner_contract(mc: Hash) -> u64   [NEW — FIX #15]
+//   17 : set_timelock(tl: Hash) -> u64
+//   18 : set_guardian(g: Address) -> u64
+//   19 : transfer_admin(new_admin: Address) -> u64
+//   20 : get_version() -> string
+// ============================================================================
+
+const VERSION: string = "OracleGovernance v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
 const GUARDIAN_KEY: string = "gd"
 const ORACLE_KEY: string = "or"
 const GOVERNANCE_VAULT_KEY: string = "gv"
+// FIX #15: miner contract (XelisVaultMiner) hash — used for TYPE_SET_REWARD
+const MINER_CONTRACT_KEY: string = "mc"
 
 const PROPOSAL_COUNT_KEY: string = "pc"
 const PROPOSAL_PREFIX: string = "pp_"
@@ -17,6 +70,7 @@ const EXECUTION_DELAY_KEY: string = "ed"
 
 const BLOCKS_PER_DAY: u64 = 17280
 
+// Proposal types
 const TYPE_ADD_FEED: u8 = 1
 const TYPE_UPDATE_FEED: u8 = 2
 const TYPE_REMOVE_FEED: u8 = 3
@@ -25,7 +79,7 @@ const TYPE_SET_REWARD: u8 = 5
 const TYPE_EMERGENCY_CB: u8 = 6
 const TYPE_RESET_FEED: u8 = 7
 
-const PARAM_WINDOW_SIZE: u8 = 1
+// Param keys (value passed by the proposer; mapped to StakedOracle entries)
 const PARAM_MAX_STALE: u8 = 2
 const PARAM_HARD_STALE: u8 = 3
 const PARAM_MAX_DEV: u8 = 4
@@ -69,7 +123,7 @@ struct VoteInfo {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(PROPOSAL_COUNT_KEY, 0u64)
@@ -82,26 +136,33 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin {
         return
     }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
 
+// ============================================================================
+// FIX #11: get_voting_power() uses GovernanceVault v5.0 entry 3
+// (get_voting_power_entry).
+// ============================================================================
 fn get_voting_power(addr: Address) -> u64 {
     let s: Storage = Storage::new()
-    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).unwrap()
-    let gv: Contract = Contract::new(gv_hash).unwrap()
-    let vp: u64 = gv.call(0u16, [addr], {})
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("err")
+    let gv: Contract = Contract::new(gv_hash).expect("err")
+    let vp: u64 = gv.call(3u16, [addr], {})
     return vp
 }
 
+// ============================================================================
+// ID 0: propose_add_feed
+// ============================================================================
 entry propose_add_feed(
     name: string,
     asset: Hash,
@@ -110,7 +171,7 @@ entry propose_add_feed(
     max_price: u64,
     description: string
 ) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let vp: u64 = get_voting_power(caller)
     require(vp > 0, "novp")
 
@@ -145,6 +206,9 @@ entry propose_add_feed(
     return id
 }
 
+// ============================================================================
+// ID 1: propose_update_feed
+// ============================================================================
 entry propose_update_feed(
     feed_id: u64,
     min_price: u64,
@@ -152,7 +216,7 @@ entry propose_update_feed(
     decimals: u8,
     description: string
 ) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(get_voting_power(caller) > 0, "novp")
 
     let s: Storage = Storage::new()
@@ -186,8 +250,11 @@ entry propose_update_feed(
     return id
 }
 
+// ============================================================================
+// ID 2: propose_remove_feed
+// ============================================================================
 entry propose_remove_feed(feed_id: u64, description: string) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(get_voting_power(caller) > 0, "novp")
 
     let s: Storage = Storage::new()
@@ -221,10 +288,16 @@ entry propose_remove_feed(feed_id: u64, description: string) -> u64 {
     return id
 }
 
+// ============================================================================
+// ID 3: propose_set_param
+// ----------------------------------------------------------------------------
+// param_key range 2..=6 (PARAM_WINDOW_SIZE removed — StakedOracle v5.0 no
+// longer exposes a window-size setter).
+// ============================================================================
 entry propose_set_param(param_key: u8, param_value: u64, description: string) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(get_voting_power(caller) > 0, "novp")
-    require(param_key >= 1 && param_key <= 6, "badkey")
+    require(param_key >= 2 && param_key <= 6, "badkey")
 
     let s: Storage = Storage::new()
     let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
@@ -257,8 +330,11 @@ entry propose_set_param(param_key: u8, param_value: u64, description: string) ->
     return id
 }
 
+// ============================================================================
+// ID 4: propose_set_reward
+// ============================================================================
 entry propose_set_reward(reward_amount: u64, description: string) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(get_voting_power(caller) > 0, "novp")
 
     let s: Storage = Storage::new()
@@ -292,13 +368,92 @@ entry propose_set_reward(reward_amount: u64, description: string) -> u64 {
     return id
 }
 
+// ============================================================================
+// ID 5: propose_emergency_cb
+// ============================================================================
+entry propose_emergency_cb(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_EMERGENCY_CB,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+// ============================================================================
+// ID 6: propose_reset_feed
+// ============================================================================
+entry propose_reset_feed(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_RESET_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return id
+}
+
+// ============================================================================
+// ID 7: vote
+// ============================================================================
 entry vote(proposal_id: u64, support: bool) -> u64 {
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let vp: u64 = get_voting_power(caller)
     require(vp > 0, "novp")
 
     let s: Storage = Storage::new()
-    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     require(!proposal.executed, "executed")
     require(!proposal.cancelled, "cancelled")
 
@@ -333,7 +488,7 @@ pub fn is_executable(proposal_id: u64) -> bool {
     if proposal_opt.is_none() {
         return false
     }
-    let proposal: Proposal = proposal_opt.unwrap()
+    let proposal: Proposal = proposal_opt.expect("err")
     if proposal.executed || proposal.cancelled {
         return false
     }
@@ -359,64 +514,90 @@ pub fn is_executable(proposal_id: u64) -> bool {
     return true
 }
 
+// ============================================================================
+// ID 8: execute_proposal
+// ----------------------------------------------------------------------------
+// FIX #2:  StakedOracle v5.0 entry IDs corrected.
+// FIX #15: TYPE_SET_REWARD now calls XelisVaultMiner.set_base_reward_oracle
+//          (entry 21).
+// ============================================================================
 entry execute_proposal(proposal_id: u64) -> u64 {
     require(is_executable(proposal_id), "notexec")
 
     let s: Storage = Storage::new()
-    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     proposal.executed = true
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
 
-    let oracle_hash: Hash = s.load(ORACLE_KEY).unwrap()
-    let oracle: Contract = Contract::new(oracle_hash).unwrap()
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("err")
+    let oracle: Contract = Contract::new(oracle_hash).expect("err")
 
     if proposal.proposal_type == TYPE_ADD_FEED {
-        let _ = oracle.call(6u16, [
+        // StakedOracle v5.0 entry 0 = add_feed(name, asset, decimals, min, max)
+        let _ = oracle.call(0u16, [
             proposal.feed_name,
-            proposal.feed_asset.to_hex(),
+            proposal.feed_asset,
             proposal.feed_decimals as u64,
             proposal.feed_min,
             proposal.feed_max
         ], {})
     } else if proposal.proposal_type == TYPE_UPDATE_FEED {
-        let _ = oracle.call(7u16, [
+        // StakedOracle v5.0 entry 1 = update_feed(feed_id, min, max, decimals)
+        let _ = oracle.call(1u16, [
             proposal.feed_id,
             proposal.feed_min,
             proposal.feed_max,
             proposal.feed_decimals as u64
         ], {})
     } else if proposal.proposal_type == TYPE_REMOVE_FEED {
-        let _ = oracle.call(8u16, [proposal.feed_id, 0u64], {})
+        // StakedOracle v5.0 entry 2 = set_feed_active(feed_id, active)
+        // FIX #2: deactivate the feed instead of calling a non-existent remove entry.
+        let _ = oracle.call(2u16, [proposal.feed_id, false], {})
     } else if proposal.proposal_type == TYPE_SET_PARAM {
+        // FIX #2: corrected StakedOracle v5.0 entry IDs
         if proposal.param_key == PARAM_MAX_STALE {
-            let _ = oracle.call(19u16, [proposal.param_value], {})
-        } else if proposal.param_key == PARAM_HARD_STALE {
-            let _ = oracle.call(20u16, [proposal.param_value], {})
-        } else if proposal.param_key == PARAM_MAX_DEV {
+            // entry 16 = set_max_stale_blocks
             let _ = oracle.call(16u16, [proposal.param_value], {})
-        } else if proposal.param_key == PARAM_CB_THRESH {
+        } else if proposal.param_key == PARAM_HARD_STALE {
+            // entry 17 = set_hard_stale_blocks
             let _ = oracle.call(17u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_MAX_DEV {
+            // entry 13 = set_max_deviation_bps
+            let _ = oracle.call(13u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_CB_THRESH {
+            // entry 14 = set_cb_threshold_bps
+            let _ = oracle.call(14u16, [proposal.param_value], {})
         } else if proposal.param_key == PARAM_SUBMIT_WINDOW {
-            let _ = oracle.call(18u16, [proposal.param_value], {})
+            // entry 15 = set_aggregation_blocks
+            let _ = oracle.call(15u16, [proposal.param_value], {})
         }
     } else if proposal.proposal_type == TYPE_SET_REWARD {
-        let _ = oracle.call(14u16, [proposal.reward_amount], {})
+        // FIX #15: implemented — call XelisVaultMiner v5.0 entry 21
+        // (set_base_reward_oracle) with proposal.reward_amount.
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(21u16, [proposal.reward_amount], {})
     } else if proposal.proposal_type == TYPE_EMERGENCY_CB {
-        let _ = oracle.call(9u16, [proposal.feed_id, "governance"], {})
+        // StakedOracle v5.0 entry 3 = trigger_feed_cb(feed_id, reason)
+        let _ = oracle.call(3u16, [proposal.feed_id, "governance"], {})
     } else if proposal.proposal_type == TYPE_RESET_FEED {
-        let _ = oracle.call(10u16, [proposal.feed_id], {})
+        // StakedOracle v5.0 entry 4 = reset_feed_cb(feed_id)
+        let _ = oracle.call(4u16, [proposal.feed_id], {})
     }
 
     return 0
 }
 
+// ============================================================================
+// ID 9: cancel_proposal
+// ============================================================================
 entry cancel_proposal(proposal_id: u64) -> u64 {
     let s: Storage = Storage::new()
-    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     require(!proposal.executed, "executed")
 
-    let caller: Address = get_caller().unwrap()
-    let is_admin: bool = caller == s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let is_admin: bool = caller == s.load(ADMIN_KEY).expect("err")
     require(caller == proposal.proposer || is_admin, "notauth")
 
     proposal.cancelled = true
@@ -424,8 +605,112 @@ entry cancel_proposal(proposal_id: u64) -> u64 {
     return 0
 }
 
+// ============================================================================
+// ID 10: set_voting_period
+// ============================================================================
+entry set_voting_period(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 17280 && blocks <= 518400, "badval")
+    Storage::new().store(VOTING_PERIOD_KEY, blocks)
+    return 0
+}
+
+// ============================================================================
+// ID 11: set_quorum_bps
+// ============================================================================
+entry set_quorum_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(QUORUM_BPS_KEY, bps)
+    return 0
+}
+
+// ============================================================================
+// ID 12: set_approval_bps
+// ============================================================================
+entry set_approval_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 5000 && bps <= 8000, "badval")
+    Storage::new().store(APPROVAL_BPS_KEY, bps)
+    return 0
+}
+
+// ============================================================================
+// ID 13: set_execution_delay
+// ============================================================================
+entry set_execution_delay(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 720 && blocks <= 604800, "badval")
+    Storage::new().store(EXECUTION_DELAY_KEY, blocks)
+    return 0
+}
+
+// ============================================================================
+// ID 14: set_oracle
+// ============================================================================
+entry set_oracle(oracle: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ORACLE_KEY, oracle)
+    return 0
+}
+
+// ============================================================================
+// ID 15: set_governance_vault
+// ============================================================================
+entry set_governance_vault(gv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
+    return 0
+}
+
+// ============================================================================
+// ID 16: set_miner_contract  [NEW — FIX #15]
+// ============================================================================
+entry set_miner_contract(mc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(MINER_CONTRACT_KEY, mc)
+    return 0
+}
+
+// ============================================================================
+// ID 17: set_timelock
+// ============================================================================
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ============================================================================
+// ID 18: set_guardian
+// ============================================================================
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// ============================================================================
+// ID 19: transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ============================================================================
+// ID 20: get_version
+// ============================================================================
+entry get_version() -> string {
+    return VERSION
+}
+
+// ----------------------------------------------------------------------------
+// Read-only helpers (do NOT count toward entry IDs)
+// ----------------------------------------------------------------------------
 pub fn get_proposal(proposal_id: u64) -> (u8, Address, u64, u64, bool, bool, u64, u64, string) {
-    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).unwrap()
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
     return (
         p.proposal_type,
         p.proposer,
@@ -446,66 +731,4 @@ pub fn get_proposal_count() -> u64 {
 pub fn has_voted(proposal_id: u64, voter: Address) -> bool {
     let key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + voter.to_string()
     return Storage::new().load(key).is_some()
-}
-
-entry set_voting_period(blocks: u64) -> u64 {
-    only_admin()
-    require(blocks >= 17280 && blocks <= 518400, "badval")
-    Storage::new().store(VOTING_PERIOD_KEY, blocks)
-    return 0
-}
-
-entry set_quorum_bps(bps: u64) -> u64 {
-    only_admin()
-    require(bps >= 100 && bps <= 5000, "badval")
-    Storage::new().store(QUORUM_BPS_KEY, bps)
-    return 0
-}
-
-entry set_approval_bps(bps: u64) -> u64 {
-    only_admin()
-    require(bps >= 5000 && bps <= 8000, "badval")
-    Storage::new().store(APPROVAL_BPS_KEY, bps)
-    return 0
-}
-
-entry set_execution_delay(blocks: u64) -> u64 {
-    only_admin()
-    require(blocks >= 720 && blocks <= 604800, "badval")
-    Storage::new().store(EXECUTION_DELAY_KEY, blocks)
-    return 0
-}
-
-entry set_oracle(oracle: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(ORACLE_KEY, oracle)
-    return 0
-}
-
-entry set_governance_vault(gv: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
-    return 0
-}
-
-entry set_timelock(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
-entry set_guardian(g: Address) -> u64 {
-    only_admin()
-    Storage::new().store(GUARDIAN_KEY, g)
-    return 0
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-
-entry get_version() -> string {
-    return VERSION
 }

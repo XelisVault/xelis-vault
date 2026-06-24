@@ -1,37 +1,90 @@
-[
-  {
-    "_comment": "EXAMPLE 1 — HTTP API source (JSON response)",
-    "name": "my_exchange",
-    "type": "http",
-    "url": "https://api.my-exchange.com/v1/ticker?pair=XELUSD",
-    "json_path": "data.last_price",
-    "headers": {
-      "Authorization": "Bearer YOUR_API_KEY_HERE"
+{
+  "_comment": "XELIS Vault v5.0 — example custom_sources.json. Copy to ~/.xelis-vault/config/custom_sources.json and edit the REPLACE_ME placeholders. The file may be either a top-level array of sources OR an object with a 'sources' key (as shown here). API keys are read locally and NEVER logged.",
+  "sources": [
+    {
+      "_comment": "EXAMPLE 1 — CoinEx (built-in type). Just provide api_key/api_secret if you have them; otherwise the public endpoint is used with stricter rate limits.",
+      "name": "coinex",
+      "type": "coinex",
+      "enabled": true,
+      "api_key": "YOUR_COINEX_API_KEY",
+      "api_secret": "YOUR_COINEX_API_SECRET",
+      "symbols": ["XEL/USDT", "XEL/BTC"],
+      "poll_interval_seconds": 5,
+      "timeout": 10
     },
-    "timeout": 10
-  },
-  {
-    "_comment": "EXAMPLE 2 — Simple HTTP API (price at root)",
-    "name": "simple_api",
-    "type": "http",
-    "url": "https://api.simple-price.com/xel",
-    "json_path": "price",
-    "timeout": 10
-  },
-  {
-    "_comment": "EXAMPLE 3 — Command source (external script)",
-    "name": "my_script",
-    "type": "command",
-    "command": "/usr/local/bin/fetch_xel_price.sh",
-    "args": ["--asset", "XEL", "--currency", "USD"],
-    "timeout": 10
-  },
-  {
-    "_comment": "EXAMPLE 4 — Python script source",
-    "name": "python_fetcher",
-    "type": "command",
-    "command": "python3",
-    "args": ["/opt/my-tools/fetch_price.py", "--exchange", "binance"],
-    "timeout": 15
-  }
-]
+    {
+      "_comment": "EXAMPLE 2 — MEXC (built-in type). Same as CoinEx — set api_key/api_secret to raise rate limits.",
+      "name": "mexc",
+      "type": "mexc",
+      "enabled": true,
+      "api_key": "YOUR_MEXC_API_KEY",
+      "api_secret": "YOUR_MEXC_API_SECRET",
+      "symbols": ["XEL/USDT"],
+      "poll_interval_seconds": 5,
+      "timeout": 10
+    },
+    {
+      "_comment": "EXAMPLE 3 — XELIS native daemon. Reads the implied XEL/USD price from your local node. NOTE: the default implementation in price_provider.py returns None — implement the real pool-price derivation (XEL/xUSD pool on VaultSwap) by editing DaemonSource.fetch_price().",
+      "name": "xelis_daemon",
+      "type": "daemon",
+      "enabled": false,
+      "rpc_url": "http://127.0.0.1:8080",
+      "poll_interval_seconds": 5
+    },
+    {
+      "_comment": "EXAMPLE 4 — Generic HTTP source template. Fetches any JSON URL and walks the dot-separated json_path to find the price.",
+      "name": "custom_http",
+      "type": "http",
+      "enabled": false,
+      "url": "https://api.my-price-feed.com/v1/xel_usd",
+      "params": {
+        "key": "YOUR_API_KEY"
+      },
+      "json_path": "data.price",
+      "headers": {
+        "Authorization": "Bearer YOUR_BEARER_TOKEN",
+        "User-Agent": "xelis-vault-provider/5.0"
+      },
+      "symbols": ["XEL/USD"],
+      "poll_interval_seconds": 5,
+      "timeout": 10
+    },
+    {
+      "_comment": "EXAMPLE 5 — Simple HTTP source (price at root).",
+      "name": "simple_api",
+      "type": "http",
+      "enabled": false,
+      "url": "https://api.simple-price.com/xel",
+      "json_path": "price",
+      "poll_interval_seconds": 5,
+      "timeout": 10
+    },
+    {
+      "_comment": "EXAMPLE 6 — External command source. Runs a local script and parses stdout as JSON with a 'price' field. Useful for OTC desks, internal price aggregators, or hardware price feeds.",
+      "name": "my_script",
+      "type": "command",
+      "enabled": false,
+      "command": "/usr/local/bin/fetch_xel_price.sh",
+      "args": ["--asset", "XEL", "--currency", "USD", "--json"],
+      "poll_interval_seconds": 5,
+      "timeout": 15
+    },
+    {
+      "_comment": "EXAMPLE 7 — Python script source (variant of command).",
+      "name": "python_fetcher",
+      "type": "command",
+      "enabled": false,
+      "command": "python3",
+      "args": ["/opt/my-tools/fetch_price.py", "--exchange", "binance"],
+      "poll_interval_seconds": 5,
+      "timeout": 15
+    }
+  ],
+  "_notes": [
+    "PRIVACY: API keys in this file are NEVER logged. The provider script only logs source name + price + timestamp.",
+    "RECOMMENDED: Enable at least 2 sources so the median is robust. 3+ is better.",
+    "STALENESS: prices older than 30 seconds are rejected before computing the median.",
+    "OUTLIERS: prices more than 5% from the median are rejected before submitting to the oracle.",
+    "FEEDS: to add new feeds (XEL/BTC, XAU/USD, ...), create them on-chain via StakedOracle.add_feed (entry ID 0) and start a separate price_provider.py instance with --feed-id N."
+  ]
+}

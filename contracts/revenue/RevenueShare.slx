@@ -1,7 +1,40 @@
-const VERSION: string = "RevenueShare v4.2"
+// ============================================================================
+// RevenueShare.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Revenue distribution to VLT stakers, preserved from v4.2.
+//
+// v5.0 changes:
+//   - pub fn (get_claimable, get_total_distributed, get_accum_per_token)
+//     wrapped as *_entry entries so other contracts can read distribution
+//     state via Contract::call.
+//   - Added EMERGENCY_KEY + set_emergency entry.
+//   - Added two-step emergency_withdraw (IDs 14/15, "ert" key, 17280-block
+//     delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : deposit_revenue
+//   1  : claim
+//   2  : set_share_token
+//   3  : set_total_supply
+//   4  : set_registry
+//   5  : set_timelock
+//   6  : set_emergency
+//   7  : pause
+//   8  : unpause
+//   9  : transfer_admin
+//   10 : get_claimable_entry
+//   11 : get_total_distributed_entry
+//   12 : get_accum_per_token_entry
+//   13 : get_version
+//   14 : request_emergency_withdraw
+//   15 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "RevenueShare v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
 
@@ -9,26 +42,39 @@ const SHARE_TOKEN_KEY: string = "st"
 const TOTAL_SUPPLY_KEY: string = "ts"
 
 const DISTRIBUTION_PREFIX: string = "d_"
+const TOTAL_DISTRIBUTED_PREFIX: string = "td_"
+const ACCUM_PER_TOKEN_PREFIX: string = "at_"
 const LAST_CLAIM_PREFIX: string = "lc_"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
     s.store(PAUSED_KEY, false)
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
 }
 
 fn when_not_paused() {
@@ -36,51 +82,50 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: deposit_revenue
 entry deposit_revenue(asset: Hash, amount: u64) -> u64 {
     when_not_paused()
     only_admin()
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let share_token: Hash = s.load(SHARE_TOKEN_KEY).unwrap()
+    let share_token: Hash = s.load(SHARE_TOKEN_KEY).expect("err")
     let total_supply: u64 = s.load(TOTAL_SUPPLY_KEY).unwrap_or(0)
     require(total_supply > 0, "noshares")
 
-    let dep: u64 = get_deposit_for_asset(asset).unwrap()
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
     require(dep >= amount, "insdep")
     if dep > amount {
-        let caller: Address = get_caller().unwrap()
-        transfer(caller, dep - amount, asset)
+        let caller: Address = get_caller().expect("err")
+        let _ = transfer(caller, dep - amount, asset)
     }
 
-    let key: string = DISTRIBUTION_PREFIX + asset.to_hex()
-    let existing: optional<Hash> = s.load(key)
-    let total_distributed: u64 = 0
-    let accum_per_token: u64 = 0
-    if existing.is_some() {
-        total_distributed = s.load("td_" + asset.to_hex()).unwrap_or(0)
-        accum_per_token = s.load("at_" + asset.to_hex()).unwrap_or(0)
-    }
+    let total_distributed: u64 = s.load(TOTAL_DISTRIBUTED_PREFIX + asset.to_hex()).unwrap_or(0)
+    let accum_per_token: u64 = s.load(ACCUM_PER_TOKEN_PREFIX + asset.to_hex()).unwrap_or(0)
     let increment: u64 = (amount as u128 * 1000000000000u128 / total_supply as u128) as u64
     let new_accum: u64 = accum_per_token + increment
-    s.store("td_" + asset.to_hex(), total_distributed + amount)
-    s.store("at_" + asset.to_hex(), new_accum)
-
+    s.store(TOTAL_DISTRIBUTED_PREFIX + asset.to_hex(), total_distributed + amount)
+    s.store(ACCUM_PER_TOKEN_PREFIX + asset.to_hex(), new_accum)
     return 0
 }
 
+// ID 1: claim
 entry claim(asset: Hash) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let share_token: Hash = s.load(SHARE_TOKEN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let share_token: Hash = s.load(SHARE_TOKEN_KEY).expect("err")
 
     let shares: u64 = get_deposit_for_asset(share_token).unwrap_or(0)
     require(shares > 0, "noshares")
 
-    transfer(caller, shares, share_token)
+    let _ = transfer(caller, shares, share_token)
 
-    let accum_per_token: u64 = s.load("at_" + asset.to_hex()).unwrap_or(0)
+    let accum_per_token: u64 = s.load(ACCUM_PER_TOKEN_PREFIX + asset.to_hex()).unwrap_or(0)
     let last_claim_key: string = LAST_CLAIM_PREFIX + caller.to_string() + "_" + asset.to_hex()
     let last_accum: u64 = s.load(last_claim_key).unwrap_or(0)
     let delta: u64 = 0
@@ -103,31 +148,21 @@ entry claim(asset: Hash) -> u64 {
         actual = claimable
     }
     if actual > 0 {
-        transfer(caller, actual, asset)
+        let _ = transfer(caller, actual, asset)
     }
 
     s.store(last_claim_key, accum_per_token)
     return actual
 }
 
-pub fn get_claimable(addr: Address, asset: Hash) -> u64 {
-    return 0
-}
-
-pub fn get_total_distributed(asset: Hash) -> u64 {
-    return Storage::new().load("td_" + asset.to_hex()).unwrap_or(0)
-}
-
-pub fn get_accum_per_token(asset: Hash) -> u64 {
-    return Storage::new().load("at_" + asset.to_hex()).unwrap_or(0)
-}
-
+// ID 2: set_share_token
 entry set_share_token(st: Hash) -> u64 {
     only_admin()
     Storage::new().store(SHARE_TOKEN_KEY, st)
     return 0
 }
 
+// ID 3: set_total_supply
 entry set_total_supply(ts: u64) -> u64 {
     only_admin()
     require(ts > 0, "badts")
@@ -135,42 +170,114 @@ entry set_total_supply(ts: u64) -> u64 {
     return 0
 }
 
+// ID 4: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
 
+// ID 5: set_timelock
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
 }
 
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
+// ID 6: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
     return 0
 }
 
+// ID 7: pause
 entry pause(reason: string) -> u64 {
     only_admin()
     Storage::new().store(PAUSED_KEY, true)
     return 0
 }
 
+// ID 8: unpause
 entry unpause() -> u64 {
     only_admin()
     Storage::new().store(PAUSED_KEY, false)
     return 0
 }
 
+// ID 9: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
 
+// ID 10: get_claimable_entry
+// NOTE: returns 0 because Silex's get_deposit_for_asset only exposes the
+// current caller's deposit; per-addr share balances must be queried against
+// the share token contract instead.
+entry get_claimable_entry(addr: Address, asset: Hash) -> u64 {
+    return 0
+}
+
+// ID 11: get_total_distributed_entry
+entry get_total_distributed_entry(asset: Hash) -> u64 {
+    return Storage::new().load(TOTAL_DISTRIBUTED_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+// ID 12: get_accum_per_token_entry
+entry get_accum_per_token_entry(asset: Hash) -> u64 {
+    return Storage::new().load(ACCUM_PER_TOKEN_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+// ID 13: get_version
 entry get_version() -> string {
     return VERSION
+}
+
+// ID 14: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 15: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_claimable(addr: Address, asset: Hash) -> u64 {
+    return 0
+}
+
+pub fn get_total_distributed(asset: Hash) -> u64 {
+    return Storage::new().load(TOTAL_DISTRIBUTED_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+pub fn get_accum_per_token(asset: Hash) -> u64 {
+    return Storage::new().load(ACCUM_PER_TOKEN_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
 }

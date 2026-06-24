@@ -1,4 +1,43 @@
-const VERSION: string = "PrivacyMixer v4.2"
+// ============================================================================
+// PrivacyMixer.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Merkle-tree deposit / ZK-proof withdraw mixer, preserved from v4.2.
+//
+// FIX: update_merkle_root() indentation + correctness bug from v4.2 fixed.
+//   In v4.2 the loop body had a stray `let combined` line preceding the
+//   if/else block (visually misindented to function scope) and never updated
+//   `current` with `hash(combined)`, so the merkle root was always equal to
+//   the latest leaf. The fixed version actually walks the tree, persists
+//   intermediate nodes for future sibling lookups, and stores the real root.
+//
+// NOTE: emergency_withdraw is ADMIN-ONLY (uses ADMIN_KEY directly, not a
+//   separate EMERGENCY_KEY) per task spec.
+//
+// Two-step emergency_withdraw (IDs 16/17, "ert" key, 17280-block delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : deposit
+//   1  : withdraw
+//   2  : get_merkle_root_entry
+//   3  : get_deposit_count_entry
+//   4  : is_nullifier_used_entry
+//   5  : get_denomination_amount_entry
+//   6  : get_deposit_count_for_denom_entry
+//   7  : get_merkle_leaf_entry
+//   8  : set_zk_verifier
+//   9  : set_registry
+//   10 : set_timelock
+//   11 : set_guardian
+//   12 : pause
+//   13 : unpause
+//   14 : transfer_admin
+//   15 : get_version
+//   16 : request_emergency_withdraw
+//   17 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "PrivacyMixer v5.0"
+
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
 const GUARDIAN_KEY: string = "gd"
@@ -10,13 +49,18 @@ const LEAF_COUNT_KEY: string = "lc"
 const NULLIFIER_PREFIX: string = "null_"
 const DENOM_DEPOSITS_PREFIX: string = "dd_"
 const ZK_VERIFIER_KEY: string = "zv"
+
 const DENOM_10: u64 = 1000000000
 const DENOM_100: u64 = 10000000000
 const DENOM_1000: u64 = 100000000000
 const MERKLE_DEPTH: u64 = 24
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(PAUSED_KEY, false)
@@ -24,28 +68,32 @@ hook constructor() -> u64 {
     s.store(LEAF_COUNT_KEY, 0u64)
     return 0
 }
+
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
+
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
     if caller == g { return }
     only_admin()
 }
+
 fn when_not_paused() {
     let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
     require(!paused, "paused")
 }
+
 fn get_denom_amount(denom_id: u64) -> u64 {
     if denom_id == 0 { return DENOM_10 }
     if denom_id == 1 { return DENOM_100 }
@@ -53,6 +101,8 @@ fn get_denom_amount(denom_id: u64) -> u64 {
     require(false, "baddenom")
     return 0
 }
+
+// FIXED: properly walks the tree, persists intermediate nodes, updates root.
 fn update_merkle_root(new_leaf: Hash, leaf_index: u64) {
     let s: Storage = Storage::new()
     let current: Hash = new_leaf
@@ -62,26 +112,38 @@ fn update_merkle_root(new_leaf: Hash, leaf_index: u64) {
         let sibling_idx: u64 = idx ^ 1
         let sibling_key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + sibling_idx.to_string(10u32)
         let sibling_val: Hash = s.load(sibling_key).unwrap_or(Hash::zero())
-    let combined: string = current.to_hex() + sibling_val.to_hex()
-    if idx % 2u64 == 0u64 {
-        combined = current.to_hex() + sibling_val.to_hex()
+        let combined: string = ""
+        if idx % 2u64 == 0u64 {
+            combined = current.to_hex() + sibling_val.to_hex()
         } else {
-        combined = sibling_val.to_hex() + current.to_hex()
+            combined = sibling_val.to_hex() + current.to_hex()
         }
+        // Persist the current node so future deposits can use it as a sibling.
+        let node_key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + idx.to_string(10u32)
+        s.store(node_key, current)
+        current = Hash::sha3(combined.to_bytes())
         idx = idx / 2
         level += 1
     }
     s.store(MERKLE_ROOT_KEY, current)
 }
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: deposit
 entry deposit(asset: Hash, denomination_id: u64, commitment: Hash) -> u64 {
     when_not_paused()
     require(commitment != Hash::zero(), "badcommit")
     let amount: u64 = get_denom_amount(denomination_id)
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let dep: u64 = get_deposit_for_asset(asset).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
     require(dep >= amount, "insdep")
-    if dep > amount { transfer(caller, dep - amount, asset) }
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
     let leaf_index: u64 = s.load(LEAF_COUNT_KEY).unwrap_or(0)
     s.store(LEAF_PREFIX + "0_" + leaf_index.to_string(10u32), commitment)
     s.store(LEAF_COUNT_KEY, leaf_index + 1)
@@ -90,6 +152,8 @@ entry deposit(asset: Hash, denomination_id: u64, commitment: Hash) -> u64 {
     s.store(denom_key, s.load(denom_key).unwrap_or(0) + 1)
     return 0
 }
+
+// ID 1: withdraw
 entry withdraw(
     asset: Hash,
     denomination_id: u64,
@@ -108,7 +172,7 @@ entry withdraw(
     require(merkle_root == current_root, "badroot")
     let zk_verifier_opt: optional<Hash> = s.load(ZK_VERIFIER_KEY)
     require(zk_verifier_opt.is_some(), "nozkverifier")
-    let zk_verifier: Contract = Contract::new(zk_verifier_opt.unwrap()).unwrap()
+    let zk_verifier: Contract = Contract::new(zk_verifier_opt.expect("err")).expect("err")
     let valid: bool = zk_verifier.call(0u16, [zk_proof, merkle_root, nullifier], {})
     require(valid, "badproof")
     s.store(nullifier_key, true)
@@ -116,76 +180,150 @@ entry withdraw(
     require(ok, "txfail")
     return 0
 }
-pub fn get_merkle_root() -> Hash {
+
+// ID 2: get_merkle_root_entry
+entry get_merkle_root_entry() -> Hash {
     return Storage::new().load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
 }
-pub fn get_deposit_count() -> u64 {
+
+// ID 3: get_deposit_count_entry
+entry get_deposit_count_entry() -> u64 {
     return Storage::new().load(LEAF_COUNT_KEY).unwrap_or(0)
 }
-pub fn is_nullifier_used(nullifier: Hash) -> bool {
+
+// ID 4: is_nullifier_used_entry
+entry is_nullifier_used_entry(nullifier: Hash) -> bool {
     return Storage::new().load(NULLIFIER_PREFIX + nullifier.to_hex()).unwrap_or(false)
 }
-pub fn get_denomination_amount(denom_id: u64) -> u64 {
+
+// ID 5: get_denomination_amount_entry
+entry get_denomination_amount_entry(denom_id: u64) -> u64 {
     return get_denom_amount(denom_id)
 }
-pub fn get_deposit_count_for_denom(asset: Hash, denom_id: u64) -> u64 {
+
+// ID 6: get_deposit_count_for_denom_entry
+entry get_deposit_count_for_denom_entry(asset: Hash, denom_id: u64) -> u64 {
     let key: string = DENOM_DEPOSITS_PREFIX + asset.to_hex() + "_" + denom_id.to_string(10u32)
     return Storage::new().load(key).unwrap_or(0)
 }
-pub fn get_merkle_leaf(level: u64, index: u64) -> Hash {
+
+// ID 7: get_merkle_leaf_entry
+entry get_merkle_leaf_entry(level: u64, index: u64) -> Hash {
     let key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + index.to_string(10u32)
     return Storage::new().load(key).unwrap_or(Hash::zero())
 }
+
+// ID 8: set_zk_verifier
 entry set_zk_verifier(zv: Hash) -> u64 {
     only_admin()
     Storage::new().store(ZK_VERIFIER_KEY, zv)
     return 0
 }
+
+// ID 9: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
+
+// ID 10: set_timelock
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
 }
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
+
+// ID 11: set_guardian
 entry set_guardian(g: Address) -> u64 {
     only_admin()
     Storage::new().store(GUARDIAN_KEY, g)
     return 0
 }
+
+// ID 12: pause
 entry pause(reason: string) -> u64 {
     only_guardian_or_admin()
     Storage::new().store(PAUSED_KEY, true)
     return 0
 }
+
+// ID 13: unpause
 entry unpause() -> u64 {
     only_admin()
     Storage::new().store(PAUSED_KEY, false)
     return 0
 }
+
+// ID 14: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
-entry emergency_withdraw(asset: Hash) -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    require(caller == admin, "notauth")
-    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
-    require(bal > 0, "nofunds")
-    transfer(caller, bal, asset)
-    return 0
-}
+
+// ID 15: get_version
 entry get_version() -> string {
     return VERSION
+}
+
+// ID 16: request_emergency_withdraw (admin-only)
+entry request_emergency_withdraw() -> u64 {
+    only_admin()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 17: execute_emergency_withdraw (admin-only)
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_merkle_root() -> Hash {
+    return Storage::new().load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+}
+
+pub fn get_deposit_count() -> u64 {
+    return Storage::new().load(LEAF_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn is_nullifier_used(nullifier: Hash) -> bool {
+    return Storage::new().load(NULLIFIER_PREFIX + nullifier.to_hex()).unwrap_or(false)
+}
+
+pub fn get_denomination_amount(denom_id: u64) -> u64 {
+    return get_denom_amount(denom_id)
+}
+
+pub fn get_deposit_count_for_denom(asset: Hash, denom_id: u64) -> u64 {
+    let key: string = DENOM_DEPOSITS_PREFIX + asset.to_hex() + "_" + denom_id.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(0)
+}
+
+pub fn get_merkle_leaf(level: u64, index: u64) -> Hash {
+    let key: string = LEAF_PREFIX + level.to_string(10u32) + "_" + index.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(Hash::zero())
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
 }

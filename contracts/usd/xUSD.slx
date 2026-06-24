@@ -1,4 +1,16 @@
-const VERSION: string = "xUSD v4.2"
+// ============================================================================
+// xUSD.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX: mint_tokens / mint_split / burn_tokens are now `entry` (not `pub fn`)
+//      so other contracts (PSM, VaultSwapV2, etc.) can invoke them via
+//      Contract::call with the v5.0 entry ID convention:
+//        ID 1 = mint_tokens(to, amount)
+//        ID 2 = mint_split(to, amount, treasury, fee)
+//        ID 3 = burn_tokens(amount)
+// FIX #14: Two-step emergency_withdraw at IDs 15/16 with 17280-block delay.
+// ============================================================================
+
+const VERSION: string = "xUSD v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -12,51 +24,66 @@ const BURNER_PREFIX: string = "bu_"
 const DECIMALS: u8 = 8
 const MAX_SUPPLY: u64 = 18446744073709551615
 
+// Two-step emergency withdraw keys
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    return 0
+}
+
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    if caller == admin {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
+
 fn require_minter() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    if caller == admin {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
     let cc_opt: optional<Hash> = get_contract_caller()
     if cc_opt.is_some() {
-        let cc: Hash = cc_opt.unwrap()
+        let cc: Hash = cc_opt.expect("err")
         let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
         require(is_minter, "notminter")
         return
     }
     require(false, "notminter")
 }
+
 fn require_burner() {
     let s: Storage = Storage::new()
     let cc_opt: optional<Hash> = get_contract_caller()
     require(cc_opt.is_some(), "notburner")
-    let cc: Hash = cc_opt.unwrap()
+    let cc: Hash = cc_opt.expect("err")
     let is_burner: bool = s.load(BURNER_PREFIX + cc.to_hex()).unwrap_or(false)
     require(is_burner, "notburner")
 }
-hook constructor() -> u64 {
+
+fn only_emergency() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    s.store(ADMIN_KEY, caller)
-    s.store(EMERGENCY_KEY, caller)
-    return 0
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
 }
 
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: create_asset
 entry create_asset() -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -69,19 +96,20 @@ entry create_asset() -> u64 {
         "xUSD",
         DECIMALS,
         MaxSupplyMode::None
-    ).unwrap()
+    ).expect("err")
     let hash: Hash = asset.get_hash()
     s.store(ASSET_HASH_KEY, hash)
     return 0
 }
 
-pub fn mint_tokens(to: Address, amount: u64) -> u64 {
+// ID 1: mint_tokens — callable by authorized minters (cross-contract)
+entry mint_tokens(to: Address, amount: u64) -> u64 {
     require_minter()
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let asset: Asset = Asset::get_by_hash(hash).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
 
     let ok: bool = asset.mint(amount)
     require(ok, "mintfail")
@@ -90,15 +118,16 @@ pub fn mint_tokens(to: Address, amount: u64) -> u64 {
     return 0
 }
 
-pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
+// ID 2: mint_split — mints amount+fee, transfers `amount` to `to`, `fee` to `treasury`
+entry mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
     require_minter()
     let total: u64 = amount + fee
     require(total > 0, "amtgt0")
     require(total >= amount, "ovf")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let asset: Asset = Asset::get_by_hash(hash).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
 
     let ok: bool = asset.mint(total)
     require(ok, "mintfail")
@@ -114,12 +143,13 @@ pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 
     return 0
 }
 
-pub fn burn_tokens(amount: u64) -> u64 {
+// ID 3: burn_tokens — callable by authorized burners
+entry burn_tokens(amount: u64) -> u64 {
     require_burner()
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
 
     let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
     require(bal >= amount, "lowbal")
@@ -129,109 +159,149 @@ pub fn burn_tokens(amount: u64) -> u64 {
     return 0
 }
 
+// ID 4: transfer_tokens
 entry transfer_tokens(to: Address, amount: u64) -> u64 {
     require(amount > 0, "amtgt0")
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(to != caller, "selfxfer")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
 
     let dep: optional<u64> = get_deposit_for_asset(hash)
-    require(dep.is_some() && dep.unwrap() >= amount, "nodep")
+    require(dep.is_some() && dep.expect("err") >= amount, "nodep")
 
     let ok: bool = transfer(to, amount, hash)
     require(ok, "txfail")
 
-    if dep.unwrap() > amount {
-        let ok_r: bool = transfer(caller, dep.unwrap() - amount, hash)
+    if dep.expect("err") > amount {
+        let ok_r: bool = transfer(caller, dep.expect("err") - amount, hash)
         require(ok_r, "rfail")
     }
     return 0
 }
 
-pub fn get_asset_hash() -> Hash {
-    return Storage::new().load(ASSET_HASH_KEY).unwrap()
-}
-
-pub fn get_asset_info() -> (string, string, u64, u8) {
-    let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let asset: Asset = Asset::get_by_hash(hash).unwrap()
-    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
-}
-
-pub fn get_balance(addr: Address) -> u64 {
-    let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    return get_balance_for_asset(hash).unwrap_or(0)
-}
-
-
-
-
+// ID 5: set_minter
 entry set_minter(contract_hash: Hash, enabled: bool) -> u64 {
     only_admin()
     Storage::new().store(MINTER_PREFIX + contract_hash.to_hex(), enabled)
     return 0
 }
 
+// ID 6: set_burner
 entry set_burner(contract_hash: Hash, enabled: bool) -> u64 {
     only_admin()
     Storage::new().store(BURNER_PREFIX + contract_hash.to_hex(), enabled)
     return 0
 }
 
+// ID 7: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
 
+// ID 8: set_timelock
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
 }
 
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
+// ID 9: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
 
+// ID 10: set_emergency
 entry set_emergency(e: Address) -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let current: Address = s.load(EMERGENCY_KEY).unwrap()
-    require(caller == current, "notemg")
-    s.store(EMERGENCY_KEY, e)
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
     return 0
 }
 
-entry emergency_withdraw() -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let e: Address = s.load(EMERGENCY_KEY).unwrap()
-    require(caller == e, "notemg")
-    let xel_bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
-    if xel_bal > 0 {
-        let _ = transfer(caller, xel_bal, Hash::zero())
-    }
-    let xusd_hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let xusd_bal: u64 = get_balance_for_asset(xusd_hash).unwrap_or(0)
-    if xusd_bal > 0 {
-        let _ = transfer(caller, xusd_bal, xusd_hash)
-    }
-    return 0
-}
-
+// ID 11: get_version
 entry get_version() -> string {
     return VERSION
+}
+
+// ID 12: get_asset_hash_entry
+entry get_asset_hash_entry() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// ID 13: get_asset_info_entry
+entry get_asset_info_entry() -> (string, string, u64, u8) {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
+}
+
+// ID 14: get_balance_entry
+entry get_balance_entry(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    // Note: balance is for the contract's asset, addr is reserved for future
+    // per-account balance query via confidential deposit introspection.
+    return get_balance_for_asset(hash).unwrap_or(0)
+}
+
+// ============================================================================
+// FIX #14: Two-step emergency_withdraw (IDs 15/16, delay 17280 blocks)
+// ============================================================================
+
+// ID 15: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 16: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — usable internally and not counted for entry IDs
+// ============================================================================
+
+pub fn get_asset_hash() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+pub fn get_asset_info() -> (string, string, u64, u8) {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
+}
+
+pub fn get_balance(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    return get_balance_for_asset(hash).unwrap_or(0)
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
 }

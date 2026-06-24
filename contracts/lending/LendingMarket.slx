@@ -1,46 +1,38 @@
 // ============================================================================
-// LendingMarket.slx — XELIS Vault v4.2
+// LendingMarket.slx — XELIS Vault v5.0
 // ----------------------------------------------------------------------------
-// Marché de prêt multi-pool multi-collateral.
+// FIX #12: get_asset_price() calls oracle.call(9u16, [asset], {})
+//          (StakedOracle v5.0 entry 9 = get_price_for_asset_entry).
+// FIX N-01: Accrued interest computed via index ratio
+//          (accrued = principal * current_index / position_index) before any
+//          calculation that uses principal.
+// FIX #14: Two-step emergency_withdraw at IDs 19/20 with 17280-block delay.
 //
-// PRINCIPE
-// =========
-// Contrairement à VaultEngine (qui ne supporte que XEL collateral → xUSD borrow),
-// LendingMarket permet de créer des pools de prêt pour n'importe quelle paire
-// d'assets XELIS Confidential.
-//
-// EXEMPLES
-// ========
-//   - Pool VLT/xUSD : déposer du VLT, borrow du xUSD
-//   - Pool xUSD/XEL : déposer du xUSD, borrow du XEL
-//   - Pool AssetVault/xUSD : déposer un RWA token, borrow du xUSD
-//
-// CHAQUE POOL A SON PROPRE
-// ========================
-//   - InterestRateModel (configurable)
-//   - Collateral factor (ex: 75% pour VLT, 50% pour un RWA volatil)
-//   - Reserve factor (part des intérêts gardée par le protocole)
-//   - Liquidation threshold et penalty
-//
-// ADAPTATION v4.2
-// ===============
-// - Lit les prix depuis StakedOracle (par feed name)
-// - Compatible avec tous les Confidential Assets
-// - Fees dirigées vers TreasuryVault
-//
-// ENTRY IDs
-// =========
-//   0 : create_pool(collateral_asset, borrow_asset, collateral_factor, ...)  [admin]
-//   1 : supply(pool_id, amount)             [public]
-//   2 : borrow(pool_id, amount)             [public]
-//   3 : repay(pool_id, amount)              [public]
-//   4 : withdraw(pool_id, amount)           [public]
-//   5 : liquidate(pool_id, user, amount)    [public]
-//   6 : get_pool_info(pool_id)              [pub fn]
-//   7 : get_user_position(pool_id, user)    [pub fn]
+// Entry IDs (sequential, starting at 0):
+//   0  : create_pool
+//   1  : supply
+//   2  : borrow
+//   3  : repay
+//   4  : withdraw
+//   5  : liquidate
+//   6  : get_pool_info_entry
+//   7  : get_user_position_entry
+//   8  : get_pools_count_entry
+//   9  : pause
+//   10 : unpause
+//   11 : set_oracle
+//   12 : set_treasury
+//   13 : set_registry
+//   14 : set_timelock
+//   15 : set_guardian
+//   16 : set_emergency
+//   17 : transfer_admin
+//   18 : get_version
+//   19 : request_emergency_withdraw
+//   20 : execute_emergency_withdraw
 // ============================================================================
 
-const VERSION: string = "LendingMarket v4.2"
+const VERSION: string = "LendingMarket v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -61,20 +53,25 @@ const POOL_LAST_UPDATE_PREFIX: string = "plu_"
 const POOL_BORROW_INDEX_PREFIX: string = "pbi_"
 const POOL_SUPPLY_INDEX_PREFIX: string = "psi_"
 
-const USER_SUPPLY_PREFIX: string = "us_"   // us_<pool>_<addr> => (principal, index)
-const USER_BORROW_PREFIX: string = "ub_"   // ub_<pool>_<addr> => (principal, index)
+const USER_SUPPLY_PREFIX: string = "us_"
+const USER_BORROW_PREFIX: string = "ub_"
 
 const MAX_POOLS: u64 = 64
 const BLOCKS_PER_YEAR: u64 = 6307200
+const PRICE_DECIMALS: u64 = 100000000
+const INITIAL_INDEX: u64 = 1000000000000
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
 
 struct Pool {
     id: u64,
     collateral_asset: Hash,
     borrow_asset: Hash,
-    collateral_factor_bps: u64,    // ex: 7500 = 75%
-    liquidation_threshold_bps: u64, // ex: 8000 = 80%
-    liquidation_penalty_bps: u64,   // ex: 800 = 8%
-    reserve_factor_bps: u64,        // ex: 1000 = 10% to treasury
+    collateral_factor_bps: u64,
+    liquidation_threshold_bps: u64,
+    liquidation_penalty_bps: u64,
+    reserve_factor_bps: u64,
     interest_rate_model: Hash,
     active: bool,
     created_at: u64
@@ -82,7 +79,7 @@ struct Pool {
 
 struct UserPosition {
     principal: u64,
-    index: u64   // borrow index ou supply index selon le cas
+    index: u64
 }
 
 hook constructor() -> u64 {
@@ -100,12 +97,10 @@ fn only_admin() {
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
     let admin: Address = s.load(ADMIN_KEY).expect("anset")
-    if caller == admin {
-        return
-    }
-    let tl_opt: optional = s.load(TIMELOCK_KEY)
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
+    let tl: Hash = tl_opt.expect("err")
     let cc: Hash = get_contract_caller().expect("nocc")
     require(cc == tl, "notauth")
 }
@@ -114,10 +109,15 @@ fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
     let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
-    if caller == g {
-        return
-    }
+    if caller == g { return }
     only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == e, "notemg")
 }
 
 fn when_not_paused() {
@@ -125,22 +125,57 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
-// ============================================================================
-// ORACLE — récupère le prix d'un asset
-// ============================================================================
+// FIX #12: StakedOracle v5.0 entry 9 = get_price_for_asset_entry
 fn get_asset_price(asset: Hash) -> u64 {
     let s: Storage = Storage::new()
     let oracle_hash: Hash = s.load(ORACLE_KEY).expect("ornoset")
     let oracle: Contract = Contract::new(oracle_hash).expect("ornf")
-    // StakedOracle.get_price_for_asset(asset) — entry ID 0 (pub fn)
-    let price: u64 = oracle.call(0u16, [asset], {})
+    let price: u64 = oracle.call(9u16, [asset], {})
     require(price > 0, "noprice")
     return price
 }
 
+fn pool_key(pool_id: u64) -> string {
+    return POOL_PREFIX + pool_id.to_string(10u32)
+}
+
+fn ts_key(pool_id: u64) -> string {
+    return POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)
+}
+
+fn tb_key(pool_id: u64) -> string {
+    return POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)
+}
+
+fn res_key(pool_id: u64) -> string {
+    return POOL_RESERVE_PREFIX + pool_id.to_string(10u32)
+}
+
+fn lu_key(pool_id: u64) -> string {
+    return POOL_LAST_UPDATE_PREFIX + pool_id.to_string(10u32)
+}
+
+fn bi_key(pool_id: u64) -> string {
+    return POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32)
+}
+
+fn si_key(pool_id: u64) -> string {
+    return POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32)
+}
+
+fn user_supply_key(pool_id: u64, addr: Address) -> string {
+    return USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + addr.to_string()
+}
+
+fn user_borrow_key(pool_id: u64, addr: Address) -> string {
+    return USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + addr.to_string()
+}
+
 // ============================================================================
-// CREATE POOL — Entry ID 0
+// ENTRIES (sequential IDs starting at 0)
 // ============================================================================
+
+// ID 0: create_pool
 entry create_pool(
     collateral_asset: Hash,
     borrow_asset: Hash,
@@ -173,179 +208,212 @@ entry create_pool(
         active: true,
         created_at: get_current_topoheight()
     }
-    s.store(POOL_PREFIX + count.to_string(10u32), pool)
-    s.store(POOL_TOTAL_SUPPLY_PREFIX + count.to_string(10u32), 0u64)
-    s.store(POOL_TOTAL_BORROW_PREFIX + count.to_string(10u32), 0u64)
-    s.store(POOL_RESERVE_PREFIX + count.to_string(10u32), 0u64)
-    s.store(POOL_LAST_UPDATE_PREFIX + count.to_string(10u32), get_current_topoheight())
-    s.store(POOL_BORROW_INDEX_PREFIX + count.to_string(10u32), 1000000000000u64)  // 1e12
-    s.store(POOL_SUPPLY_INDEX_PREFIX + count.to_string(10u32), 1000000000000u64)
+    s.store(pool_key(count), pool)
+    s.store(ts_key(count), 0u64)
+    s.store(tb_key(count), 0u64)
+    s.store(res_key(count), 0u64)
+    s.store(lu_key(count), get_current_topoheight())
+    s.store(bi_key(count), INITIAL_INDEX)
+    s.store(si_key(count), INITIAL_INDEX)
     s.store(POOLS_COUNT_KEY, count + 1)
     return count
 }
 
 // ============================================================================
-// SUPPLY — Entry ID 1
+// Internal helpers — interest accrual
 // ============================================================================
+
+fn update_pool_interest(pool_id: u64, pool: Pool) {
+    let s: Storage = Storage::new()
+    let last_update: u64 = s.load(lu_key(pool_id)).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= last_update { return }
+
+    let blocks_elapsed: u64 = current_topo - last_update
+    let total_supply: u64 = s.load(ts_key(pool_id)).unwrap_or(0)
+    let total_borrow: u64 = s.load(tb_key(pool_id)).unwrap_or(0)
+
+    if total_borrow == 0 {
+        s.store(lu_key(pool_id), current_topo)
+        return
+    }
+
+    let utilization: u64 = (total_borrow as u128 * 10000u128 / total_supply as u128) as u64
+
+    let irm: Contract = Contract::new(pool.interest_rate_model).expect("irmnf")
+    let borrow_rate_bps: u64 = irm.call(0u16, [utilization], {})
+
+    let borrow_index: u64 = s.load(bi_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    let interest_accumulated: u128 = ((borrow_rate_bps as u128 * blocks_elapsed as u128 * borrow_index as u128) / (BLOCKS_PER_YEAR as u128 * 10000u128)) as u64 as u128
+    let new_borrow_index: u128 = borrow_index as u128 + interest_accumulated
+    if new_borrow_index > u64::MAX as u128 {
+        s.store(bi_key(pool_id), u64::MAX)
+    } else {
+        s.store(bi_key(pool_id), new_borrow_index as u64)
+    }
+
+    let reserve_factor: u64 = pool.reserve_factor_bps
+    let supply_rate: u64 = irm.call(1u16, [utilization], {})
+    let supply_index: u64 = s.load(si_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    let supply_acc: u128 = ((supply_rate as u128 * blocks_elapsed as u128 * supply_index as u128) / (BLOCKS_PER_YEAR as u128 * 10000u128)) as u64 as u128
+    let new_supply_index: u128 = supply_index as u128 + supply_acc
+    if new_supply_index > u64::MAX as u128 {
+        s.store(si_key(pool_id), u64::MAX)
+    } else {
+        s.store(si_key(pool_id), new_supply_index as u64)
+    }
+
+    let reserves: u64 = s.load(res_key(pool_id)).unwrap_or(0)
+    let reserve_increment: u64 = (interest_accumulated * reserve_factor as u128 / 10000u128) as u64
+    s.store(res_key(pool_id), reserves + reserve_increment)
+
+    s.store(lu_key(pool_id), current_topo)
+}
+
+// N-01 FIX: accrued = principal * current_pool_index / position_index
+fn get_accrued_borrow(pool_id: u64, principal: u64, position_index: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let current_index: u64 = s.load(bi_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    if position_index == 0 { return principal }
+    return (principal as u128 * current_index as u128 / position_index as u128) as u64
+}
+
+fn get_accrued_supply(pool_id: u64, principal: u64, position_index: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let current_index: u64 = s.load(si_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    if position_index == 0 { return principal }
+    return (principal as u128 * current_index as u128 / position_index as u128) as u64
+}
+
+// ID 1: supply
 entry supply(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
     require(pool.active, "inactive")
 
-    // Recevoir l'asset à supply
     let dep: u64 = get_deposit_for_asset(pool.borrow_asset).expect("nodep")
     require(dep >= amount, "insdep")
     if dep > amount {
         let _ = transfer(caller, dep - amount, pool.borrow_asset)
     }
 
-    // Update interest indexes
     update_pool_interest(pool_id, pool)
 
-    // Mettre à jour la position utilisateur
-    let user_key: string = USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let existing: optional = s.load(user_key)
-    let mut position: UserPosition
-    if existing.is_none() {
-        position = UserPosition { principal: 0, index: 0 }
-    } else {
-        position = existing.unwrap()
-    }
+    let user_key: string = user_supply_key(pool_id, caller)
+    let position: UserPosition = s.load(user_key).unwrap_or(UserPosition { principal: 0, index: 0 })
     position.principal += amount
-    position.index = s.load(POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
+    position.index = s.load(si_key(pool_id)).unwrap_or(INITIAL_INDEX)
     s.store(user_key, position)
 
-    // Mettre à jour le total supply
-    let total: u64 = s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32), total + amount)
-
+    let total: u64 = s.load(ts_key(pool_id)).unwrap_or(0)
+    s.store(ts_key(pool_id), total + amount)
     return 0
 }
 
-// ============================================================================
-// BORROW — Entry ID 2
-// ============================================================================
+// ID 2: borrow
 entry borrow(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
     require(pool.active, "inactive")
 
-    // Vérifier que le user a assez de collateral
-    let supply_pos: UserPosition = s.load(USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()).unwrap_or(UserPosition { principal: 0, index: 0 })
+    let supply_pos: UserPosition = s.load(user_supply_key(pool_id, caller)).unwrap_or(UserPosition { principal: 0, index: 0 })
     require(supply_pos.principal > 0, "nocol")
 
-    let borrow_pos_opt: optional = s.load(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string())
-    let current_borrow: u64 = if borrow_pos_opt.is_some() {
-        let bp: UserPosition = borrow_pos_opt.unwrap()
-        bp.principal
-    } else {
-        0
+    let borrow_pos_opt: optional<UserPosition> = s.load(user_borrow_key(pool_id, caller))
+    let current_borrow: u64 = 0
+    if borrow_pos_opt.is_some() {
+        let bp: UserPosition = borrow_pos_opt.expect("err")
+        current_borrow = get_accrued_borrow(pool_id, bp.principal, bp.index)
     }
 
-    // Calculer la valeur du collateral
     let col_price: u64 = get_asset_price(pool.collateral_asset)
-    let col_value: u64 = (supply_pos.principal as u128 * col_price as u128 / 100000000u128) as u64
+    let col_value: u64 = (supply_pos.principal as u128 * col_price as u128 / PRICE_DECIMALS as u128) as u64
 
-    // Calculer la valeur du borrow (incluant le nouveau)
     let borrow_price: u64 = get_asset_price(pool.borrow_asset)
-    let new_borrow_value: u64 = ((current_borrow + amount) as u128 * borrow_price as u128 / 100000000u128) as u64
+    let new_borrow_value: u64 = ((current_borrow + amount) as u128 * borrow_price as u128 / PRICE_DECIMALS as u128) as u64
 
-    // Vérifier le collateral factor
     let max_borrow_value: u64 = (col_value as u128 * pool.collateral_factor_bps as u128 / 10000u128) as u64
     require(new_borrow_value <= max_borrow_value, "inscol")
 
-    // Vérifier la liquidité
-    let total_supply: u64 = s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    let total_borrow: u64 = s.load(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    let available: u64 = if total_supply > total_borrow { total_supply - total_borrow } else { 0 }
+    let total_supply: u64 = s.load(ts_key(pool_id)).unwrap_or(0)
+    let total_borrow: u64 = s.load(tb_key(pool_id)).unwrap_or(0)
+    let available: u64 = 0
+    if total_supply > total_borrow { available = total_supply - total_borrow } else { available = 0 }
     require(available >= amount, "insliq")
 
-    // Transférer le borrow au user
     let ok: bool = transfer(caller, amount, pool.borrow_asset)
     require(ok, "txfail")
 
-    // Mettre à jour la position
     update_pool_interest(pool_id, pool)
-    let mut bp: UserPosition
-    if borrow_pos_opt.is_some() {
-        bp = borrow_pos_opt.unwrap()
-    } else {
-        bp = UserPosition { principal: 0, index: 0 }
-    }
-    bp.principal += amount
-    bp.index = s.load(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
-    s.store(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string(), bp)
+    let bp: UserPosition = borrow_pos_opt.unwrap_or(UserPosition { principal: 0, index: 0 })
+    bp.principal = current_borrow + amount
+    bp.index = s.load(bi_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    s.store(user_borrow_key(pool_id, caller), bp)
 
-    s.store(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32), total_borrow + amount)
-
+    s.store(tb_key(pool_id), total_borrow + amount)
     return 0
 }
 
-// ============================================================================
-// REPAY — Entry ID 3
-// ============================================================================
+// ID 3: repay
 entry repay(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
 
-    // Recevoir le repayment
     let dep: u64 = get_deposit_for_asset(pool.borrow_asset).expect("nodep")
     require(dep >= amount, "insdep")
 
-    let borrow_key: string = USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let bp_opt: optional = s.load(borrow_key)
+    let borrow_key: string = user_borrow_key(pool_id, caller)
+    let bp_opt: optional<UserPosition> = s.load(borrow_key)
     require(bp_opt.is_some(), "noborrow")
-    let mut bp: UserPosition = bp_opt.unwrap()
+    let bp: UserPosition = bp_opt.expect("err")
     let accrued_borrow: u64 = get_accrued_borrow(pool_id, bp.principal, bp.index)
-    let repay_amount: u64 = if amount > accrued_borrow { accrued_borrow } else { amount }
+    let repay_amount: u64 = 0
+    if amount > accrued_borrow { repay_amount = accrued_borrow } else { repay_amount = amount }
     if dep > repay_amount {
         let _ = transfer(caller, dep - repay_amount, pool.borrow_asset)
     }
 
     update_pool_interest(pool_id, pool)
     bp.principal = accrued_borrow - repay_amount
-    bp.index = s.load(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
+    bp.index = s.load(bi_key(pool_id)).unwrap_or(INITIAL_INDEX)
     s.store(borrow_key, bp)
 
-    let total_borrow: u64 = s.load(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32), total_borrow - repay_amount)
-
+    let total_borrow: u64 = s.load(tb_key(pool_id)).unwrap_or(0)
+    s.store(tb_key(pool_id), total_borrow - repay_amount)
     return 0
 }
 
-// ============================================================================
-// WITHDRAW — Entry ID 4
-// ============================================================================
+// ID 4: withdraw
 entry withdraw(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
 
-    let supply_key: string = USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let sp_opt: optional = s.load(supply_key)
+    let supply_key: string = user_supply_key(pool_id, caller)
+    let sp_opt: optional<UserPosition> = s.load(supply_key)
     require(sp_opt.is_some(), "nosupply")
-    let mut sp: UserPosition = sp_opt.unwrap()
+    let sp: UserPosition = sp_opt.expect("err")
     require(sp.principal >= amount, "insbal")
 
-    // Vérifier que le retrait ne casse pas le collateral ratio
-    let bp_opt: optional = s.load(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string())
+    let bp_opt: optional<UserPosition> = s.load(user_borrow_key(pool_id, caller))
     if bp_opt.is_some() {
-        let bp: UserPosition = bp_opt.unwrap()
+        let bp: UserPosition = bp_opt.expect("err")
+        let accrued_b: u64 = get_accrued_borrow(pool_id, bp.principal, bp.index)
         let col_price: u64 = get_asset_price(pool.collateral_asset)
         let borrow_price: u64 = get_asset_price(pool.borrow_asset)
-        let new_col_value: u64 = ((sp.principal - amount) as u128 * col_price as u128 / 100000000u128) as u64
-        let borrow_value: u64 = (bp.principal as u128 * borrow_price as u128 / 100000000u128) as u64
+        let new_col_value: u64 = ((sp.principal - amount) as u128 * col_price as u128 / PRICE_DECIMALS as u128) as u64
+        let borrow_value: u64 = (accrued_b as u128 * borrow_price as u128 / PRICE_DECIMALS as u128) as u64
         let max_borrow: u64 = (new_col_value as u128 * pool.collateral_factor_bps as u128 / 10000u128) as u64
         require(borrow_value <= max_borrow, "inscol")
     }
@@ -357,155 +425,66 @@ entry withdraw(pool_id: u64, amount: u64) -> u64 {
     let ok: bool = transfer(caller, amount, pool.borrow_asset)
     require(ok, "txfail")
 
-    let total_supply: u64 = s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32), total_supply - amount)
-
+    let total_supply: u64 = s.load(ts_key(pool_id)).unwrap_or(0)
+    s.store(ts_key(pool_id), total_supply - amount)
     return 0
 }
 
-// ============================================================================
-// LIQUIDATE — Entry ID 5
-// ============================================================================
+// ID 5: liquidate
 entry liquidate(pool_id: u64, user: Address, repay_amount: u64) -> u64 {
     when_not_paused()
     require(repay_amount > 0, "amtgt0")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("nocaller")
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
 
-    let sp: UserPosition = s.load(USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string()).expect("nosupply")
-    let bp: UserPosition = s.load(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string()).expect("noborrow")
+    let sp: UserPosition = s.load(user_supply_key(pool_id, user)).expect("nosupply")
+    let bp: UserPosition = s.load(user_borrow_key(pool_id, user)).expect("noborrow")
     require(bp.principal > 0, "nodebt")
 
-    // Calculer le health factor
+    let accrued_b: u64 = get_accrued_borrow(pool_id, bp.principal, bp.index)
     let col_price: u64 = get_asset_price(pool.collateral_asset)
     let borrow_price: u64 = get_asset_price(pool.borrow_asset)
-    let col_value: u64 = (sp.principal as u128 * col_price as u128 / 100000000u128) as u64
-    let borrow_value: u64 = (bp.principal as u128 * borrow_price as u128 / 100000000u128) as u64
+    let col_value: u64 = (sp.principal as u128 * col_price as u128 / PRICE_DECIMALS as u128) as u64
+    let borrow_value: u64 = (accrued_b as u128 * borrow_price as u128 / PRICE_DECIMALS as u128) as u64
     require(borrow_value > 0, "zerobv")
 
-    // Health factor = (col_value * threshold / 10000) / borrow_value
     let hf: u64 = (col_value as u128 * pool.liquidation_threshold_bps as u128 / 10000u128 / borrow_value as u128) as u64
-    require(hf < 10000, "healthy")  // < 1.0
+    require(hf < 10000, "healthy")
 
-    // Calculer le collateral à saisir
-    let repay_value: u64 = (repay_amount as u128 * borrow_price as u128 / 100000000u128) as u64
-    let collateral_to_seize: u64 = (repay_value as u128 * (10000u128 + pool.liquidation_penalty_bps as u128) / 10000u128 * 100000000u128 / col_price as u128) as u64
+    let repay_value: u64 = (repay_amount as u128 * borrow_price as u128 / PRICE_DECIMALS as u128) as u64
+    let collateral_to_seize: u64 = (repay_value as u128 * (10000u128 + pool.liquidation_penalty_bps as u128) / 10000u128 * PRICE_DECIMALS as u128 / col_price as u128) as u64
     require(collateral_to_seize <= sp.principal, "seizeovf")
 
-    // Recevoir le repay du liquidateur
     let dep: u64 = get_deposit_for_asset(pool.borrow_asset).expect("nodep")
     require(dep >= repay_amount, "insdep")
     if dep > repay_amount {
         let _ = transfer(caller, dep - repay_amount, pool.borrow_asset)
     }
 
-    // Transférer le collateral au liquidateur
     let ok: bool = transfer(caller, collateral_to_seize, pool.collateral_asset)
     require(ok, "txfail")
 
-    // Update positions
     update_pool_interest(pool_id, pool)
-    let mut sp2: UserPosition = sp
+    let sp2: UserPosition = sp
     sp2.principal -= collateral_to_seize
-    s.store(USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string(), sp2)
-    let mut bp2: UserPosition = bp
-    bp2.principal -= repay_amount
-    s.store(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string(), bp2)
+    s.store(user_supply_key(pool_id, user), sp2)
+    let bp2: UserPosition = bp
+    bp2.principal = accrued_b - repay_amount
+    bp2.index = s.load(bi_key(pool_id)).unwrap_or(INITIAL_INDEX)
+    s.store(user_borrow_key(pool_id, user), bp2)
 
-    let total_supply: u64 = s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32), total_supply - collateral_to_seize)
-    let total_borrow: u64 = s.load(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    s.store(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32), total_borrow - repay_amount)
-
+    let total_supply: u64 = s.load(ts_key(pool_id)).unwrap_or(0)
+    s.store(ts_key(pool_id), total_supply - collateral_to_seize)
+    let total_borrow: u64 = s.load(tb_key(pool_id)).unwrap_or(0)
+    s.store(tb_key(pool_id), total_borrow - repay_amount)
     return 0
 }
 
-// ============================================================================
-// HELPER — update interest indexes
-// ============================================================================
-fn update_pool_interest(pool_id: u64, pool: Pool) {
+// ID 6: get_pool_info_entry
+entry get_pool_info_entry(pool_id: u64) -> (Hash, Hash, u64, u64, u64, u64, u64, u64, bool) {
     let s: Storage = Storage::new()
-    let last_update: u64 = s.load(POOL_LAST_UPDATE_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    let current_topo: u64 = get_current_topoheight()
-    if current_topo <= last_update {
-        return
-    }
-
-    let blocks_elapsed: u64 = current_topo - last_update
-    let total_supply: u64 = s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    let total_borrow: u64 = s.load(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-
-    if total_borrow == 0 {
-        s.store(POOL_LAST_UPDATE_PREFIX + pool_id.to_string(10u32), current_topo)
-        return
-    }
-
-    let utilization: u64 = (total_borrow as u128 * 10000u128 / total_supply as u128) as u64
-
-    // Appeler InterestRateModel pour le borrow rate
-    let irm: Contract = Contract::new(pool.interest_rate_model).expect("irmnf")
-    let borrow_rate_bps: u64 = irm.call(0u16, [utilization], {})  // get_borrow_rate(utilization)
-
-    // Calculer l'interest accumulé
-    let borrow_index: u64 = s.load(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
-    let interest_accumulated: u128 = (borrow_rate_bps as u128 * blocks_elapsed as u128 * borrow_index as u128 / (BLOCKS_PER_YEAR as u128 * 10000u128)) as u64 as u128
-    let new_borrow_index: u128 = borrow_index as u128 + interest_accumulated
-    if new_borrow_index > u64::MAX as u128 {
-        s.store(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32), u64::MAX)
-    } else {
-        s.store(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32), new_borrow_index as u64)
-    }
-
-    // Update supply index (basé sur reserve_factor)
-    let reserve_factor: u64 = pool.reserve_factor_bps
-    let supply_rate: u64 = irm.call(1u16, [utilization], {})
-    let supply_index: u64 = s.load(POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
-    let supply_acc: u128 = (supply_rate as u128 * blocks_elapsed as u128 * supply_index as u128 / (BLOCKS_PER_YEAR as u128 * 10000u128)) as u64 as u128
-    let new_supply_index: u128 = supply_index as u128 + supply_acc
-    if new_supply_index > u64::MAX as u128 {
-        s.store(POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32), u64::MAX)
-    } else {
-        s.store(POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32), new_supply_index as u64)
-    }
-
-    // Accumuler reserves
-    let reserves: u64 = s.load(POOL_RESERVE_PREFIX + pool_id.to_string(10u32)).unwrap_or(0)
-    let reserve_increment: u64 = (interest_accumulated as u128 * reserve_factor as u128 / 10000u128) as u64
-    s.store(POOL_RESERVE_PREFIX + pool_id.to_string(10u32), reserves + reserve_increment)
-
-    s.store(POOL_LAST_UPDATE_PREFIX + pool_id.to_string(10u32), current_topo)
-}
-
-// ============================================================================
-// N-01 FIX: Scale principal by index ratio to get accrued amount
-// ============================================================================
-// accrued = principal * current_pool_index / position_index
-// This must be called before any calculation that uses principal
-fn get_accrued_borrow(pool_id: u64, principal: u64, position_index: u64) -> u64 {
-    let s: Storage = Storage::new()
-    let current_index: u64 = s.load(POOL_BORROW_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
-    if position_index == 0 {
-        return principal
-    }
-    return (principal as u128 * current_index as u128 / position_index as u128) as u64
-}
-
-fn get_accrued_supply(pool_id: u64, principal: u64, position_index: u64) -> u64 {
-    let s: Storage = Storage::new()
-    let current_index: u64 = s.load(POOL_SUPPLY_INDEX_PREFIX + pool_id.to_string(10u32)).unwrap_or(1000000000000u64)
-    if position_index == 0 {
-        return principal
-    }
-    return (principal as u128 * current_index as u128 / position_index as u128) as u64
-}
-
-// ============================================================================
-// VUES — Entry IDs 6-7
-// ============================================================================
-pub fn get_pool_info(pool_id: u64) -> (Hash, Hash, u64, u64, u64, u64, u64, u64, bool) {
-    let s: Storage = Storage::new()
-    let pool: Pool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).expect("pnf")
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
     return (
         pool.collateral_asset,
         pool.borrow_asset,
@@ -513,101 +492,171 @@ pub fn get_pool_info(pool_id: u64) -> (Hash, Hash, u64, u64, u64, u64, u64, u64,
         pool.liquidation_threshold_bps,
         pool.liquidation_penalty_bps,
         pool.reserve_factor_bps,
-        s.load(POOL_TOTAL_SUPPLY_PREFIX + pool_id.to_string(10u32)).unwrap_or(0),
-        s.load(POOL_TOTAL_BORROW_PREFIX + pool_id.to_string(10u32)).unwrap_or(0),
+        s.load(ts_key(pool_id)).unwrap_or(0),
+        s.load(tb_key(pool_id)).unwrap_or(0),
         pool.active
     )
 }
 
-pub fn get_user_position(pool_id: u64, user: Address) -> (u64, u64) {
+// ID 7: get_user_position_entry — FIX N-01: returns accrued values
+entry get_user_position_entry(pool_id: u64, user: Address) -> (u64, u64) {
     let s: Storage = Storage::new()
-    let sp_opt: optional = s.load(USER_SUPPLY_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string())
-    let bp_opt: optional = s.load(USER_BORROW_PREFIX + pool_id.to_string(10u32) + "_" + user.to_string())
-    let supply: u64 = if sp_opt.is_some() {
-        let sp: UserPosition = sp_opt.unwrap()
-        sp.principal
-    } else {
-        0
+    let sp_opt: optional<UserPosition> = s.load(user_supply_key(pool_id, user))
+    let bp_opt: optional<UserPosition> = s.load(user_borrow_key(pool_id, user))
+    let supply: u64 = 0
+    let borrow: u64 = 0
+    if sp_opt.is_some() {
+        let sp: UserPosition = sp_opt.expect("err")
+        supply = get_accrued_supply(pool_id, sp.principal, sp.index)
     }
-    let borrow: u64 = if bp_opt.is_some() {
-        let bp: UserPosition = bp_opt.unwrap()
-        bp.principal
-    } else {
-        0
+    if bp_opt.is_some() {
+        let bp: UserPosition = bp_opt.expect("err")
+        borrow = get_accrued_borrow(pool_id, bp.principal, bp.index)
     }
-    return (get_accrued_supply(pool_id, sp.principal, sp.index), get_accrued_borrow(pool_id, bp.principal, bp.index))
+    return (supply, borrow)
 }
 
-pub fn get_pools_count() -> u64 {
+// ID 8: get_pools_count_entry
+entry get_pools_count_entry() -> u64 {
     return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
 }
 
-// ============================================================================
-// PAUSE + Wiring (simplifié pour gagner de la place)
-// ============================================================================
+// ID 9: pause
 entry pause(reason: string) -> u64 {
     only_guardian_or_admin()
     Storage::new().store(PAUSED_KEY, true)
     return 0
 }
 
+// ID 10: unpause
 entry unpause() -> u64 {
     only_admin()
     Storage::new().store(PAUSED_KEY, false)
     return 0
 }
 
+// ID 11: set_oracle
 entry set_oracle(oracle: Hash) -> u64 {
     only_admin()
     Storage::new().store(ORACLE_KEY, oracle)
     return 0
 }
 
+// ID 12: set_treasury
 entry set_treasury(t: Address) -> u64 {
     only_admin()
     Storage::new().store(TREASURY_KEY, t)
     return 0
 }
 
+// ID 13: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
 
+// ID 14: set_timelock
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
 }
 
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
+// ID 15: set_guardian
 entry set_guardian(g: Address) -> u64 {
     only_admin()
     Storage::new().store(GUARDIAN_KEY, g)
     return 0
 }
 
+// ID 16: set_emergency
 entry set_emergency(e: Address) -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().expect("nocaller")
-    let current: Address = s.load(EMERGENCY_KEY).expect("easet")
-    require(caller == current, "notemg")
-    s.store(EMERGENCY_KEY, e)
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
     return 0
 }
 
+// ID 17: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
 
+// ID 18: get_version
 entry get_version() -> string {
     return VERSION
+}
+
+// ID 19: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 20: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let e: Address = s.load(EMERGENCY_KEY).expect("easet")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_pool_info(pool_id: u64) -> (Hash, Hash, u64, u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let pool: Pool = s.load(pool_key(pool_id)).expect("pnf")
+    return (
+        pool.collateral_asset,
+        pool.borrow_asset,
+        pool.collateral_factor_bps,
+        pool.liquidation_threshold_bps,
+        pool.liquidation_penalty_bps,
+        pool.reserve_factor_bps,
+        s.load(ts_key(pool_id)).unwrap_or(0),
+        s.load(tb_key(pool_id)).unwrap_or(0),
+        pool.active
+    )
+}
+
+pub fn get_user_position(pool_id: u64, user: Address) -> (u64, u64) {
+    let s: Storage = Storage::new()
+    let sp_opt: optional<UserPosition> = s.load(user_supply_key(pool_id, user))
+    let bp_opt: optional<UserPosition> = s.load(user_borrow_key(pool_id, user))
+    let supply: u64 = 0
+    let borrow: u64 = 0
+    if sp_opt.is_some() {
+        let sp: UserPosition = sp_opt.expect("err")
+        supply = get_accrued_supply(pool_id, sp.principal, sp.index)
+    }
+    if bp_opt.is_some() {
+        let bp: UserPosition = bp_opt.expect("err")
+        borrow = get_accrued_borrow(pool_id, bp.principal, bp.index)
+    }
+    return (supply, borrow)
+}
+
+pub fn get_pools_count() -> u64 {
+    return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
 }

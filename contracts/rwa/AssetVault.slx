@@ -1,7 +1,40 @@
-const VERSION: string = "AssetVault v4.2"
+// ============================================================================
+// AssetVault.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Tokenized RWA asset vault, preserved from v4.2.
+//
+// v5.0 changes:
+//   - pub fn get_asset_info / get_asset_hash / get_total_supply converted to
+//     entry wrappers (get_asset_info_entry / get_asset_hash_entry /
+//     get_total_supply_entry) so other contracts can read asset metadata.
+//   - Added transfer_admin (transfers ISSUER_KEY) and set_emergency entry.
+//   - Added two-step emergency_withdraw (IDs 14/15, "ert" key, 17280-block
+//     delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : create_asset
+//   1  : mint
+//   2  : transfer_asset
+//   3  : pause
+//   4  : unpause
+//   5  : set_compliance
+//   6  : set_registry
+//   7  : set_timelock
+//   8  : set_emergency
+//   9  : transfer_admin
+//   10 : get_asset_info_entry
+//   11 : get_asset_hash_entry
+//   12 : get_total_supply_entry
+//   13 : get_version
+//   14 : request_emergency_withdraw
+//   15 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "AssetVault v5.0"
 
 const ISSUER_KEY: string = "i"
 const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
 const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
 const COMPLIANCE_KEY: string = "cm"
@@ -13,10 +46,14 @@ const ASSET_DECIMALS_KEY: string = "ad"
 const ASSET_MAX_SUPPLY_KEY: string = "ams"
 const TOTAL_MINTED_KEY: string = "tm"
 
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ISSUER_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(TOTAL_MINTED_KEY, 0u64)
     return 0
@@ -24,9 +61,21 @@ hook constructor() -> u64 {
 
 fn only_issuer() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let issuer: Address = s.load(ISSUER_KEY).unwrap()
-    require(caller == issuer, "notissuer")
+    let caller: Address = get_caller().expect("err")
+    let issuer: Address = s.load(ISSUER_KEY).expect("err")
+    if caller == issuer { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
 }
 
 fn when_not_paused() {
@@ -34,6 +83,11 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: create_asset
 entry create_asset(
     name: string,
     ticker: string,
@@ -54,7 +108,7 @@ entry create_asset(
         ticker,
         decimals,
         MaxSupplyMode::None
-    ).unwrap()
+    ).expect("err")
     let hash: Hash = asset.get_hash()
     s.store(ASSET_HASH_KEY, hash)
     s.store(ASSET_NAME_KEY, name)
@@ -64,17 +118,18 @@ entry create_asset(
     return 0
 }
 
+// ID 1: mint
 entry mint(to: Address, amount: u64) -> u64 {
     only_issuer()
     when_not_paused()
     require(amount > 0, "amtgt0")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let asset: Asset = Asset::get_by_hash(hash).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
 
     let current_supply: u64 = asset.get_supply()
-    let max_supply: u64 = s.load(ASSET_MAX_SUPPLY_KEY).unwrap()
+    let max_supply: u64 = s.load(ASSET_MAX_SUPPLY_KEY).expect("err")
     require(current_supply + amount <= max_supply, "supmax")
 
     let ok: bool = asset.mint(amount)
@@ -87,35 +142,21 @@ entry mint(to: Address, amount: u64) -> u64 {
     return 0
 }
 
-// entry burn(amount: u64) -> u64 {
-//     only_issuer()
-//     when_not_paused()
-//     require(amount > 0, "amtgt0")
-// 
-//     let s: Storage = Storage::new()
-//     let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-//     let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
-//     require(bal >= amount, "insbal")
-// 
-//     let ok: bool = burn(amount, hash)
-//     require(ok, "burnfail")
-//     return 0
-// }
-
+// ID 2: transfer_asset
 entry transfer_asset(to: Address, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     require(to != caller, "selfxfer")
 
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
     let dep: optional<u64> = get_deposit_for_asset(hash)
-    require(dep.is_some() && dep.unwrap() >= amount, "nodep")
+    require(dep.is_some() && dep.expect("err") >= amount, "nodep")
 
     let compliance_opt: optional<Hash> = s.load(COMPLIANCE_KEY)
     if compliance_opt.is_some() {
-        let compliance: Contract = Contract::new(compliance_opt.unwrap()).unwrap()
+        let compliance: Contract = Contract::new(compliance_opt.expect("err")).expect("err")
         let allowed: bool = compliance.call(0u16, [caller, to, hash, amount], {})
         require(allowed, "notallowed")
     }
@@ -123,23 +164,119 @@ entry transfer_asset(to: Address, amount: u64) -> u64 {
     let ok: bool = transfer(to, amount, hash)
     require(ok, "txfail")
 
-    if dep.unwrap() > amount {
-        transfer(caller, dep.unwrap() - amount, hash)
+    if dep.expect("err") > amount {
+        let _ = transfer(caller, dep.expect("err") - amount, hash)
     }
     return 0
 }
 
+// ID 3: pause
 entry pause(reason: string) -> u64 {
     only_issuer()
     Storage::new().store(PAUSED_KEY, true)
     return 0
 }
 
+// ID 4: unpause
 entry unpause() -> u64 {
     only_issuer()
     Storage::new().store(PAUSED_KEY, false)
     return 0
 }
+
+// ID 5: set_compliance
+entry set_compliance(cm: Hash) -> u64 {
+    only_issuer()
+    Storage::new().store(COMPLIANCE_KEY, cm)
+    return 0
+}
+
+// ID 6: set_registry
+entry set_registry(reg: Hash) -> u64 {
+    only_issuer()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 7: set_timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_issuer()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 8: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 9: transfer_admin (transfers the ISSUER_KEY)
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_issuer()
+    Storage::new().store(ISSUER_KEY, new_admin)
+    return 0
+}
+
+// ID 10: get_asset_info_entry
+entry get_asset_info_entry() -> (string, string, u8, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(ASSET_NAME_KEY).unwrap_or(""),
+        s.load(ASSET_TICKER_KEY).unwrap_or(""),
+        s.load(ASSET_DECIMALS_KEY).unwrap_or(0),
+        s.load(ASSET_MAX_SUPPLY_KEY).unwrap_or(0),
+        s.load(TOTAL_MINTED_KEY).unwrap_or(0)
+    )
+}
+
+// ID 11: get_asset_hash_entry
+entry get_asset_hash_entry() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// ID 12: get_total_supply_entry
+entry get_total_supply_entry() -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return asset.get_supply()
+}
+
+// ID 13: get_version
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 14: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 15: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
 
 pub fn get_asset_info() -> (string, string, u8, u64, u64) {
     let s: Storage = Storage::new()
@@ -153,40 +290,18 @@ pub fn get_asset_info() -> (string, string, u8, u64, u64) {
 }
 
 pub fn get_asset_hash() -> Hash {
-    return Storage::new().load(ASSET_HASH_KEY).unwrap()
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
 }
 
 pub fn get_total_supply() -> u64 {
     let s: Storage = Storage::new()
-    let hash: Hash = s.load(ASSET_HASH_KEY).unwrap()
-    let asset: Asset = Asset::get_by_hash(hash).unwrap()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
     return asset.get_supply()
 }
 
-entry set_compliance(cm: Hash) -> u64 {
-    only_issuer()
-    Storage::new().store(COMPLIANCE_KEY, cm)
-    return 0
-}
-
-entry set_registry(reg: Hash) -> u64 {
-    only_issuer()
-    Storage::new().store(REGISTRY_KEY, reg)
-    return 0
-}
-
-entry set_timelock(tl: Hash) -> u64 {
+pub fn set_timelock_tl(tl: Hash) -> u64 {
     only_issuer()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
-}
-
-// entry transfer_issuer(new_issuer: Address) -> u64 {
-    // only_issuer()
-    // Storage::new().store(ISSUER_KEY, new_issuer)
-    // return 0
-    // }
-    // 
-entry get_version() -> string {
-    return VERSION
 }

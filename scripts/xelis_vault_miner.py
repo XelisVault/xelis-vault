@@ -1,795 +1,680 @@
 #!/usr/bin/env python3
 """
 ============================================================================
- XELIS Vault Miner — Script unifié (Oracle + Chat + futurs services)
+ XELIS Vault v5.0 — Miner Daemon (xelis_vault_miner.py)
 ============================================================================
 
-Un seul script pour gérer TOUS les services XELIS Vault :
-  - Service 1 : Oracle (soumettre des prix toutes les 25s)
-  - Service 2 : Chat (stocker et servir les messages VaultChat)
-  - Service 3+ : Futurs services (storage, indexer, etc.)
+Long-running daemon that:
 
-INSTALLATION
-============
-Une seule commande :
+  1. Loads config from ~/.xelis-vault/config/config.json
+  2. Connects to the XELIS daemon RPC
+  3. Verifies the wallet has >= 100 VLT (calls VLTToken entry 11
+     `get_asset_hash_entry` then checks balance)
+  4. Calls `XelisVaultMiner.register_miner(endpoint_url, miner_pubkey,
+     services_mask=1)` (entry ID 0) if not already registered
+  5. Loops:
+     - Every 100 blocks (~8 min): call `submit_heartbeat` (entry ID 6)
+     - Read `get_miner_reputation_entry(addr)` (entry ID 11) — if below
+       5000 (Good tier floor), log warning
+     - Read `is_miner_active_entry(addr, 1)` (entry ID 9) — if not active,
+       try to recover (re-heartbeat / re-register)
+     - Log all activity to ~/.xelis-vault/logs/miner.log with timestamps
 
-    Linux / macOS:
-        curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/xelis_vault_miner.py | python3
+PRIVACY:
+  - NEVER logs the wallet private key, mnemonic, or balance in plain text.
+    Wallet balances are masked with "****".
+  - NEVER logs IP addresses of other miners.
+  - DOES log block heights, topoheights, heartbeat confirmations,
+    reputation changes, reward amounts (public on-chain), error messages
+    (without sensitive context).
 
-    Windows (PowerShell):
-        iwr -useb https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/xelis_vault_miner.py | python
-
-    Ou en local:
-        python3 xelis_vault_miner.py
-
-Le script est 100% interactif. Il détecte votre OS, configure tout,
-et vous demande uniquement les informations nécessaires.
-
-FONCTIONNALITÉS
-===============
-  ✅ Détection automatique OS (Linux / macOS / Windows)
-  ✅ Installation automatique de XELIS daemon/wallet si nécessaire
-  ✅ Création ou import de wallet interactif
-  ✅ Choix des services à activer (oracle, chat, ou les deux)
-  ✅ Configuration automatique (systemd / launchd / Windows Service)
-  ✅ Sources de prix personnalisées (HTTP ou commande externe)
-  ✅ Monitoring Prometheus intégré
-  ✅ Heartbeats automatiques (preuve de vie toutes les 8min)
-  ✅ Ancrage automatique pour VaultChat (toutes les 1h)
-  ✅ Reconnexion automatique en cas de déconnexion
-  ✅ Logging complet avec rotation
-
-PRÉREQUIS
-=========
-  - Python 3.8+
-  - Module requests (pip install requests)
-  - XELIS daemon sync (le script aide à l'installer)
-  - 100 VLT pour le stake (le script aide à les obtenir)
+CLI:
+  python3 xelis_vault_miner.py --wallet ~/.xelis/wallet \\
+      --rpc http://localhost:8080 \\
+      --endpoint https://my-miner.example.com:8080 \\
+      --services 1 \\
+      [--dry-run] [--verbose]
 """
-import os
-import sys
-import platform
-import subprocess
-import shutil
-import json
-import time
-import logging
+from __future__ import annotations
+
 import argparse
-import threading
-import hashlib
-import statistics
+import json
+import logging
+import os
 import signal
+import sys
+import time
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
-from dataclasses import dataclass
+from typing import Any, Optional
 
 try:
     import requests
 except ImportError:
-    print("Installing requests...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--quiet", "requests"])
-    import requests
+    print("ERROR: 'requests' is not installed. Run install.py first:",
+          file=sys.stderr)
+    print("  python3 install.py", file=sys.stderr)
+    sys.exit(1)
 
 # ============================================================================
-# CONFIGURATION
+# CONSTANTS — v5.0 entry IDs (canonical, see docs/ENTRY_IDS.md)
 # ============================================================================
-VAULT_DIR = Path.home() / ".xelis-vault"
-VAULT_CONFIG = VAULT_DIR / "miner_config.json"
-VAULT_ENV = VAULT_DIR / "miner.env"
-VAULT_LOG = VAULT_DIR / "miner.log"
+# XelisVaultMiner entry IDs
+ENTRY_REGISTER_MINER            = 0   # (endpoint_url, miner_pubkey, services_mask)
+ENTRY_ENABLE_SERVICE            = 1
+ENTRY_DISABLE_SERVICE           = 2
+ENTRY_INCREASE_STAKE            = 3
+ENTRY_DECREASE_STAKE            = 4
+ENTRY_DEREGISTER_MINER          = 5
+ENTRY_SUBMIT_HEARTBEAT          = 6   # ()
+ENTRY_SLASH_MINER               = 7
+ENTRY_DISTRIBUTE_REWARD         = 8
+ENTRY_IS_MINER_ACTIVE           = 9   # (addr, service_id) -> u64
+ENTRY_GET_MINER_STAKE           = 10  # (addr) -> u64
+ENTRY_GET_MINER_REPUTATION      = 11  # (addr) -> u64
+ENTRY_GET_ACTIVE_MINERS_FOR_SVC = 12  # (service_id) -> u64
+ENTRY_GET_MINERS_COUNT          = 13  # () -> u64
+ENTRY_GET_TOTAL_STAKED          = 14  # () -> u64
+ENTRY_GET_BASE_REWARD_ORACLE    = 15  # () -> u64
+ENTRY_REGISTER_SERVICE          = 16
+ENTRY_UNREGISTER_SERVICE        = 17
+ENTRY_SET_MIN_STAKE             = 18
+ENTRY_SET_HEARTBEAT_INTERVAL    = 19
+ENTRY_SET_HEARTBEAT_TIMEOUT     = 20
+ENTRY_SET_BASE_REWARD_ORACLE    = 21
+ENTRY_SET_BASE_REWARD_CHAT      = 22
+ENTRY_SET_TOTAL_BUDGET          = 23
+ENTRY_SET_TARGET_DURATION       = 24
+ENTRY_SET_VLT_CONTRACT          = 25
+ENTRY_SET_VLT_ASSET             = 26
+ENTRY_SET_TREASURY              = 27
+ENTRY_SET_REGISTRY              = 28
+ENTRY_SET_TIMELOCK              = 29
+ENTRY_SET_GUARDIAN               = 30
+ENTRY_SET_EMERGENCY             = 31
+ENTRY_PAUSE                     = 32
+ENTRY_UNPAUSE                   = 33
+ENTRY_TRANSFER_ADMIN            = 34
+ENTRY_GET_VERSION               = 35
+ENTRY_REQUEST_EMERGENCY_WITHDRAW = 36
+ENTRY_CANCEL_EMERGENCY_WITHDRAW  = 37
+ENTRY_EXECUTE_EMERGENCY_WITHDRAW = 38
 
-# Default contract addresses (to be updated after testnet deployment)
-DEFAULT_CONFIG = {
-    "miner_address": "",
-    "miner_contract": "",
-    "oracle_contract": "",
-    "chat_contract": "",
-    "vlt_asset": "",
-    "xusd_asset": "",
-    "rpc_url": "http://127.0.0.1:8080",
-    "network": "testnet",
-    "services": {
-        "oracle": True,
-        "chat": True,
-    },
-    "oracle_config": {
-        "submit_interval": 20,
-        "feeds": ["XEL/USD"],
-        "sources": ["mexc", "coinex"],
-    },
-    "chat_config": {
-        "storage_dir": str(VAULT_DIR / "chat_messages"),
-        "anchor_interval": 3600,  # 1 hour
-        "max_messages_per_hour": 10000,
-    },
-    "heartbeat_interval": 480,  # 8 minutes (96 blocks × 5s)
-    "prometheus_port": 9091,
-    "log_level": "INFO",
-}
+# VLTToken entry IDs (only the ones we use)
+VLT_GET_ASSET_HASH              = 11  # () -> Hash
+VLT_GET_MAX_SUPPLY              = 12  # () -> u64
+VLT_GET_TOTAL_BURNED            = 13  # () -> u64
+VLT_GET_CIRCULATING_SUPPLY      = 14  # () -> u64
 
-# Colors
-class Colors:
-    PURPLE = '\033[95m' if sys.stdout.isatty() else ''
-    BLUE = '\033[94m' if sys.stdout.isatty() else ''
-    CYAN = '\033[96m' if sys.stdout.isatty() else ''
-    GREEN = '\033[92m' if sys.stdout.isatty() else ''
-    YELLOW = '\033[93m' if sys.stdout.isatty() else ''
-    RED = '\033[91m' if sys.stdout.isatty() else ''
-    BOLD = '\033[1m' if sys.stdout.isatty() else ''
-    END = '\033[0m' if sys.stdout.isatty() else ''
+# Defaults
+VAULT_DIR     = Path.home() / ".xelis-vault"
+CONFIG_PATH   = VAULT_DIR / "config" / "config.json"
+LOG_DIR       = VAULT_DIR / "logs"
+LOG_FILE      = LOG_DIR / "miner.log"
 
-def c(text, color):
-    return f"{color}{text}{Colors.END}"
-
-def header(msg):
-    print()
-    print(c("=" * 70, Colors.CYAN))
-    print(c(f"  {msg}", Colors.BOLD))
-    print(c("=" * 70, Colors.CYAN))
-    print()
-
-def info(msg):  print(f"  {c('ℹ', Colors.BLUE)} {msg}")
-def ok(msg):    print(f"  {c('✓', Colors.GREEN)} {msg}")
-def warn(msg):  print(f"  {c('!', Colors.YELLOW)} {msg}")
-def err(msg):   print(f"  {c('✗', Colors.RED)} {msg}")
-
-def prompt(msg, default=""):
-    suffix = f" [{default}]" if default else ""
-    return input(f"  {c('>', Colors.CYAN)} {msg}{suffix}: ").strip() or default
-
-def confirm(msg, default=True):
-    d = "Y/n" if default else "y/N"
-    r = input(f"  {c('?', Colors.CYAN)} {msg} [{d}]: ").strip().lower()
-    if not r: return default
-    return r in ("y", "yes", "o", "oui")
+MIN_STAKE_VLT_ATOMIC = 10_000_000_000   # 100 VLT @ 8 decimals
+HEARTBEAT_INTERVAL_BLOCKS_DEFAULT = 100
+REPUTATION_GOOD_TIER_FLOOR  = 5_000
+REPUTATION_WARN_TIER_FLOOR  = 2_000
+REPUTATION_CRIT_TIER_FLOOR  = 1_000
+SERVICE_ORACLE = 1
+SERVICE_CHAT   = 2
 
 # ============================================================================
-# PLATFORM DETECTION
+# PRIVACY UTILITIES
 # ============================================================================
-def detect_platform():
-    system = platform.system()
-    machine = platform.machine().lower()
-    if system == "Linux":
-        return {"os": "linux", "arch": "x86_64" if "x86" in machine else "arm64"}
-    elif system == "Darwin":
-        return {"os": "macos", "arch": "x86_64" if "x86" in machine else "arm64"}
-    elif system == "Windows":
-        return {"os": "windows", "arch": "x86_64"}
-    return {"os": "unknown", "arch": "unknown"}
+def mask(s: Optional[str], keep: int = 4) -> str:
+    """Mask a string for safe logging. Keeps the first/last `keep` chars."""
+    if not s:
+        return ""
+    if len(s) <= keep * 2:
+        return "*" * len(s)
+    return f"{s[:keep]}{'*' * (len(s) - keep * 2)}{s[-keep:]}"
+
+
+def mask_balance(amount: Any) -> str:
+    """Mask a wallet balance for safe logging."""
+    return "****"
 
 # ============================================================================
-# PRICE SOURCES (for Oracle service)
+# LOGGING
 # ============================================================================
-@dataclass
-class PriceSample:
-    source: str
-    price: float
-    timestamp: float
-    latency_ms: int
-
-def fetch_mexc():
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("miner")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = False
+    # Avoid double-adding handlers on restart
+    if logger.handlers:
+        return logger
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # File handler (rotating)
     try:
-        r = requests.get("https://api.mexc.com/api/v3/ticker/price",
-                         params={"symbol": "XELUSDT"}, timeout=10)
-        r.raise_for_status()
-        price = float(r.json()["price"])
-        if 0.001 < price < 10000:
-            return PriceSample("mexc", price, time.time(), 0)
-    except: pass
-    return None
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(
+            LOG_FILE, maxBytes=100 * 1024 * 1024, backupCount=5
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass  # fall through to stdout only
+    # stdout handler
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
 
-def fetch_coinex():
-    try:
-        r = requests.get("https://api.coinex.com/v2/spot/ticker",
-                         params={"market": "XELUSDT"}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") == 0 and data.get("data"):
-            price = float(data["data"][0]["last"])
-            if 0.001 < price < 10000:
-                return PriceSample("coinex", price, time.time(), 0)
-    except: pass
-    return None
 
-PRICE_SOURCES = {"mexc": fetch_mexc, "coinex": fetch_coinex}
+log = logging.getLogger("miner")
 
-def load_custom_sources():
-    custom_file = VAULT_DIR / "custom_sources.json"
-    if not custom_file.exists():
-        return {}
-    try:
-        sources = json.loads(custom_file.read_text())
-        return {s["name"]: s for s in sources if "name" in s}
-    except:
-        return {}
+# ============================================================================
+# CONFIG
+# ============================================================================
+class Config:
+    """Loaded from ~/.xelis-vault/config/config.json with CLI overrides."""
 
-def fetch_custom(src_config):
-    if src_config.get("type") == "http":
-        try:
-            r = requests.get(src_config["url"], headers=src_config.get("headers", {}), timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            for key in src_config.get("json_path", "price").split("."):
-                data = data.get(key, {})
-            price = float(data)
-            if 0.001 < price < 10000:
-                return PriceSample(src_config["name"], price, time.time(), 0)
-        except: pass
-    return None
+    def __init__(self) -> None:
+        self.wallet_path: str = str(VAULT_DIR / "wallet")
+        self.rpc_url: str = "http://127.0.0.1:8080"
+        self.miner_address: str = ""
+        self.endpoint_url: str = ""
+        self.services_mask: int = SERVICE_ORACLE
+        self.contracts: dict[str, str] = {}
+        self.vlt_asset_hash: str = ""
+        self.log_level: str = "INFO"
+        self.prometheus_port: int = 9091
+        self.mask_balances: bool = True
+        self.heartbeat_interval_blocks: int = HEARTBEAT_INTERVAL_BLOCKS_DEFAULT
+        self.reputation_warning_threshold: int = REPUTATION_GOOD_TIER_FLOOR
+        self.reputation_critical_threshold: int = REPUTATION_CRIT_TIER_FLOOR
 
-def aggregate_price(config):
-    samples = []
-    for name in config["oracle_config"]["sources"]:
-        fetcher = PRICE_SOURCES.get(name)
-        if fetcher:
-            s = fetcher()
-            if s: samples.append(s)
-    custom = load_custom_sources()
-    for name, src in custom.items():
-        if name in config["oracle_config"]["sources"]:
-            s = fetch_custom(src)
-            if s: samples.append(s)
-    if len(samples) < 2:
-        return None, [], []
-    prices = [s.price for s in samples]
-    median = statistics.median(prices)
-    valid = [s for s in samples if abs(s.price - median) / median <= 0.10]
-    if len(valid) < 2:
-        return None, samples, []
-    final = statistics.median([s.price for s in valid])
-    return final, valid, [s.source for s in samples if s not in valid]
+    @classmethod
+    def load(cls, path: Path, cli_args: argparse.Namespace) -> "Config":
+        cfg = cls()
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text())
+            except Exception as e:
+                log.warning(f"Could not parse {path}: {e} — using defaults")
+                raw = {}
+            cfg.wallet_path = raw.get("wallet_path", cfg.wallet_path)
+            cfg.rpc_url = raw.get("rpc_url", cfg.rpc_url)
+            cfg.miner_address = raw.get("miner_address", cfg.miner_address)
+            cfg.endpoint_url = raw.get("endpoint_url", cfg.endpoint_url)
+            cfg.services_mask = int(raw.get("services_mask", cfg.services_mask))
+            cfg.contracts = raw.get("contracts", {}) or {}
+            cfg.vlt_asset_hash = raw.get("vlt_asset_hash", cfg.vlt_asset_hash)
+            cfg.log_level = raw.get("log_level", cfg.log_level)
+            cfg.prometheus_port = int(raw.get("prometheus_port", cfg.prometheus_port))
+            cfg.mask_balances = bool(raw.get("mask_balances", True))
+            cfg.heartbeat_interval_blocks = int(raw.get(
+                "heartbeat_interval_blocks",
+                HEARTBEAT_INTERVAL_BLOCKS_DEFAULT,
+            ))
+            cfg.reputation_warning_threshold = int(raw.get(
+                "reputation_warning_threshold",
+                REPUTATION_GOOD_TIER_FLOOR,
+            ))
+            cfg.reputation_critical_threshold = int(raw.get(
+                "reputation_critical_threshold",
+                REPUTATION_CRIT_TIER_FLOOR,
+            ))
+        # CLI overrides
+        if cli_args.wallet:
+            cfg.wallet_path = str(cli_args.wallet)
+        if cli_args.rpc:
+            cfg.rpc_url = cli_args.rpc
+        if cli_args.endpoint:
+            cfg.endpoint_url = cli_args.endpoint
+        if cli_args.services is not None:
+            cfg.services_mask = cli_args.services
+        # Env vars override everything (CI-friendly)
+        cfg.miner_address = os.environ.get("MINER_ADDRESS", cfg.miner_address)
+        cfg.vlt_asset_hash = os.environ.get("VLT_ASSET_HASH", cfg.vlt_asset_hash)
+        return cfg
+
+    def miner_contract(self) -> str:
+        return self.contracts.get("XelisVaultMiner", "")
+
+    def vlt_token_contract(self) -> str:
+        return self.contracts.get("VLTToken", "")
 
 # ============================================================================
 # XELIS RPC CLIENT
 # ============================================================================
 class XelisClient:
-    def __init__(self, rpc_url):
+    """Thin wrapper around the XELIS daemon JSON-RPC."""
+
+    def __init__(self, rpc_url: str) -> None:
         self.rpc_url = rpc_url
         self._id = 0
 
-    def call(self, method, params=None):
+    def _call(self, method: str, params: Optional[dict] = None) -> Any:
         self._id += 1
-        payload = {"method": method, "params": params or {}, "jsonrpc": "2.0", "id": self._id}
+        payload = {
+            "method": method,
+            "params": params or {},
+            "jsonrpc": "2.0",
+            "id": self._id,
+        }
         try:
-            r = requests.post(self.rpc_url, json=payload, timeout=15)
+            r = requests.post(self.rpc_url, json=payload, timeout=30)
             r.raise_for_status()
             data = r.json()
-            if "error" in data:
-                return None
-            return data.get("result")
-        except:
-            return None
+        except Exception as e:
+            raise RuntimeError(f"RPC call failed ({method}): {e}")
+        if "error" in data and data["error"]:
+            raise RuntimeError(f"RPC error: {data['error']}")
+        return data.get("result", {})
 
-    def get_topoheight(self):
-        return self.call("get_topoheight")
+    # ---- chain queries ----
+    def get_topoheight(self) -> int:
+        return int(self._call("get_topoheight"))
 
-    def submit_tx(self, tx_type, contract, entry, args, signer=None):
-        params = {"tx_type": tx_type, "contract": contract, "entry": entry, "args": [str(a) for a in args]}
+    def get_height(self) -> int:
+        return int(self._call("get_height"))
+
+    def is_synced(self) -> bool:
+        info = self._call("get_info")
+        return bool(info.get("synced", False))
+
+    def get_balance(self, address: str, asset_hash: str) -> int:
+        """Get balance of `address` for `asset_hash`."""
+        try:
+            result = self._call("get_balance", {
+                "address": address,
+                "asset": asset_hash,
+            })
+            return int(result)
+        except Exception:
+            # Some daemons use get_balances with a different shape
+            try:
+                result = self._call("get_balances", {"address": address})
+                if isinstance(result, dict):
+                    return int(result.get(asset_hash, 0))
+                if isinstance(result, list):
+                    for entry in result:
+                        if entry.get("asset") == asset_hash:
+                            return int(entry.get("balance", 0))
+            except Exception:
+                pass
+            return 0
+
+    # ---- contract calls ----
+    def call_contract_entry(
+        self,
+        contract: str,
+        entry_id: int,
+        args: list[Any],
+        deposits: Optional[list[dict]] = None,
+        signer: str = "",
+    ) -> str:
+        """Submit a CallContract tx with a numeric entry ID. Returns tx hash."""
+        params: dict[str, Any] = {
+            "tx_type": "CallContract",
+            "contract": contract,
+            "entry_id": entry_id,
+            "args": [str(a) for a in args],
+        }
+        if deposits:
+            params["deposits"] = deposits
         if signer:
             params["signer"] = signer
-        return self.call("submit_transaction", params)
+        result = self._call("submit_transaction", params)
+        tx_hash = result.get("hash") if isinstance(result, dict) else None
+        if not tx_hash:
+            raise RuntimeError(f"submit_transaction returned no hash: {result}")
+        return tx_hash
 
-# ============================================================================
-# ORACLE SERVICE
-# ============================================================================
-class OracleService:
-    def __init__(self, client, config, stats):
-        self.client = client
-        self.config = config
-        self.stats = stats
-        self.running = False
-        self.feed_ids = {}
+    def read_contract_entry(
+        self,
+        contract: str,
+        entry_id: int,
+        args: Optional[list[Any]] = None,
+    ) -> Any:
+        """Read-only contract call by entry ID."""
+        return self._call("call_contract_read", {
+            "contract": contract,
+            "entry_id": entry_id,
+            "args": [str(a) for a in (args or [])],
+        })
 
-    def resolve_feeds(self):
-        for feed_name in self.config["oracle_config"]["feeds"]:
-            result = self.client.call("call_contract_read", {
-                "contract": self.config["oracle_contract"],
-                "entry": "get_feed_id",
-                "args": [feed_name]
-            })
-            if result is not None:
-                self.feed_ids[feed_name] = int(result)
-                ok(f"Feed {feed_name} → ID {self.feed_ids[feed_name]}")
-
-    def run(self):
-        self.running = True
-        interval = self.config["oracle_config"]["submit_interval"]
-        while self.running:
+    def wait_for_tx(self, tx_hash: str, timeout: int = 60) -> bool:
+        """Wait for a tx to be confirmed. Returns True if confirmed."""
+        start = time.time()
+        while time.time() - start < timeout:
             try:
-                for feed_name, feed_id in self.feed_ids.items():
-                    price, valid, ignored = aggregate_price(self.config)
-                    if price and price > 0:
-                        atomic = int(price * 1e8)
-                        tx = self.client.submit_tx(
-                            "CallContract", self.config["oracle_contract"],
-                            "submit_price", [feed_id, atomic], self.config["miner_address"]
-                        )
-                        if tx:
-                            self.stats["prices_submitted"] += 1
-                            self.stats["last_price"] = price
-                        else:
-                            self.stats["prices_failed"] += 1
-            except Exception as e:
-                logging.error(f"Oracle error: {e}")
-            time.sleep(interval)
+                self._call("get_transaction", {"hash": tx_hash})
+                return True
+            except Exception:
+                time.sleep(2)
+        return False
 
-    def stop(self):
-        self.running = False
 
 # ============================================================================
-# CHAT SERVICE
+# MINER DAEMON
 # ============================================================================
-class ChatService:
-    def __init__(self, client, config, stats):
+class MinerDaemon:
+    def __init__(
+        self,
+        cfg: Config,
+        client: XelisClient,
+        dry_run: bool = False,
+    ) -> None:
+        self.cfg = cfg
         self.client = client
-        self.config = config
-        self.stats = stats
-        self.running = False
-        self.storage_dir = Path(config["chat_config"]["storage_dir"])
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self.messages_buffer = []
+        self.dry_run = dry_run
+        self.signer = "default"  # xelis_wallet picks the default wallet
+        self.last_heartbeat_block: int = 0
+        self.running: bool = True
+        self._register_signals()
 
-    def run(self):
-        self.running = False
-        # Chat service is more complex - requires WebSocket server, E2E crypto, etc.
-        # For now, just do heartbeats and anchoring
-        # Full chat implementation would be in a separate module
-        anchor_interval = self.config["chat_config"]["anchor_interval"]
-        while self.running:
+    # ---- signal handling ----
+    def _register_signals(self) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                # Calculate merkle root of messages from last hour
-                # Submit anchor to chain
-                # This is a simplified version
-                time.sleep(anchor_interval)
-            except Exception as e:
-                logging.error(f"Chat error: {e}")
+                signal.signal(sig, self._handle_signal)
+            except (ValueError, OSError):
+                pass  # not in main thread
 
-    def stop(self):
+    def _handle_signal(self, signum, frame) -> None:
+        log.info(f"Received signal {signum} — shutting down")
         self.running = False
 
-# ============================================================================
-# HEARTBEAT SERVICE
-# ============================================================================
-class HeartbeatService:
-    def __init__(self, client, config, stats):
-        self.client = client
-        self.config = config
-        self.stats = stats
-        self.running = False
+    # ---- helpers ----
+    @property
+    def miner_addr(self) -> str:
+        return self.cfg.miner_address
 
-    def run(self):
-        self.running = True
-        interval = self.config["heartbeat_interval"]
-        while self.running:
-            try:
-                time.sleep(interval)
-                tx = self.client.submit_tx(
-                    "CallContract", self.config["miner_contract"],
-                    "submit_heartbeat", [], self.config["miner_address"]
-                )
-                if tx:
-                    self.stats["heartbeats_sent"] += 1
-            except Exception as e:
-                logging.error(f"Heartbeat error: {e}")
-
-    def stop(self):
-        self.running = False
-
-# ============================================================================
-# PROMETHEUS METRICS
-# ============================================================================
-def start_metrics_server(port, stats):
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path != "/metrics":
-                self.send_response(404); self.end_headers(); return
-            lines = [
-                f"# HELP xelis_miner_prices_submitted_total Total prices submitted",
-                f"# TYPE xelis_miner_prices_submitted_total counter",
-                f"xelis_miner_prices_submitted_total {stats['prices_submitted']}",
-                f"# HELP xelis_miner_heartbeats_total Total heartbeats sent",
-                f"# TYPE xelis_miner_heartbeats_total counter",
-                f"xelis_miner_heartbeats_total {stats['heartbeats_sent']}",
-                f"# HELP xelis_miner_last_price Last XEL price submitted",
-                f"# TYPE xelis_miner_last_price gauge",
-                f"xelis_miner_last_price {stats.get('last_price', 0)}",
-                f"# HELP xelis_miner_up 1 if running",
-                f"# TYPE xelis_miner_up gauge",
-                f"xelis_miner_up 1",
-                "",
-            ]
-            body = "\n".join(lines).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4")
-            self.end_headers()
-            self.wfile.write(body)
-        def log_message(self, *args): pass
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
-
-# ============================================================================
-# INTERACTIVE SETUP
-# ============================================================================
-def interactive_setup(config):
-    header("XELIS VAULT MINER — SETUP")
-
-    # 1. Platform detection
-    plat = detect_platform()
-    info(f"OS detected: {plat['os']} ({plat['arch']})")
-
-    # 2. Check Python
-    ver = sys.version_info
-    if ver.major < 3 or (ver.major == 3 and ver.minor < 8):
-        err(f"Python 3.8+ required, you have {ver.major}.{ver.minor}")
-        sys.exit(1)
-    ok(f"Python {ver.major}.{ver.minor}.{ver.micro}")
-
-    # 3. Check XELIS daemon
-    if shutil.which("xelis_daemon"):
-        ok("XELIS daemon found")
-    else:
-        warn("XELIS daemon not found in PATH")
-        if confirm("Install XELIS daemon from source? (takes ~20min)", False):
-            install_xelis_daemon()
+    def _log_balance(self, label: str, amount: int) -> None:
+        """Log a balance in a privacy-safe way."""
+        if self.cfg.mask_balances:
+            log.info(f"{label}: {mask_balance(amount)}")
         else:
-            warn("You'll need to install XELIS daemon manually")
-            rpc = prompt("XELIS daemon RPC URL", "http://127.0.0.1:8080")
-            config["rpc_url"] = rpc
+            vlt = amount / 1e8
+            log.info(f"{label}: {vlt:.4f} VLT (atomic={amount})")
 
-    # 4. Wallet setup
-    header("WALLET CONFIGURATION")
-    print("You need a wallet with at least 100 VLT to become a miner.")
-    print()
-    print("  1. Create a new wallet")
-    print("  2. Import existing wallet (seed phrase)")
-    print("  3. I already have a wallet configured")
-    choice = prompt("Your choice", "1")
-
-    if choice == "1":
-        wallet_name = prompt("Wallet name", "xelis-vault-miner")
-        print()
-        info("To create your wallet, run in another terminal:")
-        print(f"  xelis_wallet --network {config['network']}")
-        print(f"  > create-wallet {wallet_name}")
-        warn("Save your seed phrase securely!")
-        config["miner_address"] = prompt("Enter your wallet address")
-    elif choice == "2":
-        wallet_name = prompt("Wallet name", "xelis-vault-miner")
-        print()
-        info("To import your wallet:")
-        print(f"  xelis_wallet --network {config['network']}")
-        print(f"  > restore-wallet {wallet_name}")
-        config["miner_address"] = prompt("Enter your wallet address")
-    else:
-        config["miner_address"] = prompt("Enter your wallet address")
-
-    if not config["miner_address"]:
-        err("Wallet address is required")
-        sys.exit(1)
-    ok(f"Wallet: {config['miner_address']}")
-
-    # 5. Contract addresses
-    header("CONTRACT ADDRESSES")
-    print("Enter the contract addresses (from deployment).")
-    print("Press Enter to use defaults if available.")
-    config["miner_contract"] = prompt("XelisVaultMiner contract", config.get("miner_contract", ""))
-    config["oracle_contract"] = prompt("StakedOracle contract", config.get("oracle_contract", ""))
-    config["chat_contract"] = prompt("VaultChat contract (or empty if no chat)", config.get("chat_contract", ""))
-    config["vlt_asset"] = prompt("VLT asset hash", config.get("vlt_asset", ""))
-
-    # 6. Service selection
-    header("SERVICES")
-    print("Choose which services to enable:")
-    print()
-    config["services"]["oracle"] = confirm("Oracle (submit prices, earn rewards)", True)
-    config["services"]["chat"] = confirm("Chat (store messages, earn rewards)", True)
-
-    if not config["services"]["oracle"] and not config["services"]["chat"]:
-        warn("No services selected. You need at least one.")
-        sys.exit(1)
-
-    # 7. Oracle sources (if enabled)
-    if config["services"]["oracle"]:
-        header("PRICE SOURCES")
-        print("Default sources: MEXC + CoinEx (recommended, no rate limits)")
-        if confirm("Add custom price source?", False):
-            add_custom_source()
-
-    # 8. Save config
-    VAULT_DIR.mkdir(parents=True, exist_ok=True)
-    VAULT_CONFIG.write_text(json.dumps(config, indent=2))
-    ok(f"Config saved: {VAULT_CONFIG}")
-    return config
-
-def add_custom_source():
-    print()
-    print("  1. HTTP API (JSON)")
-    print("  2. Command (external script)")
-    choice = prompt("Type", "1")
-    src = {}
-    if choice == "1":
-        src["type"] = "http"
-        src["name"] = prompt("Source name")
-        src["url"] = prompt("API URL")
-        src["json_path"] = prompt("JSON path to price", "price")
-    else:
-        src["type"] = "command"
-        src["name"] = prompt("Source name")
-        src["command"] = prompt("Command path")
-    custom_file = VAULT_DIR / "custom_sources.json"
-    existing = []
-    if custom_file.exists():
-        existing = json.loads(custom_file.read_text())
-    existing.append(src)
-    custom_file.write_text(json.dumps(existing, indent=2))
-    ok(f"Custom source '{src['name']}' added")
-
-def install_xelis_daemon():
-    info("Installing Rust...")
-    try:
-        subprocess.check_call("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y", shell=True)
-        cargo_bin = str(Path.home() / ".cargo" / "bin")
-        os.environ["PATH"] = f"{cargo_bin}:{os.environ.get('PATH', '')}"
-        ok("Rust installed")
-    except:
-        err("Failed to install Rust")
-        return
-    info("Cloning XELIS blockchain...")
-    clone_dir = VAULT_DIR / "xelis-blockchain"
-    if not clone_dir.exists():
-        subprocess.check_call(["git", "clone", "--depth", "1",
-            "https://github.com/xelis-project/xelis-blockchain.git", str(clone_dir)])
-    info("Compiling (10-20 minutes)...")
-    try:
-        subprocess.check_call(["cargo", "build", "--release", "--bin", "xelis_daemon", "--bin", "xelis_wallet"],
-                              cwd=clone_dir)
-        for binary in ["xelis_daemon", "xelis_wallet"]:
-            src = clone_dir / "target" / "release" / binary
-            dst = Path("/usr/local/bin") / binary
-            if dst.parent.exists():
-                shutil.copy2(src, dst)
-            else:
-                shutil.copy2(src, Path.home() / ".local" / "bin" / binary)
-        ok("XELIS daemon + wallet installed")
-    except:
-        err("Compilation failed")
-
-# ============================================================================
-# MAIN MINER LOOP
-# ============================================================================
-def run_miner(config):
-    header("STARTING XELIS VAULT MINER")
-
-    client = XelisClient(config["rpc_url"])
-    stats = {
-        "prices_submitted": 0,
-        "prices_failed": 0,
-        "heartbeats_sent": 0,
-        "anchors_submitted": 0,
-        "last_price": 0.0,
-        "start_time": time.time(),
-    }
-
-    # Check daemon
-    topo = client.get_topoheight()
-    if topo is None:
-        err(f"Cannot connect to XELIS daemon at {config['rpc_url']}")
-        err("Make sure xelis_daemon is running and synced")
-        sys.exit(1)
-    ok(f"Connected to daemon (topoheight: {topo})")
-
-    # Start Prometheus
-    threading.Thread(target=start_metrics_server,
-                     args=(config["prometheus_port"], stats), daemon=True).start()
-    ok(f"Prometheus metrics on :{config['prometheus_port']}/metrics")
-
-    # Start services
-    threads = []
-
-    if config["services"]["oracle"]:
-        oracle = OracleService(client, config, stats)
-        oracle.resolve_feeds()
-        t = threading.Thread(target=oracle.run, daemon=True)
-        t.start()
-        threads.append(t)
-        ok("Oracle service started")
-
-    if config["services"]["chat"]:
-        chat = ChatService(client, config, stats)
-        t = threading.Thread(target=chat.run, daemon=True)
-        t.start()
-        threads.append(t)
-        ok("Chat service started")
-
-    # Heartbeat (always running)
-    heartbeat = HeartbeatService(client, config, stats)
-    t = threading.Thread(target=heartbeat.run, daemon=True)
-    t.start()
-    threads.append(t)
-    ok("Heartbeat service started")
-
-    ok("Miner is running! Press Ctrl+C to stop.")
-    print()
-    info(f"Wallet: {config['miner_address']}")
-    info(f"Services: {[k for k, v in config['services'].items() if v]}")
-    info(f"Metrics: http://localhost:{config['prometheus_port']}/metrics")
-    info(f"Logs: {VAULT_LOG}")
-    print()
-
-    # Main loop
-    try:
-        while True:
-            time.sleep(60)
-            uptime = int(time.time() - stats["start_time"])
-            info(f"Uptime: {uptime}s | Prices: {stats['prices_submitted']} | "
-                 f"Heartbeats: {stats['heartbeats_sent']} | "
-                 f"Last price: ${stats['last_price']:.6f}")
-    except KeyboardInterrupt:
-        print()
-        warn("Stopping miner...")
-        oracle.running = False
-        chat.running = False
-        heartbeat.running = False
-        time.sleep(2)
-        ok("Miner stopped. Goodbye!")
-
-# ============================================================================
-# SERVICE INSTALLATION (systemd / launchd / Windows)
-# ============================================================================
-def install_service(config):
-    plat = detect_platform()
-    system = plat["os"]
-
-    if system == "linux":
-        svc_path = Path(f"/etc/systemd/system/xelis-vault-miner.service")
-        content = f"""[Unit]
-Description=XELIS Vault Miner
-After=network.target
-
-[Service]
-Type=simple
-User={os.getenv('USER', 'root')}
-WorkingDirectory={VAULT_DIR}
-EnvironmentFile={VAULT_ENV}
-ExecStart={sys.executable} {Path(__file__).resolve()} --run
-Restart=always
-RestartSec=10
-StandardOutput=append:{VAULT_LOG}
-StandardError=append:{VAULT_LOG}
-
-[Install]
-WantedBy=multi-user.target
-"""
+    # ---- pre-flight checks ----
+    def verify_vlt_balance(self) -> bool:
+        """Verify the wallet has >= 100 VLT for the stake."""
+        vlt_contract = self.cfg.vlt_token_contract()
+        vlt_asset = self.cfg.vlt_asset_hash
+        if not vlt_contract or not vlt_asset:
+            log.error("VLTToken contract / asset hash not set in config")
+            log.error("Edit ~/.xelis-vault/config/config.json and fill in")
+            log.error("'contracts.VLTToken' and 'vlt_asset_hash'.")
+            return False
+        # Sanity check: read the asset hash back via entry 11
         try:
-            svc_path.write_text(content)
-            ok(f"Service installed: {svc_path}")
-            info("Enable and start:")
-            print("  sudo systemctl daemon-reload")
-            print("  sudo systemctl enable xelis-vault-miner")
-            print("  sudo systemctl start xelis-vault-miner")
-        except PermissionError:
-            alt = VAULT_DIR / "xelis-vault-miner.service"
-            alt.write_text(content)
-            warn(f"Permission denied. Service file at: {alt}")
-            info(f"Install with: sudo cp {alt} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now xelis-vault-miner")
+            on_chain_asset = self.client.read_contract_entry(
+                vlt_contract, VLT_GET_ASSET_HASH, []
+            )
+            if on_chain_asset and on_chain_asset != vlt_asset:
+                log.warning(f"VLT asset hash mismatch: "
+                            f"config={mask(vlt_asset)} "
+                            f"on-chain={mask(on_chain_asset)}")
+        except Exception as e:
+            log.debug(f"Could not read asset hash from VLTToken: {e}")
+        # Check wallet balance
+        try:
+            balance = self.client.get_balance(self.miner_addr, vlt_asset)
+        except Exception as e:
+            log.error(f"Could not fetch VLT balance: {e}")
+            return False
+        self._log_balance("Wallet VLT balance", balance)
+        if balance < MIN_STAKE_VLT_ATOMIC:
+            log.error(f"Insufficient VLT balance. Need >= 100 VLT "
+                      f"({MIN_STAKE_VLT_ATOMIC} atomic). "
+                      f"Wallet balance is masked — verify with "
+                      f"`xelis_wallet get-balance`.")
+            return False
+        return True
 
-    elif system == "macos":
-        plist = Path.home() / "Library" / "LaunchAgents" / "com.xelisvault.miner.plist"
-        plist.parent.mkdir(parents=True, exist_ok=True)
-        content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.xelisvault.miner</string>
-    <key>ProgramArguments</key><array>
-        <string>{sys.executable}</string>
-        <string>{Path(__file__).resolve()}</string>
-        <string>--run</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>{VAULT_LOG}</string>
-    <key>StandardErrorPath</key><string>{VAULT_LOG}</string>
-</dict>
-</plist>"""
-        plist.write_text(content)
-        ok(f"Service installed: {plist}")
-        info(f"Start: launchctl load {plist}")
+    def is_registered(self) -> bool:
+        """Check whether this miner is already registered."""
+        if not self.miner_addr:
+            log.error("miner_address not set in config")
+            return False
+        try:
+            result = self.client.read_contract_entry(
+                self.cfg.miner_contract(),
+                ENTRY_GET_MINER_STAKE,
+                [self.miner_addr],
+            )
+            stake = int(result) if result else 0
+            return stake > 0
+        except Exception as e:
+            log.debug(f"is_registered check failed: {e}")
+            return False
 
-    elif system == "windows":
-        bat = VAULT_DIR / "start_miner.bat"
-        content = f"""@echo off
-cd /d {VAULT_DIR}
-{sys.executable} {Path(__file__).resolve()} --run
-"""
-        bat.write_text(content)
-        ok(f"Start script: {bat}")
-        info("For auto-start, use Task Scheduler or NSSM:")
-        print(f"  nssm install xelis-vault-miner {bat}")
+    def register(self) -> bool:
+        """Call XelisVaultMiner.register_miner (entry ID 0)."""
+        if self.dry_run:
+            log.info(f"[DRY-RUN] would call register_miner("
+                     f"endpoint={self.cfg.endpoint_url!r}, "
+                     f"pubkey=0x0, services_mask={self.cfg.services_mask})")
+            return True
+        if not self.cfg.vlt_asset_hash:
+            log.error("vlt_asset_hash not set — cannot include deposit")
+            return False
+        deposits = [{self.cfg.vlt_asset_hash: str(MIN_STAKE_VLT_ATOMIC)}]
+        try:
+            tx = self.client.call_contract_entry(
+                self.cfg.miner_contract(),
+                ENTRY_REGISTER_MINER,
+                [self.cfg.endpoint_url, "0x" + "0" * 64, self.cfg.services_mask],
+                deposits=deposits,
+                signer=self.signer,
+            )
+            log.info(f"register_miner tx submitted: {tx}")
+            if self.client.wait_for_tx(tx):
+                log.info("Registration confirmed")
+                return True
+            log.warning("Registration tx not yet confirmed after 60 s — "
+                        "check explorer")
+            return True
+        except Exception as e:
+            log.error(f"register_miner failed: {e}")
+            return False
+
+    # ---- reputation / status ----
+    def get_reputation(self) -> int:
+        try:
+            result = self.client.read_contract_entry(
+                self.cfg.miner_contract(),
+                ENTRY_GET_MINER_REPUTATION,
+                [self.miner_addr],
+            )
+            return int(result) if result else 0
+        except Exception as e:
+            log.debug(f"get_reputation failed: {e}")
+            return 0
+
+    def is_active(self, service_id: int = SERVICE_ORACLE) -> bool:
+        try:
+            result = self.client.read_contract_entry(
+                self.cfg.miner_contract(),
+                ENTRY_IS_MINER_ACTIVE,
+                [self.miner_addr, service_id],
+            )
+            return bool(int(result) if result else 0)
+        except Exception as e:
+            log.debug(f"is_active failed: {e}")
+            return False
+
+    @staticmethod
+    def reputation_tier(rep: int) -> str:
+        if rep >= 8000:  return "Excellent"
+        if rep >= 5000:  return "Good"
+        if rep >= 2000:  return "Warning"
+        if rep >= 1000:  return "Critical"
+        return "Banned"
+
+    # ---- heartbeat ----
+    def submit_heartbeat(self) -> bool:
+        """Call XelisVaultMiner.submit_heartbeat (entry ID 6)."""
+        if self.dry_run:
+            log.info("[DRY-RUN] would call submit_heartbeat")
+            return True
+        try:
+            tx = self.client.call_contract_entry(
+                self.cfg.miner_contract(),
+                ENTRY_SUBMIT_HEARTBEAT,
+                [],
+                signer=self.signer,
+            )
+            log.info(f"Heartbeat sent  tx={tx}")
+            return True
+        except Exception as e:
+            # Common errors: hbtoosoon (wait), notreg (re-register), paused
+            msg = str(e).lower()
+            if "hbtoosoon" in msg:
+                log.debug("Heartbeat too soon — skipping")
+                return True
+            if "notreg" in msg:
+                log.error("Miner not registered — attempting re-registration")
+                return False
+            if "paused" in msg:
+                log.warning("Contract is paused — skipping heartbeat")
+                return True
+            log.error(f"submit_heartbeat failed: {e}")
+            return False
+
+    # ---- recovery ----
+    def recover_if_needed(self) -> None:
+        """If not active, try to recover."""
+        if not self.is_active(SERVICE_ORACLE):
+            log.warning("Miner is not active on oracle service — "
+                        "attempting recovery")
+            # First try a heartbeat (sometimes that reactivates)
+            if not self.submit_heartbeat():
+                # If heartbeat fails with notreg, re-register
+                if not self.is_registered():
+                    log.warning("Miner not registered — re-registering")
+                    self.register()
+                else:
+                    # Registered but inactive — wait for reputation to
+                    # regenerate above 1000
+                    rep = self.get_reputation()
+                    log.warning(f"Miner registered but inactive. "
+                                f"Reputation={rep} ({self.reputation_tier(rep)} tier). "
+                                f"Will retry on next cycle.")
+
+    # ---- main loop ----
+    def run(self) -> None:
+        log.info("=" * 60)
+        log.info("XELIS Vault v5.0 Miner Daemon")
+        log.info("=" * 60)
+        log.info(f"  Miner address:  {mask(self.miner_addr)}")
+        log.info(f"  Endpoint URL:   {self.cfg.endpoint_url or '(none)'}")
+        log.info(f"  Services mask:  {self.cfg.services_mask}")
+        log.info(f"  RPC URL:        {self.cfg.rpc_url}")
+        log.info(f"  Heartbeat:      every {self.cfg.heartbeat_interval_blocks} blocks")
+        log.info(f"  Dry run:        {self.dry_run}")
+        log.info("=" * 60)
+
+        # Pre-flight
+        if not self.cfg.miner_address:
+            log.error("miner_address not set in config — aborting")
+            sys.exit(1)
+        if not self.cfg.miner_contract():
+            log.error("XelisVaultMiner contract hash not set — aborting")
+            sys.exit(1)
+
+        if not self.client.is_synced():
+            log.warning("Daemon is not synced — continuing anyway, but "
+                        "txs may fail until sync completes")
+
+        if not self.verify_vlt_balance():
+            log.error("VLT balance verification failed — aborting")
+            sys.exit(1)
+
+        if not self.is_registered():
+            log.info("Miner not registered — calling register_miner")
+            if not self.register():
+                log.error("Registration failed — aborting")
+                sys.exit(1)
+        else:
+            log.info("Miner already registered")
+
+        last_topo = 0
+        last_heartbeat_topo = 0
+        while self.running:
+            try:
+                topo = self.client.get_topoheight()
+                if topo != last_topo:
+                    log.debug(f"Topoheight={topo}")
+                    last_topo = topo
+
+                # Heartbeat every N blocks
+                blocks_since_hb = topo - last_heartbeat_topo
+                if (last_heartbeat_topo == 0 or
+                    blocks_since_hb >= self.cfg.heartbeat_interval_blocks):
+                    if self.submit_heartbeat():
+                        last_heartbeat_topo = topo
+                        self.last_heartbeat_block = topo
+
+                # Periodic reputation check (every loop iteration is fine —
+                # it's a read-only call)
+                rep = self.get_reputation()
+                tier = self.reputation_tier(rep)
+                if rep < self.cfg.reputation_warning_threshold:
+                    log.warning(f"Reputation={rep} ({tier} tier) — below "
+                                f"Good tier floor "
+                                f"({self.cfg.reputation_warning_threshold}). "
+                                f"Check your price sources & uptime.")
+                elif rep < 8000:
+                    log.info(f"Reputation={rep} ({tier} tier)")
+                else:
+                    log.debug(f"Reputation={rep} ({tier} tier)")
+
+                # Active check — if inactive, try recovery
+                if not self.is_active(SERVICE_ORACLE):
+                    self.recover_if_needed()
+
+                # Sleep until next block (~5 s on XELIS)
+                time.sleep(5)
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                log.error(f"Main loop error: {e}")
+                time.sleep(10)
+
+        log.info("Miner daemon stopped — goodbye")
+        sys.exit(0)
+
 
 # ============================================================================
-# MAIN
+# CLI
 # ============================================================================
-def main():
-    parser = argparse.ArgumentParser(description="XELIS Vault Miner — Unified Service Script")
-    parser.add_argument("--setup", action="store_true", help="Run interactive setup")
-    parser.add_argument("--run", action="store_true", help="Run miner (after setup)")
-    parser.add_argument("--install-service", action="store_true", help="Install as system service")
-    parser.add_argument("--status", action="store_true", help="Show miner status")
-    parser.add_argument("--config", action="store_true", help="Show current configuration")
-    parser.add_argument("--add-source", action="store_true", help="Add custom price source")
-    parser.add_argument("--test-sources", action="store_true", help="Test price sources")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="XELIS Vault v5.0 Miner Daemon"
+    )
+    parser.add_argument("--wallet", help="Path to wallet storage directory")
+    parser.add_argument("--rpc",    help="XELIS daemon JSON-RPC URL")
+    parser.add_argument("--endpoint", help="Public endpoint URL")
+    parser.add_argument("--services", type=int, choices=[1, 2, 3],
+                        help="Services mask: 1=oracle, 2=chat, 3=both")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH,
+                        help=f"Config file (default: {CONFIG_PATH})")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Don't submit txs, just log what would happen")
+    parser.add_argument("--verbose", action="store_true",
+                        help="DEBUG-level logging")
     args = parser.parse_args()
 
-    # Load existing config or use defaults
-    config = DEFAULT_CONFIG.copy()
-    if VAULT_CONFIG.exists():
-        config.update(json.loads(VAULT_CONFIG.read_text()))
+    global log
+    log = setup_logging(verbose=args.verbose)
 
-    if args.setup or not VAULT_CONFIG.exists():
-        config = interactive_setup(config)
-        # Generate .env
-        env_lines = [f"# XELIS Vault Miner — Auto-generated"]
-        for k, v in config.items():
-            if isinstance(v, str):
-                env_lines.append(f"{k.upper()}={v}")
-        VAULT_ENV.write_text("\n".join(env_lines))
-        ok(f"Environment file: {VAULT_ENV}")
-        if confirm("Install as system service (auto-start on boot)?", True):
-            install_service(config)
-        if confirm("Start miner now?", True):
-            run_miner(config)
-    elif args.run:
-        run_miner(config)
-    elif args.install_service:
-        install_service(config)
-    elif args.status:
-        topo = XelisClient(config["rpc_url"]).get_topoheight()
-        print(f"Daemon topoheight: {topo}")
-        print(f"Miner address: {config['miner_address']}")
-        print(f"Services: {[k for k, v in config['services'].items() if v]}")
-    elif args.config:
-        print(json.dumps(config, indent=2))
-    elif args.add_source:
-        add_custom_source()
-    elif args.test_sources:
-        header("TESTING PRICE SOURCES")
-        for name in config["oracle_config"]["sources"]:
-            fetcher = PRICE_SOURCES.get(name)
-            if fetcher:
-                s = fetcher()
-                if s:
-                    ok(f"{name}: ${s.price:.6f}")
-                else:
-                    warn(f"{name}: FAIL")
-        custom = load_custom_sources()
-        for name, src in custom.items():
-            s = fetch_custom(src)
-            if s:
-                ok(f"{name} (custom): ${s.price:.6f}")
-            else:
-                warn(f"{name} (custom): FAIL")
-    else:
-        # Default: show help
-        header("XELIS VAULT MINER")
-        print("Commands:")
-        print("  --setup          First-time interactive setup")
-        print("  --run            Start mining (after setup)")
-        print("  --install-service  Install as auto-start service")
-        print("  --status         Show daemon + miner status")
-        print("  --config         Show current configuration")
-        print("  --add-source     Add custom price source")
-        print("  --test-sources   Test all price sources")
-        print()
-        if not VAULT_CONFIG.exists():
-            info("First time? Run: python3 xelis_vault_miner.py --setup")
-        else:
-            info("Already configured. Run: python3 xelis_vault_miner.py --run")
+    cfg = Config.load(args.config, args)
+    client = XelisClient(cfg.rpc_url)
+    daemon = MinerDaemon(cfg, client, dry_run=args.dry_run)
+    daemon.run()
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nInterrupted")
-        sys.exit(1)
+    main()

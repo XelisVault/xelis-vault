@@ -1,4 +1,37 @@
-const VERSION: string = "SyndicatePool v4.2"
+// ============================================================================
+// SyndicatePool.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Replicates v4.2 logic with sequential entry IDs starting at 0.
+// Price lookups (if introduced) use oracle.call(9u16, [asset], {})
+// (StakedOracle v5.0 entry 9 = get_price_for_asset_entry).
+// FIX #14: Two-step emergency_withdraw at IDs 19/20 with 17280-block delay.
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : create_pool
+//   1  : supply
+//   2  : withdraw_supply
+//   3  : activate_pool
+//   4  : repay
+//   5  : claim
+//   6  : get_pool_entry
+//   7  : get_lender_position_entry
+//   8  : get_pools_count_entry
+//   9  : pause
+//   10 : unpause
+//   11 : set_oracle
+//   12 : set_treasury
+//   13 : set_registry
+//   14 : set_timelock
+//   15 : set_guardian
+//   16 : set_emergency
+//   17 : transfer_admin
+//   18 : get_version
+//   19 : request_emergency_withdraw
+//   20 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "SyndicatePool v5.0"
+
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
 const GUARDIAN_KEY: string = "gd"
@@ -7,10 +40,15 @@ const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
 const ORACLE_KEY: string = "or"
 const TREASURY_KEY: string = "tr"
+
 const POOLS_COUNT_KEY: string = "pc"
 const POOL_PREFIX: string = "p_"
 const LENDER_PREFIX: string = "l_"
 const PROTOCOL_FEE_BPS: u64 = 50
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 struct SyndicatePool {
     id: u64,
     borrower: Address,
@@ -27,9 +65,10 @@ struct SyndicatePool {
     repaid_amount: u64,
     status: u8
 }
+
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -37,28 +76,62 @@ hook constructor() -> u64 {
     s.store(POOLS_COUNT_KEY, 0u64)
     return 0
 }
+
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
+
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
     if caller == g { return }
     only_admin()
 }
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
 fn when_not_paused() {
     let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
     require(!paused, "paused")
 }
+
+fn pool_key(pool_id: u64) -> string {
+    return POOL_PREFIX + pool_id.to_string(10u32)
+}
+
+fn lender_key(pool_id: u64, lender: Address) -> string {
+    return LENDER_PREFIX + pool_id.to_string(10u32) + "_" + lender.to_string()
+}
+
+// FIX #12 helper: any price lookup uses StakedOracle v5.0 entry 9
+fn get_asset_price(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("ornoset")
+    let oracle: Contract = Contract::new(oracle_hash).expect("ornf")
+    let price: u64 = oracle.call(9u16, [asset], {})
+    require(price > 0, "noprice")
+    return price
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: create_pool
 entry create_pool(
     asset_lent: Hash,
     total_amount: u64,
@@ -73,7 +146,7 @@ entry create_pool(
     require(interest_bps <= 5000, "badrate")
     require(duration_blocks >= 1440 && duration_blocks <= 1051920, "baddur")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let id: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
     let pool: SyndicatePool = SyndicatePool {
         id: id,
@@ -91,73 +164,81 @@ entry create_pool(
         repaid_amount: 0,
         status: 0
     }
-    s.store(POOL_PREFIX + id.to_string(10u32), pool)
+    s.store(pool_key(id), pool)
     s.store(POOLS_COUNT_KEY, id + 1)
     return id
 }
+
+// ID 1: supply
 entry supply(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let pool: SyndicatePool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let pool: SyndicatePool = s.load(pool_key(pool_id)).expect("err")
     require(pool.status == 0, "notfunding")
     require(pool.borrower != caller, "selfsupply")
     require(pool.funded_amount + amount <= pool.total_amount, "overfunded")
-    let dep: u64 = get_deposit_for_asset(pool.asset_lent).unwrap()
+    let dep: u64 = get_deposit_for_asset(pool.asset_lent).expect("err")
     require(dep >= amount, "insdep")
     if dep > amount {
-        transfer(caller, dep - amount, pool.asset_lent)
+        let _ = transfer(caller, dep - amount, pool.asset_lent)
     }
-    let lender_key: string = LENDER_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let existing: u64 = s.load(lender_key).unwrap_or(0)
-    s.store(lender_key, existing + amount)
+    let key: string = lender_key(pool_id, caller)
+    let existing: u64 = s.load(key).unwrap_or(0)
+    s.store(key, existing + amount)
     pool.funded_amount += amount
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
+
+// ID 2: withdraw_supply
 entry withdraw_supply(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let pool: SyndicatePool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let pool: SyndicatePool = s.load(pool_key(pool_id)).expect("err")
     require(pool.status == 0, "notfunding")
-    let lender_key: string = LENDER_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let existing: u64 = s.load(lender_key).unwrap_or(0)
+    let key: string = lender_key(pool_id, caller)
+    let existing: u64 = s.load(key).unwrap_or(0)
     require(existing >= amount, "insbal")
-    transfer(caller, amount, pool.asset_lent)
-    s.store(lender_key, existing - amount)
+    let _ = transfer(caller, amount, pool.asset_lent)
+    s.store(key, existing - amount)
     pool.funded_amount -= amount
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
+
+// ID 3: activate_pool
 entry activate_pool(pool_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let pool: SyndicatePool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let pool: SyndicatePool = s.load(pool_key(pool_id)).expect("err")
     require(pool.status == 0, "notfunding")
     require(pool.borrower == caller, "notborrower")
     require(pool.funded_amount == pool.total_amount, "notfull")
-    let dep: u64 = get_deposit_for_asset(pool.collateral_asset).unwrap()
+    let dep: u64 = get_deposit_for_asset(pool.collateral_asset).expect("err")
     require(dep >= pool.collateral_amount, "inscol")
     if dep > pool.collateral_amount {
-        transfer(caller, dep - pool.collateral_amount, pool.collateral_asset)
+        let _ = transfer(caller, dep - pool.collateral_amount, pool.collateral_asset)
     }
-    transfer(caller, pool.total_amount, pool.asset_lent)
+    let _ = transfer(caller, pool.total_amount, pool.asset_lent)
     pool.activated_at = get_current_topoheight()
     pool.due_at = pool.activated_at + pool.duration_blocks
     pool.status = 1
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
+
+// ID 4: repay
 entry repay(pool_id: u64, amount: u64) -> u64 {
     when_not_paused()
     require(amount > 0, "amtgt0")
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let pool: SyndicatePool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let pool: SyndicatePool = s.load(pool_key(pool_id)).expect("err")
     require(pool.status == 1, "notactive")
     require(pool.borrower == caller, "notborrower")
     let interest: u64 = (pool.total_amount as u128 * pool.interest_bps as u128 / 10000u128) as u64
@@ -169,32 +250,34 @@ entry repay(pool_id: u64, amount: u64) -> u64 {
     } else {
         repay_amount = amount
     }
-    let dep: u64 = get_deposit_for_asset(pool.asset_lent).unwrap()
+    let dep: u64 = get_deposit_for_asset(pool.asset_lent).expect("err")
     require(dep >= repay_amount, "insdep")
     if dep > repay_amount {
-        transfer(caller, dep - repay_amount, pool.asset_lent)
+        let _ = transfer(caller, dep - repay_amount, pool.asset_lent)
     }
     pool.repaid_amount += repay_amount
     let fee: u64 = (repay_amount as u128 * PROTOCOL_FEE_BPS as u128 / 10000u128) as u64
     if fee > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).unwrap()
-        transfer(treasury, fee, pool.asset_lent)
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee, pool.asset_lent)
     }
     if pool.repaid_amount >= total_due {
-        transfer(caller, pool.collateral_amount, pool.collateral_asset)
+        let _ = transfer(caller, pool.collateral_amount, pool.collateral_asset)
         pool.status = 2
     }
-    s.store(POOL_PREFIX + pool_id.to_string(10u32), pool)
+    s.store(pool_key(pool_id), pool)
     return 0
 }
+
+// ID 5: claim
 entry claim(pool_id: u64) -> u64 {
     when_not_paused()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let pool: SyndicatePool = s.load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let pool: SyndicatePool = s.load(pool_key(pool_id)).expect("err")
     require(pool.status == 2 || pool.status == 3, "notclaimable")
-    let lender_key: string = LENDER_PREFIX + pool_id.to_string(10u32) + "_" + caller.to_string()
-    let my_supply: u64 = s.load(lender_key).unwrap_or(0)
+    let key: string = lender_key(pool_id, caller)
+    let my_supply: u64 = s.load(key).unwrap_or(0)
     require(my_supply > 0, "nosupply")
     let total_due: u64 = pool.collateral_amount
     if pool.status == 2 {
@@ -202,84 +285,155 @@ entry claim(pool_id: u64) -> u64 {
         total_due = pool.total_amount + interest
     }
     let my_share: u64 = (my_supply as u128 * total_due as u128 / pool.total_amount as u128) as u64
-    
+
     let asset_to_receive: Hash = pool.collateral_asset
     if pool.status == 2 {
         asset_to_receive = pool.asset_lent
     }
-    
-    transfer(caller, my_share, asset_to_receive)
-    s.store(lender_key, 0u64)
+
+    let _ = transfer(caller, my_share, asset_to_receive)
+    s.store(key, 0u64)
     return my_share
 }
-pub fn get_pool(pool_id: u64) -> (Address, Hash, u64, u64, u64, u64, Hash, u64, u64, u64, u64, u8) {
-    let p: SyndicatePool = Storage::new().load(POOL_PREFIX + pool_id.to_string(10u32)).unwrap()
+
+// ID 6: get_pool_entry
+entry get_pool_entry(pool_id: u64) -> (Address, Hash, u64, u64, u64, u64, Hash, u64, u64, u64, u64, u8) {
+    let p: SyndicatePool = Storage::new().load(pool_key(pool_id)).expect("err")
     return (
         p.borrower, p.asset_lent, p.total_amount, p.funded_amount,
         p.interest_bps, p.duration_blocks, p.collateral_asset, p.collateral_amount,
         p.activated_at, p.due_at, p.repaid_amount, p.status
     )
 }
-pub fn get_lender_position(pool_id: u64, lender: Address) -> u64 {
-    let key: string = LENDER_PREFIX + pool_id.to_string(10u32) + "_" + lender.to_string()
+
+// ID 7: get_lender_position_entry
+entry get_lender_position_entry(pool_id: u64, lender: Address) -> u64 {
+    let key: string = lender_key(pool_id, lender)
     return Storage::new().load(key).unwrap_or(0)
 }
-pub fn get_pools_count() -> u64 {
+
+// ID 8: get_pools_count_entry
+entry get_pools_count_entry() -> u64 {
     return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
 }
+
+// ID 9: pause
 entry pause(reason: string) -> u64 {
     only_guardian_or_admin()
     Storage::new().store(PAUSED_KEY, true)
     return 0
 }
+
+// ID 10: unpause
 entry unpause() -> u64 {
     only_admin()
     Storage::new().store(PAUSED_KEY, false)
     return 0
 }
+
+// ID 11: set_oracle
 entry set_oracle(oracle: Hash) -> u64 {
     only_admin()
     Storage::new().store(ORACLE_KEY, oracle)
     return 0
 }
+
+// ID 12: set_treasury
 entry set_treasury(t: Address) -> u64 {
     only_admin()
     Storage::new().store(TREASURY_KEY, t)
     return 0
 }
+
+// ID 13: set_registry
 entry set_registry(reg: Hash) -> u64 {
     only_admin()
     Storage::new().store(REGISTRY_KEY, reg)
     return 0
 }
+
+// ID 14: set_timelock
 entry set_timelock(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
 }
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
+
+// ID 15: set_guardian
 entry set_guardian(g: Address) -> u64 {
     only_admin()
     Storage::new().store(GUARDIAN_KEY, g)
     return 0
 }
+
+// ID 16: set_emergency
 entry set_emergency(e: Address) -> u64 {
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let current: Address = s.load(EMERGENCY_KEY).unwrap()
-    require(caller == current, "notemg")
-    s.store(EMERGENCY_KEY, e)
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
     return 0
 }
+
+// ID 17: transfer_admin
 entry transfer_admin(new_admin: Address) -> u64 {
     only_admin()
     Storage::new().store(ADMIN_KEY, new_admin)
     return 0
 }
+
+// ID 18: get_version
 entry get_version() -> string {
     return VERSION
+}
+
+// ID 19: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 20: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_pool(pool_id: u64) -> (Address, Hash, u64, u64, u64, u64, Hash, u64, u64, u64, u64, u8) {
+    let p: SyndicatePool = Storage::new().load(pool_key(pool_id)).expect("err")
+    return (
+        p.borrower, p.asset_lent, p.total_amount, p.funded_amount,
+        p.interest_bps, p.duration_blocks, p.collateral_asset, p.collateral_amount,
+        p.activated_at, p.due_at, p.repaid_amount, p.status
+    )
+}
+
+pub fn get_lender_position(pool_id: u64, lender: Address) -> u64 {
+    let key: string = lender_key(pool_id, lender)
+    return Storage::new().load(key).unwrap_or(0)
+}
+
+pub fn get_pools_count() -> u64 {
+    return Storage::new().load(POOLS_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
 }

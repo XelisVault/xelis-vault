@@ -1,323 +1,425 @@
-# Miner Guide — Unified XELIS Vault Miner
+# Miner Guide — XELIS Vault v5.0
 
-> Complete guide for becoming a XELIS Vault miner: stake 100 VLT, choose your services (oracle, chat, or both), and earn rewards through the unified `XelisVaultMiner` contract.
+> Complete guide for becoming a XELIS Vault miner: stake 100 VLT, choose your
+> services (oracle, chat, or both), and earn rewards through the unified
+> `XelisVaultMiner` contract.
 
 ---
 
-## What Is a XELIS Vault Miner?
+## 1. Introduction
 
-A XELIS Vault miner is **not** the same as a XELIS BlockDAG miner. BlockDAG miners produce blocks and earn XEL; Vault miners run **protocol services** and earn **VLT** rewards. The two roles are independent — you can be one, the other, or both.
+### 1.1 What is a XELIS Vault miner?
 
-Vault miners serve one or more of these services:
+A XELIS Vault miner is **not** the same as a XELIS BlockDAG miner. BlockDAG
+miners produce blocks and earn XEL; Vault miners run **protocol services** and
+earn **VLT** rewards. The two roles are independent — you can be one, the
+other, or both.
+
+A Vault miner signs up with the `XelisVaultMiner` contract, locks **100 VLT**
+as stake, picks one or more services from a bitmask, and then keeps a daemon
+process running that submits proofs/heartbeats every few minutes. In return
+the protocol mints VLT to the miner address on every valid action.
 
 | Service ID | Service | What you do | How you earn |
 |------------|---------|-------------|--------------|
-| 1 | **Oracle** | Fetch XEL prices from MEXC/CoinEx/your own sources, submit them on-chain every ~25s | `BASE_REWARD_ORACLE` × reputation × budget factor (≈0.48 VLT per valid cycle) |
-| 2 | **Chat** | Run a VaultChat relayer: receive signed encrypted messages, store them, anchor a Merkle root on-chain every hour | `BASE_REWARD_CHAT` × reputation × budget factor (≈0.5 VLT per anchor) |
+| 1 | **Oracle** | Fetch XEL prices from MEXC/CoinEx/your own sources and submit them on-chain every ~25s | `BASE_REWARD_ORACLE` (≈0.4756 VLT) × reputation mult × budget factor |
+| 2 | **Chat** | Run a VaultChat relayer: receive signed encrypted messages, store them, anchor a Merkle root on-chain every hour | `BASE_REWARD_CHAT` (≈0.5 VLT) × reputation mult × budget factor |
 | 3–8 | Reserved | Future services: storage, indexer, etc. | — |
 
-All rewards are paid in **VLT** and sourced from a fixed 6,000,000 VLT pool that the contract self-adjusts to last exactly **10 years** (see §Dynamic Rewards below).
+### 1.2 Why it matters
+
+Every swap, loan, liquidation and PSM mint on XELIS Vault reads a price from
+the on-chain `StakedOracle`. If the oracle is wrong, money moves incorrectly.
+Miners — by submitting prices and heartbeats — are the **decentralised defence
+layer** that keeps the protocol honest. The more reliable miners there are,
+the harder it is for any single party to push a bad price.
+
+### 1.3 Expected earnings
+
+Reward formula (v5.0):
+
+```
+dynamic_reward = BASE_REWARD_ORACLE (0.4756 VLT)
+               × reputation_multiplier      (1.5× if Excellent tier, see §10)
+               × budget_factor / 10000      (starts at 1.0×, auto-adjusts)
+```
+
+| Miners active | Est. reward/miner/day | ROI on 100 VLT stake |
+|---------------|------------------------|-----------------------|
+| 10            | ~55 VLT                | < 2 days              |
+| 50            | ~11 VLT                | ~9 days               |
+| 200           | ~2.7 VLT               | ~37 days              |
+| 1,000         | ~0.55 VLT              | ~6 months             |
+
+These figures assume the default `budget_factor = 10,000` (1.0×) and
+Excellent-tier reputation. The protocol self-adjusts the factor every 2,016
+blocks so the 6,000,000 VLT reward pool always lasts ~10 years.
 
 ---
 
-## Why Become a Miner?
+## 2. Requirements
 
-- **Low barrier**: only 100 VLT required to stake (≈ a few dollars at launch prices)
-- **Passive income**: rewards scale with your reputation — reliable miners earn up to 1.5× more
-- **Multiple revenue streams**: run oracle + chat simultaneously from a single process
-- **Composable**: join or create a `MinerPool` to mutualize stake and reputation with other miners
-- **Public good**: your oracle submissions protect every swap, loan, and liquidation on XELIS Vault
+### 2.1 Hardware
+
+| Setup                       | CPU    | RAM   | Disk      | Network      | Cost          |
+|-----------------------------|--------|-------|-----------|--------------|---------------|
+| **Minimal** (oracle only)   | 2 cores| 2 GB  | 50 GB SSD | 100 Mbps, port 8080 open | ~$5–10/mo VPS |
+| **Recommended** (oracle+chat)| 4 cores| 8 GB | 200 GB SSD| 100 Mbps     | ~$20–30/mo VPS|
+| **Pool operator**           | 4+ cores | 8+ GB | 500 GB NVMe | 1 Gbps    | ~$40–80/mo VPS|
+
+### 2.2 Software
+
+- **Python 3.10+** (`python3 --version`)
+- **`requests`** + **`python-dotenv`** (auto-installed by `install.py`)
+- **XELIS daemon** synced on testnet or mainnet
+  (`xelis_daemon --network testnet --rpc-server`)
+- **XELIS wallet** with at least **100 VLT** balance (testnet faucet or
+  mainnet purchase — see §3)
+- A public endpoint URL reachable from the internet (e.g.
+  `https://my-miner.example.com:8080`). This is the `endpoint_url` you will
+  register on-chain so users can reach your chat relayer or oracle RPC.
+
+### 2.3 Network
+
+- Open TCP **port 8080** on your firewall / security group so the daemon's
+  JSON-RPC is reachable.
+- Stable uplink with packet loss < 1 % — price submissions must be every
+  ~25 s.
+- Static IP or a stable DNS hostname. The `endpoint_url` you register is
+  public and used by other miners / relayers.
 
 ---
 
-## 1. Prerequisites
+## 3. Step 1 — Get VLT tokens
 
-### 1.1 Hardware
+You need **at least 100 VLT** (10,000,000,000 atomic units at 8 decimals) to
+register. Anything beyond 100 VLT is not staked automatically — call
+`increase_stake` (entry ID 3) if you want a larger stake to absorb any
+slashing.
 
-| Setup | CPU | RAM | Disk | Network | Cost |
-|-------|-----|-----|------|---------|------|
-| **Minimal** (oracle only) | 2 cores | 4 GB | 100 GB SSD | 100 Mbps | ~$10–15/mo VPS |
-| **Recommended** (oracle + chat) | 4 cores | 8 GB | 200 GB SSD | 100 Mbps | ~$20–30/mo VPS |
-| **Pool operator** | 4+ cores | 8+ GB | 500 GB NVMe | 1 Gbps | ~$40–80/mo VPS |
-
-### 1.2 Software
-
-- **Python 3.8+** (`python3 --version`)
-- **`requests` module** (auto-installed by the script if missing)
-- **XELIS daemon** synced on testnet or mainnet (the script can install it for you)
-- **A XELIS wallet** with at least 100 VLT (claimable from the testnet faucet)
-
-### 1.3 Get 100 VLT
-
-On testnet, claim from the Faucet contract:
+### Testnet
 
 ```bash
+# 1. Sync daemon + create wallet (see §4)
+# 2. Claim from the FaucetContract (entry: claim_both)
 xelis_wallet call-contract <FaucetContract> claim_both --signer mywallet
-# → 100 XEL (for gas) + 200 VLT (more than enough to stake)
+#   → 100 XEL testnet (for gas) + 200 VLT (more than enough to stake)
 ```
 
-On mainnet, buy VLT on VaultSwap or receive it from another holder.
+### Mainnet
+
+1. Buy XEL on **MEXC** or **CoinEx** (both list XEL/USDT).
+2. Withdraw XEL to your XELIS wallet address.
+3. Swap XEL → VLT on **VaultSwap** (`VaultSwapV2` contract, see
+   [USER_GUIDE.md](USER_GUIDE.md) §7).
+4. Or buy VLT OTC from an existing holder.
 
 ---
 
-## 2. Quick Start — One-Command Setup
-
-The easiest path: run the unified miner script interactively. It will guide you through every step.
-
-### Linux / macOS
+## 4. Step 2 — Set up your XELIS wallet
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/xelis_vault_miner.py -o xelis_vault_miner.py
-python3 xelis_vault_miner.py --setup
+# Install xelis_wallet (build from source or download a release)
+git clone https://github.com/xelis-project/xelis-blockchain.git
+cd xelis-blockchain
+cargo build --release --bin xelis_wallet
+sudo cp target/release/xelis_wallet /usr/local/bin/
+
+# Start the wallet daemon (with RPC server so the miner script can talk to it)
+xelis_wallet --network testnet --rpc-server &
+
+# In another terminal, attach and create a wallet
+xelis_wallet --network testnet
+> create-wallet mywallet
+#   → set a strong password (SAVE IT)
+#   → write down the 24-word mnemonic (SAVE IT OFFLINE — see §12 privacy)
+
+> get-address
+#   → xet1abc...   ← this is your miner address
+
+> get-balance
+#   → confirm you have ≥ 100 VLT and some XEL for gas
 ```
 
-### Windows (PowerShell)
-
-```powershell
-iwr -useb https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/xelis_vault_miner.py -OutFile xelis_vault_miner.py
-python xelis_vault_miner.py --setup
-```
-
-The script will:
-
-1. ✅ Detect your OS and architecture (Linux / macOS / Windows)
-2. ✅ Verify Python 3.8+ is installed
-3. ✅ Detect (or offer to install) the XELIS daemon
-4. ✅ Help you create or import a wallet
-5. ✅ Ask for the `XelisVaultMiner`, `StakedOracle`, and `VaultChat` contract addresses
-6. ✅ Ask which services to enable (oracle, chat, or both)
-7. ✅ Optionally add a custom price source (HTTP API or external command)
-8. ✅ Save the config to `~/.xelis-vault/miner_config.json`
-9. ✅ Offer to install a systemd / launchd / Windows service for auto-start
-10. ✅ Offer to start mining immediately
-
-**No technical knowledge required** — the installer is 100% interactive.
+> **Privacy note:** The miner script never logs your mnemonic or private key.
+> It only talks to the wallet RPC over localhost. Keep your mnemonic offline
+> (paper / hardware) — anyone with it controls your stake.
 
 ---
 
-## 3. Manual Setup (advanced)
+## 5. Step 3 — Install the XELIS Vault miner software
 
-If you prefer to control every step, here is the manual path.
-
-### 3.1 Install the script
+The `install.py` script in this repository bootstraps everything:
 
 ```bash
-mkdir -p ~/.xelis-vault
-curl -fsSL https://raw.githubusercontent.com/XelisVault/xelis-vault/main/scripts/xelis_vault_miner.py \
-    -o ~/.xelis-vault/xelis_vault_miner.py
-chmod +x ~/.xelis-vault/xelis_vault_miner.py
+cd /path/to/xelis-vault-v5
+python3 install.py
 ```
 
-### 3.2 Register as a miner on-chain
+What it does:
+
+1. Checks Python ≥ 3.10.
+2. Creates a virtualenv at `~/.xelis-vault/venv`.
+3. Installs `requests`, `xelis-sdk` (placeholder) and `python-dotenv`.
+4. Creates `~/.xelis-vault/` with subdirs `logs/`, `config/`, `wallet/`.
+5. Copies `scripts/custom_sources.example.json` →
+   `~/.xelis-vault/config/custom_sources.json`.
+6. Generates `~/.xelis-vault/config/.env` with placeholders.
+7. Prints next steps (register miner, start daemon).
+
+To uninstall:
 
 ```bash
-# 1. Deposit 100 VLT and register with services_mask = 3 (oracle + chat)
-#    services_mask is a bitmask:
-#      bit 0 (value 1) = Oracle
-#      bit 1 (value 2) = Chat
-#      bit 2 (value 4) = Reserved (storage)
-#      ...
-#    So:
-#      1 = oracle only
-#      2 = chat only
-#      3 = oracle + chat
+python3 install.py --uninstall
+```
+
+> **Privacy note:** `install.py` does **not** collect telemetry, phone home,
+> or send any wallet info anywhere. It runs entirely offline.
+
+---
+
+## 6. Step 4 — Configure price sources
+
+Edit `~/.xelis-vault/config/custom_sources.json` to add API keys for the
+exchanges you want to use. The default example includes CoinEx, MEXC, the
+XELIS native daemon, and a generic HTTP source template (see
+[`scripts/custom_sources.example.json`](../scripts/custom_sources.example.json)
+and the [Provider Guide](PROVIDER_GUIDE.md) §3 for the full schema).
+
+```json
+{
+  "sources": [
+    {
+      "name": "coinex",
+      "enabled": true,
+      "api_key": "YOUR_COINEX_API_KEY",
+      "api_secret": "YOUR_COINEX_API_SECRET",
+      "symbols": ["XEL/USDT", "XEL/BTC"],
+      "poll_interval_seconds": 5
+    },
+    {
+      "name": "mexc",
+      "enabled": true,
+      "api_key": "YOUR_MEXC_API_KEY",
+      "api_secret": "YOUR_MEXC_API_SECRET",
+      "symbols": ["XEL/USDT"],
+      "poll_interval_seconds": 5
+    }
+  ]
+}
+```
+
+> **Privacy note:** API keys are read from this local file and never logged.
+> The miner log only shows the source **name**, the **price**, and the
+> **timestamp** — never the API key.
+
+Test your sources:
+
+```bash
+python3 scripts/price_provider.py --dry-run --verbose
+```
+
+You should see one line per enabled source with a fetched price.
+
+---
+
+## 7. Step 5 — Register as a miner
+
+You must register **on-chain** with the `XelisVaultMiner` contract. The
+register call is entry **ID 0**:
+
+```
+register_miner(endpoint_url: String, miner_pubkey: Hash, services_mask: u64)
+```
+
+### Services mask (bitmask)
+
+| Value | Meaning                                  |
+|-------|------------------------------------------|
+| `1`   | Oracle only                              |
+| `2`   | Chat only                                |
+| `3`   | Both oracle and chat (maximum rewards)   |
+
+You must also send **100 VLT** as deposit in the same transaction (this
+becomes your stake).
+
+```bash
 xelis_wallet call-contract <XelisVaultMiner> register_miner \
     --signer mywallet \
     --deposit <VLT_ASSET_HASH> 10000000000 \
-    "https://my-miner.example.com"  \
-    0x<your_chat_pubkey>            \
-    3                               # services_mask
+    "https://my-miner.example.com:8080" \   # endpoint_url
+    0x<your_chat_pubkey_or_zero_hash>        \  # miner_pubkey (0x0..0 if no chat)
+    1                                            # services_mask = oracle only
 ```
 
-The `endpoint_url` is the public URL where users can reach your chat relayer (can be empty if you only run oracle). The `miner_pubkey` is the X25519 public key users will use to verify your signed chat anchors — leave it as `0x00` if you are not running chat.
+- `endpoint_url`: public URL where users can reach your chat relayer. Leave
+  as an empty string `""` if you only run oracle.
+- `miner_pubkey`: X25519 public key for chat verification. Use `Hash::zero()`
+  (32 zero bytes) if you are not running chat.
+- The deposit (100 VLT) is locked as your stake and returned on deregistration
+  (entry ID 5).
 
-### 3.3 Configure the script
+### Verify registration
 
 ```bash
-cat > ~/.xelis-vault/miner_config.json << EOF
-{
-  "miner_address": "xet1...",
-  "miner_contract": "0x<XelisVaultMiner hash>",
-  "oracle_contract": "0x<StakedOracle hash>",
-  "chat_contract": "0x<VaultChat hash or empty>",
-  "vlt_asset": "0x<VLT asset hash>",
-  "rpc_url": "http://127.0.0.1:8080",
-  "network": "testnet",
-  "services": {
-    "oracle": true,
-    "chat": true
-  },
-  "oracle_config": {
-    "submit_interval": 20,
-    "feeds": ["XEL/USD"],
-    "sources": ["mexc", "coinex"]
-  },
-  "chat_config": {
-    "storage_dir": "~/.xelis-vault/chat_messages",
-    "anchor_interval": 3600,
-    "max_messages_per_hour": 10000
-  },
-  "heartbeat_interval": 480,
-  "prometheus_port": 9091,
-  "log_level": "INFO"
-}
+# Read-only check via entry ID 11 (get_miner_reputation_entry)
+xelis_wallet call-contract <XelisVaultMiner> get_miner_reputation_entry \
+    xet1abc...
+#   → 10000   (new miners start at maximum reputation)
+```
+
+---
+
+## 8. Step 6 — Start the miner daemon
+
+```bash
+python3 scripts/xelis_vault_miner.py \
+    --wallet ~/.xelis/wallet \
+    --rpc http://localhost:8080 \
+    --endpoint https://my-miner.example.com:8080 \
+    --services 1
+```
+
+The daemon will:
+
+1. Load config from `~/.xelis-vault/config/config.json` (created by
+   `install.py`).
+2. Connect to the XELIS daemon RPC.
+3. Verify your wallet has ≥ 100 VLT (calls `VLTToken` entry **11**
+   `get_asset_hash_entry`, then checks balance).
+4. If you are not yet registered, call `register_miner` (entry ID **0**).
+5. Loop:
+   - Every **100 blocks (~8 min)**: call `submit_heartbeat` (entry ID **6**).
+   - Read `get_miner_reputation_entry(addr)` (entry ID **11**). If
+     reputation < 5,000 (Good tier floor), log a warning.
+   - Read `is_miner_active_entry(addr, 1)` (entry ID **9**). If not active,
+     attempt recovery (re-heartbeat, re-register if needed).
+   - Log every action to `~/.xelis-vault/logs/miner.log` with timestamps.
+
+### Run as a systemd service (recommended for production)
+
+```bash
+sudo tee /etc/systemd/system/xelis-vault-miner.service <<EOF
+[Unit]
+Description=XELIS Vault Miner v5.0
+After=network.target xelis-daemon.service
+
+[Service]
+Type=simple
+User=$(whoami)
+ExecStart=/home/$(whoami)/.xelis-vault/venv/bin/python3 \
+    /home/$(whoami)/xelis-vault-v5/scripts/xelis_vault_miner.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
 EOF
-```
 
-### 3.4 Run
-
-```bash
-python3 ~/.xelis-vault/xelis_vault_miner.py --run
-```
-
-### 3.5 Install as a systemd service (Linux)
-
-```bash
-python3 ~/.xelis-vault/xelis_vault_miner.py --install-service
 sudo systemctl daemon-reload
 sudo systemctl enable --now xelis-vault-miner
+sudo journalctl -u xelis-vault-miner -f
 ```
+
+### CLI flags
+
+| Flag           | Default                              | Description                              |
+|----------------|--------------------------------------|------------------------------------------|
+| `--wallet`     | `~/.xelis/wallet`                    | Wallet storage path                      |
+| `--rpc`        | `http://localhost:8080`              | XELIS daemon JSON-RPC URL                |
+| `--endpoint`   | from config                          | Public endpoint URL                      |
+| `--services`   | `1`                                  | Services mask (1/2/3)                    |
+| `--dry-run`    | off                                  | Don't submit, just log what would happen |
+| `--verbose`    | off                                  | DEBUG-level logging                      |
 
 ---
 
-## 4. Service Selection
+## 9. Step 7 — Monitor
 
-You can enable or disable services at any time, both on-chain and in your local config.
-
-### 4.1 On-chain (affects what you can be slashed/rewarded for)
+### 9.1 Live log
 
 ```bash
-# Add the chat service to an oracle-only miner
-xelis_wallet call-contract <XelisVaultMiner> enable_service 2 --signer mywallet
-
-# Remove the oracle service (you stop earning oracle rewards)
-xelis_wallet call-contract <XelisVaultMiner> disable_service 1 --signer mywallet
+tail -f ~/.xelis-vault/logs/miner.log
 ```
 
-### 4.2 In your local config
+Sample output (privacy-masked):
 
-Edit `~/.xelis-vault/miner_config.json` and toggle the `services.oracle` / `services.chat` flags. The script will only run threads for enabled services.
+```
+2026-07-15 14:32:11 INFO  Topoheight=1,847,221  block_time=5s
+2026-07-15 14:32:11 INFO  Heartbeat sent        tx=0x9f3a...c1  topo=1,847,221
+2026-07-15 14:32:11 INFO  Reputation=9820 (Excellent tier)  active=true
+2026-07-15 14:32:11 INFO  Wallet balance: **** (masked)
+2026-07-15 14:40:08 INFO  Heartbeat sent        tx=0x4b2e...a8  topo=1,847,317
+```
 
-### 4.3 Choosing what to run
-
-| Profile | Oracle | Chat | VPS size | Notes |
-|---------|--------|------|----------|-------|
-| **Lightweight** | ✓ | — | 2 vCPU / 4 GB | Lowest cost, ~25s submit cadence |
-| **Chat relayer** | — | ✓ | 2 vCPU / 4 GB + 200 GB disk | Stores ciphertexts, anchors hourly |
-| **Full miner** | ✓ | ✓ | 4 vCPU / 8 GB + 200 GB disk | Maximum rewards, both revenue streams |
-| **Pool member** | ✓ | ✓ | 2 vCPU / 4 GB | Joins an existing pool, lower SLA expectations |
-
----
-
-## 5. Reputation System Explained
-
-Every miner has a **reputation score** between 0 and 10,000. New miners start at the maximum (10,000). The score affects two things:
-
-1. **Your reward multiplier** (see §6)
-2. **Your active status** — if your reputation drops below `REP_CRITICAL` (1,000), you are automatically deactivated and stop earning rewards until you climb back up
-
-### 5.1 How to gain reputation
-
-| Action | Reputation gain |
-|--------|-----------------|
-| Submit a valid oracle price | +1 |
-| Successfully anchor a batch of chat messages | +5 |
-| Send a heartbeat (proof of life, every ~8 min) | +1 (if no infraction in the last 1,000 blocks) |
-| Bonus per day without any infraction | +10 |
-
-### 5.2 How to lose reputation
-
-| Infraction | Reputation loss | Stake slash | Severity code |
-|------------|-----------------|-------------|---------------|
-| Oracle outlier price (>5% from median) | -50 | 1% | 0 |
-| Node offline detected | -200 | 2% | 1 |
-| Chat data loss (lost stored messages) | -500 | 5% | 2 |
-| Chat censorship (refused valid messages) | -1,000 | 10% | 3 |
-| Malicious behavior (proven) | -5,000 | 50% | 4 |
-
-Stake slash split: **50% burned** (deflationary), **10% to the reporter** (incentive for watchdogs), **40% to the treasury**.
-
-### 5.3 Reputation tiers
-
-| Tier | Score range | Multiplier | Effect |
-|------|-------------|------------|--------|
-| Excellent | 10,000 – 8,000 | **1.5×** | Bonus rewards for top miners |
-| Good | 8,000 – 5,000 | 1.0× | Normal |
-| Warning | 5,000 – 2,000 | 0.5× | Half rewards — improve or you'll keep falling |
-| Critical | 2,000 – 1,000 | 0.25× | Quarter rewards — last chance |
-| Banned | < 1,000 | 0× | Auto-deactivated, no rewards until you regenerate |
-
-### 5.4 Regenerating reputation
-
-Reputation regenerates naturally: each heartbeat (every ~8 minutes) gives +1 point **if** you have had no infraction in the last 1,000 blocks (~83 minutes). This means:
-
-- A miner who had a single outlier (-50) recovers in ~50 heartbeats = ~7 hours of clean operation
-- A miner who lost 1,000 reputation (censorship) needs ~1,000 heartbeats = ~5.5 days of clean operation
-- A miner in Banned tier must wait until they cross back above 1,000 — they will be inactive during that time
-
-### 5.5 Checking your reputation
+### 9.2 On-chain status
 
 ```bash
-xelis_wallet call-contract <XelisVaultMiner> read get_miner_reputation <your_addr>
-# → returns a u64 in [0, 10000]
+# Reputation (entry ID 11)
+xelis_wallet call-contract <XelisVaultMiner> get_miner_reputation_entry xet1abc...
+# → 9820
 
-xelis_wallet call-contract <XelisVaultMiner> read get_reputation_tier <your_addr>
-# → 0=banned, 1=critical, 2=warning, 3=good, 4=excellent
+# Stake (entry ID 10)
+xelis_wallet call-contract <XelisVaultMiner> get_miner_stake_entry xet1abc...
+# → 10000000000   (= 100 VLT)
 
-xelis_wallet call-contract <XelisVaultMiner> read get_miner <your_addr>
-# → (endpoint_url, pubkey, stake, services_mask, reputation, valid_submissions,
-#    successful_anchors, total_submissions, total_rewards_earned, total_slashed, active)
+# Active? (entry ID 9)  — pass service_id=1 for oracle
+xelis_wallet call-contract <XelisVaultMiner> is_miner_active_entry xet1abc... 1
+# → 1   (true)
+
+# Active miners per service (entry ID 12)
+xelis_wallet call-contract <XelisVaultMiner> get_active_miners_for_service_entry 1
+# → 47   (47 oracle miners currently active)
+
+# Total staked across all miners (entry ID 14)
+xelis_wallet call-contract <XelisVaultMiner> get_total_staked_entry
+# → 4700000000000   (= 47,000 VLT staked network-wide)
 ```
+
+### 9.3 Dashboard
+
+A Grafana template ships at `scripts/grafana_dashboard.json` (see
+[Provider Guide](PROVIDER_GUIDE.md) §8). It exposes:
+
+- `xelis_miner_up` (gauge)
+- `xelis_miner_heartbeats_total` (counter)
+- `xelis_miner_reputation` (gauge)
+- `xelis_miner_last_reward_vlt` (gauge)
 
 ---
 
-## 6. Dynamic Rewards Explained
+## 10. Reward calculation
 
-Your per-action reward is computed by `XelisVaultMiner.distribute_reward()` as:
-
-```
-dynamic_reward = base_reward × reputation_mult × budget_factor
-```
-
-### 6.1 Base reward
-
-| Service | Base reward |
-|---------|-------------|
-| Oracle (valid price submission) | 0.48 VLT (`BASE_REWARD_ORACLE = 47,564,687` atomic) |
-| Chat (successful anchor) | 0.5 VLT (`BASE_REWARD_CHAT = 50,000,000` atomic) |
-
-### 6.2 Reputation multiplier
-
-From §5.3 above: 0× / 0.25× / 0.5× / 1.0× / 1.5× depending on your tier.
-
-### 6.3 Budget factor (auto-adjustment)
-
-The contract maintains a global `budget_factor` (in basis points, 10,000 = 1.0×). Every 2,016 blocks (~1 week), `maybe_adjust_budget()` runs:
-
-1. Compute the **actual distribution rate** = `total_distributed / elapsed_blocks`
-2. Compute the **target rate** = `remaining_budget / remaining_blocks` (so the 6M VLT pool lasts exactly 10 years)
-3. If we're distributing too fast → reduce `budget_factor` (down to 5,000 = 0.5× minimum)
-4. If we're distributing too slow → increase `budget_factor` (up to 20,000 = 2.0× maximum)
-5. Apply a 50/50 blend with the previous factor to avoid shocks
-
-This means:
-
-- **If the network is very active** (many miners, many submissions) → rewards per action decrease, but the pool lasts the full 10 years
-- **If the network is quiet** (few miners) → rewards per action increase (up to 2×), encouraging new miners to join
-- **The 6M VLT pool will always last 10 years**, regardless of network conditions
-
-### 6.4 Example calculation
-
-A miner with reputation 9,200 (Excellent tier) submitting a valid oracle price when `budget_factor = 12,000` (1.2×):
+Every valid submission triggers `XelisVaultMiner.distribute_reward(miner_addr,
+service_id, is_valid=true)` (entry ID **8** — called by the StakedOracle, not
+by the miner). The reward is:
 
 ```
-dynamic_reward = 0.48 VLT × 1.5 × 1.2 = 0.864 VLT
+dynamic_reward = base_reward
+               × reputation_multiplier
+               × (budget_factor / 10000)
+```
+
+| Component              | Default | Source                                |
+|------------------------|---------|---------------------------------------|
+| `BASE_REWARD_ORACLE`   | 0.4756 VLT | `set_base_reward_oracle` (entry 21) |
+| `BASE_REWARD_CHAT`     | 0.5 VLT    | `set_base_reward_chat`   (entry 22) |
+| `budget_factor`        | 10,000 (=1.0×) | auto-adjusted every 2,016 blocks |
+| Reputation multiplier  | 1.5× / 1.0× / 0.5× / 0.25× / 0× | based on tier (see §11) |
+
+### Example
+
+Miner with reputation 9,200 (Excellent tier) submitting a valid oracle price
+when `budget_factor = 12,000` (1.2×):
+
+```
+dynamic_reward = 0.4756 × 1.5 × 1.2 = 0.8561 VLT
 ```
 
 A miner with reputation 3,500 (Warning tier) submitting the same price:
 
 ```
-dynamic_reward = 0.48 VLT × 0.5 × 1.2 = 0.288 VLT
+dynamic_reward = 0.4756 × 0.5 × 1.2 = 0.2854 VLT
 ```
 
 A miner with reputation 800 (Banned tier):
@@ -326,361 +428,273 @@ A miner with reputation 800 (Banned tier):
 dynamic_reward = 0   ← no reward minted, regardless of validity
 ```
 
-### 6.5 Checking the current budget factor
-
-```bash
-xelis_wallet call-contract <XelisVaultMiner> read get_budget_info
-# → (total_budget, distributed, budget_factor, launch_topo, target_duration)
-# total_budget = 600,000,000,000,000 (6M VLT in atomic units)
-# distributed  = how much has been paid out so far
-# budget_factor = current multiplier in bps (10000 = 1.0×)
-```
+Read the current budget via `get_base_reward_oracle_entry` (entry ID 15) and
+the global budget info via the `XelisVaultMiner` `get_budget_info` pub-fn.
 
 ---
 
-## 7. Miner Pools
+## 11. Reputation management
 
-### 7.1 Why join a pool?
+Every miner has a reputation score between 0 and 10,000. New miners start at
+the maximum (10,000). The score affects two things:
 
-- **Mutualized availability**: if your node goes down, other pool members keep serving
-- **Combined reputation**: pool reputation is the mean of members' — useful for chat users choosing where to store messages
-- **Lower operational burden**: you can run a smaller node, the pool absorbs the slack
-- **Same rewards**: your share = `pool_pending × (your_stake / pool_total_stake)` minus the creator commission
+1. Your reward multiplier (see §10).
+2. Your active status — below 1,000 you are auto-deactivated and stop earning
+   until you climb back up.
 
-### 7.2 Creating a pool
+### 11.1 Tiers
 
-Any registered miner can create a pool:
+| Tier       | Score range     | Multiplier | Effect                                   |
+|------------|-----------------|------------|------------------------------------------|
+| Excellent  | 10,000 – 8,000  | **1.5×**   | Bonus rewards for top miners             |
+| Good       | 8,000 – 5,000   | 1.0×       | Normal                                   |
+| Warning    | 5,000 – 2,000   | 0.5×       | Half rewards — fix your setup            |
+| Critical   | 2,000 – 1,000   | 0.25×      | Quarter rewards — last chance            |
+| Banned     | < 1,000         | 0×         | Auto-deactivated, no rewards until regen |
 
-```bash
-xelis_wallet call-contract <MinerPool> create_pool \
-    --signer mywallet \
-    "My Awesome Pool"           `# name` \
-    "Reliable oracle + chat, EU-hosted"   `# description` \
-    500                          `# creator_commission_bps (5%)`
-# → returns the new pool_id
-```
+**Goal: stay above 8,000 (Excellent tier).**
 
-The creator automatically becomes member #1. The creator commission (in basis points, max 2,000 = 20%) is taken from each member's reward and sent to the creator.
+### 11.2 Gains
 
-### 7.3 Joining a pool
+| Action                                            | Gain |
+|---------------------------------------------------|------|
+| Submit a valid oracle price                       | +1   |
+| Anchor a batch of chat messages                   | +5   |
+| Heartbeat (with no infraction in last 1,000 blk)  | +1   |
+| Bonus per day with zero infractions               | +10  |
 
-```bash
-# List existing pools
-xelis_wallet call-contract <MinerPool> read get_pools_count
-# → e.g. 7
+### 11.3 Losses
 
-# Inspect a pool
-xelis_wallet call-contract <MinerPool> read get_pool 3
-# → (creator, name, description, commission_bps, total_stake, created_at, active)
+| Infraction                                | Rep loss | Stake slash | Severity |
+|-------------------------------------------|----------|-------------|----------|
+| Oracle outlier price (>5 % from median)   | -50      | 1 %         | 0        |
+| Node offline detected                     | -200     | 2 %         | 1        |
+| Chat data loss (lost stored messages)     | -500     | 5 %         | 2        |
+| Chat censorship (refused valid messages)  | -1,000   | 10 %        | 3        |
+| Malicious behaviour (proven)              | -5,000   | 50 %        | 4        |
 
-# Join
-xelis_wallet call-contract <MinerPool> join_pool 3 --signer mywallet
-```
+Stake slash split: **50 % burned** (deflationary), **10 % to the reporter**
+(incentive for watchdogs), **40 % to the treasury**.
 
-Constraints:
-- You must already be a registered miner
-- You can only be in one pool at a time
-- A pool can have at most 50 members
+### 11.4 Regenerating reputation
 
-### 7.4 Earning and claiming
+Each heartbeat (every ~8 min) gives +1 reputation **if** you have had no
+infraction in the last 1,000 blocks (~83 min):
 
-When `XelisVaultMiner.distribute_reward()` pays you, it checks if you are in a pool. If so, the reward is sent to `MinerPool.distribute_pool_rewards()` instead of to you directly. The pool accumulates these rewards.
+- One outlier (-50) → ~50 heartbeats = ~7 h of clean operation.
+- One censorship event (-1,000) → ~1,000 heartbeats = ~5.5 days.
+- Banned tier → must climb back above 1,000 before re-activation.
 
-To claim your share:
+### 11.5 How to stay Excellent
 
-```bash
-xelis_wallet call-contract <MinerPool> claim_pool_rewards --signer mywallet
-```
-
-Your share = `pool_pending × (your_stake / pool_total_stake)` minus commission.
-
-### 7.5 Leaving a pool
-
-```bash
-xelis_wallet call-contract <MinerPool> leave_pool --signer mywallet
-```
-
-On leave, your pending share is paid out. The pool creator cannot leave — they must dissolve the pool (transfer admin) instead.
-
-### 7.6 Pool operators: kicking a member
-
-```bash
-xelis_wallet call-contract <MinerPool> kick_member <member_addr> --signer creator_wallet
-```
-
-Use this for members who have gone offline, misbehaved, or whose reputation has dropped too low.
+1. Use **≥ 2 reliable price sources** (MEXC + CoinEx minimum).
+2. **Validate locally** before submitting: reject prices >5 % from your own
+   median, or older than 30 s.
+3. **Monitor heartbeat** — the daemon sends one every 100 blocks; alert if
+   `last_heartbeat_block` falls behind by more than 300 blocks.
+4. Run the daemon under systemd with `Restart=always`.
+5. Keep your stake topped up (≥ 100 VLT) so a few slashes don't de-activate
+   you.
 
 ---
 
-## 8. Custom Price Sources
+## 12. Slashing
 
-The default sources (MEXC + CoinEx) work for everyone. If you want to add your own:
+### 12.1 What triggers it
 
-### 8.1 HTTP API source
+Anyone (other miner, watchdog bot, or governance) can call
+`slash_miner(miner_addr, severity, reporter)` (entry ID **7**) on
+`XelisVaultMiner`. Severity codes are 0–4 (see §11.3). The contract verifies
+the report — for severities 0 and 1 it accepts the call from
+`StakedOracle`/`VaultChat` directly; for higher severities it requires
+governance or guardian approval (see `GuardianMultisig`).
 
-Edit `~/.xelis-vault/custom_sources.json`:
+### 12.2 How to avoid it
 
-```json
-[
-  {
-    "type": "http",
-    "name": "my_exchange",
-    "url": "https://api.myexchange.com/v1/xel_usd",
-    "json_path": "data.price",
-    "headers": {
-      "Authorization": "Bearer YOUR_API_KEY"
-    }
-  }
-]
-```
+| Risk                 | Mitigation                                            |
+|----------------------|-------------------------------------------------------|
+| Outlier (-50)        | Use ≥ 2 sources; reject prices >5 % from local median |
+| Offline (-200)       | systemd `Restart=always`; monitor `last_heartbeat`    |
+| Data loss (-500)     | Replicate chat storage; fsync before anchoring        |
+| Censorship (-1,000)  | Don't filter messages — accept all signed by sender   |
+| Malicious (-5,000)   | Never submit prices you know to be wrong              |
 
-The script will fetch this URL, walk the JSON path (`data.price`), and include the result in the median alongside MEXC and CoinEx.
+### 12.3 Reporting others
 
-### 8.2 External command source
+If you observe a misbehaving miner, collect evidence (block range, submission
+hashes) and submit a slash proposal via `GuardianMultisig` (see
+[USER_GUIDE.md](USER_GUIDE.md) §8). The reporter receives 10 % of the slash.
 
-```json
-[
-  {
-    "type": "command",
-    "name": "my_node",
-    "command": "/usr/local/bin/my_price_feed --json"
-  }
-]
-```
-
-The script runs the command and parses stdout as a JSON object with a `price` field.
-
-### 8.3 Using the interactive helper
-
-```bash
-python3 scripts/xelis_vault_miner.py --add-source
-```
-
-### 8.4 Enabling your custom source
-
-Edit `~/.xelis-vault/miner_config.json` and add your source name to the `sources` array:
-
-```json
-"oracle_config": {
-  "sources": ["mexc", "coinex", "my_exchange", "my_node"]
-}
-```
-
-The script uses a median of all sources, with outliers (>10% from median) excluded. You need at least 2 valid sources for a price to be submitted.
-
-### 8.5 Testing your sources
-
-```bash
-python3 scripts/xelis_vault_miner.py --test-sources
-```
-
-Output:
-
-```
-======================================================================
-  TESTING PRICE SOURCES
-======================================================================
-  ✓ mexc: $0.482301
-  ✓ coinex: $0.481900
-  ✓ my_exchange (custom): $0.482500
-  ! my_node (custom): FAIL
-```
-
-An example custom sources file is provided at [`scripts/custom_sources.example.json`](../scripts/custom_sources.example.json).
+> **Privacy note:** Slash events are public on-chain (miner address +
+> severity + reporter). The miner daemon logs them locally but never logs
+> other miners' IP addresses or wallet balances.
 
 ---
 
-## 9. Heartbeats
+## 13. Deregistration
 
-The script automatically sends a heartbeat every ~8 minutes (96 blocks × 5s = 480s) via `XelisVaultMiner.submit_heartbeat()`.
+When you want to exit:
 
-Heartbeats serve two purposes:
+1. **Stop the daemon** (`systemctl stop xelis-vault-miner`).
+2. **Leave any pool** if you joined one (call `MinerPool.leave_pool`).
+3. **Call deregister** (entry ID **5**):
 
-1. **Proof of life** — if you stop sending heartbeats for more than `HEARTBEAT_TIMEOUT` (300 blocks ≈ 25 min), other miners/services can report you as offline (severity 1, -200 reputation, 2% stake slash)
-2. **Reputation regeneration** — each heartbeat gives +1 reputation if you've had no infraction in the last 1,000 blocks
-
-You don't need to do anything — the script handles heartbeats for you.
-
----
-
-## 10. Monitoring
-
-### 10.1 Service status
-
-```bash
-sudo systemctl status xelis-vault-miner
-```
-
-### 10.2 Logs
-
-```bash
-# Live tail
-tail -f ~/.xelis-vault/miner.log
-
-# systemd journal
-sudo journalctl -u xelis-vault-miner -f
-```
-
-### 10.3 Prometheus metrics
-
-The script exposes metrics on port 9091:
-
-```bash
-curl http://localhost:9091/metrics
-```
-
-Key metrics:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `xelis_miner_up` | gauge | 1 if the miner is running |
-| `xelis_miner_prices_submitted_total` | counter | Total oracle prices submitted |
-| `xelis_miner_heartbeats_total` | counter | Total heartbeats sent |
-| `xelis_miner_last_price` | gauge | Last XEL price submitted (USD) |
-
-### 10.4 On-chain status
-
-```bash
-# Quick status
-python3 scripts/xelis_vault_miner.py --status
-
-# Full miner info
-xelis_wallet call-contract <XelisVaultMiner> read get_miner <your_addr>
-
-# Reputation tier
-xelis_wallet call-contract <XelisVaultMiner> read get_reputation_tier <your_addr>
-
-# Budget info
-xelis_wallet call-contract <XelisVaultMiner> read get_budget_info
-
-# Active miners per service
-xelis_wallet call-contract <XelisVaultMiner> read get_active_miners_for_service 1   # oracle
-xelis_wallet call-contract <XelisVaultMiner> read get_active_miners_for_service 2   # chat
-```
-
----
-
-## 11. Troubleshooting
-
-### 11.1 "Cannot connect to XELIS daemon"
-
-```bash
-# Check daemon is running
-sudo systemctl status xelis-daemon
-
-# Check RPC is accessible
-curl http://127.0.0.1:8080 -X POST \
-    -H "Content-Type: application/json" \
-    -d '{"method":"get_info","params":{},"jsonrpc":"2.0","id":1}'
-```
-
-If you don't have a daemon yet, re-run `python3 scripts/xelis_vault_miner.py --setup` and choose to install it.
-
-### 11.2 "insstake" error on register_miner
-
-You don't have enough VLT deposited. The `register_miner` call expects a `--deposit` of at least 100 VLT (= 10,000,000,000 atomic units) of the VLT asset.
-
-```bash
-# Check your VLT balance
-xelis_wallet balance <your_addr> <VLT_ASSET_HASH>
-
-# If insufficient, claim from faucet (testnet) or buy on VaultSwap (mainnet)
-```
-
-### 11.3 Your reputation is dropping
-
-- Check the log for "outlier" messages → your price sources may be returning bad data
-- Run `python3 scripts/xelis_vault_miner.py --test-sources` to verify each source
-- Add a more reliable source (MEXC and CoinEx are both production-tested)
-- If reputation is in Critical tier (< 2,000), stop, fix your setup, and let heartbeats regenerate you
-
-### 11.4 "notauth" error when calling distribute_reward
-
-You are not an authorized service contract. Only `StakedOracle` and `VaultChat` (or other contracts registered via `register_service()`) can call `distribute_reward()` and `slash_miner()`. If you see this error, it's a contract-level issue, not something miners should encounter.
-
-### 11.5 Chat anchoring is failing
-
-- Make sure `chat_contract` is set in your config
-- Make sure you have the chat bit set in your `services_mask` (use `enable_service 2`)
-- Make sure your relayer is reachable at the `endpoint_url` you registered with
-- Check that your storage directory is writable
-
-### 11.6 Service won't start on boot
-
-```bash
-# Re-enable
-sudo systemctl daemon-reload
-sudo systemctl enable xelis-vault-miner
-sudo systemctl start xelis-vault-miner
-
-# Check the unit file
-cat /etc/systemd/system/xelis-vault-miner.service
-```
-
----
-
-## 12. FAQ
-
-### Do I need to also be a XELIS BlockDAG miner?
-No. Vault mining and BlockDAG mining are completely independent. You can run a Vault miner on a $10 VPS without ever mining a block.
-
-### Can I run oracle without chat?
-Yes. Set `services_mask = 1` (or use `--setup` and answer "no" to chat). You will only earn oracle rewards.
-
-### Can I run chat without oracle?
-Yes. Set `services_mask = 2`. You will only earn chat rewards. This is useful for miners who want to focus on the relayer business.
-
-### What happens if I run out of stake?
-If your stake drops below 100 VLT (after cumulative slashing), you are auto-deactivated. Call `increase_stake()` to top up and re-activate:
-
-```bash
-xelis_wallet call-contract <XelisVaultMiner> increase_stake 5000000000 \
-    --signer mywallet --deposit <VLT_ASSET_HASH> 5000000000   # +50 VLT
-```
-
-### What happens if my reputation drops below 1,000?
-You are auto-deactivated. You don't lose your stake, but you stop earning rewards. Send heartbeats (the script does this automatically) to regenerate reputation. Once you cross back above 1,000, you are reactivated.
-
-### How do I withdraw my stake?
 ```bash
 xelis_wallet call-contract <XelisVaultMiner> deregister_miner --signer mywallet
 ```
-This returns your full stake and removes you from the miner registry. If you were in a pool, leave it first.
 
-### Can I run multiple miners from the same wallet?
-No. One address = one miner registration. Use a different wallet for each miner instance.
+### What happens to your stake?
 
-### Can I run multiple miners from the same machine?
-Yes, but they must use different wallets and different Prometheus ports. Edit `prometheus_port` in `miner_config.json` for each instance.
+- Your **full stake** (100 VLT minus any accumulated slash) is transferred
+  back to your wallet address.
+- Your miner entry is removed from the registry (subsequent heartbeats will
+  revert with `notreg`).
+- Any **pending rewards** in the contract are paid out before the stake is
+  returned.
+- Your historical stats (`total_rewards_earned`, `total_slashed`) are kept
+  on-chain forever for transparency.
 
-### Do I earn more in a pool or solo?
-Mathematically, pools and solo earn the same total rewards (minus the creator commission). Pools trade a small commission for higher availability and reduced operational risk. The choice depends on your reliability and infrastructure.
-
-### How are rewards taxed / reported?
-XELIS Vault is a protocol, not a tax authority. Track your own rewards via the `get_miner` view (which returns `total_rewards_earned`). Consult a tax professional in your jurisdiction.
-
----
-
-## 13. Support
-
-- **Discord**: [https://discord.gg/UHpYAWbG](https://discord.gg/UHpYAWbG) — `#mining` channel for XELIS Vault miner questions
-- **Twitter / X**: [https://x.com/xelisvault](https://x.com/xelisvault) — announcements
-- **Email**: `mining@xelisvault.io`
-- **GitHub Issues**: [XelisVault/xelis-vault/issues](https://github.com/XelisVault/xelis-vault/issues)
+If you ever want to come back, just call `register_miner` again with a fresh
+100 VLT deposit. Your reputation resets to 10,000.
 
 ---
 
-## 14. References
+## 14. Troubleshooting
 
-- [Whitepaper v3.1 §8 — XelisVaultMiner](WHITEPAPER.md#8-xelisvaultminer--unified-mining-layer)
-- [Whitepaper v3.1 §9 — MinerPool](WHITEPAPER.md#9-minerpool--composable-miner-pools)
-- [Whitepaper v3.1 §10 — VaultChat](WHITEPAPER.md#10-vaultchat--end-to-end-encrypted-chat)
-- [Whitepaper v3.1 §11 — PrivacyMixer](WHITEPAPER.md#11-privacymixer--anonymity-mixer)
-- [Architecture](ARCHITECTURE.md) — contract interactions and entry IDs
-- [Provider Guide](PROVIDER_GUIDE.md) — for the standalone `price_provider.py` (legacy path)
-- [XELIS Mining Documentation](https://docs.xelis.io/features/mining) — for XELIS BlockDAG mining (separate from Vault mining)
-- [XELIS Daemon Configuration](https://docs.xelis.io/getting-started/configuration/xelis_daemon)
+### 14.1 `insstake` error on `register_miner`
+
+You don't have 100 VLT deposited. The `register_miner` call expects a
+`--deposit` of at least 10,000,000,000 atomic units (100 VLT) of the VLT
+asset.
+
+```bash
+xelis_wallet balance <your_addr> <VLT_ASSET_HASH>
+# If insufficient: claim from faucet (testnet) or buy on VaultSwap (mainnet)
+```
+
+### 14.2 `alreadyreg` error
+
+You are already registered. Check with `is_miner_active_entry(addr, 1)`
+(entry ID 9). If you want to change services mask, use `enable_service` /
+`disable_service` (entries 1 and 2) instead of re-registering.
+
+### 14.3 `hbtoosoon` error
+
+You sent a heartbeat less than `HEARTBEAT_INTERVAL` blocks ago (default 100
+blocks ≈ 8 min). The daemon throttles heartbeats automatically — if you see
+this, your clock or the daemon's loop interval is misconfigured.
+
+### 14.4 `oorange` error on `submit_price`
+
+Your price is outside the `[min_price, max_price]` range for the feed (set
+when the feed was created via `add_feed`, entry ID 0 on `StakedOracle`).
+Test your sources:
+
+```bash
+python3 scripts/price_provider.py --dry-run --verbose
+```
+
+### 14.5 Reputation keeps dropping
+
+- Run `python3 scripts/xelis_vault_miner.py --test-sources` to verify each
+  source.
+- Add a more reliable source (MEXC + CoinEx are production-tested).
+- If reputation is in Critical (< 2,000), **stop**, fix your setup, and let
+  heartbeats regenerate you (~7 h per 50 points).
+
+### 14.6 `notauth` error when calling `distribute_reward`
+
+Only `StakedOracle` and `VaultChat` (or other contracts registered via
+`register_service` entry ID 16) can call `distribute_reward` and
+`slash_miner`. If you see this error as a miner, it's a contract-level issue —
+report it on GitHub.
+
+### 14.7 Daemon cannot connect to RPC
+
+```bash
+# Check daemon is running and synced
+curl -X POST http://127.0.0.1:8080 \
+    -H "Content-Type: application/json" \
+    -d '{"method":"get_info","params":{},"jsonrpc":"2.0","id":1}'
+# Should return {"result":{"synced":true,"topoheight":...}}
+```
+
+### 14.8 Wallet balance shows **** in logs
+
+That's intentional — the daemon masks wallet balances in logs by default. To
+see the real balance, use `xelis_wallet get-balance` directly.
 
 ---
 
-*Last updated: June 2026 — v4.3*
+## 15. FAQ
+
+### Q1. How much can I earn per day?
+At 50 active miners and Excellent reputation: ~11 VLT/day. At 200 miners:
+~2.7 VLT/day. The protocol auto-adjusts `budget_factor` so the 6M VLT pool
+always lasts ~10 years (see §10).
+
+### Q2. Can I run multiple miners from the same wallet?
+No. One address = one miner registration. Use a separate wallet per miner
+instance.
+
+### Q3. Can I run multiple miners on the same machine?
+Yes, but they need different wallets and different Prometheus ports (set
+`PROMETHEUS_PORT` per instance).
+
+### Q4. What if my node goes offline?
+No penalty for being offline **briefly** (you just miss reward cycles). After
+`HEARTBEAT_TIMEOUT` (300 blocks ≈ 25 min) other miners can report you as
+offline → severity 1 → -200 reputation, 2 % stake slash.
+
+### Q5. Do I need to also be a XELIS BlockDAG miner?
+No. Vault mining and BlockDAG mining are completely independent. You can run
+a Vault miner on a $5 VPS without ever mining a block.
+
+### Q6. Can I run oracle without chat?
+Yes — set `services_mask = 1` (or pass `--services 1` to the daemon).
+
+### Q7. What happens if my stake drops below 100 VLT?
+After cumulative slashing, you are auto-deactivated. Call
+`increase_stake(amount)` (entry ID 3) to top up and re-activate.
+
+### Q8. How do I withdraw my stake?
+Call `deregister_miner` (entry ID 5). Your full stake is returned. See §13.
+
+### Q9. Is my IP address public?
+The `endpoint_url` you register is public (so users can reach your chat
+relayer). If you run oracle only, register an empty string `""` as the
+endpoint to keep your IP private. Your wallet address is always public
+on-chain (it signs transactions).
+
+### Q10. Can I use a hardware wallet?
+Yes. The miner daemon talks to `xelis_wallet` over RPC; if your wallet is
+backed by a hardware signer, the daemon will simply route each signing
+request to it.
+
+### Q11. What happens to rewards if the oracle is paused?
+When `StakedOracle.pause(reason)` (entry ID 11) is called, no new prices are
+accepted, so no `distribute_reward` calls happen. Your stake and reputation
+are unaffected. Mining resumes when `unpause()` (entry ID 12) is called.
+
+### Q12. Where do I get help?
+- Discord: https://discord.gg/UHpYAWbG — `#mining` channel
+- Twitter / X: https://x.com/xelisvault
+- Email: `mining@xelisvault.io`
+- GitHub Issues: https://github.com/XelisVault/xelis-vault/issues
+
+---
+
+## 16. References
+
+- [Whitepaper v5.0 — XelisVaultMiner](WHITEPAPER.md)
+- [Reward System](REWARD_SYSTEM.md) — full math + budget auto-adjustment
+- [Architecture](../README.md) — contract interactions and entry IDs
+- [Entry IDs v5.0](ENTRY_IDS.md) — canonical list of all 630 entry functions
+- [Provider Guide](PROVIDER_GUIDE.md) — for the standalone `price_provider.py`
+- [User Guide](USER_GUIDE.md) — lending, swap, governance, mixer, chat
+- [XELIS Mining Documentation](https://docs.xelis.io/features/mining) — for
+  XELIS BlockDAG mining (separate from Vault mining)
+
+---
+
+*Last updated: July 2026 — v5.0*

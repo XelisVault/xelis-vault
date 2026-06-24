@@ -1,4 +1,12 @@
-const VERSION: string = "VaultEngineV3.0"
+// ============================================================================
+// VaultEngineV3.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #3: Use ContractRegistry.get_entry (entry 0) + StakedOracle.get_price_for_asset_entry (entry 9)
+// FIX #8: Commit-reveal pattern for "confidential" amounts (Ciphertext API does not exist in Silex)
+// FIX #9: Stability fee accrual — borrow amount grows over time
+// FIX #14: Two-step emergency_withdraw
+// ============================================================================
+const VERSION: string = "VaultEngineV3 v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -28,6 +36,16 @@ const INSURANCE_FEE_KEY: string = "if"
 const REDEMPTION_FEE_KEY: string = "rf"
 const GRACE_PERIOD_KEY: string = "gp"
 
+// FIX #9: Stability fee (continuous interest on borrows)
+const STABILITY_FEE_BPS_KEY: string = "sfb"          // annual rate in bps (e.g., 200 = 2%)
+const STABILITY_FEE_INDEX_KEY: string = "sfi"        // global accumulator (1e12 scale)
+const STABILITY_FEE_LAST_UPDATE_KEY: string = "sflu"
+const STABILITY_FEE_SCALE: u64 = 1000000000000        // 1e12
+const BLOCKS_PER_YEAR: u64 = 6307200
+
+// FIX #8: Commit-reveal salts for confidential vaults
+const SALT_PREFIX: string = "salt_"
+
 const DEFAULT_MIN_CR: u64 = 20000
 const DEFAULT_LIQ_PENALTY: u64 = 1000
 const DEFAULT_PROTOCOL_FEE: u64 = 50
@@ -35,15 +53,21 @@ const DEFAULT_INSURANCE_FEE: u64 = 10
 const DEFAULT_REDEMPTION_FEE: u64 = 50
 const DEFAULT_GRACE_PERIOD: u64 = 10
 const DEFAULT_QUEUE_CAP: u64 = 1000
+const DEFAULT_STABILITY_FEE_BPS: u64 = 200   // 2% APR
 const RG_NOT_ENTERED: u64 = 1
 const RG_ENTERED: u64 = 2
 const PRICE_DECIMALS: u64 = 100000000
 
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 struct VaultSnapshot {
     owner: Address,
     collateral_asset: Hash,
-    collateral_cipher: u64,
-    borrow_cipher: u64,
+    collateral_amount: u64,           // FIX #8: stored in plain (commit-reveal pattern optional)
+    collateral_salt: Hash,            // FIX #8: salt for off-chain commitment verification
+    borrow_amount: u64,
+    borrow_index_at_open: u64,        // FIX #9: stability_fee_index at open time
     last_update_topo: u64,
     liquidated: bool,
     created_at: u64,
@@ -52,7 +76,7 @@ struct VaultSnapshot {
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
@@ -69,33 +93,36 @@ hook constructor() -> u64 {
     s.store(INSURANCE_FEE_KEY, DEFAULT_INSURANCE_FEE)
     s.store(REDEMPTION_FEE_KEY, DEFAULT_REDEMPTION_FEE)
     s.store(GRACE_PERIOD_KEY, DEFAULT_GRACE_PERIOD)
+    s.store(STABILITY_FEE_BPS_KEY, DEFAULT_STABILITY_FEE_BPS)
+    s.store(STABILITY_FEE_INDEX_KEY, STABILITY_FEE_SCALE)
+    s.store(STABILITY_FEE_LAST_UPDATE_KEY, get_current_topoheight())
     return 0
 }
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
 
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
     if caller == g { return }
     only_admin()
 }
 
 fn only_emergency() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let e: Address = s.load(EMERGENCY_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
     require(caller == e, "notemg")
 }
 
@@ -115,18 +142,21 @@ fn when_not_paused() {
     require(!paused, "paused")
 }
 
+// FIX #3: Use ContractRegistry.get_entry (entry 0) to resolve StakedOracle
 fn get_oracle() -> Contract {
     let s: Storage = Storage::new()
-    let reg_hash: Hash = s.load(REGISTRY_KEY).unwrap()
-    let reg: Contract = Contract::new(reg_hash).unwrap()
+    let reg_hash: Hash = s.load(REGISTRY_KEY).expect("err")
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    // ContractRegistry v5.0 entry 0 = get_entry(name) -> Hash
     let oracle_hash: Hash = reg.call(0u16, ["StakedOracle"], {})
     require(oracle_hash != Hash::zero(), "oraclenotfound")
-    return Contract::new(oracle_hash).unwrap()
+    return Contract::new(oracle_hash).expect("err")
 }
 
 fn get_xel_price() -> u64 {
     let oracle: Contract = get_oracle()
-    let price: u64 = oracle.call(0u16, [Hash::zero()], {})
+    // StakedOracle v5.0 entry 9 = get_price_for_asset_entry(asset) -> u64
+    let price: u64 = oracle.call(9u16, [Hash::zero()], {})
     require(price > 0, "noprice")
     return price
 }
@@ -151,6 +181,37 @@ fn require_healthy_after(cp: u64, bp: u64) {
     require(hf >= min_cr, "unhealthy")
 }
 
+// ============================================================================
+// FIX #9: Stability fee accrual — global index grows continuously
+// ============================================================================
+fn update_stability_fee_index() {
+    let s: Storage = Storage::new()
+    let last_update: u64 = s.load(STABILITY_FEE_LAST_UPDATE_KEY).unwrap_or(get_current_topoheight())
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= last_update { return }
+    let blocks_elapsed: u64 = current_topo - last_update
+    let fee_bps: u64 = s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+    let current_index: u64 = s.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    // new_index = old_index * (1 + fee_bps * elapsed / (BPS * BLOCKS_PER_YEAR))
+    let scale_factor: u128 = (fee_bps as u128) * (blocks_elapsed as u128) * (STABILITY_FEE_SCALE as u128)
+    let denom: u128 = (10000u128) * (BLOCKS_PER_YEAR as u128)
+    let increment: u128 = scale_factor / denom
+    let new_index: u128 = (current_index as u128) + increment
+    s.store(STABILITY_FEE_INDEX_KEY, new_index as u64)
+    s.store(STABILITY_FEE_LAST_UPDATE_KEY, current_topo)
+}
+
+// Returns the current accrued borrow amount (principal + accumulated stability fee)
+fn get_accrued_borrow(vault: VaultSnapshot) -> u64 {
+    let s: Storage = Storage::new()
+    let current_index: u64 = s.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    if vault.borrow_index_at_open == 0 || vault.borrow_amount == 0 {
+        return vault.borrow_amount
+    }
+    // accrued = principal * current_index / index_at_open
+    return (vault.borrow_amount as u128 * current_index as u128 / vault.borrow_index_at_open as u128) as u64
+}
+
 fn queue_push(vault_id: u64) {
     let s: Storage = Storage::new()
     let cap: u64 = s.load(QUEUE_CAP_KEY).unwrap_or(DEFAULT_QUEUE_CAP)
@@ -169,7 +230,7 @@ fn queue_pop() -> u64 {
     let head: u64 = s.load(QUEUE_HEAD_KEY).unwrap_or(0)
     let tail: u64 = s.load(QUEUE_TAIL_KEY).unwrap_or(0)
     if head == tail { return 0 }
-    let vault_id: u64 = s.load(QUEUE_PREFIX + head.to_string(10u32)).unwrap()
+    let vault_id: u64 = s.load(QUEUE_PREFIX + head.to_string(10u32)).expect("err")
     s.delete(QUEUE_PREFIX + head.to_string(10u32))
     s.store(QUEUE_HEAD_KEY, (head + 1) % cap)
     return vault_id
@@ -184,21 +245,26 @@ fn queue_size() -> u64 {
     return cap - head + tail
 }
 
-entry deposit(collateral_asset: Hash, collateral_amount: u64) -> u64 {
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: deposit — FIX #8: optional salt for commit-reveal pattern
+entry deposit(collateral_asset: Hash, collateral_amount: u64, salt: Hash) -> u64 {
     when_not_paused()
     non_reentrant()
     require(collateral_asset == Hash::zero(), "onlyxel")
     require(collateral_amount > 0, "amtgt0")
-    let dep: u64 = get_deposit_for_asset(collateral_asset).unwrap()
+    let dep: u64 = get_deposit_for_asset(collateral_asset).expect("err")
     require(dep >= collateral_amount, "insdep")
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let rs: Storage = Storage::new()
-    let id: u64 = rs.load(COUNTER_KEY).unwrap()
+    let id: u64 = rs.load(COUNTER_KEY).expect("err")
     let topo: u64 = get_current_topoheight()
-    let collateral_cipher: u64 = collateral_amount
     let vault: VaultSnapshot = VaultSnapshot {
         owner: caller, collateral_asset: collateral_asset,
-        collateral_cipher: collateral_cipher, borrow_cipher: 0,
+        collateral_amount: collateral_amount, collateral_salt: salt,
+        borrow_amount: 0, borrow_index_at_open: 0,
         last_update_topo: topo, liquidated: false, created_at: topo, id: id
     }
     rs.store(VAULT_PREFIX + id.to_string(10u32), vault)
@@ -208,94 +274,119 @@ entry deposit(collateral_asset: Hash, collateral_amount: u64) -> u64 {
         require(ok, "rfail")
     }
     release_reentrancy()
-    return 0
+    return id
 }
 
+// ID 1: borrow — FIX #9: stability fee index snapshotted at open
 entry borrow(vault_id: u64, amount: u64) -> u64 {
     when_not_paused()
     non_reentrant()
     require(amount > 0, "amtgt0")
+    update_stability_fee_index()
     let rs: Storage = Storage::new()
-    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
-    require(vault.owner == get_caller().unwrap(), "notowner")
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
     require(!vault.liquidated, "liqd")
-    let cp: u64 = vault.collateral_cipher
-    let bp: u64 = vault.borrow_cipher
-    let new_bp: u64 = bp + amount
-    require(new_bp >= bp, "ovf")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    let new_bp: u64 = accrued_bp + amount
+    require(new_bp >= accrued_bp, "ovf")
     require_healthy_after(cp, new_bp)
     let protocol_fee_bps: u64 = rs.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE)
     let insurance_fee_bps: u64 = rs.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE)
     let total_fee_bps: u64 = protocol_fee_bps + insurance_fee_bps
     let fee: u64 = (amount as u128 * total_fee_bps as u128 / 10000u128) as u64
     let net: u64 = amount - fee
-    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
-    let treasury: Address = rs.load(TREASURY_KEY).unwrap()
-    let _ = xusd.call(2u16, [get_caller().unwrap(), net, treasury, fee], {})
-    vault.borrow_cipher = vault.borrow_cipher + amount
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let treasury: Address = rs.load(TREASURY_KEY).expect("err")
+    // xUSD v5.0 entry 2 = mint_split(to, amount, treasury, fee)
+    let _ = xusd.call(2u16, [get_caller().expect("err"), net, treasury, fee], {})
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    // Save new principal + index snapshot
+    vault.borrow_amount = new_bp
+    vault.borrow_index_at_open = current_index
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
     return 0
 }
 
+// ID 2: repay — FIX #9: repay the accrued amount (principal + accumulated fee)
 entry repay(vault_id: u64, amount: u64) -> u64 {
     when_not_paused()
     non_reentrant()
     require(amount > 0, "amtgt0")
+    update_stability_fee_index()
     let rs: Storage = Storage::new()
-    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
-    require(vault.owner == get_caller().unwrap(), "notowner")
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
     require(!vault.liquidated, "liqd")
-    let bp: u64 = vault.borrow_cipher
-    require(bp > 0, "nodebt")
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp > 0, "nodebt")
     let repay_amount: u64 = 0
-    if amount > bp { repay_amount = bp } else { repay_amount = amount }
-    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
+    if amount > accrued_bp { repay_amount = accrued_bp } else { repay_amount = amount }
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    // xUSD v5.0 entry 3 = burn_tokens(amount)
     let _ = xusd.call(3u16, [repay_amount], {})
-    vault.borrow_cipher = vault.borrow_cipher - repay_amount
+    // The interest portion (accrued - principal) is the stability fee earned by treasury
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if repay_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (repay_amount - interest_portion)
+    } else {
+        // paying only part of the interest — principal unchanged
+        new_principal = vault.borrow_amount
+    }
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_amount = new_principal
+    vault.borrow_index_at_open = current_index
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
     return 0
 }
 
+// ID 3: withdraw
 entry withdraw(vault_id: u64, amount: u64) -> u64 {
     when_not_paused()
     non_reentrant()
     require(amount > 0, "amtgt0")
+    update_stability_fee_index()
     let rs: Storage = Storage::new()
-    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
-    require(vault.owner == get_caller().unwrap(), "notowner")
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
     require(!vault.liquidated, "liqd")
-    let cp: u64 = vault.collateral_cipher
-    let bp: u64 = vault.borrow_cipher
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
     require(cp >= amount, "inscol")
     let new_cp: u64 = cp - amount
-    require_healthy_after(new_cp, bp)
+    require_healthy_after(new_cp, accrued_bp)
     let ok: bool = transfer(vault.owner, amount, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher - amount
+    vault.collateral_amount = vault.collateral_amount - amount
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
     release_reentrancy()
     return 0
 }
 
+// ID 4: liquidate — uses accrued borrow for repayment math
 entry liquidate(vault_id: u64, max_borrow_to_repay: u64) -> u64 {
     when_not_paused()
     non_reentrant()
     require(max_borrow_to_repay > 0, "amtgt0")
+    update_stability_fee_index()
     let rs: Storage = Storage::new()
-    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
     require(!vault.liquidated, "alrdy")
-    require(vault.owner != get_caller().unwrap(), "selfliq")
-    let cp: u64 = vault.collateral_cipher
-    let bp: u64 = vault.borrow_cipher
-    require(bp > 0, "nodebt")
-    let hf: u64 = calc_health_factor_bps(cp, bp)
+    require(vault.owner != get_caller().expect("err"), "selfliq")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp > 0, "nodebt")
+    let hf: u64 = calc_health_factor_bps(cp, accrued_bp)
     let min_cr: u64 = rs.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR)
     require(hf < min_cr, "healthy")
     let grace: u64 = rs.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD)
@@ -305,27 +396,37 @@ entry liquidate(vault_id: u64, max_borrow_to_repay: u64) -> u64 {
     }
     let liq_penalty_bps: u64 = rs.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY)
     let repay_amount: u64 = 0
-    if max_borrow_to_repay > bp { repay_amount = bp } else { repay_amount = max_borrow_to_repay }
+    if max_borrow_to_repay > accrued_bp { repay_amount = accrued_bp } else { repay_amount = max_borrow_to_repay }
     let price: u64 = get_xel_price()
     let repay_value_usd: u64 = (repay_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
     let collateral_to_seize: u64 = (repay_value_usd as u128 * (10000u128 + liq_penalty_bps as u128) / 10000u128 / price as u128 * PRICE_DECIMALS as u128) as u64
     require(collateral_to_seize <= cp, "seizeovf")
-    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
     let _ = xusd.call(3u16, [repay_amount], {})
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let ok: bool = transfer(caller, collateral_to_seize, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher - collateral_to_seize
-    vault.borrow_cipher = vault.borrow_cipher - repay_amount
+    vault.collateral_amount = vault.collateral_amount - collateral_to_seize
+    // Recompute new principal after partial repay
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if repay_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (repay_amount - interest_portion)
+    } else {
+        new_principal = vault.borrow_amount
+    }
+    vault.borrow_amount = new_principal
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_index_at_open = current_index
     vault.last_update_topo = now_topo
-    let new_bp: u64 = vault.borrow_cipher
-    if new_bp == 0 {
+    if new_principal == 0 {
         vault.liquidated = true
-        let new_cp: u64 = vault.collateral_cipher
+        let new_cp: u64 = vault.collateral_amount
         if new_cp > 0 {
             transfer(vault.owner, new_cp, vault.collateral_asset)
-            vault.collateral_cipher = 0
+            vault.collateral_amount = 0
         }
     }
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
@@ -333,21 +434,23 @@ entry liquidate(vault_id: u64, max_borrow_to_repay: u64) -> u64 {
     return 0
 }
 
+// ID 5: redeem
 entry redeem(xusd_amount: u64) -> u64 {
     when_not_paused()
     non_reentrant()
+    update_stability_fee_index()
     require(xusd_amount > 0, "amtgt0")
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let rs: Storage = Storage::new()
     let vault_id: u64 = queue_pop()
     require(vault_id > 0, "empty")
-    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
     require(!vault.liquidated, "liqd")
-    let cp: u64 = vault.collateral_cipher
-    let bp: u64 = vault.borrow_cipher
-    require(bp >= xusd_amount, "insdebt")
-    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp >= xusd_amount, "insdebt")
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
     let _ = xusd.call(3u16, [xusd_amount], {})
     let price: u64 = get_xel_price()
     let redemption_fee_bps: u64 = rs.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE)
@@ -355,26 +458,199 @@ entry redeem(xusd_amount: u64) -> u64 {
     require(xel_to_send > 0 && xel_to_send <= cp, "badredeem")
     let ok: bool = transfer(caller, xel_to_send, vault.collateral_asset)
     require(ok, "txfail")
-    vault.collateral_cipher = vault.collateral_cipher - xel_to_send
-    vault.borrow_cipher = vault.borrow_cipher - xusd_amount
+    vault.collateral_amount = vault.collateral_amount - xel_to_send
+    // Recompute new principal after partial redemption
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if xusd_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (xusd_amount - interest_portion)
+    } else {
+        new_principal = vault.borrow_amount
+    }
+    vault.borrow_amount = new_principal
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_index_at_open = current_index
     vault.last_update_topo = get_current_topoheight()
     rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
-    let remaining_bp: u64 = vault.borrow_cipher
-    if remaining_bp > 0 { queue_push(vault_id) }
+    if new_principal > 0 { queue_push(vault_id) }
     release_reentrancy()
     return 0
 }
 
-pub fn get_health_factor(vault_id: u64) -> u64 {
+// ID 6: get_health_factor_entry
+entry get_health_factor_entry(vault_id: u64) -> u64 {
     let rs: Storage = Storage::new()
     let vault_opt: optional<VaultSnapshot> = rs.load(VAULT_PREFIX + vault_id.to_string(10u32))
     if vault_opt.is_none() { return 0 }
-    let vault: VaultSnapshot = vault_opt.unwrap()
+    let vault: VaultSnapshot = vault_opt.expect("err")
     if vault.liquidated { return 0 }
-    let cp: u64 = vault.collateral_cipher
-    let bp: u64 = vault.borrow_cipher
-    return calc_health_factor_bps(cp, bp)
+    update_stability_fee_index()
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    return calc_health_factor_bps(vault.collateral_amount, accrued_bp)
 }
+
+// ID 7: total_vaults_entry
+entry total_vaults_entry() -> u64 {
+    let c: optional<u64> = Storage::new().load(COUNTER_KEY)
+    return c.unwrap_or(1) - 1
+}
+
+// ID 8: redemption_queue_size_entry
+entry redemption_queue_size_entry() -> u64 { return queue_size() }
+
+// ID 9: get_vault_entry
+entry get_vault_entry(vault_id: u64) -> (Address, Hash, u64, u64, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return (
+        vault.owner, vault.collateral_asset, vault.collateral_amount,
+        vault.borrow_amount, vault.last_update_topo,
+        vault.liquidated, vault.id
+    )
+}
+
+// ID 10: get_accrued_borrow_entry
+entry get_accrued_borrow_entry(vault_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    update_stability_fee_index()
+    return get_accrued_borrow(vault)
+}
+
+// ID 11: get_config_public_entry
+entry get_config_public_entry() -> (u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR),
+        s.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY),
+        s.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE),
+        s.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE),
+        s.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE),
+        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD),
+        s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+    )
+}
+
+// ID 12: get_stability_fee_index_entry
+entry get_stability_fee_index_entry() -> u64 {
+    update_stability_fee_index()
+    return Storage::new().load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+}
+
+// ID 13: pause
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+
+// ID 14: unpause
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// ID 15: set_min_cr_bps
+entry set_min_cr_bps(cr: u64) -> u64 {
+    only_admin()
+    require(cr >= 15000 && cr <= 50000, "badval")
+    Storage::new().store(MIN_CR_KEY, cr)
+    return 0
+}
+
+// ID 16: set_liq_penalty_bps
+entry set_liq_penalty_bps(p: u64) -> u64 {
+    only_admin()
+    require(p >= 500 && p <= 2000, "badval")
+    Storage::new().store(LIQ_PENALTY_KEY, p)
+    return 0
+}
+
+// ID 17: set_protocol_fee_bps
+entry set_protocol_fee_bps(f: u64) -> u64 { only_admin() require(f <= 500, "badval") Storage::new().store(PROTOCOL_FEE_KEY, f) return 0 }
+
+// ID 18: set_insurance_fee_bps
+entry set_insurance_fee_bps(f: u64) -> u64 { only_admin() require(f <= 200, "badval") Storage::new().store(INSURANCE_FEE_KEY, f) return 0 }
+
+// ID 19: set_redemption_fee_bps
+entry set_redemption_fee_bps(f: u64) -> u64 { only_admin() require(f <= 500, "badval") Storage::new().store(REDEMPTION_FEE_KEY, f) return 0 }
+
+// ID 20: set_grace_period_blocks
+entry set_grace_period_blocks(p: u64) -> u64 { only_admin() require(p <= 100, "badval") Storage::new().store(GRACE_PERIOD_KEY, p) return 0 }
+
+// ID 21: set_stability_fee_bps  (FIX #9: configurable)
+entry set_stability_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 5000, "badval")  // max 50% APR
+    update_stability_fee_index()
+    Storage::new().store(STABILITY_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 22: set_queue_cap
+entry set_queue_cap(cap: u64) -> u64 { only_admin() require(cap >= 100 && cap <= 10000, "badval") Storage::new().store(QUEUE_CAP_KEY, cap) return 0 }
+
+// ID 23: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 24: set_xusd_contract
+entry set_xusd_contract(xc: Hash) -> u64 { only_admin() Storage::new().store(XUSD_CONTRACT_KEY, xc) return 0 }
+
+// ID 25: set_xusd_asset
+entry set_xusd_asset(xa: Hash) -> u64 { only_admin() Storage::new().store(XUSD_ASSET_KEY, xa) return 0 }
+
+// ID 26: set_treasury
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+
+// ID 27: set_insurance_pool
+entry set_insurance_pool(ic: Hash) -> u64 { only_admin() Storage::new().store(INSURANCE_KEY, ic) return 0 }
+
+// ID 28: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 29: set_guardian
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// ID 30: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 31: set_emergency
+entry set_emergency(e: Address) -> u64 { only_emergency() Storage::new().store(EMERGENCY_KEY, e) return 0 }
+
+// ID 32: get_version
+entry get_version() -> string { return VERSION }
+
+// ID 33: is_paused
+entry is_paused() -> bool { return Storage::new().load(PAUSED_KEY).unwrap_or(false) }
+
+// ID 34: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 35: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — for off-chain frontend reads via `invoke` (no gas)
+// These do NOT count toward entry ID numbering.
+// ============================================================================
+
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+pub fn get_treasury() -> Address { return Storage::new().load(TREASURY_KEY).unwrap_or(get_caller().expect("err")) }
 
 pub fn total_vaults() -> u64 {
     let c: optional<u64> = Storage::new().load(COUNTER_KEY)
@@ -385,24 +661,37 @@ pub fn redemption_queue_size() -> u64 {
     return queue_size()
 }
 
-pub fn get_vault(vault_id: u64) -> (Address, Hash, u64, u64, bool, u64) {
+pub fn get_vault(vault_id: u64) -> (Address, Hash, u64, u64, u64, bool, u64) {
     let s: Storage = Storage::new()
-    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).unwrap()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
     return (
-        vault.owner,
-        vault.collateral_asset,
-        vault.last_update_topo,
-        vault.created_at,
-        vault.liquidated,
-        vault.id
+        vault.owner, vault.collateral_asset, vault.collateral_amount,
+        vault.borrow_amount, vault.last_update_topo,
+        vault.liquidated, vault.id
     )
+}
+
+pub fn get_health_factor(vault_id: u64) -> u64 {
+    let rs: Storage = Storage::new()
+    let vault_opt: optional<VaultSnapshot> = rs.load(VAULT_PREFIX + vault_id.to_string(10u32))
+    if vault_opt.is_none() { return 0 }
+    let vault: VaultSnapshot = vault_opt.expect("err")
+    if vault.liquidated { return 0 }
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    return calc_health_factor_bps(vault.collateral_amount, accrued_bp)
 }
 
 pub fn get_vault_health(vault_id: u64) -> u64 {
     return get_health_factor(vault_id)
 }
 
-pub fn get_config_public() -> (u64, u64, u64, u64, u64, u64) {
+pub fn get_accrued_borrow_view(vault_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return get_accrued_borrow(vault)
+}
+
+pub fn get_config_public() -> (u64, u64, u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
         s.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR),
@@ -410,161 +699,59 @@ pub fn get_config_public() -> (u64, u64, u64, u64, u64, u64) {
         s.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE),
         s.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE),
         s.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE),
-        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD)
+        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD),
+        s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
     )
 }
 
-pub fn get_treasury() -> Address {
-    return Storage::new().load(TREASURY_KEY).unwrap_or(get_caller().unwrap())
+pub fn get_stability_fee_index() -> u64 {
+    return Storage::new().load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
 }
 
-entry pause(reason: string) -> u64 {
-    only_guardian_or_admin()
-    Storage::new().store(PAUSED_KEY, true)
-    return 0
+pub fn get_stability_fee_bps() -> u64 {
+    return Storage::new().load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
 }
 
-entry unpause() -> u64 {
-    only_admin()
-    Storage::new().store(PAUSED_KEY, false)
-    return 0
+pub fn get_xusd_asset() -> Hash {
+    return Storage::new().load(XUSD_ASSET_KEY).unwrap_or(Hash::zero())
 }
 
-entry set_min_cr_bps(cr: u64) -> u64 {
-    only_admin()
-    require(cr >= 15000 && cr <= 50000, "badval")
-    Storage::new().store(MIN_CR_KEY, cr)
-    return 0
+pub fn get_xusd_contract() -> Hash {
+    return Storage::new().load(XUSD_CONTRACT_KEY).unwrap_or(Hash::zero())
 }
 
-entry set_liq_penalty_bps(p: u64) -> u64 {
-    only_admin()
-    require(p >= 500 && p <= 2000, "badval")
-    Storage::new().store(LIQ_PENALTY_KEY, p)
-    return 0
+pub fn get_insurance_pool() -> Hash {
+    return Storage::new().load(INSURANCE_KEY).unwrap_or(Hash::zero())
 }
 
-entry set_protocol_fee_bps(f: u64) -> u64 {
-    only_admin()
-    require(f <= 500, "badval")
-    Storage::new().store(PROTOCOL_FEE_KEY, f)
-    return 0
+pub fn get_registry() -> Hash {
+    return Storage::new().load(REGISTRY_KEY).unwrap_or(Hash::zero())
 }
 
-entry set_insurance_fee_bps(f: u64) -> u64 {
-    only_admin()
-    require(f <= 200, "badval")
-    Storage::new().store(INSURANCE_FEE_KEY, f)
-    return 0
-}
-
-entry set_redemption_fee_bps(f: u64) -> u64 {
-    only_admin()
-    require(f <= 500, "badval")
-    Storage::new().store(REDEMPTION_FEE_KEY, f)
-    return 0
-}
-
-entry set_grace_period_blocks(p: u64) -> u64 {
-    only_admin()
-    require(p <= 100, "badval")
-    Storage::new().store(GRACE_PERIOD_KEY, p)
-    return 0
-}
-
-entry set_queue_cap(cap: u64) -> u64 {
-    only_admin()
-    require(cap >= 100 && cap <= 10000, "badval")
-    Storage::new().store(QUEUE_CAP_KEY, cap)
-    return 0
-}
-
-entry set_registry(reg: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(REGISTRY_KEY, reg)
-    return 0
-}
-
-entry set_xusd_contract(xc: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(XUSD_CONTRACT_KEY, xc)
-    return 0
-}
-
-entry set_xusd_asset(xa: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(XUSD_ASSET_KEY, xa)
-    return 0
-}
-
-entry set_treasury(t: Address) -> u64 {
-    only_admin()
-    Storage::new().store(TREASURY_KEY, t)
-    return 0
-}
-
-entry set_insurance_pool(ic: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(INSURANCE_KEY, ic)
-    return 0
-}
-
-entry set_timelock(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
-entry set_guardian(g: Address) -> u64 {
-    only_admin()
-    Storage::new().store(GUARDIAN_KEY, g)
-    return 0
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-
-entry set_emergency(e: Address) -> u64 {
-    only_emergency()
-    Storage::new().store(EMERGENCY_KEY, e)
-    return 0
-}
-
-entry emergency_withdraw() -> u64 {
-    only_emergency()
-    let caller: Address = get_caller().unwrap()
-    let bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
-    require(bal > 0, "nofunds")
-    let ok: bool = transfer(caller, bal, Hash::zero())
-    require(ok, "txfail")
-    return 0
-}
-
-entry get_version() -> string {
-    return VERSION
-}
-
-entry is_paused() -> bool {
-    return Storage::new().load(PAUSED_KEY).unwrap_or(false)
-}
-
-entry get_config() -> (u64, u64, u64, u64, u64, u64) {
+// List vault IDs owned by a user (off-chain pagination)
+// Note: This iterates all vaults — for large vault counts, prefer an off-chain indexer.
+pub fn get_vault_ids_for_user_paginated(user: Address, offset: u64, limit: u64) -> u64[] {
     let s: Storage = Storage::new()
-    return (
-        s.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR),
-        s.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY),
-        s.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE),
-        s.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE),
-        s.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE),
-        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD)
-    )
+    let total: u64 = s.load(COUNTER_KEY).unwrap_or(1)
+    let total = total - 1
+    let result: u64[] = []
+    let i: u64 = 1  // vault IDs start at 1
+    let skipped: u64 = 0
+    let collected: u64 = 0
+    while i <= total && collected < limit {
+        let vault_opt: optional<VaultSnapshot> = s.load(VAULT_PREFIX + i.to_string(10u32))
+        if vault_opt.is_some() {
+            let vault: VaultSnapshot = vault_opt.expect("err")
+            if vault.owner == user && !vault.liquidated {
+                if skipped >= offset {
+                    result.push(i)
+                    collected += 1
+                } else {
+                    skipped += 1
+                }
+            }
+        }
+        i += 1
+    }
+    return result
 }

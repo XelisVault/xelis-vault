@@ -1,4 +1,42 @@
-const VERSION: string = "PSM v4.2"
+// ============================================================================
+// PSM.slx — XELIS Vault v5.0 (Peg Stability Module)
+// ----------------------------------------------------------------------------
+// FIX #12: get_xel_price() calls oracle.call(8u16, ["XEL/USD"], {})
+//          (StakedOracle v5.0 entry 8 = get_price_entry).
+// FIX #14: Two-step emergency_withdraw at IDs 11/12 with 17280-block delay.
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : mint(xel_amount, min_xusd_out)
+//   1  : redeem(xusd_amount, min_xel_out)
+//   2  : get_reserves_entry
+//   3  : get_mint_fee_entry
+//   4  : get_redeem_fee_entry
+//   5  : get_daily_usage_entry
+//   6  : set_mint_fee_bps
+//   7  : set_redeem_fee_bps
+//   8  : set_daily_caps
+//   9  : pause
+//   10 : unpause
+//   11 : request_emergency_withdraw
+//   12 : execute_emergency_withdraw
+//   13 : set_xusd_contract
+//   14 : set_xusd_asset
+//   15 : set_oracle
+//   16 : set_treasury
+//   17 : set_registry
+//   18 : set_timelock
+//   19 : set_guardian
+//   20 : set_emergency
+//   21 : transfer_admin
+//   22 : get_version
+//
+// Cross-contract calls (v5.0 entry IDs):
+//   mint   : xusd.call(2u16, [caller, net_xusd, treasury, fee], {})   // xUSD.mint_split
+//   redeem : xusd.call(3u16, [xusd_amount], {})                       // xUSD.burn_tokens
+// ============================================================================
+
+const VERSION: string = "PSM v5.0"
+
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
 const GUARDIAN_KEY: string = "gd"
@@ -16,16 +54,22 @@ const DAILY_REDEEM_CAP_KEY: string = "drc"
 const DAILY_MINT_USED_KEY: string = "dmu"
 const DAILY_REDEEM_USED_KEY: string = "dru"
 const DAILY_RESET_TOPO_KEY: string = "drt"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 fn get_xel_asset() -> Hash { return Hash::zero() }
+
 const DEFAULT_MINT_FEE_BPS: u64 = 50
 const DEFAULT_REDEEM_FEE_BPS: u64 = 10
 const DEFAULT_DAILY_MINT_CAP: u64 = 100000000000000
 const DEFAULT_DAILY_REDEEM_CAP: u64 = 100000000000000
 const DAILY_RESET_BLOCKS: u64 = 17280
 const PRICE_DECIMALS: u64 = 100000000
+
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -39,38 +83,39 @@ hook constructor() -> u64 {
     s.store(DAILY_RESET_TOPO_KEY, 0u64)
     return 0
 }
+
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    if caller == admin {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
+
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
-    if caller == g {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
     only_admin()
 }
+
 fn only_emergency() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let e: Address = s.load(EMERGENCY_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
     require(caller == e, "notemg")
 }
+
 fn when_not_paused() {
     let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
     require(!paused, "paused")
 }
+
 fn maybe_reset_daily() {
     let s: Storage = Storage::new()
     let last_reset: u64 = s.load(DAILY_RESET_TOPO_KEY).unwrap_or(0)
@@ -81,28 +126,36 @@ fn maybe_reset_daily() {
         s.store(DAILY_RESET_TOPO_KEY, current_topo)
     }
 }
+
+// FIX #12: oracle.call(8u16, ["XEL/USD"], {}) — StakedOracle v5.0 entry 8 = get_price_entry
 fn get_xel_price() -> u64 {
     let s: Storage = Storage::new()
-    let oracle_hash: Hash = s.load(ORACLE_KEY).unwrap()
-    let oracle: Contract = Contract::new(oracle_hash).unwrap()
-    let price: u64 = oracle.call(0u16, ["XEL/USD"], {})
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("err")
+    let oracle: Contract = Contract::new(oracle_hash).expect("err")
+    let price: u64 = oracle.call(8u16, ["XEL/USD"], {})
     require(price > 0, "noprice")
     return price
 }
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: mint
 entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     when_not_paused()
     require(xel_amount > 0, "amtgt0")
     require(min_xusd_out > 0, "noslippage")
     maybe_reset_daily()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let daily_mint_used: u64 = s.load(DAILY_MINT_USED_KEY).unwrap_or(0)
     let daily_mint_cap: u64 = s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP)
     require(daily_mint_used + xel_amount <= daily_mint_cap, "dailycap")
-    let dep: u64 = get_deposit_for_asset(get_xel_asset()).unwrap()
+    let dep: u64 = get_deposit_for_asset(get_xel_asset()).expect("err")
     require(dep >= xel_amount, "insdep")
     if dep > xel_amount {
-        transfer(caller, dep - xel_amount, get_xel_asset())
+        let _ = transfer(caller, dep - xel_amount, get_xel_asset())
     }
     let price: u64 = get_xel_price()
     let gross_xusd: u64 = (xel_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
@@ -110,20 +163,22 @@ entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     let fee: u64 = (gross_xusd as u128 * mint_fee_bps as u128 / 10000u128) as u64
     let net_xusd: u64 = gross_xusd - fee
     require(net_xusd >= min_xusd_out, "slippage")
-    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
-    let treasury: Address = s.load(TREASURY_KEY).unwrap()
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let treasury: Address = s.load(TREASURY_KEY).expect("err")
     let _ = xusd.call(2u16, [caller, net_xusd, treasury, fee], {})
     s.store(DAILY_MINT_USED_KEY, daily_mint_used + xel_amount)
     return 0
 }
+
+// ID 1: redeem
 entry redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
     when_not_paused()
     require(xusd_amount > 0, "amtgt0")
     require(min_xel_out > 0, "noslippage")
     maybe_reset_daily()
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let daily_redeem_used: u64 = s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0)
     let daily_redeem_cap: u64 = s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
     require(daily_redeem_used + xusd_amount <= daily_redeem_cap, "dailycap")
@@ -135,31 +190,202 @@ entry redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
     require(net_xel >= min_xel_out, "slippage")
     let xel_balance: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
     require(xel_balance >= net_xel, "insreserve")
-    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).unwrap()
-    let xusd: Contract = Contract::new(xusd_hash).unwrap()
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
     let _ = xusd.call(3u16, [xusd_amount], {})
     let ok: bool = transfer(caller, net_xel, get_xel_asset())
     require(ok, "txfail")
     if fee_xel > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).unwrap()
-        transfer(treasury, fee_xel, get_xel_asset())
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee_xel, get_xel_asset())
     }
     s.store(DAILY_REDEEM_USED_KEY, daily_redeem_used + xusd_amount)
     return 0
 }
-pub fn get_reserves() -> (u64, u64) {
+
+// ID 2: get_reserves_entry
+entry get_reserves_entry() -> (u64, u64) {
     let s: Storage = Storage::new()
     let xel_reserve: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
-    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).unwrap()
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
     let xusd_balance: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
     return (xel_reserve, xusd_balance)
 }
+
+// ID 3: get_mint_fee_entry
+entry get_mint_fee_entry() -> u64 {
+    return Storage::new().load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
+}
+
+// ID 4: get_redeem_fee_entry
+entry get_redeem_fee_entry() -> u64 {
+    return Storage::new().load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
+}
+
+// ID 5: get_daily_usage_entry
+entry get_daily_usage_entry() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(DAILY_MINT_USED_KEY).unwrap_or(0),
+        s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0),
+        s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP),
+        s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
+    )
+}
+
+// ID 6: set_mint_fee_bps
+entry set_mint_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 500, "badval")
+    Storage::new().store(MINT_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 7: set_redeem_fee_bps
+entry set_redeem_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 500, "badval")
+    Storage::new().store(REDEEM_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 8: set_daily_caps
+entry set_daily_caps(mint_cap: u64, redeem_cap: u64) -> u64 {
+    only_admin()
+    require(mint_cap > 0 && redeem_cap > 0, "badval")
+    let s: Storage = Storage::new()
+    s.store(DAILY_MINT_CAP_KEY, mint_cap)
+    s.store(DAILY_REDEEM_CAP_KEY, redeem_cap)
+    return 0
+}
+
+// ID 9: pause
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 10: unpause
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 11: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 12: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ID 13: set_xusd_contract
+entry set_xusd_contract(xc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_CONTRACT_KEY, xc)
+    return 0
+}
+
+// ID 14: set_xusd_asset
+entry set_xusd_asset(xa: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_ASSET_KEY, xa)
+    return 0
+}
+
+// ID 15: set_oracle
+entry set_oracle(oracle: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ORACLE_KEY, oracle)
+    return 0
+}
+
+// ID 16: set_treasury
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+// ID 17: set_registry
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 18: set_timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 19: set_guardian
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// ID 20: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 21: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 22: get_version
+entry get_version() -> string {
+    return VERSION
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn get_reserves() -> (u64, u64) {
+    let s: Storage = Storage::new()
+    let xel_reserve: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
+    let xusd_balance: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
+    return (xel_reserve, xusd_balance)
+}
+
 pub fn get_mint_fee() -> u64 {
     return Storage::new().load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
 }
+
 pub fn get_redeem_fee() -> u64 {
     return Storage::new().load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
 }
+
 pub fn get_daily_usage() -> (u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
@@ -169,104 +395,9 @@ pub fn get_daily_usage() -> (u64, u64, u64, u64) {
         s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
     )
 }
-entry set_mint_fee_bps(bps: u64) -> u64 {
-    only_admin()
-    require(bps <= 500, "badval")
-    Storage::new().store(MINT_FEE_BPS_KEY, bps)
-    return 0
-}
-entry set_redeem_fee_bps(bps: u64) -> u64 {
-    only_admin()
-    require(bps <= 500, "badval")
-    Storage::new().store(REDEEM_FEE_BPS_KEY, bps)
-    return 0
-}
-entry set_daily_caps(mint_cap: u64, redeem_cap: u64) -> u64 {
-    only_admin()
-    require(mint_cap > 0 && redeem_cap > 0, "badval")
-    let s: Storage = Storage::new()
-    s.store(DAILY_MINT_CAP_KEY, mint_cap)
-    s.store(DAILY_REDEEM_CAP_KEY, redeem_cap)
-    return 0
-}
-entry pause(reason: string) -> u64 {
-    only_guardian_or_admin()
-    Storage::new().store(PAUSED_KEY, true)
-    return 0
-}
-entry unpause() -> u64 {
-    only_admin()
-    Storage::new().store(PAUSED_KEY, false)
-    return 0
-}
-entry emergency_withdraw() -> u64 {
-    only_emergency()
-    let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let xel_bal: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
-    if xel_bal > 0 {
-        transfer(caller, xel_bal, get_xel_asset())
-    }
-    let xusd_asset_opt: optional<Hash> = s.load(XUSD_ASSET_KEY)
-    if xusd_asset_opt.is_some() {
-        let xusd_asset: Hash = xusd_asset_opt.unwrap()
-        let xusd_bal: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
-        if xusd_bal > 0 {
-            transfer(caller, xusd_bal, xusd_asset)
-        }
-    }
-    return 0
-}
-entry set_xusd_contract(xc: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(XUSD_CONTRACT_KEY, xc)
-    return 0
-}
-entry set_xusd_asset(xa: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(XUSD_ASSET_KEY, xa)
-    return 0
-}
-entry set_oracle(oracle: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(ORACLE_KEY, oracle)
-    return 0
-}
-entry set_treasury(t: Address) -> u64 {
-    only_admin()
-    Storage::new().store(TREASURY_KEY, t)
-    return 0
-}
-entry set_registry(reg: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(REGISTRY_KEY, reg)
-    return 0
-}
-entry set_timelock(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
+
 pub fn set_timelock_tl(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
-}
-entry set_guardian(g: Address) -> u64 {
-    only_admin()
-    Storage::new().store(GUARDIAN_KEY, g)
-    return 0
-}
-entry set_emergency(e: Address) -> u64 {
-    only_emergency()
-    Storage::new().store(EMERGENCY_KEY, e)
-    return 0
-}
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-entry get_version() -> string {
-    return VERSION
 }

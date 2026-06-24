@@ -1,4 +1,10 @@
-const VERSION: string = "FlashLoan v4.2"
+// ============================================================================
+// FlashLoan.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #5: flash_loan() rewritten cleanly with proper balance check.
+// FIX #14: Two-step emergency_withdraw.
+// ============================================================================
+const VERSION: string = "FlashLoan v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -12,13 +18,16 @@ const FEE_BPS_KEY: string = "fb"
 const TOTAL_EARNED_KEY: string = "te"
 const RG_STATUS_KEY: string = "rg"
 
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
 const DEFAULT_FEE_BPS: u64 = 9
 const RG_NOT_ENTERED: u64 = 1
 const RG_ENTERED: u64 = 2
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
     s.store(EMERGENCY_KEY, caller)
@@ -31,32 +40,28 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
-    if caller == admin {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
 
 fn only_guardian_or_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let g: Address = s.load(GUARDIAN_KEY).unwrap()
-    if caller == g {
-        return
-    }
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
     only_admin()
 }
 
 fn only_emergency() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let e: Address = s.load(EMERGENCY_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
     require(caller == e, "notemg")
 }
 
@@ -71,6 +76,11 @@ fn release_reentrancy() {
     Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
 }
 
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: flash_loan — FIX #5: clean structure, proper balance check
 entry flash_loan(
     asset: Hash,
     amount: u64,
@@ -91,47 +101,46 @@ entry flash_loan(
     let total_to_repay: u64 = amount + fee
     require(total_to_repay >= amount, "ovf")
 
-    let caller: Address = get_caller().unwrap()
-    let cb: Contract = Contract::new(callback_contract).unwrap()
-    let result: u64 = cb.call(0u16, [asset, amount, fee, caller.to_string(), callback_data], { asset: amount })
+    // Send the principal to the callback contract
+    let caller: Address = get_caller().expect("err")
+    let cb: Contract = Contract::new(callback_contract).expect("err")
+    // Callback contract must implement entry 0 with signature (asset, amount, fee, caller_addr, callback_data)
+    let _ = transfer(caller, amount, asset)
+    let result: u64 = cb.call(0u16, [asset, amount, fee, caller, callback_data], {})
     require(result == 0, "cbfail")
 
+    // After callback, balance must be >= balance_before + fee
     let balance_after: u64 = get_balance_for_asset(asset).unwrap_or(0)
-    let received: u64 = 0
-    if balance_after > balance_before {
-        received = balance_after - balance_before
-    } else {
-        received = 0
-    }
-        
-        if fee > 0 {
-        let treasury: Address = s.load(TREASURY_KEY).unwrap()
-        transfer(treasury, fee, asset)
+    require(balance_after >= balance_before + fee, "notrepaid")
+
+    // Send fee to treasury
+    if fee > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee, asset)
         let total_earned: u64 = s.load(TOTAL_EARNED_KEY).unwrap_or(0)
         s.store(TOTAL_EARNED_KEY, total_earned + fee)
-        }
-        
-        release_reentrancy()
-        return 0
     }
 
-pub fn approve_repay(amount: u64) -> u64 {
-    require(amount > 0, "amtgt0")
+    release_reentrancy()
     return 0
 }
 
-pub fn get_fee_bps() -> u64 {
+// ID 1: get_fee_bps_entry
+entry get_fee_bps_entry() -> u64 {
     return Storage::new().load(FEE_BPS_KEY).unwrap_or(DEFAULT_FEE_BPS)
 }
 
-pub fn get_total_earned() -> u64 {
+// ID 2: get_total_earned_entry
+entry get_total_earned_entry() -> u64 {
     return Storage::new().load(TOTAL_EARNED_KEY).unwrap_or(0)
 }
 
-pub fn get_available_liquidity(asset: Hash) -> u64 {
+// ID 3: get_available_liquidity_entry
+entry get_available_liquidity_entry(asset: Hash) -> u64 {
     return get_balance_for_asset(asset).unwrap_or(0)
 }
 
+// ID 4: set_fee_bps
 entry set_fee_bps(bps: u64) -> u64 {
     only_admin()
     require(bps >= 1 && bps <= 100, "badval")
@@ -139,83 +148,58 @@ entry set_fee_bps(bps: u64) -> u64 {
     return 0
 }
 
-entry pause(reason: string) -> u64 {
-    only_guardian_or_admin()
-    Storage::new().store(PAUSED_KEY, true)
-    return 0
-}
+// ID 5: pause
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
 
-entry unpause() -> u64 {
-    only_admin()
-    Storage::new().store(PAUSED_KEY, false)
-    return 0
-}
+// ID 6: unpause
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
 
-entry emergency_withdraw() -> u64 {
-    only_emergency()
+// ID 7: set_treasury
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+
+// ID 8: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 9: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 10: set_guardian
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// ID 11: set_emergency
+entry set_emergency(e: Address) -> u64 { only_emergency() Storage::new().store(EMERGENCY_KEY, e) return 0 }
+
+// ID 12: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 13: get_version
+entry get_version() -> string { return VERSION }
+
+// ID 14: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-
-    let xel_bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
-    if xel_bal > 0 {
-        transfer(caller, xel_bal, Hash::zero())
-    }
-
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
     return 0
 }
 
-entry emergency_withdraw_asset(asset: Hash) -> u64 {
-    only_emergency()
-    let caller: Address = get_caller().unwrap()
+// ID 15: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
     let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
-    if bal > 0 {
-        transfer(caller, bal, asset)
-    }
+    if bal > 0 { transfer(caller, bal, asset) }
     return 0
 }
 
-entry set_treasury(t: Address) -> u64 {
-    only_admin()
-    Storage::new().store(TREASURY_KEY, t)
-    return 0
-}
-
-entry set_registry(reg: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(REGISTRY_KEY, reg)
-    return 0
-}
-
-entry set_timelock(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
-pub fn set_timelock_tl(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
-entry set_guardian(g: Address) -> u64 {
-    only_admin()
-    Storage::new().store(GUARDIAN_KEY, g)
-    return 0
-}
-
-entry set_emergency(e: Address) -> u64 {
-    only_emergency()
-    Storage::new().store(EMERGENCY_KEY, e)
-    return 0
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-
-entry get_version() -> string {
-    return VERSION
-}
+// pub fn (read-only)
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }

@@ -1,4 +1,37 @@
-const VERSION: string = "ComplianceModule v4.2"
+// ============================================================================
+// ComplianceModule.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// KYC/AML compliance flags, preserved from v4.2.
+//
+// v5.0 changes:
+//   - pub fn (check_transfer, verify_proof, is_compliant, get_current_root,
+//     get_verifiers_count) wrapped as *_entry entries so AssetVault (and other
+//     RWA contracts) can call check_transfer_entry via Contract::call.
+//     AssetVault v5.0 entry 2 (transfer_asset) invokes entry 0 with
+//     [from, to, asset, amount] and expects a bool — so entry 0 MUST be
+//     check_transfer_entry.
+//   - No emergency_withdraw (contract holds no funds).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : check_transfer_entry
+//   1  : verify_proof_entry
+//   2  : is_compliant_entry
+//   3  : get_current_root_entry
+//   4  : get_verifiers_count_entry
+//   5  : update_merkle_root
+//   6  : mark_compliant
+//   7  : add_verifier
+//   8  : remove_verifier
+//   9  : set_compliance_required
+//   10 : set_registry
+//   11 : set_timelock
+//   12 : pause
+//   13 : unpause
+//   14 : transfer_admin
+//   15 : get_version
+// ============================================================================
+
+const VERSION: string = "ComplianceModule v5.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -14,7 +47,7 @@ const COMPLIANT_PREFIX: string = "co_"
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(PAUSED_KEY, false)
     s.store(VERIFIERS_COUNT_KEY, 0u64)
@@ -24,40 +57,72 @@ hook constructor() -> u64 {
 
 fn only_admin() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
-    let admin: Address = s.load(ADMIN_KEY).unwrap()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
     if caller == admin { return }
     let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
     require(tl_opt.is_some(), "notauth")
-    let tl: Hash = tl_opt.unwrap()
-    let cc: Hash = get_contract_caller().unwrap()
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
     require(cc == tl, "notauth")
 }
 
 fn only_verifier() {
     let s: Storage = Storage::new()
-    let caller: Address = get_caller().unwrap()
+    let caller: Address = get_caller().expect("err")
     let is_verifier: bool = s.load(VERIFIER_PREFIX + caller.to_string()).unwrap_or(false)
     require(is_verifier, "notverifier")
 }
 
-pub fn check_transfer(from: Address, to: Address, asset: Hash, amount: u64) -> bool {
+// ============================================================================
+// Internal helpers (shared by entry + pub fn)
+// ============================================================================
+
+fn check_transfer_internal(from: Address, to: Address, asset: Hash, amount: u64) -> bool {
     let s: Storage = Storage::new()
     let required: bool = s.load(ASSET_COMPLIANCE_PREFIX + asset.to_hex()).unwrap_or(false)
-    if !required {
-        return true
-    }
+    if !required { return true }
     let from_ok: bool = s.load(COMPLIANT_PREFIX + from.to_string()).unwrap_or(false)
     let to_ok: bool = s.load(COMPLIANT_PREFIX + to.to_string()).unwrap_or(false)
     return from_ok && to_ok
 }
 
-pub fn verify_proof(merkle_proof: Hash, merkle_root: Hash) -> bool {
+fn verify_proof_internal(merkle_proof: Hash, merkle_root: Hash) -> bool {
     let s: Storage = Storage::new()
     let current_root: Hash = s.load(CURRENT_MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
     return merkle_root == current_root && merkle_proof != Hash::zero()
 }
 
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: check_transfer_entry — called by AssetVault v5.0 entry 2
+entry check_transfer_entry(from: Address, to: Address, asset: Hash, amount: u64) -> bool {
+    return check_transfer_internal(from, to, asset, amount)
+}
+
+// ID 1: verify_proof_entry
+entry verify_proof_entry(merkle_proof: Hash, merkle_root: Hash) -> bool {
+    return verify_proof_internal(merkle_proof, merkle_root)
+}
+
+// ID 2: is_compliant_entry
+entry is_compliant_entry(addr: Address) -> bool {
+    return Storage::new().load(COMPLIANT_PREFIX + addr.to_string()).unwrap_or(false)
+}
+
+// ID 3: get_current_root_entry
+entry get_current_root_entry() -> Hash {
+    return Storage::new().load(CURRENT_MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+}
+
+// ID 4: get_verifiers_count_entry
+entry get_verifiers_count_entry() -> u64 {
+    return Storage::new().load(VERIFIERS_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 5: update_merkle_root
 entry update_merkle_root(new_root: Hash) -> u64 {
     only_verifier()
     require(new_root != Hash::zero(), "badroot")
@@ -65,12 +130,14 @@ entry update_merkle_root(new_root: Hash) -> u64 {
     return 0
 }
 
+// ID 6: mark_compliant
 entry mark_compliant(addr: Address, compliant: bool) -> u64 {
     only_verifier()
     Storage::new().store(COMPLIANT_PREFIX + addr.to_string(), compliant)
     return 0
 }
 
+// ID 7: add_verifier
 entry add_verifier(verifier: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -82,6 +149,7 @@ entry add_verifier(verifier: Address) -> u64 {
     return 0
 }
 
+// ID 8: remove_verifier
 entry remove_verifier(verifier: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -93,10 +161,63 @@ entry remove_verifier(verifier: Address) -> u64 {
     return 0
 }
 
+// ID 9: set_compliance_required
 entry set_compliance_required(asset: Hash, required: bool) -> u64 {
     only_admin()
     Storage::new().store(ASSET_COMPLIANCE_PREFIX + asset.to_hex(), required)
     return 0
+}
+
+// ID 10: set_registry
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 11: set_timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 12: pause
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 13: unpause
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 14: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 15: get_version
+entry get_version() -> string {
+    return VERSION
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+pub fn check_transfer(from: Address, to: Address, asset: Hash, amount: u64) -> bool {
+    return check_transfer_internal(from, to, asset, amount)
+}
+
+pub fn verify_proof(merkle_proof: Hash, merkle_root: Hash) -> bool {
+    return verify_proof_internal(merkle_proof, merkle_root)
 }
 
 pub fn is_compliant(addr: Address) -> bool {
@@ -111,42 +232,8 @@ pub fn get_verifiers_count() -> u64 {
     return Storage::new().load(VERIFIERS_COUNT_KEY).unwrap_or(0)
 }
 
-entry set_registry(reg: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(REGISTRY_KEY, reg)
-    return 0
-}
-
-entry set_timelock(tl: Hash) -> u64 {
-    only_admin()
-    Storage::new().store(TIMELOCK_KEY, tl)
-    return 0
-}
-
 pub fn set_timelock_tl(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
-}
-
-entry pause(reason: string) -> u64 {
-    only_admin()
-    Storage::new().store(PAUSED_KEY, true)
-    return 0
-}
-
-entry unpause() -> u64 {
-    only_admin()
-    Storage::new().store(PAUSED_KEY, false)
-    return 0
-}
-
-entry transfer_admin(new_admin: Address) -> u64 {
-    only_admin()
-    Storage::new().store(ADMIN_KEY, new_admin)
-    return 0
-}
-
-entry get_version() -> string {
-    return VERSION
 }
