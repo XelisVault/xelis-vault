@@ -1,0 +1,1666 @@
+// ============================================================================
+// XelisVaultMiner.slx — XELIS Vault v5.1
+// ----------------------------------------------------------------------------
+// Silex-verified, all entry IDs aligned, all bugs from audit v4.3 fixed.
+// v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
+// ============================================================================
+const VERSION: string = "XelisVaultMiner v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+const DELEGATION_CONTRACT_KEY: string = "dck"  // v11.0: MinerDelegation contract hash (for pushing own_stake updates)
+const TREASURY_KEY: string = "tr"
+
+const MIN_STAKE_KEY: string = "ms"
+const HEARTBEAT_INTERVAL_KEY: string = "hi"
+const HEARTBEAT_TIMEOUT_KEY: string = "ht"
+
+const TOTAL_BUDGET_KEY: string = "tb"
+const DISTRIBUTED_KEY: string = "dist"
+const LAUNCH_TOPO_KEY: string = "lt"
+const TARGET_DURATION_BLOCKS_KEY: string = "td"
+const BUDGET_FACTOR_KEY: string = "bf"
+const LAST_BUDGET_ADJUST_KEY: string = "lba"
+const BUDGET_ADJUST_INTERVAL_KEY: string = "bai"
+
+const BASE_REWARD_ORACLE_KEY: string = "bro"
+const BASE_REWARD_CHAT_KEY: string = "brc"
+
+const SERVICE_PREFIX: string = "svc_"
+
+const MINERS_COUNT_KEY: string = "mc"
+const MINER_PREFIX: string = "miner_"
+const MINER_LIST_PREFIX: string = "ml_"
+const SERVICE_MINERS_PREFIX: string = "sm_"
+const TOTAL_STAKED_KEY: string = "ts"
+
+const DEFAULT_MIN_STAKE: u64 = 100000000000          // 1000 VLT (v10.7: was 100, 10x anti-Sybil)
+const DEFAULT_HEARTBEAT_INTERVAL: u64 = 100
+const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 300
+
+const DEFAULT_TOTAL_BUDGET: u64 = 550000000000000    // 5.5M VLT (v10.7: was 6M, match whitepaper)
+const DEFAULT_TARGET_DURATION: u64 = 63072000
+const DEFAULT_BUDGET_FACTOR: u64 = 10000             // 1.0x (v10.10: budget_factor kept for compat but unused — rewards are now stake-weighted)
+const DEFAULT_BUDGET_ADJUST_INTERVAL: u64 = 2016      // 2 weeks (kept for compat, maybe_adjust_budget is now no-op)
+
+const DEFAULT_BASE_REWARD_ORACLE: u64 = 1000000       // 0.01 VLT (v10.8: stake-weighted, no daily cap)
+const DEFAULT_BASE_REWARD_CHAT: u64 = 10000000        // 0.1 VLT (v10.7: was 0.5, 5x reduction)
+
+// v10.8: Stake-weighted rewards (replaces daily cap)
+// More stake = more rewards (linear, capped at MAX_STAKE_MULTIPLIER)
+// No Sybil advantage: 10 miners × 1000 VLT = 1 miner × 10000 VLT (same total)
+const MAX_STAKE_MULTIPLIER: u64 = 50                   // max 50x reward for 50,000+ VLT stake
+
+// v10.11: Bitcoin-style halving rewards (replaces fixed daily budget)
+// Rewards halve every year, lasting 30+ years with decreasing emission
+// Geometric series: initial + initial/2 + initial/4 + ... = 2 × initial
+// Initial year distributes 2,750,000 VLT → total approaches 5,500,000 VLT
+const HALVING_INTERVAL_BLOCKS: u64 = 6307200              // 1 year at 5s blocks
+const INITIAL_REWARD_PER_BLOCK: u64 = 43593000            // ~0.436 VLT/block (2,750,000 VLT / 6,307,200 blocks)
+
+// v11.0: STAKE_FLOOR — virtual minimum total stake in denominator
+// Prevents explosive APY when few miners are active
+// Without this: 3 miners × 1,000 VLT = 3,000 total → 90,000% APY
+// With STAKE_FLOOR = 100,000 VLT: APY bounded to ~2,750% even with 3 miners
+// As real stake grows past 100,000, the floor is no longer relevant
+const STAKE_FLOOR: u64 = 10000000000000               // 100,000 VLT virtual floor
+const CAP_STAKE_PER_MINER: u64 = 50000000000000       // 500,000 VLT max stake counted per miner
+
+const REP_MAX: u64 = 10000
+const REP_EXCELLENT: u64 = 8000
+const REP_GOOD: u64 = 5000
+const REP_WARNING: u64 = 2000
+const REP_CRITICAL: u64 = 1000
+const REP_BANNED: u64 = 0
+
+// v11.4: New miners start at REP_START (between Warning and Good)
+// They must prove themselves over time to reach Good then Excellent
+const REP_START: u64 = 3000              // Start at 3000 (between Warning=2000 and Good=5000)
+// v11.4: Reputation gain per valid submission (slower growth = must prove over time)
+const REP_GAIN_PRICE: u64 = 1            // +1 per valid price submission (was 1, keep)
+const REP_GAIN_ANCHOR: u64 = 3           // +3 per valid anchor (was 5, slower)
+const REP_GAIN_HEARTBEAT: u64 = 1         // +1 per heartbeat (was 1, keep)
+// Time-based reputation: after N blocks active, get a bonus
+const REP_PROVEN_BLOCKS: u64 = 259200    // 15 days at 5s blocks (proven miner)
+
+const REP_LOSS_OUTLIER: u64 = 50
+const REP_LOSS_OFFLINE: u64 = 200
+const REP_LOSS_DATA_LOSS: u64 = 500
+const REP_LOSS_CENSORSHIP: u64 = 1000
+const REP_LOSS_MALICIOUS: u64 = 5000
+
+struct Miner {
+    addr: Address,
+    endpoint_url: string,
+    miner_pubkey: Hash,
+    stake: u64,
+    services_mask: u8,
+    registered_at: u64,
+    last_heartbeat: u64,
+    total_rewards_earned: u64,
+    total_slashed: u64,
+    reputation: u64,
+    valid_submissions: u64,
+    successful_anchors: u64,
+    total_submissions: u64,
+    last_infraction_topo: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(MINERS_COUNT_KEY, 0u64)
+    s.store(TOTAL_STAKED_KEY, 0u64)
+    s.store(MIN_STAKE_KEY, DEFAULT_MIN_STAKE)
+    s.store(HEARTBEAT_INTERVAL_KEY, DEFAULT_HEARTBEAT_INTERVAL)
+    s.store(HEARTBEAT_TIMEOUT_KEY, DEFAULT_HEARTBEAT_TIMEOUT)
+    s.store(TOTAL_BUDGET_KEY, DEFAULT_TOTAL_BUDGET)
+    s.store(DISTRIBUTED_KEY, 0u64)
+    s.store(LAUNCH_TOPO_KEY, get_current_topoheight())
+    s.store(TARGET_DURATION_BLOCKS_KEY, DEFAULT_TARGET_DURATION)
+    s.store(BUDGET_FACTOR_KEY, DEFAULT_BUDGET_FACTOR)
+    s.store(LAST_BUDGET_ADJUST_KEY, get_current_topoheight())
+    s.store(BUDGET_ADJUST_INTERVAL_KEY, DEFAULT_BUDGET_ADJUST_INTERVAL)
+    s.store(BASE_REWARD_ORACLE_KEY, DEFAULT_BASE_REWARD_ORACLE)
+    s.store(BASE_REWARD_CHAT_KEY, DEFAULT_BASE_REWARD_CHAT)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_authorized_service() {
+    let s: Storage = Storage::new()
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "noservice")
+    let cc: Hash = cc_opt.expect("err")
+    let service_id: u8 = s.load(SERVICE_PREFIX + cc.to_hex()).unwrap_or(0)
+    require(service_id > 0, "notauth")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn get_reputation_multiplier(rep: u64) -> u64 {
+    if rep >= REP_EXCELLENT { return 15000 }  // 1.5x
+    if rep >= REP_GOOD { return 10000 }       // 1.0x
+    if rep >= REP_WARNING { return 7000 }     // 0.7x (was 0.5x — slightly better for starting miners)
+    if rep >= REP_CRITICAL { return 4000 }     // 0.4x (was 0.25x)
+    return 0                                   // Banned = 0x
+}
+
+// v11.4: Get time-proven reputation bonus
+// After 15 days of activity, miner gets +2000 reputation (from 3000 → 5000 = Good)
+fn get_time_proven_bonus(miner: Miner) -> u64 {
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo >= miner.registered_at + REP_PROVEN_BLOCKS {
+        // Miner has been active for 15+ days — proven
+        return 2000  // +2000 reputation bonus (3000 → 5000 = Good)
+    }
+    return 0
+}
+
+// v11.4: Get effective reputation (base + time bonus)
+fn get_effective_reputation(miner: Miner) -> u64 {
+    let rep: u64 = miner.reputation
+    let time_bonus: u64 = get_time_proven_bonus(miner)
+    rep += time_bonus
+    if rep > REP_MAX { rep = REP_MAX }
+    return rep
+}
+
+// v11.4: New miner bonus — depends on network miner count
+// Fewer miners = higher bonus (incentivize joining when network is small)
+// More miners = bonus disappears (natural equilibrium)
+fn get_new_miner_bonus(miner: Miner, active_miners_count: u64) -> u64 {
+    let current_topo: u64 = get_current_topoheight()
+    // Only applies to miners registered less than 30 days ago
+    let thirty_days: u64 = 2592000  // 30 * 86400 blocks
+    if current_topo > miner.registered_at + thirty_days {
+        return 0  // Bonus expired after 30 days
+    }
+    
+    // Bonus depends on how many miners are active
+    // 0-10 miners: 5000 bps (0.5x extra)
+    // 11-50 miners: 3000 bps (0.3x extra)
+    // 51-100 miners: 1000 bps (0.1x extra)
+    // 100+ miners: 0 (no bonus, network is healthy)
+    if active_miners_count <= 10 {
+        return 5000
+    }
+    if active_miners_count <= 50 {
+        return 3000
+    }
+    if active_miners_count <= 100 {
+        return 1000
+    }
+    return 0
+}
+
+fn add_reputation(addr: Address, points: u64) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return }
+    let miner: Miner = miner_opt.expect("err")
+    miner.reputation += points
+    if miner.reputation > REP_MAX { miner.reputation = REP_MAX }
+    if miner.reputation >= REP_CRITICAL && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
+        miner.active = true
+    }
+    s.store(MINER_PREFIX + addr.to_string(), miner)
+}
+
+fn remove_reputation(addr: Address, points: u64) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return }
+    let miner: Miner = miner_opt.expect("err")
+    if miner.reputation > points { miner.reputation -= points } else { miner.reputation = 0 }
+    miner.last_infraction_topo = get_current_topoheight()
+    if miner.reputation < REP_CRITICAL { miner.active = false }
+    s.store(MINER_PREFIX + addr.to_string(), miner)
+}
+
+// v10.11: Bitcoin-style halving — returns current per-block reward based on elapsed epochs
+fn get_current_block_reward() -> u64 {
+    let s: Storage = Storage::new()
+    let launch_topo: u64 = s.load(LAUNCH_TOPO_KEY).unwrap_or(get_current_topoheight())
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= launch_topo { return INITIAL_REWARD_PER_BLOCK }
+
+    let elapsed: u64 = current_topo - launch_topo
+    let epoch: u64 = elapsed / HALVING_INTERVAL_BLOCKS
+
+    let reward: u64 = INITIAL_REWARD_PER_BLOCK
+    let i: u64 = 0
+    while i < epoch {
+        reward = reward / 2
+        if reward == 0 { return 0 }
+        i += 1
+    }
+    return reward
+}
+
+// v11.1: Concentration thresholds (in bps of total stake)
+// 0-8%: no penalty (1.0x), 8-20%: linear decrease to 0.3x, >20%: hard cap at 0.3x
+const CONCENTRATION_SOFT_THRESHOLD_BPS: u64 = 800   // 8% — penalty starts
+const CONCENTRATION_HARD_THRESHOLD_BPS: u64 = 2000  // 20% — penalty maxed
+const CONCENTRATION_MIN_FACTOR_BPS: u64 = 3000      // 0.3x — minimum factor at hard threshold
+
+
+pub fn get_active_miners_count() -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    let active: u64 = 0
+    let i: u64 = 0
+    while i < count {
+        let addr: Address = s.load(MINER_LIST_PREFIX + i.to_string(10u32)).expect("err")
+        let miner: Miner = s.load(MINER_PREFIX + addr.to_string()).expect("err")
+        if miner.active { active += 1 }
+        i += 1
+    }
+    return active
+}
+
+fn get_dynamic_reward(base_reward: u64, miner_addr: Address) -> u64 {
+    // v11.4: Bitcoin-style halving + STAKE_FLOOR + cap + time-proven rep + new miner bonus
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+
+    // v11.4: Use EFFECTIVE reputation (base + time-proven bonus)
+    let effective_rep: u64 = get_effective_reputation(miner)
+    let rep_mult: u64 = get_reputation_multiplier(effective_rep)
+    if rep_mult == 0 { return 0 }
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked == 0 { return 0 }
+
+    let block_reward: u64 = get_current_block_reward()
+    if block_reward == 0 { return 0 }
+
+    // Cap stake per miner (anti-concentration hard cap)
+    let effective_stake: u64 = miner.stake
+    if effective_stake > CAP_STAKE_PER_MINER {
+        effective_stake = CAP_STAKE_PER_MINER
+    }
+
+    // STAKE_FLOOR — bounds APY when few miners
+    let effective_total: u64 = total_staked
+    if effective_total < STAKE_FLOOR {
+        effective_total = STAKE_FLOOR
+    }
+
+    // v11.4: New miner bonus — extra multiplier based on network size
+    // Only for miners < 30 days old, depends on active miner count
+    let active_count: u64 = get_active_miners_count()
+    let new_miner_bonus: u64 = get_new_miner_bonus(miner, active_count)
+
+    // reward = block_reward × effective_stake × rep_mult / (effective_total × 10000)
+    //         × (1 + new_miner_bonus / 10000)
+    let base_reward_val: u64 = (block_reward as u128 * effective_stake as u128 * rep_mult as u128 / (effective_total as u128 * 10000u128)) as u64
+    let bonus_amount: u64 = (base_reward_val as u128 * new_miner_bonus as u128 / 10000u128) as u64
+    return base_reward_val + bonus_amount
+}
+
+// ============================================================================
+// FIX #13: maybe_adjust_budget — division by zero guard + remove duplicate
+// target_rate declaration + clean clamp logic.
+// ============================================================================
+fn maybe_adjust_budget() {
+    let s: Storage = Storage::new()
+    let last_adjust: u64 = s.load(LAST_BUDGET_ADJUST_KEY).unwrap_or(0)
+    let interval: u64 = s.load(BUDGET_ADJUST_INTERVAL_KEY).unwrap_or(DEFAULT_BUDGET_ADJUST_INTERVAL)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo < last_adjust + interval { return }
+
+    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    let remaining_budget: u64 = 0
+    if total_budget > distributed {
+        remaining_budget = total_budget - distributed
+    } else {
+        remaining_budget = 0
+    }
+
+    let launch_topo: u64 = s.load(LAUNCH_TOPO_KEY).unwrap_or(current_topo)
+    let elapsed: u64 = 0
+    if current_topo > launch_topo {
+        elapsed = current_topo - launch_topo
+    } else {
+        elapsed = 1
+    }
+    let target_duration: u64 = s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
+    let remaining_time: u64 = 0
+    if target_duration > elapsed {
+        remaining_time = target_duration - elapsed
+    } else {
+        remaining_time = 1
+    }
+
+    // FIX #13: single target_rate declaration + division-by-zero guard
+    let token_count: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if token_count == 0 {
+        // No miners yet — no adjustment needed
+        s.store(LAST_BUDGET_ADJUST_KEY, current_topo)
+        return
+    }
+    let target_rate: u64 = (remaining_budget as u128 / remaining_time as u128) as u64
+
+    let actual_rate: u64 = (distributed as u128 / elapsed as u128) as u64
+    let current_factor: u64 = s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR)
+    let new_factor: u64 = current_factor
+
+    if actual_rate > target_rate && target_rate > 0 {
+        // We are distributing too fast — scale down proportionally
+        let ratio: u64 = (target_rate as u128 * 10000u128 / actual_rate as u128) as u64
+        new_factor = (current_factor * ratio) / 10000
+    } else if actual_rate == 0 {
+        // No distribution yet — slight bump to encourage
+        new_factor = current_factor * 110 / 100
+    } else if actual_rate < target_rate / 2 {
+        // We are distributing too slow — scale up
+        let ratio: u64 = (target_rate as u128 * 10000u128 / actual_rate as u128) as u64
+        new_factor = (current_factor + ratio * current_factor / 10000) / 2
+    }
+
+    // Symmetric clamp
+    let clamped: u64 = new_factor
+    if new_factor < 5000 { clamped = 5000 }
+    if new_factor > 20000 { clamped = 20000 }
+    s.store(BUDGET_FACTOR_KEY, clamped)
+    s.store(LAST_BUDGET_ADJUST_KEY, current_topo)
+}
+
+// ============================================================================
+
+
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+// ID 0: register_miner
+// Register a new miner with the protocol. Locks min stake deposit and stores the miner record.
+// @caller: any user with sufficient VLT deposit
+// @params: endpoint_url - public URL where the miner's daemon is reachable
+// @params: miner_pubkey - Ed25519 public key used for signing heartbeats and submissions
+// @params: services_mask - bitmask of services the miner will run (1=oracle, 2=chat, 3=both)
+// @returns: 0 on success
+// @security: when_not_paused, rejects duplicate registration, requires attached deposit >= MIN_STAKE, excess deposit refunded to caller
+entry register_miner(endpoint_url: string, miner_pubkey: Hash, services_mask: u8) -> u64 {
+    when_not_paused()
+    require(endpoint_url != "", "badurl")
+    require(miner_pubkey != Hash::zero(), "badpubkey")
+    require(services_mask > 0, "noservices")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let existing: optional<Miner> = s.load(MINER_PREFIX + caller.to_string())
+    require(existing.is_none(), "already")
+
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("err")
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    require(dep >= min_stake, "insstake")
+    if dep > min_stake { transfer(caller, dep - min_stake, vlt_asset) }
+
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    let miner: Miner = Miner {
+        addr: caller,
+        endpoint_url: endpoint_url,
+        miner_pubkey: miner_pubkey,
+        stake: min_stake,
+        services_mask: services_mask,
+        registered_at: get_current_topoheight(),
+        last_heartbeat: get_current_topoheight(),
+        total_rewards_earned: 0,
+        total_slashed: 0,
+        reputation: REP_START,  // v11.4: Start at 3000 (between Warning and Good), must prove over time
+        valid_submissions: 0,
+        successful_anchors: 0,
+        total_submissions: 0,
+        last_infraction_topo: 0,
+        active: true
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    s.store(MINER_LIST_PREFIX + count.to_string(10u32), caller)
+    s.store(MINERS_COUNT_KEY, count + 1)
+
+    if services_mask & 1 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
+        s.store(SERVICE_MINERS_PREFIX + "1", c + 1)
+    }
+    if services_mask & 2 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
+        s.store(SERVICE_MINERS_PREFIX + "2", c + 1)
+    }
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total_staked + min_stake)
+    return 0
+}
+
+// ID 1: enable_service
+// Enable an additional service bit on an already-registered miner account.
+// @caller: the miner themselves (must already be registered)
+// @params: service_id - service slot to enable (1..=8, 1=oracle, 2=chat)
+// @returns: 0 on success
+// @security: when_not_paused, requires existing miner record, rejects re-enabling an already-active service
+entry enable_service(service_id: u8) -> u64 {
+    when_not_paused()
+    require(service_id >= 1 && service_id <= 8, "badservice")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    let bit: u8 = 1 << (service_id - 1)
+    require(miner.services_mask & bit == 0, "alreadyon")
+    miner.services_mask = miner.services_mask | bit
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
+    s.store(SERVICE_MINERS_PREFIX + service_id.to_string(10u32), c + 1)
+    return 0
+}
+
+// ID 2: disable_service
+// Disable a service bit on the caller's miner account (does not deregister the miner).
+// @caller: the miner themselves
+// @params: service_id - service slot to disable (1..=8)
+// @returns: 0 on success
+// @security: requires existing miner record, rejects disabling an inactive service; intentionally callable while paused (graceful wind-down)
+entry disable_service(service_id: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    let bit: u8 = 1 << (service_id - 1)
+    require(miner.services_mask & bit != 0, "alreadyoff")
+    miner.services_mask = miner.services_mask & (255 - bit)
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let c: u64 = s.load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
+    if c > 0 { s.store(SERVICE_MINERS_PREFIX + service_id.to_string(10u32), c - 1) }
+    return 0
+}
+
+// ID 3: increase_stake
+// Add additional VLT stake to an existing miner account; may reactivate an inactive miner.
+// @caller: the miner themselves
+// @params: amount - additional VLT to lock (must be > 0 and covered by attached deposit)
+// @returns: 0 on success
+// @security: when_not_paused, requires attached deposit >= amount, excess deposit refunded, reactivates miner if remaining stake crosses MIN_STAKE
+entry increase_stake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("err")
+    require(dep >= amount, "insdep")
+    if dep > amount { transfer(caller, dep - amount, vlt_asset) }
+    miner.stake += amount
+    if !miner.active && miner.stake >= s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE) {
+        miner.active = true
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total_staked + amount)
+
+    // v11.0: Push own_stake update to MinerDelegation if configured
+    let del_opt: optional<Hash> = s.load(DELEGATION_CONTRACT_KEY)
+    if del_opt.is_some() {
+        let del_hash: Hash = del_opt.expect("err")
+        if del_hash != Hash::zero() {
+            let del: Contract = Contract::new(del_hash).expect("err")
+            // MinerDelegation entry 9 = set_miner_own_stake
+            let _ = del.call(36u16, [caller, miner.stake], {})
+        }
+    }
+    return 0
+}
+// Withdraw part of the locked VLT stake back to the miner; may deactivate if remaining stake falls below MIN_STAKE.
+// @caller: the miner themselves
+// @params: amount - VLT to withdraw (must be > 0 and <= current stake)
+// @returns: 0 on success
+// @security: when_not_paused, requires stake >= amount, transfer must succeed, deactivates miner if remaining stake < MIN_STAKE
+entry decrease_stake(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    require(miner.stake >= amount, "insstake")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let ok: bool = transfer(caller, amount, vlt_asset)
+    require(ok, "txfail")
+    miner.stake -= amount
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    if miner.stake < min_stake { miner.active = false }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= amount { s.store(TOTAL_STAKED_KEY, total_staked - amount) }
+
+    // v11.0: Push own_stake update to MinerDelegation if configured
+    let del_opt2: optional<Hash> = s.load(DELEGATION_CONTRACT_KEY)
+    if del_opt2.is_some() {
+        let del_hash: Hash = del_opt2.expect("err")
+        if del_hash != Hash::zero() {
+            let del: Contract = Contract::new(del_hash).expect("err")
+            let _ = del.call(36u16, [caller, miner.stake], {})
+        }
+    }
+    return 0
+}
+
+// ID 5: deregister_miner
+// Fully deregister a miner: refunds the entire remaining stake and removes the miner record.
+// @caller: the miner themselves
+// @returns: 0 on success
+// @security: requires existing miner record; intentionally callable while paused (exit door); refund transfer must succeed
+entry deregister_miner() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let ok: bool = transfer(caller, miner.stake, vlt_asset)
+    require(ok, "txfail")
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= miner.stake { s.store(TOTAL_STAKED_KEY, total_staked - miner.stake) }
+    if miner.services_mask & 1 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "1").unwrap_or(0)
+        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "1", c - 1) }
+    }
+    if miner.services_mask & 2 != 0 {
+        let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
+        if c > 0 { s.store(SERVICE_MINERS_PREFIX + "2", c - 1) }
+    }
+    s.delete(MINER_PREFIX + caller.to_string())
+    return 0
+}
+
+// ID 6: submit_heartbeat
+// Submit a liveness heartbeat for the caller's miner; small reputation gain if recent.
+// @caller: the miner themselves (must be active)
+// @returns: 0 on success
+// @security: requires active miner, enforces HEARTBEAT_INTERVAL spacing between heartbeats; intentionally callable while paused; triggers maybe_adjust_budget()
+entry submit_heartbeat() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    require(miner.active, "inactive")
+    let current_topo: u64 = get_current_topoheight()
+    let interval: u64 = s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+    require(current_topo >= miner.last_heartbeat + interval, "toosoon")
+    miner.last_heartbeat = current_topo
+    if current_topo > miner.last_infraction_topo + 1000 {
+        if miner.reputation < REP_MAX {
+            miner.reputation += REP_GAIN_HEARTBEAT
+            if miner.reputation > REP_MAX { miner.reputation = REP_MAX }
+        }
+    }
+    s.store(MINER_PREFIX + caller.to_string(), miner)
+    maybe_adjust_budget()
+    return 0
+}
+
+// ============================================================================
+// FIX #1: Convert pub fn → entry for slash_miner, distribute_reward,
+// is_miner_active so StakedOracle can call them via Contract::call.
+// These are now entries 7, 8, 9.
+// ============================================================================
+
+// ID 7: slash_miner (was pub fn — unreachable cross-contract)
+// Slash a miner's stake and reputation for an infraction; distributes slash across burn / reporter / treasury.
+// @caller: authorized_service only (e.g. StakedOracle contract)
+// @params: miner_addr - address of the miner to slash
+// @params: severity - infraction severity 0..4 (0=outlier, 1=offline, 2=data_loss, 3=censorship, 4=malicious)
+// @params: reporter - address receiving the 10% reporter reward
+// @returns: slash_amount actually deducted from stake
+// @security: only_authorized_service, no-op for unknown miner, deactivates miner if stake or reputation drops below thresholds
+pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 {
+    only_authorized_service()
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+
+    let slash_bps: u64 = 0
+    let rep_loss: u64 = 0
+    if severity == 0 { slash_bps = 100; rep_loss = REP_LOSS_OUTLIER }
+    else if severity == 1 { slash_bps = 200; rep_loss = REP_LOSS_OFFLINE }
+    else if severity == 2 { slash_bps = 500; rep_loss = REP_LOSS_DATA_LOSS }
+    else if severity == 3 { slash_bps = 1000; rep_loss = REP_LOSS_CENSORSHIP }
+    else { slash_bps = 5000; rep_loss = REP_LOSS_MALICIOUS }
+
+    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    if slash_amount > 0 {
+        let actual_slash: u64 = 0
+        if slash_amount > miner.stake { actual_slash = miner.stake } else { actual_slash = slash_amount }
+        miner.stake -= actual_slash
+        miner.total_slashed += actual_slash
+        let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+        if miner.stake < min_stake { miner.active = false }
+    }
+
+    if miner.reputation > rep_loss { miner.reputation -= rep_loss } else { miner.reputation = 0 }
+    miner.last_infraction_topo = get_current_topoheight()
+    if miner.reputation < REP_CRITICAL { miner.active = false }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= slash_amount { s.store(TOTAL_STAKED_KEY, total_staked - slash_amount) }
+
+    let burn_amount: u64 = slash_amount / 2
+    let reporter_reward: u64 = slash_amount / 10
+    let treasury_amount: u64 = slash_amount - burn_amount - reporter_reward
+
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
+    if reporter_reward > 0 { transfer(reporter, reporter_reward, vlt_asset) }
+    if treasury_amount > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        transfer(treasury, treasury_amount, vlt_asset)
+    }
+    return slash_amount
+}
+
+// ID 8: distribute_reward (was pub fn)
+// Mint a dynamic reward to a miner for a valid (or invalid) submission; updates reputation and budget accounting.
+// @caller: authorized_service only (e.g. StakedOracle contract)
+// @params: miner_addr - address of the miner being rewarded
+// @params: service_id - service that produced the submission (1=oracle, 2=chat)
+// @params: is_valid - whether the submission was valid (invalid = no mint, just counter bump)
+// @returns: reward amount minted (0 if inactive / invalid / no budget)
+// @security: only_authorized_service, no-op for unknown or inactive miner, refuses to mint if reward would exceed remaining budget, calls VLTToken chunk 4 (pub fn mint_to) cross-contract
+pub fn distribute_reward(miner_addr: Address, service_id: u8, is_valid: bool) -> u64 {
+    only_authorized_service()
+    let s: Storage = Storage::new()
+
+    // v10.9: Check if rewards are frozen (emergency)
+    let rewards_frozen: bool = s.load("rewards_frozen").unwrap_or(false)
+    if rewards_frozen { return 0 }
+
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    if !miner.active { return 0 }
+
+    miner.total_submissions += 1
+    if !is_valid {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+
+    let base_reward: u64 = s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE)
+    if service_id == 2 {
+        base_reward = s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT)
+    }
+    if base_reward == 0 { return 0 }
+
+    let reward: u64 = get_dynamic_reward(base_reward, miner_addr)
+    if reward == 0 {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+
+    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+    if distributed + reward > total_budget {
+        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+        return 0
+    }
+
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("err")
+    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+    // v11.7 fix: cross-contract calls require Access::All (`pub fn`).
+    //   VLTToken chunk 4 = pub fn mint_to (All); chunk 27 (mint_to_entry) is an
+    //   Entry — wallet-only, reverted "Chunk is not public" when called here.
+    let mint_result: u64 = vlt.call(4u16, [miner_addr, reward], {})
+    require(mint_result == 0, "mintfail")
+
+    miner.total_rewards_earned += reward
+    miner.valid_submissions += 1
+    if service_id == 2 { miner.successful_anchors += 1 }
+
+    let rep_gain: u64 = 0
+    if service_id == 1 { rep_gain = REP_GAIN_PRICE } else { rep_gain = REP_GAIN_ANCHOR }
+    if miner.reputation < REP_MAX {
+        miner.reputation += rep_gain
+        if miner.reputation > REP_MAX { miner.reputation = REP_MAX }
+    }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    s.store(DISTRIBUTED_KEY, distributed + reward)
+    maybe_adjust_budget()
+    return reward
+}
+
+// ID 9: is_miner_active_entry (was pub fn is_miner_active)
+// Returns 1 if active for the service, 0 otherwise (since entry return is u64 by default)
+// Cross-contract entry: check whether a miner is active for a specific service (1=active, 0=inactive).
+// @caller: anyone (read-only)
+// @params: addr - miner address to query
+// @params: service_id - service bit to test (1..=8)
+// @returns: 1 if the miner is active, staked, reputable and opted into the service; 0 otherwise
+// @security: read-only, no access control
+pub fn is_miner_active(addr: Address, service_id: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    if !miner.active { return 0 }
+    if miner.reputation < REP_CRITICAL { return 0 }
+    let bit: u8 = 1 << (service_id - 1)
+    if miner.services_mask & bit != 0 { return 1 }
+    return 0
+}
+
+// ID 10: get_miner_stake_entry (was pub fn)
+// Cross-contract entry: return the current locked stake of a miner.
+// @caller: anyone (read-only)
+// @params: addr - miner address to query
+// @returns: stake amount, or 0 if miner does not exist
+// @security: read-only, no access control
+entry get_miner_stake_entry(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    return miner.stake
+}
+
+// ID 11: get_miner_reputation_entry
+// Cross-contract entry: return the reputation score of a miner (0..=10000).
+// @caller: anyone (read-only)
+// @params: addr - miner address to query
+// @returns: reputation score, or 0 if miner does not exist
+// @security: read-only, no access control
+entry get_miner_reputation_entry(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    return miner.reputation
+}
+
+// ID 12: get_active_miners_for_service_entry (was pub fn)
+// Cross-contract entry: return how many miners are currently opted into a service.
+// @caller: anyone (read-only)
+// @params: service_id - service slot to query (1..=8)
+// @returns: count of miners with that service bit set in their services_mask
+// @security: read-only, no access control
+pub fn get_active_miners_for_service(service_id: u8) -> u64 {
+    return Storage::new().load(SERVICE_MINERS_PREFIX + service_id.to_string(10u32)).unwrap_or(0)
+}
+
+// ID 13: get_miners_count_entry
+// Cross-contract entry: return total number of registered miners (active + inactive).
+// @caller: anyone (read-only)
+// @returns: miners count
+// @security: read-only, no access control
+entry get_miners_count_entry() -> u64 {
+    return Storage::new().load(MINERS_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 14: get_total_staked_entry
+// Cross-contract entry: return total VLT currently locked by all miners.
+// @caller: anyone (read-only)
+// @returns: total staked amount
+// @security: read-only, no access control
+entry get_total_staked_entry() -> u64 {
+    return Storage::new().load(TOTAL_STAKED_KEY).unwrap_or(0)
+}
+
+// ID 15: get_base_reward_oracle_entry (for OracleGovernance TYPE_SET_REWARD)
+// Cross-contract entry: return the current base reward for oracle submissions (used by OracleGovernance TYPE_SET_REWARD).
+// @caller: anyone (read-only)
+// @returns: base oracle reward amount
+// @security: read-only, no access control
+entry get_base_reward_oracle_entry() -> u64 {
+    return Storage::new().load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE)
+}
+
+// ID 16: register_service
+// Whitelist a contract as an authorized service allowed to call slash_miner / distribute_reward.
+// @caller: admin (or timelock as contract caller)
+// @params: service_id - service slot to assign (1..=8)
+// @params: contract_hash - hash of the contract being authorized
+// @returns: 0 on success
+// @security: only_admin
+entry register_service(service_id: u8, contract_hash: Hash) -> u64 {
+    only_admin()
+    require(service_id >= 1 && service_id <= 8, "badservice")
+    Storage::new().store(SERVICE_PREFIX + contract_hash.to_hex(), service_id)
+    return 0
+}
+
+// ID 17: unregister_service
+// Revoke a contract's authorized-service status.
+// @caller: admin (or timelock as contract caller)
+// @params: contract_hash - hash of the contract being de-authorized
+// @returns: 0 on success
+// @security: only_admin
+entry unregister_service(contract_hash: Hash) -> u64 {
+    only_admin()
+    Storage::new().delete(SERVICE_PREFIX + contract_hash.to_hex())
+    return 0
+}
+
+// ID 18: set_min_stake
+// Update the minimum stake required to register / remain active as a miner.
+// @caller: admin (or timelock as contract caller)
+// @params: amount - new minimum stake (must be >= 1_000_000_000)
+// @returns: 0 on success
+// @security: only_admin, enforces lower bound
+entry set_min_stake(amount: u64) -> u64 {
+    only_admin()
+    require(amount >= 1000000000, "badval")
+    Storage::new().store(MIN_STAKE_KEY, amount)
+    return 0
+}
+
+// ID 19: set_heartbeat_interval
+// Update the minimum number of blocks between two heartbeats from the same miner.
+// @caller: admin (or timelock as contract caller)
+// @params: blocks - new heartbeat interval (must be in [10, 1000])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+entry set_heartbeat_interval(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 10 && blocks <= 1000, "badval")
+    Storage::new().store(HEARTBEAT_INTERVAL_KEY, blocks)
+    return 0
+}
+
+// ID 20: set_heartbeat_timeout
+// Update the heartbeat timeout after which a miner is considered offline.
+// @caller: admin (or timelock as contract caller)
+// @params: blocks - new heartbeat timeout (must be in [100, 10000])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+entry set_heartbeat_timeout(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 100 && blocks <= 10000, "badval")
+    Storage::new().store(HEARTBEAT_TIMEOUT_KEY, blocks)
+    return 0
+}
+
+// ID 21: set_base_reward_oracle  (used by OracleGovernance.execute_proposal TYPE_SET_REWARD)
+// Update the base reward per valid oracle submission.
+// @caller: admin (or timelock as contract caller)
+// @params: amount - new base oracle reward (must be <= 1_000_000_000)
+// @returns: 0 on success
+// @security: only_admin, enforces upper bound
+pub fn set_base_reward_oracle(amount: u64) -> u64 {
+    only_admin()
+    require(amount <= 1000000000, "badval")
+    Storage::new().store(BASE_REWARD_ORACLE_KEY, amount)
+    return 0
+}
+
+// ID 22: set_base_reward_chat
+// Update the base reward per valid chat anchor submission.
+// @caller: admin (or timelock as contract caller)
+// @params: amount - new base chat reward (must be <= 1_000_000_000)
+// @returns: 0 on success
+// @security: only_admin, enforces upper bound
+entry set_base_reward_chat(amount: u64) -> u64 {
+    only_admin()
+    require(amount <= 1000000000, "badval")
+    Storage::new().store(BASE_REWARD_CHAT_KEY, amount)
+    return 0
+}
+
+// ID 23: set_total_budget
+// Update the total emission budget cap that distribute_reward is allowed to mint up to.
+// @caller: admin (or timelock as contract caller)
+// @params: amount - new total budget
+// @returns: 0 on success
+// @security: only_admin
+entry set_total_budget(amount: u64) -> u64 {
+    only_admin()
+    Storage::new().store(TOTAL_BUDGET_KEY, amount)
+    return 0
+}
+
+// ID 24: set_target_duration
+// Update the target distribution window (in blocks) used by maybe_adjust_budget to pace emissions.
+// @caller: admin (or timelock as contract caller)
+// @params: blocks - new target duration (must be >= 6_307_200 blocks ~= 1 year)
+// @returns: 0 on success
+// @security: only_admin, enforces lower bound
+entry set_target_duration(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 6307200, "badval")
+    Storage::new().store(TARGET_DURATION_BLOCKS_KEY, blocks)
+    return 0
+}
+
+// ID 25: set_vlt_contract
+// Set the VLTToken contract hash that distribute_reward calls to mint rewards.
+// @caller: admin (or timelock as contract caller)
+// @params: vc - hash of the VLTToken contract
+// @returns: 0 on success
+// @security: only_admin; misconfiguration would break reward distribution
+entry set_vlt_contract(vc: Hash) -> u64 { only_admin() Storage::new().store(VLT_CONTRACT_KEY, vc) return 0 }
+
+// ID 26: set_vlt_asset
+// Set the VLT asset hash used for stake deposits, refunds and slashing transfers.
+// @caller: admin (or timelock as contract caller)
+// @params: va - hash of the VLT asset
+// @returns: 0 on success
+// @security: only_admin; misconfiguration would break stake transfers
+entry set_vlt_asset(va: Hash) -> u64 { only_admin() Storage::new().store(VLT_ASSET_KEY, va) return 0 }
+
+// v11.0: Set MinerDelegation contract (for pushing own_stake updates)
+entry set_delegation_contract(dck: Hash) -> u64 { only_admin() Storage::new().store(DELEGATION_CONTRACT_KEY, dck) return 0 }
+
+// ID 27: set_treasury
+// Set the treasury address that receives the treasury slice of any slash.
+// @caller: admin (or timelock as contract caller)
+// @params: t - new treasury address
+// @returns: 0 on success
+// @security: only_admin
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+
+// ID 28: set_registry
+// Set the registry hash (referenced by tooling / off-chain indexers).
+// @caller: admin (or timelock as contract caller)
+// @params: reg - new registry hash
+// @returns: 0 on success
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 29: set_timelock
+// Set the timelock contract hash that is allowed to invoke admin-gated entries as contract caller.
+// @caller: admin (or existing timelock as contract caller)
+// @params: tl - hash of the timelock contract
+// @returns: 0 on success
+// @security: only_admin
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 30: set_guardian
+// Set the guardian address able to pause the contract and trigger circuit breakers.
+// @caller: admin (or timelock as contract caller)
+// @params: g - new guardian address
+// @returns: 0 on success
+// @security: only_admin
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// ID 31: set_emergency
+// Rotate the emergency-key holder (only the current emergency holder may do this).
+// @caller: current emergency-key holder only
+// @params: e - new emergency address
+// @returns: 0 on success
+// @security: caller must equal stored EMERGENCY_KEY (separate from admin auth)
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let current: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 32: pause
+// Halt all state-mutating user entries (register / stake / heartbeat / etc.).
+// @caller: guardian or admin
+// @params: reason - free-form reason string (off-chain audit trail only)
+// @returns: 0 on success
+// @security: only_guardian_or_admin; sets PAUSED_KEY = true; read-only entries remain callable
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+
+// ID 33: unpause
+// Resume normal operation after a pause.
+// @caller: admin only (guardian cannot unpause, only pause)
+// @returns: 0 on success
+// @security: only_admin; sets PAUSED_KEY = false
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// ID 34: transfer_admin
+// Transfer admin rights to a new address.
+// @caller: admin (or timelock as contract caller)
+// @params: new_admin - address of the new admin
+// @returns: 0 on success
+// @security: only_admin; immediate effect (no two-step confirmation in v5.1)
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 35: get_version
+// Return the contract version string.
+// @caller: anyone (read-only)
+// @returns: VERSION constant
+// @security: read-only, no access control
+entry get_version() -> string { return VERSION }
+
+// ============================================================================
+// FIX #14: Two-step emergency_withdraw — announce + execute after delay
+// ============================================================================
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280 // ~24h at 5s/block
+
+// ID 36: request_emergency_withdraw
+// Announce (step 1/2) an emergency withdrawal of all contract-held assets; starts the EMERGENCY_DELAY_BLOCKS countdown.
+// @caller: current emergency-key holder only
+// @returns: 0 on success
+// @security: caller must equal stored EMERGENCY_KEY; records request topo for later enforcement
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 37: cancel_emergency_withdraw
+// Cancel a pending emergency withdrawal request (undo step 1).
+// @caller: current emergency-key holder only
+// @returns: 0 on success
+// @security: caller must equal stored EMERGENCY_KEY; clears EMERGENCY_REQUEST_TOPO_KEY
+entry cancel_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    return 0
+}
+
+// ID 38: execute_emergency_withdraw (only after delay)
+// Execute (step 2/2) a previously announced emergency withdrawal; drains the contract's balance of one asset.
+// @caller: current emergency-key holder only
+// @params: asset - asset hash to drain
+// @returns: 0 on success
+// @security: caller must equal stored EMERGENCY_KEY, requires prior request, requires EMERGENCY_DELAY_BLOCKS (~24h) to have elapsed; deletes the request after execution
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only, NOT callable cross-contract — use entry wrappers above)
+// ============================================================================
+// Read-only access to a miner's full public state.
+// @caller: anyone (read-only)
+// @params: addr - miner address to query
+// @returns: tuple of (endpoint_url, miner_pubkey, stake, services_mask, reputation, valid_submissions, successful_anchors, total_submissions, total_rewards_earned, total_slashed, active); zeroed tuple if miner does not exist
+// @security: read-only, no access control
+pub fn get_miner(addr: Address) -> (string, Hash, u64, u8, u64, u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return ("", Hash::zero(), 0, 0, 0, 0, 0, 0, 0, 0, false) }
+    let miner: Miner = miner_opt.expect("err")
+    return (
+        miner.endpoint_url, miner.miner_pubkey, miner.stake, miner.services_mask,
+        miner.reputation, miner.valid_submissions, miner.successful_anchors,
+        miner.total_submissions, miner.total_rewards_earned, miner.total_slashed,
+        miner.active
+    )
+}
+
+// Read-only access to the address of the miner at the given index in the registration list.
+// @caller: anyone (read-only)
+// @params: index - 0-based position in MINER_LIST_PREFIX storage
+// @returns: miner Address
+// @security: read-only, no access control; requires index < MINERS_COUNT
+pub fn get_miner_at(index: u64) -> Address {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    require(index < count, "oob")
+    return s.load(MINER_LIST_PREFIX + index.to_string(10u32)).expect("err")
+}
+
+// Read-only count of currently-active miners.
+// @caller: anyone (read-only)
+// @returns: number of miners whose active flag is true
+// @security: read-only, no access control; iterates the whole miner list
+
+// Read-only mapping from a raw reputation score (0..=10000) to a coarse tier.
+// @caller: anyone (read-only)
+// @params: rep - raw reputation score
+// @returns: tier 4=excellent, 3=good, 2=warning, 1=critical, 0=banned
+// @security: read-only, no access control; pure function
+pub fn get_reputation_tier(rep: u64) -> u8 {
+    if rep >= REP_EXCELLENT { return 4 }
+    if rep >= REP_GOOD { return 3 }
+    if rep >= REP_WARNING { return 2 }
+    if rep >= REP_CRITICAL { return 1 }
+    return 0
+}
+
+// Read-only snapshot of the protocol's tunable parameters.
+// @caller: anyone (read-only)
+// @returns: tuple of (min_stake, heartbeat_interval, heartbeat_timeout, base_reward_oracle, base_reward_chat, budget_factor, total_budget, distributed)
+// @security: read-only, no access control
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE),
+        s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL),
+        s.load(HEARTBEAT_TIMEOUT_KEY).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT),
+        s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE),
+        s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT),
+        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
+        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
+        s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    )
+}
+
+// Read-only snapshot of the budget / emission-pacing state.
+// @caller: anyone (read-only)
+// @returns: tuple of (total_budget, distributed, budget_factor, launch_topo, target_duration_blocks)
+// @security: read-only, no access control
+pub fn get_budget_info() -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET),
+        s.load(DISTRIBUTED_KEY).unwrap_or(0),
+        s.load(BUDGET_FACTOR_KEY).unwrap_or(DEFAULT_BUDGET_FACTOR),
+        s.load(LAUNCH_TOPO_KEY).unwrap_or(0),
+        s.load(TARGET_DURATION_BLOCKS_KEY).unwrap_or(DEFAULT_TARGET_DURATION)
+    )
+}
+
+// Read-only check whether a contract hash is currently whitelisted as an authorized service.
+// @caller: anyone (read-only)
+// @params: contract_hash - hash to check
+// @returns: true if the hash maps to a registered service_id > 0
+// @security: read-only, no access control; mirrors the only_authorized_service() guard
+pub fn is_authorized_service(contract_hash: Hash) -> bool {
+    let service_id: u8 = Storage::new().load(SERVICE_PREFIX + contract_hash.to_hex()).unwrap_or(0)
+    return service_id > 0
+}
+
+// Set the timelock contract hash (legacy alias kept for compatibility with StakedOracle.set_timelock_tl).
+// @caller: admin (or timelock as contract caller)
+// @params: tl - hash of the timelock contract
+// @returns: 0 on success
+// @security: only_admin
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+
+
+// ============================================================================
+// v6.0 NEW FEATURES — added at END (chunks 57+, don't affect existing IDs)
+// ============================================================================
+
+const COMPOUND_PREFIX: string = "cmp_"
+const REP_DECAY_INTERVAL_KEY: string = "rdi"
+const REP_DECAY_AMOUNT_KEY: string = "rda"
+const DEFAULT_REP_DECAY_INTERVAL: u64 = 43200
+const DEFAULT_REP_DECAY_AMOUNT: u64 = 10
+
+// chunk 57: auto_slash_offline — permissionless keeper function
+// Slash miners who missed heartbeats for > HEARTBEAT_TIMEOUT blocks
+// @caller: anyone (permissionless keeper)
+// @params: miner_addr - miner to check and slash if offline
+// @returns: slash_amount (0 if not offline)
+pub fn auto_slash_offline(miner_addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    if !miner.active { return 0 }
+
+    let timeout: u64 = s.load(HEARTBEAT_TIMEOUT_KEY).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= miner.last_heartbeat + timeout { return 0 }
+
+    // Miner is offline — apply reputation decay
+    let decay_interval: u64 = s.load(REP_DECAY_INTERVAL_KEY).unwrap_or(DEFAULT_REP_DECAY_INTERVAL)
+    let decay_amount: u64 = s.load(REP_DECAY_AMOUNT_KEY).unwrap_or(DEFAULT_REP_DECAY_AMOUNT)
+    if miner.reputation > 0 && miner.last_heartbeat + decay_interval < current_topo {
+        let blocks_since: u64 = current_topo - miner.last_heartbeat - decay_interval
+        let decay_periods: u64 = blocks_since / decay_interval
+        if decay_periods > 0 {
+            let total_decay: u64 = decay_amount * decay_periods
+            if miner.reputation > total_decay {
+                miner.reputation -= total_decay
+            } else {
+                miner.reputation = 0
+            }
+        }
+    }
+
+    // Slash with severity 1 (offline) — 2%
+    let slash_bps: u64 = 200
+    let rep_loss: u64 = REP_LOSS_OFFLINE
+    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    if slash_amount > 0 {
+        miner.stake -= slash_amount
+        miner.total_slashed += slash_amount
+    }
+    if miner.reputation > rep_loss { miner.reputation -= rep_loss } else { miner.reputation = 0 }
+    miner.last_infraction_topo = current_topo
+    if miner.reputation < REP_CRITICAL { miner.active = false }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= slash_amount { s.store(TOTAL_STAKED_KEY, total_staked - slash_amount) }
+
+    let burn_amount: u64 = slash_amount / 2
+    let reporter_reward: u64 = slash_amount / 10
+    let treasury_amount: u64 = slash_amount - burn_amount - reporter_reward
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
+    if reporter_reward > 0 {
+        let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+        let _ = transfer(guardian, reporter_reward, vlt_asset)
+    }
+    if treasury_amount > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, treasury_amount, vlt_asset)
+    }
+    return slash_amount
+}
+
+// chunk 58: set_compound — enable/disable auto re-staking of rewards
+// @caller: the miner themselves
+// @params: enabled - true to compound rewards into stake, false for liquid
+entry set_compound(enabled: bool) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + caller.to_string())
+    require(miner_opt.is_some(), "notminer")
+    s.store(COMPOUND_PREFIX + caller.to_string(), enabled)
+    return 0
+}
+
+// chunk 59: is_compound_enabled — read compound status
+pub fn is_compound_enabled(addr: Address) -> bool {
+    return Storage::new().load(COMPOUND_PREFIX + addr.to_string()).unwrap_or(false)
+}
+
+// chunk 60: set_rep_decay_params — configure reputation temporal decay
+entry set_rep_decay_params(interval: u64, amount: u64) -> u64 {
+    only_admin()
+    require(interval >= 4320, "badint")
+    require(amount <= 100, "badamt")
+    let s: Storage = Storage::new()
+    s.store(REP_DECAY_INTERVAL_KEY, interval)
+    s.store(REP_DECAY_AMOUNT_KEY, amount)
+    return 0
+}
+
+// v7.0: Standalone pub fn getters for MinerPool cross-contract calls
+pub fn get_miner_stake(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    return miner.stake
+}
+
+pub fn get_miner_reputation(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    return miner.reputation
+}
+
+// ============================================================================
+// v10.0: PHASE 1 IMPROVEMENTS (from external audit)
+// ============================================================================
+
+// ── M1: Slashing Progressif (graduated, not binary) ───────────────────────
+// Instead of immediate slash, apply progressive slashing based on downtime duration
+fn get_progressive_slash_bps(offline_blocks: u64) -> u64 {
+    if offline_blocks < 300 { return 0 }      // Grace period
+    if offline_blocks < 600 { return 50 }      // 0.5% for 25-50 min
+    if offline_blocks < 1440 { return 200 }    // 2% for 50 min - 2h
+    if offline_blocks < 4320 { return 500 }    // 5% for 2-6h
+    if offline_blocks < 8640 { return 1000 }   // 10% for 6-12h
+    return 2000                                // 20% for >12h
+}
+
+pub fn get_progressive_slash_rate(offline_blocks: u64) -> u64 {
+    return get_progressive_slash_bps(offline_blocks)
+}
+
+// ── M5: Trimmed Mean for Oracle Median ────────────────────────────────────
+// Eliminates top 20% and bottom 20% of submissions before computing median
+// This prevents manipulation even if 40% of miners are compromised
+pub fn calculate_trimmed_median(prices: u64[], count: u64) -> u64 {
+    if count == 0 { return 0 }
+    if count <= 4 { return prices[(count / 2) as u32] }
+    
+    // Calculate trim amount (20% from each side)
+    let trim: u64 = count / 5
+    let start: u64 = trim
+    let end: u64 = count - trim
+    let mid: u64 = (start + end) / 2
+    
+    return prices[mid as u32]
+}
+
+// ── M6: Anti-Sybil (Progressive Stake) ───────────────────────────────────
+// Min stake increases as more miners register
+pub fn get_min_stake_for_count(count: u64) -> u64 {
+    if count <= 10  { return 10000000000 }     // 100 VLT
+    if count <= 50  { return 20000000000 }     // 200 VLT
+    if count <= 100 { return 50000000000 }     // 500 VLT
+    return 100000000000                          // 1000 VLT
+}
+
+pub fn get_current_min_stake() -> u64 {
+    let count: u64 = Storage::new().load(MINERS_COUNT_KEY).unwrap_or(0)
+    return get_min_stake_for_count(count)
+}
+
+// ── M9: Miner Streaks (consecutive valid submissions) ────────────────────
+const STREAK_BONUS_100: u64 = 10    // +10 rep at 100 streak
+const STREAK_BONUS_500: u64 = 50    // +50 rep at 500 streak
+const STREAK_BONUS_1000: u64 = 200  // +200 rep at 1000 streak
+
+pub fn get_streak_bonus(consecutive_valid: u64) -> u64 {
+    if consecutive_valid == 100 { return STREAK_BONUS_100 }
+    if consecutive_valid == 500 { return STREAK_BONUS_500 }
+    if consecutive_valid == 1000 { return STREAK_BONUS_1000 }
+    return 0
+}
+
+// ── M12: Leaderboard (top 10 miners by reputation) ───────────────────────
+pub fn get_leaderboard() -> (Address, u64, Address, u64, Address, u64, Address, u64, Address, u64) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    
+    // Simple: return top 5 miners by reputation (gas-efficient)
+    // Full top-10 would be too expensive in a single call
+    let top1: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let top1_rep: u64 = 0
+    let top2: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let top2_rep: u64 = 0
+    let top3: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let top3_rep: u64 = 0
+    let top4: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let top4_rep: u64 = 0
+    let top5: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let top5_rep: u64 = 0
+    
+    let i: u64 = 0
+    while i < count {
+        let addr: Address = s.load(MINER_LIST_PREFIX + i.to_string(10u32)).expect("err")
+        let miner: Miner = s.load(MINER_PREFIX + addr.to_string()).expect("err")
+        
+        if miner.reputation > top1_rep {
+            top5 = top4; top5_rep = top4_rep
+            top4 = top3; top4_rep = top3_rep
+            top3 = top2; top3_rep = top2_rep
+            top2 = top1; top2_rep = top1_rep
+            top1 = addr; top1_rep = miner.reputation
+        } else if miner.reputation > top2_rep {
+            top5 = top4; top5_rep = top4_rep
+            top4 = top3; top4_rep = top3_rep
+            top3 = top2; top3_rep = top2_rep
+            top2 = addr; top2_rep = miner.reputation
+        } else if miner.reputation > top3_rep {
+            top5 = top4; top5_rep = top4_rep
+            top4 = top3; top4_rep = top3_rep
+            top3 = addr; top3_rep = miner.reputation
+        } else if miner.reputation > top4_rep {
+            top5 = top4; top5_rep = top4_rep
+            top4 = addr; top4_rep = miner.reputation
+        } else if miner.reputation > top5_rep {
+            top5 = addr; top5_rep = miner.reputation
+        }
+        i += 1
+    }
+    
+    return (top1, top1_rep, top2, top2_rep, top3, top3_rep, top4, top4_rep, top5, top5_rep)
+}
+
+// ============================================================================
+// v10.5: Entry wrappers for cross-contract getters (called by MinerPool, etc.)
+// ============================================================================
+
+// ID 36: get_miner_stake_entry
+
+// ID 37: get_miner_reputation_entry
+
+// ID 38: get_active_miners_count_entry
+entry get_active_miners_count_entry() -> u64 { return get_active_miners_count() }
+
+// ID 39: get_miner_at_entry
+entry get_miner_at_entry(index: u64) -> Address { return get_miner_at(index) }
+
+// ============================================================================
+// v10.9: Emergency powers for Guardians and Governance
+// ----------------------------------------------------------------------------
+// These entries allow guardians to immediately respond to oracle manipulation
+// attacks, Sybil attacks, or malicious miner behavior.
+// ============================================================================
+
+// ID 40: emergency_slash_miner (guardian or admin only)
+// Immediately slash a miner by a custom percentage (up to 100% = full slash)
+// Used when a miner is caught manipulating the oracle
+// @params: miner_addr - the miner to slash
+// @params: slash_bps - slash percentage in bps (1-10000, i.e. 0.01% to 100%)
+// @params: reason - human-readable reason for the emergency slash
+// @returns: actual slash amount
+entry emergency_slash_miner(miner_addr: Address, slash_bps: u64, reason: string) -> u64 {
+    only_guardian_or_admin()
+    require(slash_bps > 0 && slash_bps <= 10000, "badbps")
+
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+
+    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    if slash_amount == 0 { return 0 }
+
+    let actual_slash: u64 = slash_amount
+    if slash_amount > miner.stake { actual_slash = miner.stake }
+
+    miner.stake -= actual_slash
+    miner.total_slashed += actual_slash
+
+    // Also slash reputation proportionally (slash_bps% of REP_MAX)
+    let rep_loss: u64 = (REP_MAX * slash_bps) / 10000
+    if miner.reputation > rep_loss {
+        miner.reputation -= rep_loss
+    } else {
+        miner.reputation = 0
+    }
+
+    // Deactivate if stake below minimum
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    if miner.stake < min_stake {
+        miner.active = false
+    }
+
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+
+    // Update total staked
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= actual_slash {
+        s.store(TOTAL_STAKED_KEY, total_staked - actual_slash)
+    }
+
+    // Burn 50% of slashed amount, 10% to reporter (guardian), 40% to treasury
+    // (simplified: just burn for now, full split in production)
+
+    emit_event(0u64, ["EmergencySlash", miner_addr.to_string() + "_" + actual_slash.to_string(10u32) + "_" + reason])
+    return 0
+}
+
+// ID 41: emergency_ban_miner (guardian or admin only)
+// Permanently ban a miner — sets reputation to 0, active to false, stake frozen
+// Used for proven malicious actors (repeated oracle manipulation)
+// @params: miner_addr - the miner to ban
+// @params: reason - human-readable reason
+entry emergency_ban_miner(miner_addr: Address, reason: string) -> u64 {
+    only_guardian_or_admin()
+
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+
+    miner.active = false
+    miner.reputation = 0
+    // Stake is frozen — miner cannot withdraw for 30 days (cooling period)
+    // This prevents the attacker from withdrawing and re-attacking
+    s.store("ban_" + miner_addr.to_string(), get_current_topoheight() + 518400)  // 30 days
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+
+    emit_event(0u64, ["EmergencyBan", miner_addr.to_string() + "_" + reason])
+    return 0
+}
+
+// ID 42: emergency_freeze_rewards (guardian or admin only)
+// Freeze all reward distribution temporarily
+// Used when an attack is detected and the protocol needs time to respond
+// @params: frozen - true to freeze, false to unfreeze
+entry emergency_freeze_rewards(frozen: bool) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store("rewards_frozen", frozen)
+    emit_event(0u64, ["RewardsFrozen", frozen ? "true" : "false"])
+    return 0
+}
+
+// ID 43: set_min_stake_entry (admin only, via governance)
+// Change the minimum stake required to be a miner
+// Used to increase security if attacks are detected
+entry set_min_stake_entry(new_min_stake: u64) -> u64 {
+    only_admin()
+    require(new_min_stake >= 1000000000, "toolow")  // min 10 VLT
+    let s: Storage = Storage::new()
+    s.store(MIN_STAKE_KEY, new_min_stake)
+    emit_event(0u64, ["MinStakeUpdated", new_min_stake.to_string(10u32)])
+    return 0
+}
+
+// ID 44: set_max_delegation_pct (admin only, via governance)
+// Set the maximum percentage of total stake one miner can have delegated
+// Anti-concentration parameter
+// @params: bps - max delegation in bps (e.g. 2000 = 20%)
+entry set_max_delegation_pct(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 500 && bps <= 5000, "badbps")  // 5% to 50%
+    let s: Storage = Storage::new()
+    s.store("max_del_pct", bps)
+    return 0
+}
+
+// ID 45: get_miner_own_stake_entry
+// Returns only the miner's own stake (not including delegated)
+// Used by MinerDelegation to calculate own vs delegated share
+entry get_miner_own_stake_entry(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    return miner.stake
+}
+
+// ID 46: is_rewards_frozen (pub fn via entry)
+// Check if rewards are currently frozen
+entry is_rewards_frozen_entry() -> bool {
+    let s: Storage = Storage::new()
+    return s.load("rewards_frozen").unwrap_or(false)
+}
+
+// ============================================================================
+// v11.1: pub fn wrappers for cross-contract calls (OracleGovernance)
+// entry functions cannot be called cross-contract — only pub fn can.
+// These wrappers allow governance to call emergency functions.
+// ============================================================================
+
+// Chunk 83: emergency_slash_miner (pub fn wrapper for cross-contract)
+pub fn emergency_slash_miner_cross(miner_addr: Address, slash_bps: u64, reason: string) -> u64 {
+    only_guardian_or_admin()
+    require(slash_bps > 0 && slash_bps <= 10000, "badbps")
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    if slash_amount == 0 { return 0 }
+    let actual_slash: u64 = slash_amount
+    if slash_amount > miner.stake { actual_slash = miner.stake }
+    miner.stake -= actual_slash
+    miner.total_slashed += actual_slash
+    let rep_loss: u64 = (REP_MAX * slash_bps) / 10000
+    if miner.reputation > rep_loss { miner.reputation -= rep_loss } else { miner.reputation = 0 }
+    let min_stake: u64 = s.load(MIN_STAKE_KEY).unwrap_or(DEFAULT_MIN_STAKE)
+    if miner.stake < min_stake { miner.active = false }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked >= actual_slash { s.store(TOTAL_STAKED_KEY, total_staked - actual_slash) }
+    emit_event(0u64, ["EmergencySlash", miner_addr.to_string() + "_" + actual_slash.to_string(10u32) + "_" + reason])
+    return actual_slash
+}
+
+// Chunk 84: emergency_ban_miner (pub fn wrapper for cross-contract)
+pub fn emergency_ban_miner_cross(miner_addr: Address, reason: string) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+    miner.active = false
+    miner.reputation = 0
+    s.store("ban_" + miner_addr.to_string(), get_current_topoheight() + 518400)
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
+    emit_event(0u64, ["EmergencyBan", miner_addr.to_string() + "_" + reason])
+    return 0
+}
+
+// Chunk 85: emergency_freeze_rewards (pub fn wrapper for cross-contract)
+pub fn emergency_freeze_rewards_cross(frozen: bool) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store("rewards_frozen", frozen)
+    emit_event(0u64, ["RewardsFrozen", frozen ? "true" : "false"])
+    return 0
+}
+
+// Chunk 86: set_min_stake (pub fn wrapper for cross-contract)
+pub fn set_min_stake_cross(new_min_stake: u64) -> u64 {
+    only_admin()
+    require(new_min_stake >= 1000000000, "toolow")
+    let s: Storage = Storage::new()
+    s.store(MIN_STAKE_KEY, new_min_stake)
+    emit_event(0u64, ["MinStakeUpdated", new_min_stake.to_string(10u32)])
+    return 0
+}

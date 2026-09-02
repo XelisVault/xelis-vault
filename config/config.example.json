@@ -1,0 +1,11 @@
+{
+  "rpc_url": "https://testnet-node.xelis.io/json_rpc",
+  "wallet_url": "http://127.0.0.1:18082/json_rpc",
+  "wallet_user": "wallet",
+  "wallet_pass": "CHANGE_ME",
+  "miner_address": "",
+  "miner_endpoint": "",
+  "services": "both",
+  "compound": false,
+  "contracts": {}
+}

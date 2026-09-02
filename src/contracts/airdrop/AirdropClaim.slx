@@ -1,0 +1,376 @@
+// ============================================================================
+// AirdropClaim.slx — XELIS Vault v10.4 (MAINNET ONLY)
+// ----------------------------------------------------------------------------
+// Contrat de distribution de l'airdrop sur mainnet.
+// Reçoit le Merkle root généré depuis AirdropTracker (testnet) et permet
+// aux utilisateurs de claim leurs VLT.
+//
+// RÔLE :
+//   1. Stocke le Merkle root (calculé off-chain depuis AirdropTracker)
+//   2. Vérifie les proofs lors du claim
+//   3. Mint les VLT à l'adresse mainnet enregistrée par l'utilisateur
+//   4. Empêche le double-claim (tracking des claims effectués)
+//
+// MÉCANIQUE :
+//   - Admin déploie le contrat avec le Merkle root + total à distribuer
+//   - User appelle claim(testnet_addr, mainnet_addr, amount, merkle_proof)
+//   - Le contrat vérifie :
+//       1. Que (testnet_addr, mainnet_addr, amount) est dans le Merkle tree
+//       2. Que l'appelant signe depuis mainnet_addr (prouve ownership)
+//       3. Que cet utilisateur n'a pas déjà claim
+//   - Si tout est OK, mint `amount` VLT à mainnet_addr
+//
+// SÉCURITÉ :
+//   - Merkle proof verification (standard OpenZeppelin)
+//   - Anti double-claim (mapping claimed[testnet_addr] = true)
+//   - Ownership check (caller == mainnet_addr)
+//   - Emergency withdraw pour les fonds non réclamés après 6 mois
+//
+// Entry IDs:
+//   0  : claim
+//   1  : emergency_withdraw_unclaimed (admin, after 6 months)
+//   2  : get_merkle_root (pub fn)
+//   3  : get_total_claimed (pub fn)
+//   4  : get_claimants_count (pub fn)
+//   5  : has_claimed (pub fn)
+//   6  : is_paused (pub fn)
+//   7  : set_vlt_contract
+//   8  : set_merkle_root (admin, in case of correction)
+//   9  : set_registry
+//   10 : set_timelock
+//   11 : set_guardian
+//   12 : pause
+//   13 : unpause
+//   14 : transfer_admin
+//   15 : get_version
+// ============================================================================
+
+const VERSION: string = "AirdropClaim v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+
+const MERKLE_ROOT_KEY: string = "mr"
+const CLAIMED_PREFIX: string = "cl_"     // testnet_addr → bool
+const TOTAL_CLAIMED_KEY: string = "tc"
+const CLAIMANTS_COUNT_KEY: string = "cc"
+const DEPLOY_TOPO_KEY: string = "dt"
+// F-01 fix (CRITICAL): track the airdrop envelope so emergency_withdraw can compute the remainder.
+const TOTAL_DISTRIBUTABLE_KEY: string = "td"
+const WITHDRAWN_KEY: string = "wd"
+const DEFAULT_TOTAL_DISTRIBUTABLE: u64 = 50000000000000  // 500,000 VLT @ 1e8 atomic
+
+// Emergency withdraw after 6 months (6 * 30 * 17280 = 3,110,400 blocks)
+const EMERGENCY_DELAY_BLOCKS: u64 = 3110400
+
+// v10.6: Reentrancy guard
+const RG_STATUS_KEY: string = "rg"
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+
+fn non_reentrant() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(MERKLE_ROOT_KEY, Hash::zero())
+    s.store(TOTAL_CLAIMED_KEY, 0u64)
+    s.store(CLAIMANTS_COUNT_KEY, 0u64)
+    s.store(DEPLOY_TOPO_KEY, get_current_topoheight())
+    s.store(TOTAL_DISTRIBUTABLE_KEY, DEFAULT_TOTAL_DISTRIBUTABLE)
+    s.store(WITHDRAWN_KEY, 0u64)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Merkle proof verification
+// proof: array of 32-byte hashes (sibling hashes from leaf to root)
+// leaf: hash of the data (testnet_addr || mainnet_addr || amount)
+// root: stored Merkle root
+fn verify_merkle_proof(proof: Hash[], leaf: Hash, root: Hash) -> bool {
+    let computed: Hash = leaf
+    let i: u32 = 0
+    while i < proof.len() {
+        let sibling: Hash = proof[i]
+        // Sort the pair to maintain canonical ordering (smaller hash first)
+        if computed < sibling {
+            computed = Hash::blake3(computed.to_bytes() + sibling.to_bytes())
+        } else {
+            computed = Hash::blake3(sibling.to_bytes() + computed.to_bytes())
+        }
+        i += 1
+    }
+    return computed == root
+}
+
+// Build the leaf hash from (testnet_addr, mainnet_addr, amount)
+// Format: keccak256(testnet_addr || mainnet_addr || amount_bytes)
+fn build_leaf(testnet_addr: Address, mainnet_addr: Address, amount: u64) -> Hash {
+    let data: bytes = testnet_addr.to_bytes() + mainnet_addr.to_bytes() + amount.to_string(10u32).to_bytes()
+    return Hash::blake3(data)
+}
+
+// Entry 0: Claim airdrop
+// Caller must be the mainnet_addr (proves ownership)
+// proof: Merkle proof that (testnet_addr, mainnet_addr, amount) is in the tree
+entry claim(
+    testnet_addr: Address,
+    mainnet_addr: Address,
+    amount: u64,
+    proof: Hash[]
+) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Verify caller owns the mainnet address
+    require(caller == mainnet_addr, "notowner")
+
+    // Verify amount is positive
+    require(amount > 0, "zeroamt")
+
+    // Verify Merkle root is set
+    let root: Hash = s.load(MERKLE_ROOT_KEY).expect("noroot")
+    require(root != Hash::zero(), "noroot")
+
+    // Verify not already claimed
+    let already: bool = s.load(CLAIMED_PREFIX + testnet_addr.to_string()).unwrap_or(false)
+    require(!already, "alreadyclaimed")
+
+    // Verify Merkle proof
+    let leaf: Hash = build_leaf(testnet_addr, mainnet_addr, amount)
+    let valid: bool = verify_merkle_proof(proof, leaf, root)
+    require(valid, "badproof")
+
+    // Mark as claimed
+    s.store(CLAIMED_PREFIX + testnet_addr.to_string(), true)
+
+    // Update totals
+    let total: u64 = s.load(TOTAL_CLAIMED_KEY).unwrap_or(0)
+    s.store(TOTAL_CLAIMED_KEY, total + amount)
+    let count: u64 = s.load(CLAIMANTS_COUNT_KEY).unwrap_or(0)
+    s.store(CLAIMANTS_COUNT_KEY, count + 1)
+
+    // Mint VLT to mainnet_addr — v11.7 fix: cross-contract calls require
+    // Access::All. VLTToken chunk 4 = pub fn mint_to (All); the v11.5 target
+    // chunk 27 (mint_to_entry, Entry) reverted "Chunk is not public".
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("novlt")
+    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+    let mint_result: u64 = vlt.call(4u16, [mainnet_addr, amount], {})
+    require(mint_result == 0, "mintfail")
+
+    emit_event(0u64, ["AirdropClaimed", testnet_addr.to_string() + "_" + amount.to_string(10u32)])
+    release_reentrancy()
+    return 0
+}
+
+// Entry 1: Emergency withdraw unclaimed funds (admin, after 6 months)
+// F-01 fix (CRITICAL): now actually transfers the remaining VLT envelope to `to`.
+//   remaining = TOTAL_DISTRIBUTABLE - total_claimed - already_withdrawn
+//   Minted to `to` via VLTToken chunk 27 (mint_to_entry).
+//   Records the withdrawn amount in WITHDRAWN_KEY so subsequent calls cannot double-spend.
+entry emergency_withdraw_unclaimed(to: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let deploy_topo: u64 = s.load(DEPLOY_TOPO_KEY).expect("err")
+    let current: u64 = get_current_topoheight()
+    require(current >= deploy_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    require(to != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), "badaddr")
+
+    // Compute remaining distributable VLT (envelope - already claimed - already withdrawn).
+    let total_distributable: u64 = s.load(TOTAL_DISTRIBUTABLE_KEY).unwrap_or(DEFAULT_TOTAL_DISTRIBUTABLE)
+    let total_claimed: u64 = s.load(TOTAL_CLAIMED_KEY).unwrap_or(0)
+    let already_withdrawn: u64 = s.load(WITHDRAWN_KEY).unwrap_or(0)
+    require(total_distributable > total_claimed + already_withdrawn, "nothing")
+    let remaining: u64 = total_distributable - total_claimed - already_withdrawn
+
+    // Mint the remaining VLT to `to` via VLTToken chunk 4 (pub fn mint_to, All).
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("novlt")
+    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+    let mint_result: u64 = vlt.call(4u16, [to, remaining], {})
+    require(mint_result == 0, "mintfail")
+
+    // Track withdrawn amount to prevent re-entrancy / double-withdraw.
+    s.store(WITHDRAWN_KEY, already_withdrawn + remaining)
+
+    emit_event(0u64, ["EmergencyWithdraw", to.to_string() + "_" + remaining.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 2: Get Merkle root
+pub fn get_merkle_root() -> Hash {
+    let s: Storage = Storage::new()
+    return s.load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+}
+
+// Pub fn 3: Get total VLT claimed so far
+pub fn get_total_claimed() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_CLAIMED_KEY).unwrap_or(0)
+}
+
+// Pub fn 4: Get number of claimants
+pub fn get_claimants_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(CLAIMANTS_COUNT_KEY).unwrap_or(0)
+}
+
+// Pub fn 5: Check if a testnet address has already claimed
+pub fn has_claimed(testnet_addr: Address) -> bool {
+    let s: Storage = Storage::new()
+    return s.load(CLAIMED_PREFIX + testnet_addr.to_string()).unwrap_or(false)
+}
+
+// Pub fn 6: Check if claims are paused
+pub fn is_paused() -> bool {
+    let s: Storage = Storage::new()
+    return s.load(PAUSED_KEY).unwrap_or(false)
+}
+
+// Entry 7: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 8: Set Merkle root (admin, can be updated if correction needed)
+entry set_merkle_root(root: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(root != Hash::zero(), "badroot")
+    s.store(MERKLE_ROOT_KEY, root)
+    emit_event(0u64, ["MerkleRootUpdated", root.to_hex()])
+    return 0
+}
+
+// Entry 9: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 10: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 11: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 12: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 13: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 14: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 15: Get version
+entry get_version() -> string {
+    return VERSION
+}
+
+// Entry 16: Set total distributable (admin only, typically set once at deployment)
+// F-01 fix: allows the admin to configure the airdrop envelope size after deployment.
+entry set_total_distributable(amount: u64) -> u64 {
+    only_admin()
+    require(amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let total_claimed: u64 = s.load(TOTAL_CLAIMED_KEY).unwrap_or(0)
+    let already_withdrawn: u64 = s.load(WITHDRAWN_KEY).unwrap_or(0)
+    require(amount >= total_claimed + already_withdrawn, "toolow")
+    s.store(TOTAL_DISTRIBUTABLE_KEY, amount)
+    emit_event(0u64, ["TotalDistributableSet", amount.to_string(10u32)])
+    return 0
+}
+
+// Pub fn: Get total distributable envelope
+pub fn get_total_distributable() -> u64 {
+    return Storage::new().load(TOTAL_DISTRIBUTABLE_KEY).unwrap_or(DEFAULT_TOTAL_DISTRIBUTABLE)
+}
+
+// Pub fn: Get already emergency-withdrawn amount
+pub fn get_emergency_withdrawn() -> u64 {
+    return Storage::new().load(WITHDRAWN_KEY).unwrap_or(0)
+}
+
+// Pub fn: Get remaining unclaimed VLT (envelope - claimed - withdrawn)
+pub fn get_remaining_unclaimed() -> u64 {
+    let s: Storage = Storage::new()
+    let total_distributable: u64 = s.load(TOTAL_DISTRIBUTABLE_KEY).unwrap_or(DEFAULT_TOTAL_DISTRIBUTABLE)
+    let total_claimed: u64 = s.load(TOTAL_CLAIMED_KEY).unwrap_or(0)
+    let already_withdrawn: u64 = s.load(WITHDRAWN_KEY).unwrap_or(0)
+    if total_distributable <= total_claimed + already_withdrawn { return 0 }
+    return total_distributable - total_claimed - already_withdrawn
+}

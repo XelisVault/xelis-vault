@@ -1,0 +1,1374 @@
+// ============================================================================
+// AirdropTracker.slx — XELIS Vault v10.4 (TESTNET ONLY)
+// ----------------------------------------------------------------------------
+// Contrat central qui accumule les points de contribution testnet pour
+// l'airdrop mainnet. Tous les contrats core lui envoient les actions des
+// utilisateurs via record_*().
+//
+// RÔLE :
+//   1. Reçoit les events de tous les contrats (mining, relayer, chat, gov, etc.)
+//   2. Accumule des points par utilisateur et par catégorie
+//   3. Applique des caps quotidiens (anti-farm/anti-bot)
+//   4. L'admin peut "freeze" (snapshot) à la fin du testnet
+//   5. L'utilisateur enregistre son adresse mainnet
+//   6. L'admin "finalize" → calcule la distribution (proportionnelle)
+//   7. Génère un Merkle root pour le claim sur mainnet
+//
+// CATÉGORIES :
+//   1 = MINING (price submissions, uptime)
+//   2 = RELAYER (anchors, uptime)
+//   3 = GOVERNANCE (votes, proposals)
+//   4 = CHAT (messages, groups)
+//   5 = LIQUIDITY (deposits, LP)
+//   6 = BOUNTY (bugs, watcher)
+//   7 = COMMUNITY (manual attribution)
+//
+// CAPS QUOTIDIENS (anti-farm) :
+//   MINING : 1000 pts/jour (submissions) + 50 pts/heure (uptime)
+//   RELAYER : 500 pts/jour (anchors) + 200 pts/jour (uptime)
+//   CHAT : 100 pts/jour (messages)
+//
+// BONUS (appliqués au finalize) :
+//   Early miner (top 100) : +50% mining
+//   High reputation (>9000) : +30% total
+//   Multi-role (3+ catégories actives) : +25% total
+//
+// DISTRIBUTION :
+//   user_vlt = (user_total_points × 500,000 VLT) / sum(all_users_total_points)
+//   Minimum pour qualifier : 1000 points + 7 jours distincts d'activité
+//
+// Entry IDs:
+//   0  : record_mining_activity (only authorized)
+//   1  : record_relayer_activity (only authorized)
+//   2  : record_governance_vote (only authorized)
+//   3  : record_governance_proposal (only authorized)
+//   4  : record_chat_message (only authorized)
+//   5  : record_chat_group_created (only authorized)
+//   6  : record_liquidity_provided (only authorized)
+//   7  : record_bug_bounty (admin only)
+//   8  : record_manual_attribution (admin only)
+//   9  : record_mainnet_address (user)
+//   10 : freeze_points (admin)
+//   11 : finalize_distribution (admin)
+//   12 : set_merkle_root (admin)
+//   13 : get_user_points (pub fn)
+//   14 : get_user_breakdown (pub fn)
+//   15 : get_total_points (pub fn)
+//   16 : get_user_count (pub fn)
+//   17 : get_user_distribution (pub fn)
+//   18 : get_mainnet_address (pub fn)
+//   19 : is_frozen (pub fn)
+//   20 : is_finalized (pub fn)
+//   21 : get_merkle_root (pub fn)
+//   22 : get_qualified_users (pub fn)
+//   23 : set_authorized_recorder
+//   24 : set_vlt_contract
+//   25 : set_registry
+//   26 : set_timelock
+//   27 : set_guardian
+//   28 : pause
+//   29 : unpause
+//   30 : transfer_admin
+//   31 : get_version
+// ============================================================================
+
+const VERSION: string = "AirdropTracker v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+
+// Authorized recorders (other contracts that can call record_*)
+const RECORDER_PREFIX: string = "rec_"
+
+// User points storage
+const USER_PREFIX: string = "user_"
+const USER_COUNT_KEY: string = "uc"
+const USER_LIST_PREFIX: string = "ul_"
+
+// Daily caps tracking
+const DAILY_PREFIX: string = "daily_"  // daily_user_category_day → count
+
+// State
+const FROZEN_KEY: string = "fz"
+const FINALIZED_KEY: string = "fn"
+const MERKLE_ROOT_KEY: string = "mr"
+const TOTAL_POINTS_KEY: string = "tp"
+const QUALIFIED_COUNT_KEY: string = "qc"
+
+// v10.4.1: Timestamps for transparency
+const START_TOPO_KEY: string = "stt"        // when contract was deployed
+const FREEZE_TOPO_KEY: string = "fzt"        // when points were frozen
+const FINALIZE_TOPO_KEY: string = "flt"       // when distribution was finalized
+
+// F-11 fix (MEDIUM): pagination cursor for finalize_distribution(start, count).
+//   Stores the next user index to process across batches. Cleared on completion.
+const FINALIZE_CURSOR_KEY: string = "flc"
+// F-11 fix: running total of total_with_bonus across batches.
+const FINALIZE_TOTAL_KEY: string = "flt_total"
+
+// F-12 fix (MEDIUM): precomputed sorted leaderboard index — built once at finalize.
+//   LEADERBOARD_INDEX_PREFIX stores (rank -> Address), LEADERBOARD_COUNT_KEY the total.
+const LEADERBOARD_INDEX_PREFIX: string = "lb_"
+const LEADERBOARD_COUNT_KEY: string = "lbc"
+
+// v10.4.1: Reverse lookup — mainnet_addr → testnet_addr
+const MAINNET_TO_TESTNET_PREFIX: string = "m2t_"
+
+// v10.4.1: Category totals (for stats dashboard)
+const CAT_TOTAL_PREFIX: string = "ct_"        // category → total points across all users
+
+// v10.4.2: Admin features — manual attribution, audit log, custom multipliers
+const MANUAL_CAP_KEY: string = "mcap"                  // configurable cap for manual attribution
+const DEFAULT_MANUAL_CAP: u64 = 50000                  // 50,000 points per call (was 10,000)
+const USER_BONUS_PREFIX: string = "ubon_"              // user → custom bonus multiplier (bps, 0 = none)
+const DISQUALIFIED_PREFIX: string = "disq_"            // user → bool (banned)
+const FORCE_QUALIFIED_PREFIX: string = "fqual_"        // user → bool (manually qualified)
+const ADMIN_LOG_PREFIX: string = "alog_"               // index → AdminLogEntry
+const ADMIN_LOG_COUNT_KEY: string = "alc"
+const ADMIN_LOG_MAX: u64 = 1000                        // keep last 1000 admin actions
+
+// Categories
+const CAT_MINING: u8 = 1
+const CAT_RELAYER: u8 = 2
+const CAT_GOVERNANCE: u8 = 3
+const CAT_CHAT: u8 = 4
+const CAT_LIQUIDITY: u8 = 5
+const CAT_BOUNTY: u8 = 6
+const CAT_COMMUNITY: u8 = 7
+
+// Daily caps (points per day per user per category)
+const CAP_MINING_DAILY: u64 = 1000
+const CAP_RELAYER_DAILY: u64 = 500
+const CAP_CHAT_DAILY: u64 = 100
+
+// Points per action
+const PTS_MINING_SUBMISSION: u64 = 1
+const PTS_MINING_HOUR: u64 = 50
+const PTS_RELAYER_ANCHOR: u64 = 10
+const PTS_RELAYER_DAY: u64 = 200
+const PTS_GOV_VOTE: u64 = 50
+const PTS_GOV_PROPOSAL: u64 = 500
+const PTS_CHAT_MSG: u64 = 1
+const PTS_CHAT_GROUP: u64 = 100
+const PTS_LIQ_PER_XEL: u64 = 10  // 10 points per XEL deposited
+const PTS_BUG_CRITICAL: u64 = 5000
+const PTS_BUG_HIGH: u64 = 1000
+const PTS_BUG_MEDIUM: u64 = 200
+
+// Bonus multipliers (in bps, 10000 = 1x)
+const BONUS_EARLY_MINER_BPS: u64 = 15000   // +50%
+const BONUS_HIGH_REP_BPS: u64 = 13000      // +30%
+const BONUS_MULTI_ROLE_BPS: u64 = 12500    // +25%
+
+// Qualification thresholds
+const MIN_POINTS_TO_QUALIFY: u64 = 1000
+const MIN_DAYS_ACTIVE: u64 = 7
+
+// Total distributable (500,000 VLT with 8 decimals)
+const TOTAL_DISTRIBUTABLE: u64 = 50000000000000
+
+// Blocks per day (5s blocks)
+const BLOCKS_PER_DAY: u64 = 17280
+
+struct UserPoints {
+    mining: u64,
+    relayer: u64,
+    governance: u64,
+    chat: u64,
+    liquidity: u64,
+    bounty: u64,
+    community: u64,
+    total_raw: u64,           // sum before bonus
+    total_with_bonus: u64,    // after bonus (set at finalize)
+    days_active: u64,          // distinct days with activity
+    last_active_day: u64,
+    mainnet_address: Address,
+    qualified: bool,
+    registered: bool
+}
+
+// v10.4.2: Admin log entry — audit trail for all admin actions
+struct AdminLogEntry {
+    admin: Address,            // who performed the action
+    action_type: u8,           // 1=add, 2=deduct, 3=disqualify, 4=force_qualify, 5=multiplier, 6=batch_add
+    target_user: Address,      // who was affected
+    category: u8,              // category (for add/deduct, 0 otherwise)
+    amount: u64,               // points (for add/deduct, 0 otherwise)
+    multiplier_bps: u64,       // multiplier (for set_multiplier, 0 otherwise)
+    reason: string,            // human-readable reason
+    topo: u64                  // when it happened
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(FROZEN_KEY, false)
+    s.store(FINALIZED_KEY, false)
+    s.store(USER_COUNT_KEY, 0u64)
+    s.store(TOTAL_POINTS_KEY, 0u64)
+    s.store(QUALIFIED_COUNT_KEY, 0u64)
+    s.store(MERKLE_ROOT_KEY, Hash::zero())
+    s.store(START_TOPO_KEY, get_current_topoheight())
+    s.store(FREEZE_TOPO_KEY, 0u64)
+    s.store(FINALIZE_TOPO_KEY, 0u64)
+    s.store(MANUAL_CAP_KEY, DEFAULT_MANUAL_CAP)
+    s.store(ADMIN_LOG_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn when_not_frozen() {
+    let s: Storage = Storage::new()
+    let frozen: bool = s.load(FROZEN_KEY).unwrap_or(false)
+    require(!frozen, "frozen")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Only authorized contracts (recorders) can call record_*
+// Admin is always authorized.
+// v11.6 fix: contract recorders are authorized by Hash via get_contract_caller()
+//   (the previous Address-based check could never match a contract caller).
+fn only_authorized_recorder() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let cc_opt: optional<Hash> = get_contract_caller()
+    if cc_opt.is_some() {
+        let cc: Hash = cc_opt.expect("err")
+        let is_auth_c: bool = s.load(RECORDER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_auth_c, "notauth")
+        return
+    }
+    // Check if caller is in the authorized recorders list
+    let is_auth: bool = s.load(RECORDER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_auth, "notauth")
+}
+
+fn get_day(topo: u64) -> u64 {
+    return topo / BLOCKS_PER_DAY
+}
+
+fn get_or_init_user(user: Address) -> UserPoints {
+    let s: Storage = Storage::new()
+    let key: string = USER_PREFIX + user.to_string()
+    let opt: optional<UserPoints> = s.load(key)
+    if opt.is_some() {
+        return opt.expect("err")
+    }
+    // New user — register
+    let up: UserPoints = UserPoints {
+        mining: 0,
+        relayer: 0,
+        governance: 0,
+        chat: 0,
+        liquidity: 0,
+        bounty: 0,
+        community: 0,
+        total_raw: 0,
+        total_with_bonus: 0,
+        days_active: 0,
+        last_active_day: 0,
+        mainnet_address: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        qualified: false,
+        registered: true
+    }
+    s.store(key, up)
+    // Add to user list
+    let count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    s.store(USER_LIST_PREFIX + count.to_string(10u32), user)
+    s.store(USER_COUNT_KEY, count + 1)
+    return up
+}
+
+fn update_day_activity(up: UserPoints, current_day: u64) -> UserPoints {
+    if up.last_active_day != current_day {
+        up.days_active += 1
+        up.last_active_day = current_day
+    }
+    return up
+}
+
+fn check_daily_cap(user: Address, category: u8, points_to_add: u64, cap: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let current_day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + user.to_string() + "_" + category.to_string(10u32) + "_" + current_day.to_string(10u32)
+    let current: u64 = s.load(key).unwrap_or(0)
+    if current + points_to_add > cap {
+        // Cap reached — only add up to cap
+        let allowed: u64 = cap - current
+        s.store(key, cap)
+        return allowed
+    }
+    s.store(key, current + points_to_add)
+    return points_to_add
+}
+
+// v10.4.2: Log admin actions for audit trail
+fn log_admin_action(action_type: u8, target: Address, category: u8, amount: u64, multiplier_bps: u64, reason: string) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(ADMIN_LOG_COUNT_KEY).unwrap_or(0)
+    let idx: u64 = count % ADMIN_LOG_MAX  // ring buffer
+
+    let entry: AdminLogEntry = AdminLogEntry {
+        admin: get_caller().expect("err"),
+        action_type: action_type,
+        target_user: target,
+        category: category,
+        amount: amount,
+        multiplier_bps: multiplier_bps,
+        reason: reason,
+        topo: get_current_topoheight()
+    }
+    s.store(ADMIN_LOG_PREFIX + idx.to_string(10u32), entry)
+    s.store(ADMIN_LOG_COUNT_KEY, count + 1)
+}
+
+// v10.4.2: Deduct points from a user (internal helper)
+fn deduct_points_internal(user: Address, category: u8, points: u64) {
+    if points == 0 { return }
+    let s: Storage = Storage::new()
+    let up_opt: optional<UserPoints> = s.load(USER_PREFIX + user.to_string())
+    if up_opt.is_none() { return }  // user doesn't exist, nothing to deduct
+    let up: UserPoints = up_opt.expect("err")
+
+    if category == CAT_MINING {
+        if up.mining >= points { up.mining -= points } else { up.mining = 0 }
+    } else if category == CAT_RELAYER {
+        if up.relayer >= points { up.relayer -= points } else { up.relayer = 0 }
+    } else if category == CAT_GOVERNANCE {
+        if up.governance >= points { up.governance -= points } else { up.governance = 0 }
+    } else if category == CAT_CHAT {
+        if up.chat >= points { up.chat -= points } else { up.chat = 0 }
+    } else if category == CAT_LIQUIDITY {
+        if up.liquidity >= points { up.liquidity -= points } else { up.liquidity = 0 }
+    } else if category == CAT_BOUNTY {
+        if up.bounty >= points { up.bounty -= points } else { up.bounty = 0 }
+    } else if category == CAT_COMMUNITY {
+        if up.community >= points { up.community -= points } else { up.community = 0 }
+    }
+
+    if up.total_raw >= points {
+        up.total_raw -= points
+    } else {
+        up.total_raw = 0
+    }
+    s.store(USER_PREFIX + user.to_string(), up)
+
+    // Update global total
+    let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+    if total >= points {
+        s.store(TOTAL_POINTS_KEY, total - points)
+    } else {
+        s.store(TOTAL_POINTS_KEY, 0u64)
+    }
+
+    // Update category total
+    let cat_key: string = CAT_TOTAL_PREFIX + category.to_string(10u32)
+    let cat_total: u64 = s.load(cat_key).unwrap_or(0)
+    if cat_total >= points {
+        s.store(cat_key, cat_total - points)
+    } else {
+        s.store(cat_key, 0u64)
+    }
+}
+
+fn add_points(user: Address, category: u8, points: u64) {
+    if points == 0 { return }
+    let s: Storage = Storage::new()
+    let up: UserPoints = get_or_init_user(user)
+    let current_day: u64 = get_day(get_current_topoheight())
+    up = update_day_activity(up, current_day)
+
+    if category == CAT_MINING {
+        up.mining += points
+    } else if category == CAT_RELAYER {
+        up.relayer += points
+    } else if category == CAT_GOVERNANCE {
+        up.governance += points
+    } else if category == CAT_CHAT {
+        up.chat += points
+    } else if category == CAT_LIQUIDITY {
+        up.liquidity += points
+    } else if category == CAT_BOUNTY {
+        up.bounty += points
+    } else if category == CAT_COMMUNITY {
+        up.community += points
+    }
+    up.total_raw += points
+    s.store(USER_PREFIX + user.to_string(), up)
+
+    // Update global total
+    let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+    s.store(TOTAL_POINTS_KEY, total + points)
+
+    // Update category total (for stats dashboard)
+    let cat_key: string = CAT_TOTAL_PREFIX + category.to_string(10u32)
+    let cat_total: u64 = s.load(cat_key).unwrap_or(0)
+    s.store(cat_key, cat_total + points)
+}
+
+// Entry 0: Record mining activity (called by XelisVaultMiner or StakedOracle)
+// valid_submissions: number of valid price submissions
+// runtime_blocks: blocks since last heartbeat (for uptime points)
+entry record_mining_activity(miner: Address, valid_submissions: u64, runtime_blocks: u64) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+
+    // Submissions points (with daily cap)
+    let sub_points: u64 = valid_submissions * PTS_MINING_SUBMISSION
+    let capped_sub: u64 = check_daily_cap(miner, CAT_MINING, sub_points, CAP_MINING_DAILY)
+    add_points(miner, CAT_MINING, capped_sub)
+
+    // Uptime points (50 per hour = 50 per 720 blocks)
+    let hours: u64 = runtime_blocks / 720
+    let uptime_points: u64 = hours * PTS_MINING_HOUR
+    add_points(miner, CAT_MINING, uptime_points)
+
+    return 0
+}
+
+// Entry 1: Record relayer activity (called by VaultChat)
+entry record_relayer_activity(relayer: Address, valid_anchors: u64, uptime_blocks: u64) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+
+    let anchor_points: u64 = valid_anchors * PTS_RELAYER_ANCHOR
+    let capped: u64 = check_daily_cap(relayer, CAT_RELAYER, anchor_points, CAP_RELAYER_DAILY)
+    add_points(relayer, CAT_RELAYER, capped)
+
+    let days: u64 = uptime_blocks / BLOCKS_PER_DAY
+    let uptime_points: u64 = days * PTS_RELAYER_DAY
+    add_points(relayer, CAT_RELAYER, uptime_points)
+
+    return 0
+}
+
+// Entry 2: Record governance vote (called by Governor)
+entry record_governance_vote(voter: Address, _proposal_id: u64) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+    add_points(voter, CAT_GOVERNANCE, PTS_GOV_VOTE)
+    return 0
+}
+
+// Entry 3: Record governance proposal (called by Governor)
+entry record_governance_proposal(proposer: Address, _proposal_id: u64) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+    add_points(proposer, CAT_GOVERNANCE, PTS_GOV_PROPOSAL)
+    return 0
+}
+
+// Entry 4: Record chat message (called by VaultChat, capped daily)
+entry record_chat_message(sender: Address) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+    let capped: u64 = check_daily_cap(sender, CAT_CHAT, PTS_CHAT_MSG, CAP_CHAT_DAILY)
+    add_points(sender, CAT_CHAT, capped)
+    return 0
+}
+
+// Entry 5: Record chat group created (called by VaultChat)
+entry record_chat_group_created(creator: Address) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+    add_points(creator, CAT_CHAT, PTS_CHAT_GROUP)
+    return 0
+}
+
+// Entry 6: Record liquidity provided (called by VaultEngine, VaultSwap, PSM)
+// xel_amount: amount of XEL provided (in atomic)
+entry record_liquidity_provided(user: Address, xel_amount: u64) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_authorized_recorder()
+    let points: u64 = (xel_amount / 100000000) * PTS_LIQ_PER_XEL  // convert atomic to XEL
+    add_points(user, CAT_LIQUIDITY, points)
+    return 0
+}
+
+// Entry 7: Record bug bounty (admin only)
+// severity: 1=critical, 2=high, 3=medium
+entry record_bug_bounty(reporter: Address, severity: u8) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_admin()
+    let points: u64 = 0
+    if severity == 1 {
+        points = PTS_BUG_CRITICAL
+    } else if severity == 2 {
+        points = PTS_BUG_HIGH
+    } else if severity == 3 {
+        points = PTS_BUG_MEDIUM
+    } else {
+        require(false, "badsev")
+    }
+    add_points(reporter, CAT_BOUNTY, points)
+    return 0
+}
+
+// Entry 8: Record manual attribution (admin only, for community contributions)
+// Stores the reason and logs to admin audit trail
+entry record_manual_attribution(user: Address, category: u8, points: u64, reason: string) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_admin()
+    require(category >= 1 && category <= 7, "badcat")
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(MANUAL_CAP_KEY).unwrap_or(DEFAULT_MANUAL_CAP)
+    require(points <= cap, "toomuch")
+
+    // Check user is not disqualified
+    let is_disq: bool = s.load(DISQUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+    require(!is_disq, "disqualified")
+
+    add_points(user, category, points)
+    log_admin_action(1u8, user, category, points, 0u64, reason)
+    emit_event(0u64, ["ManualAttribution", user.to_string() + "_" + points.to_string(10u32) + "_" + reason])
+    return 0
+}
+
+// Entry 9: User records their mainnet address
+// Must be called BEFORE freeze_points()
+entry record_mainnet_address(mainnet_addr: Address) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    require(mainnet_addr != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), "badaddr")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Check if mainnet_addr is already used by another testnet address
+    let existing_opt: optional<Address> = s.load(MAINNET_TO_TESTNET_PREFIX + mainnet_addr.to_string())
+    require(existing_opt.is_none() || existing_opt.expect("err") == caller, "mainnetused")
+
+    // If user had a previous mainnet address, clear the old reverse lookup
+    let up: UserPoints = get_or_init_user(caller)
+    if up.mainnet_address != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) && up.mainnet_address != mainnet_addr {
+        s.delete(MAINNET_TO_TESTNET_PREFIX + up.mainnet_address.to_string())
+    }
+
+    // Set new mainnet address + reverse lookup
+    up.mainnet_address = mainnet_addr
+    s.store(USER_PREFIX + caller.to_string(), up)
+    s.store(MAINNET_TO_TESTNET_PREFIX + mainnet_addr.to_string(), caller)
+    emit_event(0u64, ["MainnetAddressRecorded", caller.to_string()])
+    return 0
+}
+
+// Entry 10: Freeze points (admin only, ends point accumulation)
+// After freeze, no more record_* calls accepted
+entry freeze_points() -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let frozen: bool = s.load(FROZEN_KEY).unwrap_or(false)
+    require(!frozen, "alreadyfrozen")
+    s.store(FROZEN_KEY, true)
+    s.store(FREEZE_TOPO_KEY, get_current_topoheight())
+    emit_event(0u64, ["PointsFrozen", ""])
+    return 0
+}
+
+// Entry 11: Finalize distribution (admin only, after freeze)
+// F-11 fix (MEDIUM): converted from a single unbounded loop into a paginated /
+//   resumable design — the admin calls finalize_distribution(start, count)
+//   repeatedly with batches of users (recommended 50-200 per call) until the
+//   entire user list has been processed. The final batch sets FINALIZED_KEY = true
+//   and builds the sorted leaderboard index (F-12 fix).
+// Returns: number of users processed in this batch (0 when already finalized).
+
+// F-12 fix (MEDIUM): build a sorted leaderboard index once after finalize.
+// Stores addresses sorted by total_with_bonus (desc) under LEADERBOARD_INDEX_PREFIX.
+// O(n^2) worst case but only runs ONCE at finalize — get_leaderboard_at_rank is then O(1).
+fn build_leaderboard_index() {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    // Collect (address, points) pairs into a flat list using a simple selection-sort.
+    // For small/medium testnet populations (<1000 users) this is acceptable.
+    // For larger populations, off-chain indexing is the recommended approach (per the audit).
+    let n: u64 = 0
+    let i: u64 = 0
+    while i < count {
+        let user_opt: optional<Address> = s.load(USER_LIST_PREFIX + i.to_string(10u32))
+        if user_opt.is_some() {
+            let user: Address = user_opt.expect("err")
+            let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("err")
+            // Insert (user, up.total_with_bonus) into the running sorted list.
+            // Find the right slot: scan from the top.
+            let insert_rank: u64 = n  // default: append at the bottom
+            let j: u64 = 0
+            while j < n {
+                let other_addr: Address = s.load(LEADERBOARD_INDEX_PREFIX + j.to_string(10u32)).expect("err")
+                let other_up: UserPoints = s.load(USER_PREFIX + other_addr.to_string()).expect("err")
+                if up.total_with_bonus > other_up.total_with_bonus {
+                    insert_rank = j
+                    j = n  // break
+                }
+                j += 1
+            }
+            // Shift entries from insert_rank downward by 1
+            let k: u64 = n
+            while k > insert_rank {
+                let prev_addr: Address = s.load(LEADERBOARD_INDEX_PREFIX + (k - 1).to_string(10u32)).expect("err")
+                s.store(LEADERBOARD_INDEX_PREFIX + k.to_string(10u32), prev_addr)
+                k -= 1
+            }
+            s.store(LEADERBOARD_INDEX_PREFIX + insert_rank.to_string(10u32), user)
+            n += 1
+        }
+        i += 1
+    }
+    s.store(LEADERBOARD_COUNT_KEY, n)
+}
+
+entry finalize_distribution(start_index: u64, count: u64) -> u64 {
+    only_admin()
+    require(count > 0 && count <= 200, "badbatch")
+    let s: Storage = Storage::new()
+    require(s.load(FROZEN_KEY).unwrap_or(false), "notfrozen")
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false); require(!finalized, "alreadyfinal")
+
+    let user_count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    require(start_index <= user_count, "oob")
+    if start_index == user_count {
+        // No more work to do — finalize
+        s.store(FINALIZED_KEY, true)
+        s.store(FINALIZE_TOPO_KEY, get_current_topoheight())
+        s.delete(FINALIZE_CURSOR_KEY)
+        let qualified_count: u64 = s.load(QUALIFIED_COUNT_KEY).unwrap_or(0); emit_event(0u64, ["DistributionFinalized", qualified_count.to_string(10u32)])
+        // F-12 fix: build the sorted leaderboard index in a single pass on completion.
+        build_leaderboard_index()
+        return 0
+    }
+
+    // Load running totals from the previous batch (or 0 if this is the first batch).
+    let total_with_bonus: u64 = s.load(FINALIZE_TOTAL_KEY).unwrap_or(0)
+    let qualified_count: u64 = s.load(QUALIFIED_COUNT_KEY).unwrap_or(0)
+
+    let end: u64 = start_index + count
+    if end > user_count { end = user_count }
+
+    let i: u64 = start_index
+    while i < end {
+        let user_opt: optional<Address> = s.load(USER_LIST_PREFIX + i.to_string(10u32))
+        if user_opt.is_some() {
+            let user: Address = user_opt.expect("err")
+            let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("err")
+
+            // v10.4.2: Check disqualification (banned users get 0)
+            let is_disqualified: bool = s.load(DISQUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+            if is_disqualified {
+                up.qualified = false
+                up.total_with_bonus = 0
+                s.store(USER_PREFIX + user.to_string(), up)
+                i += 1
+                continue
+            }
+
+            // v10.4.2: Check force-qualification (admin override)
+            let is_force_qualified: bool = s.load(FORCE_QUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+
+            // Check standard qualification
+            let has_mainnet: bool = up.mainnet_address != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+            let has_min_points: bool = up.total_raw >= MIN_POINTS_TO_QUALIFY
+            let has_min_days: bool = up.days_active >= MIN_DAYS_ACTIVE
+            let standard_qualified: bool = has_mainnet && has_min_points && has_min_days
+
+            // Qualified if standard OR force-qualified
+            up.qualified = standard_qualified || is_force_qualified
+
+            if up.qualified {
+                // Apply bonuses
+                let bonus_mult: u64 = 10000  // 1x base
+
+                // v10.4.2: Custom user bonus multiplier (e.g. +50% for Discord mods)
+                let custom_mult: u64 = s.load(USER_BONUS_PREFIX + user.to_string()).unwrap_or(0)
+                if custom_mult > 0 {
+                    bonus_mult = (bonus_mult * custom_mult) / 10000
+                }
+
+                // Multi-role bonus (3+ categories with > 0 points)
+                let active_categories: u64 = 0
+                if up.mining > 0 { active_categories += 1 }
+                if up.relayer > 0 { active_categories += 1 }
+                if up.governance > 0 { active_categories += 1 }
+                if up.chat > 0 { active_categories += 1 }
+                if up.liquidity > 0 { active_categories += 1 }
+                if up.bounty > 0 { active_categories += 1 }
+                if up.community > 0 { active_categories += 1 }
+                if active_categories >= 3 {
+                    bonus_mult = (bonus_mult * BONUS_MULTI_ROLE_BPS) / 10000
+                }
+
+                // Apply bonus to total
+                up.total_with_bonus = (up.total_raw * bonus_mult) / 10000
+                total_with_bonus += up.total_with_bonus
+                qualified_count += 1
+            } else {
+                up.total_with_bonus = 0
+            }
+            s.store(USER_PREFIX + user.to_string(), up)
+        }
+        i += 1
+    }
+
+    // Persist running totals for the next batch
+    s.store(FINALIZE_TOTAL_KEY, total_with_bonus)
+    s.store(QUALIFIED_COUNT_KEY, qualified_count)
+    s.store(FINALIZE_CURSOR_KEY, end)
+
+    // If this batch reached the end, mark as finalized.
+    if end >= user_count {
+        s.store(TOTAL_POINTS_KEY, total_with_bonus)
+        s.store(FINALIZED_KEY, true)
+        s.store(FINALIZE_TOPO_KEY, get_current_topoheight())
+        s.delete(FINALIZE_CURSOR_KEY)
+        emit_event(0u64, ["DistributionFinalized", qualified_count.to_string(10u32)])
+        // F-12 fix: build the sorted leaderboard index in a single pass on completion.
+        build_leaderboard_index()
+    } else {
+        emit_event(0u64, ["DistributionBatchProcessed", end.to_string(10u32) + "/" + user_count.to_string(10u32)])
+    }
+    return 0
+}
+
+// F-12 fix: pub fn returning leaderboard count (for pagination/iteration).
+pub fn get_leaderboard_count() -> u64 {
+    return Storage::new().load(LEADERBOARD_COUNT_KEY).unwrap_or(0)
+}
+
+// F-12 fix: pub fn returning the finalized flag (so callers know whether
+//   the sorted index has been built).
+pub fn is_leaderboard_ready() -> bool {
+    return Storage::new().load(FINALIZED_KEY).unwrap_or(false)
+}
+
+// Entry 12: Set Merkle root (admin, after finalize)
+// The Merkle root is generated off-chain from the qualified users + their distributions
+entry set_merkle_root(root: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(s.load(FINALIZED_KEY).unwrap_or(false), "notfinal")
+    require(root != Hash::zero(), "badroot")
+    s.store(MERKLE_ROOT_KEY, root)
+    emit_event(0u64, ["MerkleRootSet", root.to_hex()])
+    return 0
+}
+
+// Pub fn 13: Get total points for a user (with bonus, if finalized)
+pub fn get_user_points(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    if finalized {
+        return up.total_with_bonus
+    }
+    return up.total_raw
+}
+
+// Pub fn 14: Get user breakdown (per category)
+pub fn get_user_breakdown(user: Address) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    return (
+        up.mining, up.relayer, up.governance, up.chat,
+        up.liquidity, up.bounty, up.community,
+        up.total_raw, up.total_with_bonus,
+        up.qualified, up.registered
+    )
+}
+
+// Pub fn 15: Get total points across all users
+pub fn get_total_points() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+}
+
+// Pub fn 16: Get total user count
+pub fn get_user_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(USER_COUNT_KEY).unwrap_or(0)
+}
+
+// Pub fn 17: Get VLT distribution for a user (proportional to points)
+// Returns 0 if not finalized or not qualified
+pub fn get_user_distribution(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    if !finalized { return 0 }
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    if !up.qualified { return 0 }
+    let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+    if total == 0 { return 0 }
+    return (up.total_with_bonus * TOTAL_DISTRIBUTABLE) / total
+}
+
+// Pub fn 18: Get mainnet address recorded by user
+pub fn get_mainnet_address(user: Address) -> Address {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    return up.mainnet_address
+}
+
+// Pub fn 19: Check if points are frozen
+pub fn is_frozen() -> bool {
+    let s: Storage = Storage::new()
+    return s.load(FROZEN_KEY).unwrap_or(false)
+}
+
+// Pub fn 20: Check if distribution is finalized
+pub fn is_finalized() -> bool {
+    let s: Storage = Storage::new()
+    return s.load(FINALIZED_KEY).unwrap_or(false)
+}
+
+// Pub fn 21: Get Merkle root (for mainnet claim verification)
+pub fn get_merkle_root() -> Hash {
+    let s: Storage = Storage::new()
+    return s.load(MERKLE_ROOT_KEY).unwrap_or(Hash::zero())
+}
+
+// Pub fn 22: Get qualified users count
+pub fn get_qualified_users() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(QUALIFIED_COUNT_KEY).unwrap_or(0)
+}
+
+// ============================================================================
+// v10.4.1: Dashboard getters — for website / leaderboard / stats
+// ============================================================================
+
+// Pub fn 23: Get user at index (for website iteration)
+// Returns the testnet address of the user at position `index` in the user list
+pub fn get_user_at_index(index: u64) -> Address {
+    let s: Storage = Storage::new()
+    return s.load(USER_LIST_PREFIX + index.to_string(10u32)).expect("oob")
+}
+
+// Pub fn 24: Get user rank (position in leaderboard by total points)
+// Returns 0 if user not found, otherwise 1-indexed rank
+// Note: This is O(N) — for large user counts, prefer off-chain indexing
+pub fn get_user_rank(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let user_opt: optional<UserPoints> = s.load(USER_PREFIX + user.to_string())
+    if user_opt.is_none() { return 0 }
+    let target: UserPoints = user_opt.expect("err")
+
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    let target_points: u64 = 0
+    if finalized {
+        target_points = target.total_with_bonus
+    } else {
+        target_points = target.total_raw
+    }
+
+    let count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    let rank: u64 = 1
+    let i: u64 = 0
+    while i < count {
+        let addr_opt: optional<Address> = s.load(USER_LIST_PREFIX + i.to_string(10u32))
+        if addr_opt.is_some() {
+            let addr: Address = addr_opt.expect("err")
+            if addr != user {
+                let other: UserPoints = s.load(USER_PREFIX + addr.to_string()).expect("err")
+                let other_points: u64 = 0
+                if finalized {
+                    other_points = other.total_with_bonus
+                } else {
+                    other_points = other.total_raw
+                }
+                if other_points > target_points {
+                    rank += 1
+                }
+            }
+        }
+        i += 1
+    }
+    return rank
+}
+
+// Pub fn 25: Get estimated distribution (works BEFORE finalize)
+// Returns the VLT the user would receive if finalized now
+// Formula: (user_total_raw × 500,000 VLT) / sum(all_users_total_raw)
+pub fn get_estimated_distribution(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    if finalized {
+        return get_user_distribution(user)
+    }
+
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+    if total == 0 { return 0 }
+    return (up.total_raw * TOTAL_DISTRIBUTABLE) / total
+}
+
+// Pub fn 26: Get user percentage (user_points / total_points × 10000 = bps)
+pub fn get_user_percentage(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+    if total == 0 { return 0 }
+
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    let user_points: u64 = 0
+    if finalized {
+        user_points = up.total_with_bonus
+    } else {
+        user_points = up.total_raw
+    }
+
+    return (user_points * 10000) / total
+}
+
+// Pub fn 27: Get category total (total points across all users for a category)
+// category: 1=mining, 2=relayer, 3=governance, 4=chat, 5=liquidity, 6=bounty, 7=community
+pub fn get_category_total(category: u8) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(CAT_TOTAL_PREFIX + category.to_string(10u32)).unwrap_or(0)
+}
+
+// Pub fn 28: Get all category totals in one call
+// Returns (mining, relayer, governance, chat, liquidity, bounty, community)
+pub fn get_all_category_totals() -> (u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(CAT_TOTAL_PREFIX + "1").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "2").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "3").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "4").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "5").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "6").unwrap_or(0),
+        s.load(CAT_TOTAL_PREFIX + "7").unwrap_or(0)
+    )
+}
+
+// Pub fn 29: Reverse lookup — get testnet address from mainnet address
+// Returns Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) if not found
+pub fn get_testnet_address(mainnet_addr: Address) -> Address {
+    let s: Storage = Storage::new()
+    let opt: optional<Address> = s.load(MAINNET_TO_TESTNET_PREFIX + mainnet_addr.to_string())
+    if opt.is_none() { return Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) }
+    return opt.expect("err")
+}
+
+// Pub fn 30: Get snapshot info (timestamps)
+// Returns (deploy_topo, freeze_topo, finalize_topo, current_topo)
+pub fn get_snapshot_info() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(START_TOPO_KEY).expect("err"),
+        s.load(FREEZE_TOPO_KEY).unwrap_or(0),
+        s.load(FINALIZE_TOPO_KEY).unwrap_or(0),
+        get_current_topoheight()
+    )
+}
+
+// Pub fn 31: Get user activity summary (days_active, last_active_day, qualified, has_mainnet)
+pub fn get_user_activity_summary(user: Address) -> (u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    let has_mainnet: bool = up.mainnet_address != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    return (up.days_active, up.last_active_day, up.qualified, has_mainnet)
+}
+
+// Pub fn 32: Get protocol stats (all key metrics in one call)
+// Returns (user_count, qualified_count, total_points, total_distributable, frozen, finalized)
+pub fn get_protocol_stats() -> (u64, u64, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(USER_COUNT_KEY).unwrap_or(0),
+        s.load(QUALIFIED_COUNT_KEY).unwrap_or(0),
+        s.load(TOTAL_POINTS_KEY).unwrap_or(0),
+        TOTAL_DISTRIBUTABLE,
+        s.load(FROZEN_KEY).unwrap_or(false),
+        s.load(FINALIZED_KEY).unwrap_or(false)
+    )
+}
+
+// Pub fn 33: Get leaderboard top N (returns addresses sorted by points desc)
+// F-12 fix (MEDIUM): was O(n^2) (nested scan over all users for every rank).
+//   Now uses a precomputed sorted index built once at finalize — O(1) lookup.
+//   Falls back to the old O(n^2) algorithm only if finalize has not run yet,
+//   with a clear comment that off-chain indexing is preferred pre-finalize.
+// rank: 1-indexed position (1 = highest points)
+pub fn get_leaderboard_at_rank(rank: u64) -> Address {
+    let s: Storage = Storage::new()
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    // F-12 fix: post-finalize, use the precomputed sorted index (O(1)).
+    if finalized {
+        let lb_count: u64 = s.load(LEADERBOARD_COUNT_KEY).unwrap_or(0)
+        require(rank > 0 && rank <= lb_count, "badrank")
+        return s.load(LEADERBOARD_INDEX_PREFIX + (rank - 1).to_string(10u32)).expect("oob")
+    }
+    // Pre-finalize fallback: keep the legacy O(n^2) algorithm for backward compat,
+    //   but warn callers (via the audit doc) that this is expensive and that
+    //   they should wait for finalize to use the fast path.
+    let count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    require(rank > 0 && rank <= count, "badrank")
+
+    let i: u64 = 0
+    while i < count {
+        let addr_opt: optional<Address> = s.load(USER_LIST_PREFIX + i.to_string(10u32))
+        if addr_opt.is_some() {
+            let addr: Address = addr_opt.expect("err")
+            let up: UserPoints = s.load(USER_PREFIX + addr.to_string()).expect("err")
+            let user_points: u64 = up.total_raw
+
+            // Count how many users have MORE points than this user
+            let higher_count: u64 = 0
+            let j: u64 = 0
+            while j < count {
+                if j != i {
+                    let other_opt: optional<Address> = s.load(USER_LIST_PREFIX + j.to_string(10u32))
+                    if other_opt.is_some() {
+                        let other_addr: Address = other_opt.expect("err")
+                        let other: UserPoints = s.load(USER_PREFIX + other_addr.to_string()).expect("err")
+                        if other.total_raw > user_points {
+                            higher_count += 1
+                        }
+                    }
+                }
+                j += 1
+            }
+
+            // If exactly (rank-1) users have more points, this is the user at this rank
+            if higher_count == rank - 1 {
+                return addr
+            }
+        }
+        i += 1
+    }
+    return Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+}
+
+// Pub fn 34: Get leaderboard entry (full info for a rank)
+// Returns (testnet_addr, points, qualified, mainnet_addr, distribution)
+pub fn get_leaderboard_entry(rank: u64) -> (Address, u64, bool, Address, u64) {
+    let addr: Address = get_leaderboard_at_rank(rank)
+    if addr == Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) {
+        return (Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), 0, false, Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), 0)
+    }
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + addr.to_string()).expect("err")
+    let finalized: bool = s.load(FINALIZED_KEY).unwrap_or(false)
+    let points: u64 = 0
+    if finalized {
+        points = up.total_with_bonus
+    } else {
+        points = up.total_raw
+    }
+    let distribution: u64 = 0
+    if finalized && up.qualified {
+        let total: u64 = s.load(TOTAL_POINTS_KEY).unwrap_or(0)
+        if total > 0 {
+            distribution = (up.total_with_bonus * TOTAL_DISTRIBUTABLE) / total
+        }
+    }
+    return (addr, points, up.qualified, up.mainnet_address, distribution)
+}
+
+// Pub fn 35: Check if user is qualified
+pub fn is_qualified(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    return up.qualified
+}
+
+// Pub fn 36: Get total distributable VLT (constant, for display)
+pub fn get_total_distributable() -> u64 {
+    return TOTAL_DISTRIBUTABLE
+}
+
+// Pub fn 37: Get user full info (all fields, for profile page)
+// Returns (mining, relayer, governance, chat, liquidity, bounty, community,
+//          total_raw, total_with_bonus, days_active, mainnet_addr, qualified, rank)
+pub fn get_user_full_info(user: Address) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, Address, bool, u64) {
+    let s: Storage = Storage::new()
+    let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("notreg")
+    let rank: u64 = get_user_rank(user)
+    return (
+        up.mining, up.relayer, up.governance, up.chat,
+        up.liquidity, up.bounty, up.community,
+        up.total_raw, up.total_with_bonus,
+        up.days_active, up.mainnet_address, up.qualified, rank
+    )
+}
+
+// ============================================================================
+// v10.4.2: Admin power features — batch, deduct, disqualify, force-qualify, multiplier
+// ============================================================================
+
+// Entry 32: Batch manual attribution — add points to multiple users at once
+// Efficient for rewarding Discord helpers, community contributors, etc.
+// users: array of testnet addresses (max 50 per call)
+// category: 1-7
+// points: same amount for all users in this batch
+// reason: human-readable reason (stored in audit log)
+entry record_manual_attribution_batch(
+    users: Address[],
+    category: u8,
+    points: u64,
+    reason: string
+) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_admin()
+    require(users.len() > 0 && users.len() <= 50, "badbatch")
+    require(category >= 1 && category <= 7, "badcat")
+    require(points > 0, "zero")
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(MANUAL_CAP_KEY).unwrap_or(DEFAULT_MANUAL_CAP)
+    require(points <= cap, "toomuch")
+
+    let i: u32 = 0
+    while i < users.len() {
+        let user: Address = users[i]
+        let is_disq: bool = s.load(DISQUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+        if !is_disq {
+            add_points(user, category, points)
+        }
+        i += 1
+    }
+
+    log_admin_action(6u8, Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), category, points, 0u64, reason + " (batch " + users.len().to_string(10u32) + " users)")
+    emit_event(0u64, ["BatchAttribution", users.len().to_string(10u32) + "_" + points.to_string(10u32) + "_" + reason])
+    return 0
+}
+
+// Entry 33: Deduct points from a user (admin, with reason)
+// Used to correct mistakes or penalize users for rule violations
+entry deduct_points(user: Address, category: u8, points: u64, reason: string) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_admin()
+    require(category >= 1 && category <= 7, "badcat")
+    require(points > 0, "zero")
+    deduct_points_internal(user, category, points)
+    log_admin_action(2u8, user, category, points, 0u64, reason)
+    emit_event(0u64, ["PointsDeducted", user.to_string() + "_" + points.to_string(10u32) + "_" + reason])
+    return 0
+}
+
+// Entry 34: Disqualify a user (admin, with reason)
+// Banned users get 0 VLT even if they have points
+// Used for cheaters, Sybil attackers, bot farmers
+entry disqualify_user(user: Address, reason: string) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(DISQUALIFIED_PREFIX + user.to_string(), true)
+    log_admin_action(3u8, user, 0u8, 0u64, 0u64, reason)
+    emit_event(0u64, ["UserDisqualified", user.to_string() + "_" + reason])
+    return 0
+}
+
+// Entry 35: Revoke disqualification (admin, with reason)
+// Undo a disqualification if it was made by mistake
+entry revoke_disqualification(user: Address, reason: string) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(DISQUALIFIED_PREFIX + user.to_string(), false)
+    log_admin_action(3u8, user, 0u8, 0u64, 0u64, "REVOKE: " + reason)
+    emit_event(0u64, ["DisqualificationRevoked", user.to_string()])
+    return 0
+}
+
+// Entry 36: Force-qualify a user (admin, with reason)
+// Manually qualify a user who doesn't meet standard thresholds
+// Used for valuable contributors (Discord mods, doc writers) who don't have 7 days
+entry force_qualify_user(user: Address, reason: string) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(FORCE_QUALIFIED_PREFIX + user.to_string(), true)
+    log_admin_action(4u8, user, 0u8, 0u64, 0u64, reason)
+    emit_event(0u64, ["UserForceQualified", user.to_string() + "_" + reason])
+    return 0
+}
+
+// Entry 37: Revoke force-qualification (admin, with reason)
+entry revoke_force_qualification(user: Address, reason: string) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(FORCE_QUALIFIED_PREFIX + user.to_string(), false)
+    log_admin_action(4u8, user, 0u8, 0u64, 0u64, "REVOKE: " + reason)
+    emit_event(0u64, ["ForceQualificationRevoked", user.to_string()])
+    return 0
+}
+
+// Entry 38: Set custom bonus multiplier for a user (admin, with reason)
+// multiplier_bps: 10000 = 1x (no bonus), 15000 = +50%, 20000 = +100%, 0 = remove
+// Used to reward Discord moderators, community leaders, etc.
+entry set_user_bonus_multiplier(user: Address, multiplier_bps: u64, reason: string) -> u64 {
+    only_admin()
+    require(multiplier_bps <= 30000, "toohigh")  // max 3x
+    let s: Storage = Storage::new()
+    s.store(USER_BONUS_PREFIX + user.to_string(), multiplier_bps)
+    log_admin_action(5u8, user, 0u8, 0u64, multiplier_bps, reason)
+    emit_event(0u64, ["BonusMultiplierSet", user.to_string() + "_" + multiplier_bps.to_string(10u32) + "_" + reason])
+    return 0
+}
+
+// Entry 39: Set manual attribution cap (admin)
+// Change the max points per record_manual_attribution call
+entry set_manual_attribution_cap(new_cap: u64) -> u64 {
+    only_admin()
+    require(new_cap >= 100 && new_cap <= 500000, "badcap")
+    let s: Storage = Storage::new()
+    s.store(MANUAL_CAP_KEY, new_cap)
+    return 0
+}
+
+// Pub fn 38: Get user's custom bonus multiplier (0 = no custom multiplier)
+pub fn get_user_bonus_multiplier(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(USER_BONUS_PREFIX + user.to_string()).unwrap_or(0)
+}
+
+// Pub fn 39: Check if user is disqualified
+pub fn is_disqualified(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    return s.load(DISQUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+}
+
+// Pub fn 40: Check if user is force-qualified
+pub fn is_force_qualified(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    return s.load(FORCE_QUALIFIED_PREFIX + user.to_string()).unwrap_or(false)
+}
+
+// Pub fn 41: Get admin log count (total actions ever, may exceed ADMIN_LOG_MAX)
+pub fn get_admin_log_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(ADMIN_LOG_COUNT_KEY).unwrap_or(0)
+}
+
+// Pub fn 42: Get admin log entry at index (ring buffer, use index % ADMIN_LOG_MAX)
+// Returns (admin, action_type, target_user, category, amount, multiplier_bps, reason, topo)
+pub fn get_admin_log_entry(index: u64) -> (Address, u8, Address, u8, u64, u64, string, u64) {
+    let s: Storage = Storage::new()
+    let entry: AdminLogEntry = s.load(ADMIN_LOG_PREFIX + index.to_string(10u32)).expect("oob")
+    return (
+        entry.admin,
+        entry.action_type,
+        entry.target_user,
+        entry.category,
+        entry.amount,
+        entry.multiplier_bps,
+        entry.reason,
+        entry.topo
+    )
+}
+
+// Pub fn 43: Get manual attribution cap
+pub fn get_manual_attribution_cap() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(MANUAL_CAP_KEY).unwrap_or(DEFAULT_MANUAL_CAP)
+}
+
+// Entry 23: Set authorized recorder (contract that can call record_*)
+// v11.6 fix: takes the contract Hash (was Address — could never match a
+//   contract caller, see only_authorized_recorder).
+entry set_authorized_recorder(contract_hash: Hash, authorized: bool) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(RECORDER_PREFIX + contract_hash.to_hex(), authorized)
+    return 0
+}
+
+// Entry 24: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 25: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 26: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 27: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 28: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 29: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 30: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 31: Get version
+entry get_version() -> string {
+    return VERSION
+}

@@ -1,0 +1,411 @@
+// ============================================================================
+// CreditScore.slx — XELIS Vault v10.2 (Brainstorming Feature #4)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Système de réputation on-chain pour les emprunteurs P2P.
+//
+// RÔLE : Calcule et stocke un credit score (0-1000) pour chaque utilisateur
+//        basé sur :
+//          - Historique de repayment (punctual vs late vs default)
+//          - Volume total emprunté/remboursé
+//          - Duration moyenne des prêts
+//          - Collateral ratio moyen
+//        Le score affecte :
+//          - Taux d'intérêt (meilleur score = taux plus bas)
+//          - LTV max (meilleur score = LTV plus élevé)
+//          - Accès aux pools premium
+//
+// PRIVACY : Le score est public (réputation), mais les détails sont chiffrés.
+//           Seul l'utilisateur voit l'historique détaillé.
+//
+// SCORING :
+//   - Score initial : 500 (neutral)
+//   - +50 par prêt remboursé à temps
+//   - +20 par prêt remboursé en avance
+//   - -30 par prêt remboursé en retard (< 7 jours)
+//   - -100 par prêt remboursé en retard (> 7 jours)
+//   - -300 par default
+//   - +1 par XEL de volume (capped à +100)
+//   - +5 par mois de durée moyenne (capped à +50)
+//   - +10 par tranche de 10% de collateral ratio moyen au-dessus de 150%
+//
+// Entry IDs:
+//   0  : record_loan_opened
+//   1  : record_loan_repaid
+//   2  : record_loan_defaulted
+//   3  : get_score (pub fn)
+//   4  : get_score_tier (pub fn)
+//   5  : get_user_stats (pub fn)
+//   6  : get_interest_rate_adjustment (pub fn)
+//   7  : get_max_ltv_adjustment (pub fn)
+//   8  : set_registry
+//   9  : set_timelock
+//   10 : set_guardian
+//   11 : pause
+//   12 : unpause
+//   13 : transfer_admin
+//   14 : get_version
+// ============================================================================
+
+const VERSION: string = "CreditScore v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const SCORE_PREFIX: string = "score_"
+const STATS_PREFIX: string = "stats_"
+
+const INITIAL_SCORE: u64 = 500
+const MAX_SCORE: u64 = 1000
+const MIN_SCORE: u64 = 0
+
+// Tier thresholds
+const TIER_EXCELLENT: u64 = 800    // 800-1000: best rates, premium pools
+const TIER_GOOD: u64 = 650         // 650-799: standard rates
+const TIER_FAIR: u64 = 450         // 450-649: higher rates
+const TIER_POOR: u64 = 250         // 250-449: limited access
+// 0-249: locked out of P2P lending
+
+// Rate adjustments (in bps, applied to base rate)
+// Excellent: -200 bps (2% lower)
+// Good: -100 bps
+// Fair: 0
+// Poor: +300 bps
+// Very Poor: +500 bps
+const RATE_ADJ_EXCELLENT: u64 = 200    // discount
+const RATE_ADJ_GOOD: u64 = 100
+const RATE_ADJ_FAIR: u64 = 0
+const RATE_ADJ_POOR: u64 = 300         // premium
+const RATE_ADJ_VERY_POOR: u64 = 500
+
+// LTV adjustments (in bps, applied to max LTV)
+const LTV_ADJ_EXCELLENT: u64 = 1000    // +10% LTV
+const LTV_ADJ_GOOD: u64 = 500
+const LTV_ADJ_FAIR: u64 = 0
+const LTV_ADJ_POOR: u64 = 500          // -5% LTV
+const LTV_ADJ_VERY_POOR: u64 = 1000    // -10% LTV
+
+struct CreditStats {
+    score: u64,
+    loans_opened: u64,
+    loans_repaid_on_time: u64,
+    loans_repaid_late: u64,
+    loans_repaid_very_late: u64,
+    loans_defaulted: u64,
+    total_volume_borrowed: u64,        // in atomic XEL
+    total_volume_repaid: u64,
+    total_duration_blocks: u64,        // sum of all loan durations
+    avg_collateral_ratio_bps: u64,     // running average
+    last_updated: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Only authorized lending contracts (PeerLoan, SyndicatePool, LendingMarket) can record events
+// F-07 fix (HIGH): was accepting ANY contract caller (only checked
+//   get_contract_caller().is_some()). A forged contract could arbitrarily
+//   inflate or destroy a target address's on-chain credit score, with direct
+//   financial consequences on borrowing terms. Now resolves the registry and
+//   requires that the contract caller is one of the three authorized lenders.
+fn only_authorized_lender() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == admin || caller == guardian { return }
+    // F-07 fix: require an explicit contract caller AND that it is one of the
+    //   three registered lending contracts (PeerLoan, SyndicatePool, LendingMarket).
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notlender")
+    let cc: Hash = cc_opt.expect("err")
+    require(is_authorized_lender(cc), "notlender")
+}
+
+// F-07 fix: check whether `caller_hash` matches one of the three registered lenders.
+fn is_authorized_lender(caller_hash: Hash) -> bool {
+    let s: Storage = Storage::new()
+    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+    if reg_opt.is_none() { return false }
+    let reg_hash: Hash = reg_opt.expect("err")
+    if reg_hash == Hash::zero() { return false }
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    let names: string[] = ["PeerLoan", "SyndicatePool", "LendingMarket"]
+    let i: u64 = 0
+    while i < names.len() {
+        let name: string = names[i]
+        let h: Hash = reg.call(14u16, [name], {})
+        if h != Hash::zero() && h == caller_hash { return true }
+        i += 1
+    }
+    return false
+}
+
+fn get_or_init_stats(user: Address) -> CreditStats {
+    let s: Storage = Storage::new()
+    let key: string = STATS_PREFIX + user.to_string()
+    let stats_opt: optional<CreditStats> = s.load(key)
+    if stats_opt.is_some() {
+        return stats_opt.expect("err")
+    }
+    return CreditStats {
+        score: INITIAL_SCORE,
+        loans_opened: 0,
+        loans_repaid_on_time: 0,
+        loans_repaid_late: 0,
+        loans_repaid_very_late: 0,
+        loans_defaulted: 0,
+        total_volume_borrowed: 0,
+        total_volume_repaid: 0,
+        total_duration_blocks: 0,
+        avg_collateral_ratio_bps: 0,
+        last_updated: get_current_topoheight()
+    }
+}
+
+fn clamp_score(score: u64) -> u64 {
+    if score > MAX_SCORE { return MAX_SCORE }
+    if score < MIN_SCORE { return MIN_SCORE }
+    return score
+}
+
+// Entry 0: Record loan opened (called by lending contracts)
+entry record_loan_opened(borrower: Address, amount: u64, collateral_ratio_bps: u64) -> u64 {
+    when_not_paused()
+    only_authorized_lender()
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(borrower)
+    stats.loans_opened += 1
+    stats.total_volume_borrowed += amount
+    // Update running average collateral ratio
+    if stats.loans_opened == 1 {
+        stats.avg_collateral_ratio_bps = collateral_ratio_bps
+    } else {
+        // Weighted running average: new_avg = (old_avg * (n-1) + new) / n
+        let n: u64 = stats.loans_opened
+        stats.avg_collateral_ratio_bps = (stats.avg_collateral_ratio_bps * (n - 1) + collateral_ratio_bps) / n
+    }
+    stats.last_updated = get_current_topoheight()
+    s.store(STATS_PREFIX + borrower.to_string(), stats)
+    return 0
+}
+
+// Entry 1: Record loan repaid (called by lending contracts when loan is closed)
+// days_late: 0 = on time, 1-7 = late, >7 = very late
+entry record_loan_repaid(borrower: Address, amount: u64, duration_blocks: u64, days_late: u64) -> u64 {
+    when_not_paused()
+    only_authorized_lender()
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(borrower)
+    stats.total_volume_repaid += amount
+    stats.total_duration_blocks += duration_blocks
+
+    // Score adjustments based on timeliness
+    if days_late == 0 {
+        stats.loans_repaid_on_time += 1
+        stats.score += 50
+    } else if days_late <= 7 {
+        stats.loans_repaid_late += 1
+        stats.score -= 30
+    } else {
+        stats.loans_repaid_very_late += 1
+        stats.score -= 100
+    }
+
+    // Volume bonus: +1 per XEL (atomic), capped at +100
+    let volume_bonus: u64 = amount / 100000000
+    if volume_bonus > 100 { volume_bonus = 100 }
+    stats.score += volume_bonus
+
+    // Duration bonus: +5 per 30 days (43200 blocks at 5s), capped at +50
+    let duration_months: u64 = duration_blocks / 43200
+    let duration_bonus: u64 = duration_months * 5
+    if duration_bonus > 50 { duration_bonus = 50 }
+    stats.score += duration_bonus
+
+    // Collateral ratio bonus: +10 per 10% above 150%
+    if stats.avg_collateral_ratio_bps > 15000 {
+        let excess_bps: u64 = stats.avg_collateral_ratio_bps - 15000
+        let cr_bonus: u64 = (excess_bps / 1000) * 10
+        if cr_bonus > 100 { cr_bonus = 100 }
+        stats.score += cr_bonus
+    }
+
+    stats.score = clamp_score(stats.score)
+    stats.last_updated = get_current_topoheight()
+    s.store(STATS_PREFIX + borrower.to_string(), stats)
+    return 0
+}
+
+// Entry 2: Record loan defaulted (called by lending contracts on liquidation)
+entry record_loan_defaulted(borrower: Address, amount: u64) -> u64 {
+    when_not_paused()
+    only_authorized_lender()
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(borrower)
+    stats.loans_defaulted += 1
+    stats.score -= 300
+    stats.score = clamp_score(stats.score)
+    stats.last_updated = get_current_topoheight()
+    s.store(STATS_PREFIX + borrower.to_string(), stats)
+    return 0
+}
+
+// Pub fn 3: Get raw credit score (0-1000)
+pub fn get_score(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(user)
+    return stats.score
+}
+
+// Pub fn 4: Get tier (1=Excellent, 2=Good, 3=Fair, 4=Poor, 5=Very Poor)
+pub fn get_score_tier(user: Address) -> u8 {
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(user)
+    if stats.score >= TIER_EXCELLENT { return 1 }
+    if stats.score >= TIER_GOOD { return 2 }
+    if stats.score >= TIER_FAIR { return 3 }
+    if stats.score >= TIER_POOR { return 4 }
+    return 5
+}
+
+// Pub fn 5: Get detailed stats (only public fields, no PII)
+pub fn get_user_stats(user: Address) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(user)
+    return (
+        stats.score,
+        stats.loans_opened,
+        stats.loans_repaid_on_time,
+        stats.loans_repaid_late,
+        stats.loans_repaid_very_late,
+        stats.loans_defaulted,
+        stats.total_volume_borrowed,
+        stats.total_volume_repaid,
+        stats.total_duration_blocks,
+        stats.avg_collateral_ratio_bps,
+        stats.last_updated
+    )
+}
+
+// Pub fn 6: Get interest rate adjustment (in bps, negative = discount)
+// Lending contracts call this to adjust the interest rate for a borrower
+pub fn get_interest_rate_adjustment(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(user)
+    // Return as positive number; caller decides sign based on tier
+    if stats.score >= TIER_EXCELLENT { return RATE_ADJ_EXCELLENT }
+    if stats.score >= TIER_GOOD { return RATE_ADJ_GOOD }
+    if stats.score >= TIER_FAIR { return RATE_ADJ_FAIR }
+    if stats.score >= TIER_POOR { return RATE_ADJ_POOR }
+    return RATE_ADJ_VERY_POOR
+}
+
+// Pub fn 7: Get max LTV adjustment (in bps, positive = more LTV allowed)
+pub fn get_max_ltv_adjustment(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let stats: CreditStats = get_or_init_stats(user)
+    if stats.score >= TIER_EXCELLENT { return LTV_ADJ_EXCELLENT }
+    if stats.score >= TIER_GOOD { return LTV_ADJ_GOOD }
+    if stats.score >= TIER_FAIR { return LTV_ADJ_FAIR }
+    if stats.score >= TIER_POOR { return LTV_ADJ_POOR }
+    return LTV_ADJ_VERY_POOR
+}
+
+// Entry 8: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 9: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 10: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 11: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 12: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 13: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 14: Get version
+entry get_version() -> string {
+    return VERSION
+}

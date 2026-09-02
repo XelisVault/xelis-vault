@@ -1,0 +1,461 @@
+// ============================================================================
+// Timelock.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #7: only_guardian() now accepts BOTH an EOA (caller == GUARDIAN_KEY)
+//         AND a contract caller (get_contract_caller() == GUARDIAN_CONTRACT_KEY)
+//         so GuardianMultisig can invoke submit_emergency_proposal /
+//         cancel_proposal directly. A new GUARDIAN_CONTRACT_KEY storage key
+//         (string "gc") is introduced and a set_guardian_contract entry is
+//         exposed (ID 8). only_guardian_or_admin() mirrors the same rule.
+//
+// Two-step emergency_withdraw pattern (entries 12 & 13) with a 17280-block
+// (~1 day) delay. Request topo is stored under the "ert" key.
+//
+// ENTRY IDs (sequential, starting at 0):
+//   0  : submit_proposal(target, entry_id, params, delay) -> u64
+//   1  : execute_proposal(proposal_id) -> u64
+//   2  : cancel_proposal(proposal_id) -> u64
+//   3  : submit_emergency_proposal(target, entry_id, params) -> u64
+//   4  : set_min_delay(delay) -> u64
+//   5  : set_max_delay(delay) -> u64
+//   6  : set_governor(gov: Hash) -> u64
+//   7  : set_guardian(g: Address) -> u64
+//   8  : set_guardian_contract(gc: Hash) -> u64
+//   9  : set_emergency(e: Address) -> u64
+//   10 : transfer_admin(new_admin: Address) -> u64
+//   11 : get_version() -> string
+//   12 : request_emergency_withdraw() -> u64
+//   13 : execute_emergency_withdraw(asset: Hash) -> u64
+// ============================================================================
+
+const VERSION: string = "Timelock v11.3"
+
+const ADMIN_KEY: string = "a"
+const GOVERNOR_KEY: string = "gv"
+const GUARDIAN_KEY: string = "gd"
+// FIX #7: guardian contract (e.g. GuardianMultisig) hash key
+const GUARDIAN_CONTRACT_KEY: string = "gc"
+const EMERGENCY_KEY: string = "ea"
+
+const MIN_DELAY_KEY: string = "md"
+const MAX_DELAY_KEY: string = "xd"
+const EMERGENCY_DELAY_KEY: string = "ed"
+const PROPOSALS_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "p_"
+
+// Two-step emergency withdraw
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_WITHDRAW_DELAY_BLOCKS: u64 = 17280
+
+const DEFAULT_MIN_DELAY: u64 = 720
+const DEFAULT_MAX_DELAY: u64 = 604800
+const DEFAULT_EMERGENCY_DELAY: u64 = 1440
+
+struct Proposal {
+    id: u64,
+    target_contract: Hash,
+    entry_id: u16,
+    params: bytes,
+    submitted_at: u64,
+    delay: u64,
+    executed: bool,
+    cancelled: bool,
+    is_emergency: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(MIN_DELAY_KEY, DEFAULT_MIN_DELAY)
+    s.store(MAX_DELAY_KEY, DEFAULT_MAX_DELAY)
+    s.store(EMERGENCY_DELAY_KEY, DEFAULT_EMERGENCY_DELAY)
+    s.store(PROPOSALS_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+}
+
+fn only_admin_or_governor() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+
+    let gov_opt: optional<Hash> = s.load(GOVERNOR_KEY)
+    if gov_opt.is_some() {
+        let gov: Hash = gov_opt.expect("err")
+        let cc_opt: optional<Hash> = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.expect("err")
+            if cc == gov { return }
+        }
+    }
+    require(false, "notauth")
+}
+
+// ============================================================================
+// FIX #7: only_guardian() accepts guardian EOA OR guardian contract.
+// ============================================================================
+fn only_guardian() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+
+    // Accept contract caller matching the guardian contract (e.g. GuardianMultisig)
+    let gc_opt: optional<Hash> = s.load(GUARDIAN_CONTRACT_KEY)
+    if gc_opt.is_some() {
+        let gc: Hash = gc_opt.expect("err")
+        let cc_opt: optional<Hash> = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.expect("err")
+            if cc == gc { return }
+        }
+    }
+    require(false, "notguard")
+}
+
+// ============================================================================
+// FIX #7: only_guardian_or_admin() — admin OR guardian EOA OR guardian contract.
+// ============================================================================
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+
+    let gc_opt: optional<Hash> = s.load(GUARDIAN_CONTRACT_KEY)
+    if gc_opt.is_some() {
+        let gc: Hash = gc_opt.expect("err")
+        let cc_opt: optional<Hash> = get_contract_caller()
+        if cc_opt.is_some() {
+            let cc: Hash = cc_opt.expect("err")
+            if cc == gc { return }
+        }
+    }
+    require(false, "notauth")
+}
+
+// Submit a timelocked proposal to call a target entry after `delay` blocks.
+// @caller: admin or Governor contract (via contract call)
+// @params: target - hash of contract to execute
+// @params: entry_id - entry ID on target to call
+// @params: params - ABI-encoded call params for the target entry
+// @params: delay - delay in blocks before execution (clamped to [MIN_DELAY, MAX_DELAY])
+// @returns: the new proposal ID
+// @security: only_admin_or_governor, delay range-checked
+// ============================================================================
+// ID 0: submit_proposal
+// ============================================================================
+pub fn submit_proposal(
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    delay: u64
+) -> u64 {
+    only_admin_or_governor()
+    let s: Storage = Storage::new()
+    let min_delay: u64 = s.load(MIN_DELAY_KEY).unwrap_or(DEFAULT_MIN_DELAY)
+    let max_delay: u64 = s.load(MAX_DELAY_KEY).unwrap_or(DEFAULT_MAX_DELAY)
+    require(delay >= min_delay, "tooshort")
+    require(delay <= max_delay, "toolong")
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let proposal: Proposal = Proposal {
+        id: id,
+        target_contract: target,
+        entry_id: entry_id,
+        params: params,
+        submitted_at: get_current_topoheight(),
+        delay: delay,
+        executed: false,
+        cancelled: false,
+        is_emergency: false
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return id
+}
+
+// Execute a timelocked proposal after its delay has elapsed.
+// @caller: anyone (open access once delay elapsed)
+// @params: proposal_id - target proposal to execute
+// @returns: 0 on success
+// @security: requires current_topo >= submitted_at + delay; one-shot execution; calls target contract
+// ============================================================================
+// ID 1: execute_proposal
+// ============================================================================
+entry execute_proposal(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.executed, "executed")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo >= proposal.submitted_at + proposal.delay, "early")
+
+    proposal.executed = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    let target: Contract = Contract::new(proposal.target_contract).expect("err")
+    let _ = target.call(proposal.entry_id, [proposal.params], {})
+
+    return 0
+}
+
+// Cancel a pending (unexecuted) proposal. Used by guardian to veto.
+// @caller: admin or guardian (EOA or GuardianMultisig contract)
+// @params: proposal_id - target proposal to cancel
+// @returns: 0 on success
+// @security: only_guardian_or_admin (FIX #7: guardian EOA OR guardian contract), cannot cancel executed proposals
+// ============================================================================
+// ID 2: cancel_proposal (FIX #7: also accepts guardian EOA/contract)
+// ============================================================================
+entry cancel_proposal(proposal_id: u64) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.executed, "executed")
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+// Submit a guardian emergency proposal with the short EMERGENCY_DELAY (no quorum).
+// @caller: guardian (EOA or GuardianMultisig contract)
+// @params: target - hash of contract to execute
+// @params: entry_id - entry ID on target to call
+// @params: params - ABI-encoded call params for the target entry
+// @returns: the new proposal ID
+// @security: only_guardian (FIX #7: guardian EOA OR GuardianMultisig contract), uses EMERGENCY_DELAY_KEY
+// ============================================================================
+// ID 3: submit_emergency_proposal
+// ----------------------------------------------------------------------------
+// FIX #7: only_guardian() now accepts the GuardianMultisig contract caller.
+// ============================================================================
+pub fn submit_emergency_proposal(
+    target: Hash,
+    entry_id: u16,
+    params: bytes
+) -> u64 {
+    only_guardian()
+    let s: Storage = Storage::new()
+    let emergency_delay: u64 = s.load(EMERGENCY_DELAY_KEY).unwrap_or(DEFAULT_EMERGENCY_DELAY)
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let proposal: Proposal = Proposal {
+        id: id,
+        target_contract: target,
+        entry_id: entry_id,
+        params: params,
+        submitted_at: get_current_topoheight(),
+        delay: emergency_delay,
+        executed: false,
+        cancelled: false,
+        is_emergency: true
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return id
+}
+
+// Set the minimum timelock delay for non-emergency proposals.
+// @caller: admin
+// @params: delay - minimum delay in blocks (144–43200)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 4: set_min_delay
+// ============================================================================
+entry set_min_delay(delay: u64) -> u64 {
+    only_admin()
+    require(delay >= 144 && delay <= 43200, "badval")
+    Storage::new().store(MIN_DELAY_KEY, delay)
+    return 0
+}
+
+// Set the maximum timelock delay for non-emergency proposals.
+// @caller: admin
+// @params: delay - maximum delay in blocks (1440–2592000)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 5: set_max_delay
+// ============================================================================
+entry set_max_delay(delay: u64) -> u64 {
+    only_admin()
+    require(delay >= 1440 && delay <= 2592000, "badval")
+    Storage::new().store(MAX_DELAY_KEY, delay)
+    return 0
+}
+
+// Set the Governor contract hash (allowed to submit_proposal via contract call).
+// @caller: admin
+// @params: gov - Governor contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 6: set_governor
+// ============================================================================
+entry set_governor(gov: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNOR_KEY, gov)
+    return 0
+}
+
+// Set the guardian EOA address (allowed to submit/cancel emergency proposals).
+// @caller: admin
+// @params: g - guardian address
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 7: set_guardian
+// ============================================================================
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Set the guardian contract hash (e.g., GuardianMultisig) allowed to invoke guardian-only entries.
+// @caller: admin
+// @params: gc - guardian contract hash
+// @returns: 0 on success
+// @security: only_admin (FIX #7 — new entry)
+// ============================================================================
+// ID 8: set_guardian_contract  (FIX #7 — new entry)
+// ============================================================================
+entry set_guardian_contract(gc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_CONTRACT_KEY, gc)
+    return 0
+}
+
+// Set the emergency admin address (only the current emergency admin can change it).
+// @caller: emergency admin only
+// @params: e - new emergency admin address
+// @returns: 0 on success
+// @security: only current emergency admin (self-managed role)
+// ============================================================================
+// ID 9: set_emergency
+// ============================================================================
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let current: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// Transfer admin role to a new address (single-step).
+// @caller: admin
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ============================================================================
+// ID 10: transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("Timelock v5.0")
+// @security: read-only, no access restrictions
+// ============================================================================
+// ID 11: get_version
+// ============================================================================
+entry get_version() -> string {
+    return VERSION
+}
+
+// Step 1 of 2-step emergency withdrawal: record the request topoheight (starts delay window).
+// @caller: emergency admin only
+// @returns: 0 on success
+// @security: only emergency admin, stores request topo for delay verification
+// ============================================================================
+// ID 12: request_emergency_withdraw
+// ----------------------------------------------------------------------------
+// Two-step pattern: emergency role requests, then must wait
+// EMERGENCY_WITHDRAW_DELAY_BLOCKS before executing.
+// ============================================================================
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// Step 2 of 2-step emergency withdrawal: drain all of `asset` after EMERGENCY_WITHDRAW_DELAY_BLOCKS elapsed.
+// @caller: emergency admin only
+// @params: asset - hash of asset to withdraw (Hash::zero() for XEL)
+// @returns: 0 on success
+// @security: only emergency admin, requires prior request + EMERGENCY_WITHDRAW_DELAY_BLOCKS delay (2-step protection)
+// ============================================================================
+// ID 13: execute_emergency_withdraw
+// ============================================================================
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_WITHDRAW_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// Returns a proposal snapshot by ID (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to read
+// @returns: (target_contract, entry_id, submitted_at, delay, executed, cancelled, is_emergency)
+// @security: read-only, no access restrictions, panics if proposal missing
+// ----------------------------------------------------------------------------
+// Read-only helpers (do NOT count toward entry IDs)
+// ----------------------------------------------------------------------------
+pub fn get_proposal(proposal_id: u64) -> (Hash, u16, u64, u64, bool, bool, bool) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    return (p.target_contract, p.entry_id, p.submitted_at, p.delay, p.executed, p.cancelled, p.is_emergency)
+}
+
+// Returns the total number of timelock proposals ever created (read-only view).
+// @caller: anyone
+// @returns: proposal counter value
+// @security: read-only, no access restrictions
+pub fn get_proposals_count() -> u64 {
+    return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+}
+
+// Returns the (min, max, emergency) delay configuration tuple (read-only view).
+// @caller: anyone
+// @returns: (min_delay, max_delay, emergency_delay)
+// @security: read-only, no access restrictions
+pub fn get_delays() -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_DELAY_KEY).unwrap_or(DEFAULT_MIN_DELAY),
+        s.load(MAX_DELAY_KEY).unwrap_or(DEFAULT_MAX_DELAY),
+        s.load(EMERGENCY_DELAY_KEY).unwrap_or(DEFAULT_EMERGENCY_DELAY)
+    )
+}

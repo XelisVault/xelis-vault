@@ -1,0 +1,991 @@
+// ============================================================================
+// StakedOracle.slx — XELIS Vault v5.1
+// ----------------------------------------------------------------------------
+// Oracle décentralisé basé sur XelisVaultMiner v5.0.
+// Tous les entry IDs ont été réalignés avec XelisVaultMiner v5.0.
+// v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
+// ============================================================================
+const VERSION: string = "StakedOracle v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const MINER_CONTRACT_KEY: string = "mc"
+const DELEGATION_CONTRACT_KEY: string = "dc"  // v11.0: MinerDelegation contract for total stake (own + delegated)
+
+const FEEDS_COUNT_KEY: string = "fc"
+const FEED_PREFIX: string = "fd_"
+const FEED_ACTIVE_PREFIX: string = "fa_"
+const FEED_NAME_PREFIX: string = "fn_"
+const FEED_AGG_PREFIX: string = "fg_"
+const FEED_CB_PAUSED_PREFIX: string = "cb_"
+
+const SUB_COUNT_PREFIX: string = "sc_"
+const SUB_ENTRY_PREFIX: string = "se_"
+const SUB_PROVIDED_PREFIX: string = "sp_"
+const CYCLE_PREFIX: string = "cy_"
+const LAST_AGG_PREFIX: string = "la_"
+
+const MAX_DEVIATION_BPS_KEY: string = "mdb"
+const CB_THRESHOLD_BPS_KEY: string = "cbt"
+const AGGREGATION_BLOCKS_KEY: string = "ab"
+const MAX_STALE_BLOCKS_KEY: string = "msb"
+const HARD_STALE_BLOCKS_KEY: string = "hsb"
+
+const BOOTSTRAP_MODE_KEY: string = "bsm"
+const BOOTSTRAP_MIN_PROVIDERS_KEY: string = "bsmp"
+const DEFAULT_BOOTSTRAP_MIN_PROVIDERS: u64 = 3
+const MIN_PROVIDERS_FOR_ORACLE_KEY: string = "mpo"
+const DEFAULT_MIN_PROVIDERS: u64 = 10
+
+const DEFAULT_MAX_DEV: u64 = 500
+const DEFAULT_CB_THRESH: u64 = 2000
+const DEFAULT_AGG_BLOCKS: u64 = 5
+const DEFAULT_MAX_STALE: u64 = 30
+const DEFAULT_HARD_STALE: u64 = 100
+const MAX_FEEDS: u64 = 32
+const MAX_SUBMISSIONS_PER_CYCLE: u64 = 256
+
+struct Feed {
+    id: u64, name: string, asset: Hash, decimals: u8,
+    min_price: u64, max_price: u64, created_at: u64
+}
+
+struct PriceSubmission {
+    price: u64, topo: u64, provider: Address, feed_id: u64, cycle: u64
+}
+
+struct AggregatedPrice {
+    price: u64, topo: u64, deviation_bps: u64, sources_count: u64, cycle: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(FEEDS_COUNT_KEY, 0u64)
+    s.store(MAX_DEVIATION_BPS_KEY, DEFAULT_MAX_DEV)
+    s.store(CB_THRESHOLD_BPS_KEY, DEFAULT_CB_THRESH)
+    s.store(AGGREGATION_BLOCKS_KEY, DEFAULT_AGG_BLOCKS)
+    s.store(MAX_STALE_BLOCKS_KEY, DEFAULT_MAX_STALE)
+    s.store(HARD_STALE_BLOCKS_KEY, DEFAULT_HARD_STALE)
+    s.store(BOOTSTRAP_MODE_KEY, true)
+    s.store(BOOTSTRAP_MIN_PROVIDERS_KEY, DEFAULT_BOOTSTRAP_MIN_PROVIDERS)
+    s.store(MIN_PROVIDERS_FOR_ORACLE_KEY, DEFAULT_MIN_PROVIDERS)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let admin: Address = s.load(ADMIN_KEY).expect("anset")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("nocc")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    let g: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    if caller == g { return }
+    only_admin()
+}
+
+fn when_not_paused() {
+    let tmp_s: Storage = Storage::new()
+    let tmp_paused: bool = tmp_s.load(PAUSED_KEY).unwrap_or(false)
+    require(!tmp_paused, "paused")
+}
+
+fn get_miner_contract() -> Contract {
+    let s: Storage = Storage::new()
+    let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+    return Contract::new(mc_hash).expect("mcnf")
+}
+
+// ============================================================================
+// FIX #1: Updated entry IDs to match XelisVaultMiner v5.0
+// - is_miner_active_entry = ID 9
+// - distribute_reward      = ID 8
+// - slash_miner            = ID 7
+// - get_active_miners_for_service_entry = ID 12
+// ============================================================================
+fn check_miner(addr: Address) -> bool {
+    let mc: Contract = get_miner_contract()
+    let result: u64 = mc.call(24u16, [addr, 1u8], {})
+    return result == 1
+}
+
+fn reward_miner(addr: Address, is_valid: bool) {
+    let mc: Contract = get_miner_contract()
+    let _ = mc.call(23u16, [addr, 1u8, is_valid], {})
+}
+
+fn slash_miner(addr: Address) {
+    let mc: Contract = get_miner_contract()
+    let s: Storage = Storage::new()
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("gnos")
+    let _ = mc.call(22u16, [addr, 0u8, guardian], {})
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: add_feed
+// Create a new price feed (cap: MAX_FEEDS).
+// @caller: admin (or timelock as contract caller)
+// @params: name - human-readable unique feed name
+// @params: asset - on-chain asset hash the feed prices
+// @params: decimals - asset decimals, used by consumers to scale the price
+// @params: min_price - lower sanity bound accepted from providers
+// @params: max_price - upper sanity bound accepted from providers
+// @returns: 0 on success
+// @security: only_admin, rejects empty / duplicate names, requires max_price > min_price, enforces MAX_FEEDS cap
+pub fn add_feed(name: string, asset: Hash, decimals: u8, min_price: u64, max_price: u64) -> u64 {
+    only_admin()
+    require(name != "", "emptyname")
+    require(max_price > min_price, "badrange")
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    require(count < MAX_FEEDS, "maxfeeds")
+    let i: u64 = 0
+    while i < count {
+        let existing: string = s.load(FEED_NAME_PREFIX + i.to_string(10u32)).expect("nnf")
+        require(existing != name, "exists")
+        i += 1
+    }
+    let id: u64 = count
+    let feed: Feed = Feed {
+        id: id, name: name, asset: asset, decimals: decimals,
+        min_price: min_price, max_price: max_price, created_at: get_current_topoheight()
+    }
+    s.store(FEED_PREFIX + id.to_string(10u32), feed)
+    s.store(FEED_NAME_PREFIX + id.to_string(10u32), name)
+    s.store(FEED_ACTIVE_PREFIX + id.to_string(10u32), true)
+    s.store(FEED_CB_PAUSED_PREFIX + id.to_string(10u32), false)
+    s.store(CYCLE_PREFIX + id.to_string(10u32), 0u64)
+    s.store(LAST_AGG_PREFIX + id.to_string(10u32), 0u64)
+    s.store(FEEDS_COUNT_KEY, id + 1)
+    return 0
+}
+
+// ID 1: update_feed
+// Update the sanity range and decimals of an existing feed.
+// @caller: admin (or timelock as contract caller)
+// @params: feed_id - id of the feed to update
+// @params: min_price - new lower sanity bound
+// @params: max_price - new upper sanity bound
+// @params: decimals - new decimals value
+// @returns: 0 on success
+// @security: only_admin, requires max_price > min_price, requires feed to exist
+pub fn update_feed(feed_id: u64, min_price: u64, max_price: u64, decimals: u8) -> u64 {
+    only_admin()
+    require(max_price > min_price, "badrange")
+    let s: Storage = Storage::new()
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    feed.min_price = min_price
+    feed.max_price = max_price
+    feed.decimals = decimals
+    s.store(FEED_PREFIX + feed_id.to_string(10u32), feed)
+    return 0
+}
+
+// ID 1b: add_feed_entry
+// Entry wrapper around add_feed so the feed can be configured externally
+// (pub fn chunks are not invokable via wallet invoke_contract).
+entry add_feed_entry(name: string, asset: Hash, decimals: u8, min_price: u64, max_price: u64) -> u64 {
+    return add_feed(name, asset, decimals, min_price, max_price)
+}
+
+// ID 2: set_feed_active
+// Enable or disable a feed (disabled feeds reject new submissions).
+// @caller: admin (or timelock as contract caller)
+// @params: feed_id - id of the feed to toggle
+// @params: active - true to enable, false to disable
+// @returns: 0 on success
+// @security: only_admin
+pub fn set_feed_active(feed_id: u64, active: bool) -> u64 {
+    only_admin()
+    Storage::new().store(FEED_ACTIVE_PREFIX + feed_id.to_string(10u32), active)
+    return 0
+}
+
+// ID 3: trigger_feed_cb
+// Manually trip a feed's circuit breaker, pausing new submissions and price reads for that feed.
+// @caller: guardian or admin
+// @params: feed_id - id of the feed to trip
+// @params: reason - free-form reason string (off-chain audit trail only)
+// @returns: 0 on success
+// @security: only_guardian_or_admin; sets FEED_CB_PAUSED_PREFIX = true
+pub fn trigger_feed_cb(feed_id: u64, reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), true)
+    return 0
+}
+
+// ID 4: reset_feed_cb
+// Clear a feed's circuit breaker so submissions and reads can resume.
+// @caller: admin (or timelock as contract caller)
+// @params: feed_id - id of the feed to resume
+// @returns: 0 on success
+// @security: only_admin; guardian may trip but only admin may reset
+pub fn reset_feed_cb(feed_id: u64) -> u64 {
+    only_admin()
+    Storage::new().store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), false)
+    return 0
+}
+
+// ID 5: submit_price
+// Submit a price observation for a feed in the current aggregation cycle.
+// @caller: any registered & active miner with the oracle service bit set
+// @params: feed_id - id of the feed being priced
+// @params: price - observed price (must be within feed's [min_price, max_price])
+// @returns: 0 on success
+// @security: when_not_paused, requires caller to be an active miner (cross-call to XelisVaultMiner ID 9), feed must be active and not circuit-broken, one submission per (miner, cycle), capped at MAX_SUBMISSIONS_PER_CYCLE; triggers try_aggregate
+fn aggregate(feed_id: u64) {
+    let s: Storage = Storage::new()
+    let current_topo: u64 = get_current_topoheight()
+    let max_stale: u64 = s.load(MAX_STALE_BLOCKS_KEY).unwrap_or(DEFAULT_MAX_STALE)
+    let cycle: u64 = s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let max_dev: u64 = s.load(MAX_DEVIATION_BPS_KEY).unwrap_or(DEFAULT_MAX_DEV)
+
+    let count_key: string = SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)
+    let sub_count: u64 = s.load(count_key).unwrap_or(0)
+
+    if sub_count == 0 {
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+        return
+    }
+
+    let collected_prices: u64[] = []
+    let collected_providers: Address[] = []
+    let j: u64 = 0
+    while j < sub_count {
+        let entry_key: string = SUB_ENTRY_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + j.to_string(10u32)
+        let entry_opt: optional<PriceSubmission> = s.load(entry_key)
+        if entry_opt.is_none() { j += 1 }
+        else {
+            let entry: PriceSubmission = entry_opt.expect("err")
+            if current_topo > entry.topo && current_topo - entry.topo > max_stale {
+                j += 1
+            } else {
+                collected_prices.push(entry.price)
+                collected_providers.push(entry.provider)
+                s.delete(entry_key)
+                j += 1
+            }
+        }
+    }
+    s.delete(count_key)
+
+    let n_sub: u64 = collected_prices.len() as u64
+    if n_sub == 0 {
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+        return
+    }
+
+    // Bubble sort
+    let a: u64 = 0
+    while a < n_sub {
+        let b: u64 = 0
+        while b < n_sub - 1 - a {
+            let tmp_b1_u64: u64 = b + 1
+            let tmp_b1_idx: u32 = tmp_b1_u64 as u32
+            let cp_a: u64 = collected_prices[b as u32]
+            let cp_b: u64 = collected_prices[tmp_b1_idx]
+            if cp_a > cp_b {
+                collected_prices[b as u32] = cp_b
+                collected_prices[tmp_b1_idx] = cp_a
+                let pv_a: Address = collected_providers[b as u32]
+                let pv_b: Address = collected_providers[tmp_b1_idx]
+                collected_providers[b as u32] = pv_b
+                collected_providers[tmp_b1_idx] = pv_a
+            }
+            b += 1
+        }
+        a += 1
+    }
+
+    // v10.9: Stake-weighted median (anti-Sybil)
+    // Instead of simple median (by count), we weight each price by the miner's stake
+    // This prevents Sybil attacks: splitting stake into N miners gives same weight
+    let mc_hash_opt: optional<Hash> = s.load(MINER_CONTRACT_KEY)
+    let total_stake_weight: u64 = 0
+
+    // Get stake for each provider and compute total
+    // v11.0: Try MinerDelegation first (own + delegated), fallback to XelisVaultMiner (own only)
+    // v11.3: Apply concentration penalty to ORACLE WEIGHT (not rewards)
+    //   - 0-8% of total stake: full weight (1.0x)
+    //   - 8-20%: linear decrease from 1.0x to 0.3x
+    //   - >20%: capped at 0.3x
+    //   This limits manipulation power without penalizing honest miners' rewards
+    let collected_stakes: u64[] = []
+    let idx_stake: u64 = 0
+    let del_hash_opt: optional<Hash> = s.load(DELEGATION_CONTRACT_KEY)
+    
+    // v11.3: First pass — collect raw stakes and compute total
+    let raw_stakes: u64[] = []
+    let raw_total: u64 = 0
+    while idx_stake < n_sub {
+        let provider: Address = collected_providers[idx_stake as u32]
+        let stake: u64 = 1  // default weight if contracts not set
+        if del_hash_opt.is_some() {
+            let del_hash: Hash = del_hash_opt.expect("err")
+            let del: Contract = Contract::new(del_hash).expect("err")
+            let result: u64 = del.call(16u16, [provider], {})
+            if result > 0 { stake = result }
+        } else if mc_hash_opt.is_some() {
+            let mc_hash: Hash = mc_hash_opt.expect("err")
+            let mc: Contract = Contract::new(mc_hash).expect("err")
+            let result: u64 = mc.call(66u16, [provider], {})
+            if result > 0 { stake = result }
+        }
+        raw_stakes.push(stake)
+        raw_total += stake
+        idx_stake += 1
+    }
+    
+    // v11.3: Second pass — apply concentration penalty to oracle weight
+    idx_stake = 0
+    while idx_stake < n_sub {
+        let raw_stake: u64 = raw_stakes[idx_stake as u32]
+        let effective_stake: u64 = raw_stake
+        
+        // Apply concentration curve if we know the total
+        if raw_total > 0 {
+            let share_bps: u64 = (raw_stake * 10000) / raw_total
+            if share_bps > 800 {
+                // Above 8% — apply penalty
+                let factor: u64 = 10000  // 1.0x default
+                if share_bps >= 2000 {
+                    // Above 20% — minimum factor (0.3x)
+                    factor = 3000
+                } else {
+                    // Between 8% and 20% — linear from 1.0x to 0.3x
+                    let excess: u64 = share_bps - 800
+                    let range: u64 = 1200  // 2000 - 800
+                    let penalty: u64 = (excess * 7000) / range
+                    factor = 10000 - penalty
+                }
+                effective_stake = (raw_stake * factor) / 10000
+            }
+        }
+        
+        collected_stakes.push(effective_stake)
+        total_stake_weight += effective_stake
+        idx_stake += 1
+    }
+
+    // Stake-weighted median: find the price where cumulative stake crosses 50%
+    let median: u64 = collected_prices[0]
+    if total_stake_weight > 0 {
+        let half_stake: u64 = total_stake_weight / 2
+        let cumul: u64 = 0
+        let idx_wm: u64 = 0
+        while idx_wm < n_sub {
+            cumul += collected_stakes[idx_wm as u32]
+            if cumul > half_stake {
+                median = collected_prices[idx_wm as u32]
+                break
+            }
+            idx_wm += 1
+        }
+        // If we didn't cross 50% (edge case), use last price
+        if idx_wm == n_sub && n_sub > 0 {
+            median = collected_prices[(n_sub - 1) as u32]
+        }
+    }
+
+    let min_p: u64 = collected_prices[0]
+    let tmp_last_idx: u32 = (n_sub - 1) as u32
+    let max_p: u64 = collected_prices[tmp_last_idx]
+    let deviation_bps: u64 = 0
+    if median > 0 {
+        deviation_bps = ((max_p - min_p) as u128 * 10000u128 / median as u128) as u64
+    }
+
+    // If global deviation too high → slash all
+    if deviation_bps > max_dev {
+        let k: u64 = 0
+        while k < n_sub { slash_miner(collected_providers[k as u32]); k += 1 }
+        s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+        s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+        return
+    }
+
+    // Circuit breaker vs previous aggregated price
+    let prev_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    if prev_opt.is_some() {
+        let prev: AggregatedPrice = prev_opt.expect("err")
+        if prev.price > 0 {
+            let diff: u64 = 0
+            if median > prev.price { diff = median - prev.price } else { diff = prev.price - median }
+            let pct_bps: u64 = (diff as u128 * 10000u128 / prev.price as u128) as u64
+            let cb_thresh: u64 = s.load(CB_THRESHOLD_BPS_KEY).unwrap_or(DEFAULT_CB_THRESH)
+            if pct_bps > cb_thresh {
+                s.store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), true)
+                return
+            }
+        }
+    }
+
+    // Identify valid vs outlier providers
+    let valid_providers: Address[] = []
+    let n_valid: u64 = 0
+    let k2: u64 = 0
+    while k2 < n_sub {
+        let diff: u64 = 0
+        if collected_prices[k2 as u32] > median {
+            diff = collected_prices[k2 as u32] - median
+        } else {
+            diff = median - collected_prices[k2 as u32]
+        }
+        let pct_bps: u64 = 0
+        if median > 0 {
+            pct_bps = (diff as u128 * 10000u128 / median as u128) as u64
+        }
+        if pct_bps <= max_dev {
+            valid_providers.push(collected_providers[k2 as u32])
+            n_valid += 1
+        } else {
+            slash_miner(collected_providers[k2 as u32])
+        }
+        k2 += 1
+    }
+
+    let agg: AggregatedPrice = AggregatedPrice {
+        price: median, topo: current_topo, deviation_bps: deviation_bps,
+        sources_count: n_valid, cycle: cycle
+    }
+    s.store(FEED_AGG_PREFIX + feed_id.to_string(10u32), agg)
+
+    // Reward valid providers
+    let m: u64 = 0
+    while m < n_valid { reward_miner(valid_providers[m as u32], true); m += 1 }
+
+    s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+    s.store(LAST_AGG_PREFIX + feed_id.to_string(10u32), current_topo)
+}
+fn try_aggregate(feed_id: u64) {
+    let s: Storage = Storage::new()
+    let last_agg: u64 = s.load(LAST_AGG_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    let agg_blocks: u64 = s.load(AGGREGATION_BLOCKS_KEY).unwrap_or(DEFAULT_AGG_BLOCKS)
+    if current_topo < last_agg + agg_blocks { return }
+    aggregate(feed_id)
+}
+entry submit_price(feed_id: u64, price: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("nocaller")
+    require(check_miner(caller), "notminer")
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    require(price > 0, "zero")
+    require(price >= feed.min_price && price <= feed.max_price, "oorange")
+
+    // v10.5: Circuit breaker check — reject submissions when feed is CB-paused
+    let cb_paused: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    require(!cb_paused, "cbpaused")
+
+    let cycle: u64 = s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    let provided_key: string = SUB_PROVIDED_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + caller.to_string()
+    require(s.load(provided_key).is_none(), "alreadysub")
+
+    let count_key: string = SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)
+    let sub_count: u64 = s.load(count_key).unwrap_or(0)
+    require(sub_count < MAX_SUBMISSIONS_PER_CYCLE, "maxsub")
+
+    let entry_key: string = SUB_ENTRY_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32) + "_" + sub_count.to_string(10u32)
+    let submission: PriceSubmission = PriceSubmission {
+        price: price, topo: get_current_topoheight(),
+        provider: caller, feed_id: feed_id, cycle: cycle
+    }
+    s.store(entry_key, submission)
+    s.store(provided_key, true)
+    s.store(count_key, sub_count + 1)
+    try_aggregate(feed_id)
+    return 0
+}
+
+// ID 6: aggregate_now
+// Force an immediate aggregation attempt for a feed, bypassing the aggregation-blocks delay.
+// @caller: anyone (read-mostly; aggregation writes if window elapsed)
+// @params: feed_id - id of the feed to aggregate
+// @returns: 0 on success
+// @security: no access control, but try_aggregate short-circuits unless enough blocks have passed
+entry aggregate_now(feed_id: u64) -> u64 {
+    try_aggregate(feed_id)
+    return 0
+}
+
+
+
+// ============================================================================
+fn get_price_by_feed_impl(feed_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let gpi_paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!gpi_paused, "paused")
+
+    let bootstrap: bool = s.load(BOOTSTRAP_MODE_KEY).unwrap_or(true)
+    let min_providers: u64 = 0
+    if bootstrap {
+        min_providers = s.load(BOOTSTRAP_MIN_PROVIDERS_KEY).unwrap_or(DEFAULT_BOOTSTRAP_MIN_PROVIDERS)
+    } else {
+        min_providers = s.load(MIN_PROVIDERS_FOR_ORACLE_KEY).unwrap_or(DEFAULT_MIN_PROVIDERS)
+    }
+    let mc: Contract = get_miner_contract()
+    let active_count: u64 = mc.call(12u16, [], {})
+    require(active_count >= min_providers, "notenoughproviders")
+
+    let agg_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    require(agg_opt.is_some(), "noprice")
+    let agg: AggregatedPrice = agg_opt.expect("err")
+    require(agg.price > 0, "zero")
+
+    let current_topo: u64 = get_current_topoheight()
+    let hard_stale: u64 = s.load(HARD_STALE_BLOCKS_KEY).unwrap_or(DEFAULT_HARD_STALE)
+    if current_topo > agg.topo {
+        require(current_topo - agg.topo <= hard_stale, "stale")
+    }
+    return agg.price
+}
+
+fn get_feed_id_impl(name: string) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let n: string = s.load(FEED_NAME_PREFIX + i.to_string(10u32)).expect("nnf")
+        if n == name { return i }
+        i += 1
+    }
+    require(false, "feednotfound")
+    return 0
+}
+
+// Read-only: return the latest aggregated price for a feed by id.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to read
+// @returns: latest aggregated price
+// @security: read-only; delegates to get_price_by_feed_impl (enforces not-paused, not-cb, min-providers, hard-stale)
+pub fn get_price_by_feed(feed_id: u64) -> u64 { return get_price_by_feed_impl(feed_id) }
+// Read-only: return the latest aggregated price for a feed by name.
+// @caller: anyone (read-only)
+// @params: name - feed name to resolve
+// @returns: latest aggregated price
+// @security: read-only; resolves name -> feed_id then delegates to get_price_by_feed_impl
+pub fn get_price(name: string) -> u64 { return get_price_by_feed_impl(get_feed_id_impl(name)) }
+// Read-only: return the latest aggregated price for the first feed matching an asset hash.
+// @caller: anyone (read-only)
+// @params: asset - asset hash to look up
+// @returns: latest aggregated price
+// @security: read-only; iterates feeds linearly, requires at least one feed for the asset
+pub fn get_price_for_asset(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let feed: Feed = s.load(FEED_PREFIX + i.to_string(10u32)).expect("fnf")
+        if feed.asset == asset { return get_price_by_feed_impl(i) }
+        i += 1
+    }
+    require(false, "assetnofeed")
+    return 0
+}
+// Read-only: resolve a feed's numeric id from its name.
+// @caller: anyone (read-only)
+// @params: name - feed name to resolve
+// @returns: feed id (reverts with "feednotfound" if unknown)
+// @security: read-only; iterates feeds linearly
+pub fn get_feed_id(name: string) -> u64 { return get_feed_id_impl(name) }
+
+// Read-only: return how many feeds are currently registered.
+// @caller: anyone (read-only)
+// @returns: feeds count
+// @security: read-only, no access control
+pub fn get_feeds_count() -> u64 { return Storage::new().load(FEEDS_COUNT_KEY).unwrap_or(0) }
+// Read-only: return the static configuration of a feed.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to read
+// @returns: tuple of (name, asset, decimals, min_price, max_price, active, cb_paused)
+// @security: read-only, no access control; reverts if feed does not exist
+pub fn get_feed(feed_id: u64) -> (string, Hash, u8, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    return (feed.name, feed.asset, feed.decimals, feed.min_price, feed.max_price,
+            s.load(FEED_ACTIVE_PREFIX + feed_id.to_string(10u32)).unwrap_or(false),
+            s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false))
+}
+// Read-only: return the latest aggregated price plus its metadata for a feed.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to read
+// @returns: tuple of (price, topo, deviation_bps, sources_count, cb_paused); all zero if no aggregation yet
+// @security: read-only, no access control
+pub fn get_price_meta(feed_id: u64) -> (u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let cb: bool = s.load(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32)).unwrap_or(false)
+    let agg_opt: optional<AggregatedPrice> = s.load(FEED_AGG_PREFIX + feed_id.to_string(10u32))
+    if agg_opt.is_none() { return (0, 0, 0, 0, cb) }
+    let agg: AggregatedPrice = agg_opt.expect("err")
+    return (agg.price, agg.topo, agg.deviation_bps, agg.sources_count, cb)
+}
+// Read-only: return the current aggregation cycle index for a feed.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to read
+// @returns: current cycle index
+// @security: read-only, no access control
+pub fn get_cycle(feed_id: u64) -> u64 { return Storage::new().load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0) }
+// Read-only: return how many submissions were collected for a feed in a given cycle.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to query
+// @params: cycle - cycle index to query
+// @returns: submission count for that cycle
+// @security: read-only, no access control
+pub fn get_submissions_count(feed_id: u64, cycle: u64) -> u64 {
+    return Storage::new().load(SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32)).unwrap_or(0)
+}
+
+// Set the timelock contract hash (legacy alias kept for symmetry with XelisVaultMiner.set_timelock_tl).
+// @caller: admin (or timelock as contract caller)
+// @params: tl - hash of the timelock contract
+// @returns: 0 on success
+// @security: only_admin
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+// FIX #3 + #12: New entry wrappers for pub fn so they're callable
+// cross-contract via Contract::call.
+// ============================================================================
+
+// ID 7: get_price_by_feed_entry
+// Cross-contract entry: return the latest aggregated price for a feed by id.
+// @caller: anyone (read-only)
+// @params: feed_id - id of the feed to read
+// @returns: latest aggregated price
+// @security: read-only; enforces not-paused, not-circuit-broken, min-providers and hard-stale bounds via get_price_by_feed_impl
+entry get_price_by_feed_entry(feed_id: u64) -> u64 {
+    return get_price_by_feed_impl(feed_id)
+}
+
+// ID 8: get_price_entry
+// Cross-contract entry: return the latest aggregated price for a feed by name.
+// @caller: anyone (read-only)
+// @params: name - feed name to resolve
+// @returns: latest aggregated price
+// @security: read-only; resolves name -> feed_id then delegates to get_price_by_feed_impl
+entry get_price_entry(name: string) -> u64 {
+    return get_price_by_feed_impl(get_feed_id_impl(name))
+}
+
+// ID 9: get_price_for_asset_entry
+// Cross-contract entry: return the latest aggregated price for the first feed matching an asset hash.
+// @caller: anyone (read-only)
+// @params: asset - asset hash to look up
+// @returns: latest aggregated price
+// @security: read-only; iterates feeds linearly, requires at least one feed for the asset, delegates to get_price_by_feed_impl
+entry get_price_for_asset_entry(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(FEEDS_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < count {
+        let feed: Feed = s.load(FEED_PREFIX + i.to_string(10u32)).expect("fnf")
+        if feed.asset == asset { return get_price_by_feed_impl(i) }
+        i += 1
+    }
+    require(false, "assetnofeed")
+    return 0
+}
+
+// ID 10: get_feed_id_entry
+// Cross-contract entry: resolve a feed's numeric id from its name.
+// @caller: anyone (read-only)
+// @params: name - feed name to resolve
+// @returns: feed id (reverts with "feednotfound" if unknown)
+// @security: read-only; iterates feeds linearly
+entry get_feed_id_entry(name: string) -> u64 {
+    return get_feed_id_impl(name)
+}
+
+// ID 11: pause
+// Halt all state-mutating user entries (submit_price, etc.).
+// @caller: guardian or admin
+// @params: reason - free-form reason string (off-chain audit trail only)
+// @returns: 0 on success
+// @security: only_guardian_or_admin; sets PAUSED_KEY = true; read-only entries remain callable
+pub fn pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 12: unpause
+// Resume normal operation after a pause.
+// @caller: admin only (guardian cannot unpause, only pause)
+// @returns: 0 on success
+// @security: only_admin; sets PAUSED_KEY = false
+pub fn unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 13: set_max_deviation_bps
+// Update the global max deviation (in bps) tolerated between providers during aggregation before slashing all.
+// @caller: admin (or timelock as contract caller)
+// @params: bps - new max deviation in basis points (must be in [100, 5000])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+pub fn set_max_deviation_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(MAX_DEVIATION_BPS_KEY, bps)
+    return 0
+}
+
+// ID 14: set_cb_threshold_bps
+// Update the per-feed circuit-breaker threshold: how much the new median may move vs the previous aggregated price.
+// @caller: admin (or timelock as contract caller)
+// @params: bps - new CB threshold in basis points (must be in [500, 5000])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+pub fn set_cb_threshold_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 500 && bps <= 5000, "badval")
+    Storage::new().store(CB_THRESHOLD_BPS_KEY, bps)
+    return 0
+}
+
+// ID 15: set_aggregation_blocks
+// Update the minimum number of blocks between two aggregations of the same feed.
+// @caller: admin (or timelock as contract caller)
+// @params: n - new aggregation window (must be in [1, 100])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+pub fn set_aggregation_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 1 && n <= 100, "badval")
+    Storage::new().store(AGGREGATION_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 16: set_max_stale_blocks
+// Update the staleness threshold (in blocks) after which a submission is dropped from aggregation.
+// @caller: admin (or timelock as contract caller)
+// @params: n - new staleness window (must be in [5, 500])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+pub fn set_max_stale_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 5 && n <= 500, "badval")
+    Storage::new().store(MAX_STALE_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 17: set_hard_stale_blocks
+// Update the hard-stale threshold (in blocks) after which aggregated prices are no longer served to consumers.
+// @caller: admin (or timelock as contract caller)
+// @params: n - new hard-stale window (must be in [20, 500])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range; affects get_price_by_feed_impl
+pub fn set_hard_stale_blocks(n: u64) -> u64 {
+    only_admin()
+    require(n >= 20 && n <= 500, "badval")
+    Storage::new().store(HARD_STALE_BLOCKS_KEY, n)
+    return 0
+}
+
+// ID 18: disable_bootstrap
+// Switch the oracle out of bootstrap mode (which requires fewer providers) into full production mode.
+// @caller: admin (or timelock as contract caller)
+// @returns: 0 on success
+// @security: only_admin; requires at least 20 active miners (cross-call to XelisVaultMiner ID 12); one-way transition
+entry disable_bootstrap() -> u64 {
+    only_admin()
+    let mc: Contract = get_miner_contract()
+    let active_count: u64 = mc.call(12u16, [], {})
+    require(active_count >= 20, "need20providers")
+    Storage::new().store(BOOTSTRAP_MODE_KEY, false)
+    return 0
+}
+
+// ID 19: set_bootstrap_min_providers
+// Update the minimum number of active miners required to serve prices while in bootstrap mode.
+// @caller: admin (or timelock as contract caller)
+// @params: n - new bootstrap min-providers threshold (must be in [1, 10])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+entry set_bootstrap_min_providers(n: u64) -> u64 {
+    only_admin()
+    require(n >= 1 && n <= 10, "badval")
+    Storage::new().store(BOOTSTRAP_MIN_PROVIDERS_KEY, n)
+    return 0
+}
+
+// ID 20: set_min_providers
+// Update the minimum number of active miners required to serve prices in production (post-bootstrap) mode.
+// @caller: admin (or timelock as contract caller)
+// @params: n - new min-providers threshold (must be in [3, 100])
+// @returns: 0 on success
+// @security: only_admin, enforces bounded range
+entry set_min_providers(n: u64) -> u64 {
+    only_admin()
+    require(n >= 3 && n <= 100, "badval")
+    Storage::new().store(MIN_PROVIDERS_FOR_ORACLE_KEY, n)
+    return 0
+}
+
+// ID 21: set_miner_contract
+// Set the XelisVaultMiner contract hash that this oracle cross-calls for miner verification / reward / slash.
+// @caller: admin (or timelock as contract caller)
+// @params: mc - hash of the XelisVaultMiner contract
+// @returns: 0 on success
+// @security: only_admin; misconfiguration would break every submit_price / aggregate
+entry set_miner_contract(mc: Hash) -> u64 { only_admin() Storage::new().store(MINER_CONTRACT_KEY, mc) return 0 }
+
+// v11.0: Set MinerDelegation contract (for total stake = own + delegated in oracle weight)
+entry set_delegation_contract(dc: Hash) -> u64 { only_admin() Storage::new().store(DELEGATION_CONTRACT_KEY, dc) return 0 }
+
+// ID 22: set_registry
+// Set the registry hash (referenced by tooling / off-chain indexers).
+// @caller: admin (or timelock as contract caller)
+// @params: reg - new registry hash
+// @returns: 0 on success
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 23: set_timelock
+// Set the timelock contract hash that is allowed to invoke admin-gated entries as contract caller.
+// @caller: admin (or existing timelock as contract caller)
+// @params: tl - hash of the timelock contract
+// @returns: 0 on success
+// @security: only_admin
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 24: set_guardian
+// Set the guardian address able to pause the contract and trip feed circuit breakers.
+// @caller: admin (or timelock as contract caller)
+// @params: g - new guardian address
+// @returns: 0 on success
+// @security: only_admin
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// ID 25: set_emergency
+// Rotate the emergency-key holder (only the current emergency holder may do this).
+// @caller: current emergency-key holder only
+// @params: e - new emergency address
+// @returns: 0 on success
+// @security: caller must equal stored EMERGENCY_KEY (separate from admin auth)
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let c: Address = get_caller().expect("nocaller")
+    require(c == s.load(EMERGENCY_KEY).expect("easet"), "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 26: transfer_admin
+// Transfer admin rights to a new address.
+// @caller: admin (or timelock as contract caller)
+// @params: new_admin - address of the new admin
+// @returns: 0 on success
+// @security: only_admin; immediate effect (no two-step confirmation in v5.1)
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 27: get_version
+// Return the contract version string.
+// @caller: anyone (read-only)
+// @returns: VERSION constant
+// @security: read-only, no access control
+entry get_version() -> string { return VERSION }
+
+// ============================================================================
+// pub fn (read-only) — usable internally and via entry wrappers above
+// ============================================================================
+
+
+// ============================================================================
+// v10.5: Entry wrappers for parameter setters (called by OracleGovernance)
+// These are entry versions of the pub fn above, so they get entry IDs
+// and can be called cross-contract via Contract::call.
+// ============================================================================
+
+// ID 16: set_max_deviation_bps_entry
+entry set_max_deviation_bps_entry(bps: u64) -> u64 { return set_max_deviation_bps(bps) }
+
+// ID 17: set_cb_threshold_bps_entry
+entry set_cb_threshold_bps_entry(bps: u64) -> u64 { return set_cb_threshold_bps(bps) }
+
+// ID 18: set_aggregation_blocks_entry
+entry set_aggregation_blocks_entry(n: u64) -> u64 { return set_aggregation_blocks(n) }
+
+// ID 19: set_max_stale_blocks_entry
+entry set_max_stale_blocks_entry(n: u64) -> u64 { return set_max_stale_blocks(n) }
+
+// ID 20: set_hard_stale_blocks_entry
+entry set_hard_stale_blocks_entry(n: u64) -> u64 { return set_hard_stale_blocks(n) }
+
+// ID 21: pause_entry (entry wrapper for pub fn pause)
+entry pause_entry(reason: string) -> u64 { return pause(reason) }
+
+// ID 22: unpause_entry (entry wrapper for pub fn unpause)
+entry unpause_entry() -> u64 { return unpause() }
+
+// ============================================================================
+// v10.5: force_update_price — escape hatch for stuck feeds
+// ----------------------------------------------------------------------------
+// If a feed is permanently stuck due to circuit breaker or rapid price movement
+// beyond the deviation threshold, admin can force-update the price.
+// This unblocks the feed without needing to wait for new submissions.
+//
+// Audit fix: "no exit door" — previously a feed could be stuck forever
+// ============================================================================
+
+// ID 23: force_update_price (admin/guardian only)
+// Force-update a feed's aggregated price, bypassing deviation check.
+// Resets the circuit breaker for this feed.
+// @caller: admin or guardian
+// @params: feed_id - id of the feed to update
+// @params: new_price - the new price to set
+// @returns: 0 on success
+// @security: only_guardian_or_admin, emits event, resets CB flag
+entry force_update_price(feed_id: u64, new_price: u64) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let feed: Feed = s.load(FEED_PREFIX + feed_id.to_string(10u32)).expect("fnf")
+    require(new_price > 0, "zero")
+    require(new_price >= feed.min_price && new_price <= feed.max_price, "oorange")
+
+    // Build a new AggregatedPrice with current topoheight
+    let agg: AggregatedPrice = AggregatedPrice {
+        price: new_price,
+        topo: get_current_topoheight(),
+        deviation_bps: 0,
+        sources_count: 1,
+        cycle: s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    }
+    s.store(FEED_AGG_PREFIX + feed_id.to_string(10u32), agg)
+
+    // Reset circuit breaker
+    s.store(FEED_CB_PAUSED_PREFIX + feed_id.to_string(10u32), false)
+
+    // Advance cycle to allow fresh submissions
+    let cycle: u64 = s.load(CYCLE_PREFIX + feed_id.to_string(10u32)).unwrap_or(0)
+    s.store(CYCLE_PREFIX + feed_id.to_string(10u32), cycle + 1)
+
+    // Reset submission tracking
+    s.store(SUB_COUNT_PREFIX + feed_id.to_string(10u32) + "_" + cycle.to_string(10u32), 0u64)
+
+    emit_event(0u64, ["ForceUpdatePrice", feed_id.to_string(10u32) + "_" + new_price.to_string(10u32)])
+    return 0
+}

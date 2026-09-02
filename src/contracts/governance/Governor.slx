@@ -1,0 +1,461 @@
+// ============================================================================
+// Governor.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #10: queue() now calls gv.call(8u16, [], {}) — GovernanceVault v5.0
+//          entry 4 = get_total_voting_power_entry.
+// FIX #11: get_voting_power() now calls gv.call(7u16, [addr], {}) —
+//          GovernanceVault v5.0 entry 3 = get_voting_power_entry.
+// FIX:     queue() now submits the proposal to Timelock via
+//          tl.call(5u16, [target, entry_id, params, delay], {}) — Timelock v5.0
+//          entry 0 = submit_proposal(target, entry_id, params, delay).
+//
+// ENTRY IDs (sequential, starting at 0):
+//   0  : propose(target, entry_id, params, description) -> u64
+//   1  : vote(proposal_id, support) -> u64
+//   2  : queue(proposal_id) -> u64
+//   3  : cancel(proposal_id) -> u64
+//   4  : get_proposal_count_entry() -> u64
+//   5  : set_governance_vault(gv: Hash) -> u64
+//   6  : set_timelock(tl: Hash) -> u64
+//   7  : set_voting_period(blocks: u64) -> u64
+//   8  : set_quorum_bps(bps: u64) -> u64
+//   9  : set_approval_bps(bps: u64) -> u64
+//   10 : set_proposal_threshold(threshold: u64) -> u64
+//   11 : transfer_admin(new_admin: Address) -> u64
+//   12 : get_version() -> string
+// ============================================================================
+
+const VERSION: string = "Governor v11.3"
+
+const ADMIN_KEY: string = "a"
+const GOVERNANCE_VAULT_KEY: string = "gv"
+const TIMELOCK_KEY: string = "tl"
+
+const PROPOSALS_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "p_"
+const VOTE_PREFIX: string = "v_"
+
+const VOTING_PERIOD_KEY: string = "vp"
+const QUORUM_BPS_KEY: string = "qb"
+const APPROVAL_BPS_KEY: string = "ab"
+const PROPOSAL_THRESHOLD_KEY: string = "pt"
+
+const DEFAULT_VOTING_PERIOD: u64 = 120960
+const DEFAULT_QUORUM_BPS: u64 = 1000
+const DEFAULT_APPROVAL_BPS: u64 = 5000
+const DEFAULT_PROPOSAL_THRESHOLD: u64 = 10000000000
+
+// Default delay (in blocks) submitted to the Timelock when a proposal is queued.
+// 34560 blocks ~= 2 days at 120 blocks/hour.
+const QUEUE_DELAY_BLOCKS: u64 = 150  // testnet: ~7 min (mainnet: 34560)
+
+struct Proposal {
+    id: u64,
+    proposer: Address,
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    description: string,
+    start_topo: u64,
+    end_topo: u64,
+    yes_votes: u64,
+    no_votes: u64,
+    abstain_votes: u64,
+    queued: bool,
+    cancelled: bool,
+    executed: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(PROPOSALS_COUNT_KEY, 0u64)
+    s.store(VOTING_PERIOD_KEY, DEFAULT_VOTING_PERIOD)
+    s.store(QUORUM_BPS_KEY, DEFAULT_QUORUM_BPS)
+    s.store(APPROVAL_BPS_KEY, DEFAULT_APPROVAL_BPS)
+    s.store(PROPOSAL_THRESHOLD_KEY, DEFAULT_PROPOSAL_THRESHOLD)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+}
+
+// ============================================================================
+// FIX #11: get_voting_power() uses GovernanceVault v5.0 entry 3
+// (get_voting_power_entry).
+// ============================================================================
+fn get_voting_power(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("err")
+    let gv: Contract = Contract::new(gv_hash).expect("err")
+    let vp: u64 = gv.call(7u16, [addr], {})
+    return vp
+}
+
+// Submit a new governance proposal targeting a single entry on `target` contract.
+// @caller: any user with voting power >= proposal threshold
+// @params: target - hash of contract to execute on queue
+// @params: entry_id - entry ID on target to call
+// @params: params - ABI-encoded call params for the target entry
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires proposer's voting power >= PROPOSAL_THRESHOLD; voting period starts immediately
+// ============================================================================
+// ID 0: propose
+// ============================================================================
+entry propose(
+    target: Hash,
+    entry_id: u16,
+    params: bytes,
+    description: string
+) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let vp: u64 = get_voting_power(caller)
+    let threshold: u64 = s.load(PROPOSAL_THRESHOLD_KEY).unwrap_or(DEFAULT_PROPOSAL_THRESHOLD)
+    require(vp >= threshold, "novenough")
+
+    let id: u64 = s.load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposer: caller,
+        target: target,
+        entry_id: entry_id,
+        params: params,
+        description: description,
+        start_topo: current_topo,
+        end_topo: current_topo + voting_period,
+        yes_votes: 0,
+        no_votes: 0,
+        abstain_votes: 0,
+        queued: false,
+        cancelled: false,
+        executed: false
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSALS_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Cast a vote (no/yes/abstain) on an active proposal. One-vote-per-voter.
+// @caller: any voting-power holder
+// @params: proposal_id - target proposal to vote on
+// @params: support - 0=no, 1=yes, else=abstain
+// @returns: 0 on success
+// @security: requires voting during [start_topo, end_topo], double-voting blocked, proposal must not be queued/cancelled
+// ============================================================================
+// ID 1: vote
+// ============================================================================
+entry vote(proposal_id: u64, support: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.queued, "queued")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo >= proposal.start_topo, "notstarted")
+    require(current_topo <= proposal.end_topo, "ended")
+
+    let vote_key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + caller.to_string()
+    let already: bool = s.load(vote_key).unwrap_or(false)
+    require(!already, "alreadyvoted")
+
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    if support == 0 {
+        proposal.no_votes += vp
+    } else if support == 1 {
+        proposal.yes_votes += vp
+    } else {
+        proposal.abstain_votes += vp
+    }
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    s.store(vote_key, true)
+    return 0
+}
+
+// Queue a passed proposal for execution via Timelock (subject to timelock delay).
+// @caller: anyone (open access after voting ends)
+// @params: proposal_id - target proposal to queue
+// @returns: 0 on success
+// @security: voting must be ended, quorum & approval thresholds must be met, submits to Timelock entry 0 (submit_proposal)
+// ============================================================================
+// ID 2: queue
+// ----------------------------------------------------------------------------
+// FIX #10: total voting power read via gv.call(8u16, [], {}) — GovernanceVault
+//          v5.0 entry 4 = get_total_voting_power_entry.
+// FIX:     On success, submits to Timelock v5.0 entry 0
+//          (submit_proposal(target, entry_id, params, delay)).
+// ============================================================================
+entry queue(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.queued, "alreadyqueued")
+    require(!proposal.cancelled, "cancelled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > proposal.end_topo, "notended")
+
+    let total_votes: u64 = proposal.yes_votes + proposal.no_votes + proposal.abstain_votes
+    let quorum_bps: u64 = s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS)
+
+    // FIX #10: GovernanceVault v5.0 entry 4 = get_total_voting_power_entry
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("err")
+    let gv: Contract = Contract::new(gv_hash).expect("err")
+    let total_vp: u64 = gv.call(8u16, [], {})
+
+    let quorum_required: u64 = (total_vp as u128 * quorum_bps as u128 / 10000u128) as u64
+    require(total_votes >= quorum_required, "noquorum")
+
+    let approval_bps: u64 = s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS)
+    let cast_yes_no: u64 = proposal.yes_votes + proposal.no_votes
+    if cast_yes_no > 0 {
+        let yes_bps: u64 = (proposal.yes_votes as u128 * 10000u128 / cast_yes_no as u128) as u64
+        require(yes_bps >= approval_bps, "noapprove")
+    }
+
+    proposal.queued = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    // FIX: submit the queued proposal to the Timelock.
+    // Timelock v5.0 entry 0 = submit_proposal(target, entry_id, params, delay).
+    let tl_hash: Hash = s.load(TIMELOCK_KEY).expect("err")
+    let tl: Contract = Contract::new(tl_hash).expect("err")
+    let _ = tl.call(5u16, [proposal.target, proposal.entry_id as u64, proposal.params, QUEUE_DELAY_BLOCKS], {})
+
+    return 0
+}
+
+// Cancel a proposal that has not yet been queued or executed.
+// @caller: original proposer OR admin
+// @params: proposal_id - target proposal to cancel
+// @returns: 0 on success
+// @security: only proposer or admin; cannot cancel queued/executed proposals
+// ============================================================================
+// ID 3: cancel
+// ============================================================================
+entry cancel(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.queued, "queued")
+    require(!proposal.executed, "executed")
+
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == proposal.proposer || caller == admin, "notauth")
+
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+// Returns the total number of proposals ever created (entry wrapper).
+// @caller: anyone
+// @returns: proposal counter value
+// @security: read-only, no access restrictions
+// ============================================================================
+// ID 4: get_proposal_count_entry
+// ============================================================================
+entry get_proposal_count_entry() -> u64 {
+    return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+}
+
+// Returns a proposal snapshot by ID (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to read
+// @returns: (proposer, target, entry_id, start_topo, end_topo, yes_votes, no_votes, abstain_votes, queued, cancelled)
+// @security: read-only, no access restrictions, panics if proposal missing
+pub fn get_proposal(proposal_id: u64) -> (Address, Hash, u16, u64, u64, u64, u64, u64, bool, bool) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    return (
+        p.proposer, p.target, p.entry_id,
+        p.start_topo, p.end_topo,
+        p.yes_votes, p.no_votes, p.abstain_votes,
+        p.queued, p.cancelled
+    )
+}
+
+// Returns the governor configuration tuple (read-only view).
+// @caller: anyone
+// @returns: (voting_period, quorum_bps, approval_bps, proposal_threshold)
+// @security: read-only, no access restrictions
+pub fn get_config() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD),
+        s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS),
+        s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS),
+        s.load(PROPOSAL_THRESHOLD_KEY).unwrap_or(DEFAULT_PROPOSAL_THRESHOLD)
+    )
+}
+
+// Set the GovernanceVault contract hash (used to read voting power).
+// @caller: admin
+// @params: gv - GovernanceVault contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 5: set_governance_vault
+// ============================================================================
+entry set_governance_vault(gv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
+    return 0
+}
+
+// Set the Timelock contract hash (destination for queued proposals).
+// @caller: admin
+// @params: tl - Timelock contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 6: set_timelock
+// ============================================================================
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Set the voting period (in topo blocks) for new proposals.
+// @caller: admin
+// @params: blocks - voting period length (17280–604800 blocks = 1–35 days)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 7: set_voting_period
+// ============================================================================
+entry set_voting_period(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 17280 && blocks <= 604800, "badval")
+    Storage::new().store(VOTING_PERIOD_KEY, blocks)
+    return 0
+}
+
+// Set the quorum threshold (in bps of total voting power) required to queue.
+// @caller: admin
+// @params: bps - quorum in bps (100–5000 = 1%–50%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 8: set_quorum_bps
+// ============================================================================
+entry set_quorum_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(QUORUM_BPS_KEY, bps)
+    return 0
+}
+
+// Set the approval threshold (in bps of yes/no votes) required to queue.
+// @caller: admin
+// @params: bps - approval in bps (5000–8000 = 50%–80%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 9: set_approval_bps
+// ============================================================================
+entry set_approval_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 5000 && bps <= 8000, "badval")
+    Storage::new().store(APPROVAL_BPS_KEY, bps)
+    return 0
+}
+
+// Set the minimum voting power required to submit a proposal.
+// @caller: admin
+// @params: threshold - minimum voting power in atomic units
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 10: set_proposal_threshold
+// ============================================================================
+entry set_proposal_threshold(threshold: u64) -> u64 {
+    only_admin()
+    Storage::new().store(PROPOSAL_THRESHOLD_KEY, threshold)
+    return 0
+}
+
+// Transfer admin role to a new address (single-step).
+// @caller: admin
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ============================================================================
+// ID 11: transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("Governor v5.0")
+// @security: read-only, no access restrictions
+// ============================================================================
+// ID 12: get_version
+// ============================================================================
+entry get_version() -> string {
+    return VERSION
+}
+
+// ============================================================================
+// Additional pub fn getters — read-only, for off-chain frontend reads
+// ============================================================================
+
+// Returns the total number of proposals ever created (read-only view).
+// @caller: anyone
+// @returns: proposal counter value
+// @security: read-only, no access restrictions
+pub fn get_proposals_count() -> u64 {
+    return Storage::new().load(PROPOSALS_COUNT_KEY).unwrap_or(0)
+}
+
+// Returns whether a given voter has voted on a given proposal (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to check
+// @params: voter - address whose vote to verify
+// @returns: true if `voter` has voted on `proposal_id`, false otherwise
+// @security: read-only, no access restrictions
+pub fn has_voted(proposal_id: u64, voter: Address) -> bool {
+    let s: Storage = Storage::new()
+    let key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + voter.to_string()
+    let v: bool = s.load(key).unwrap_or(false)
+    return v
+}
+
+// Returns whether the contract is paused (Governor has no pause — always false).
+// @caller: anyone
+// @returns: false (Governor is always active)
+// @security: read-only, no access restrictions
+pub fn is_paused() -> bool {
+    return false  // Governor has no pause — always active
+}
+
+// Returns the configured GovernanceVault contract hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: GovernanceVault contract hash
+// @security: read-only, no access restrictions
+pub fn get_governance_vault() -> Hash {
+    return Storage::new().load(GOVERNANCE_VAULT_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the configured Timelock contract hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: Timelock contract hash
+// @security: read-only, no access restrictions
+pub fn get_timelock() -> Hash {
+    return Storage::new().load(TIMELOCK_KEY).unwrap_or(Hash::zero())
+}

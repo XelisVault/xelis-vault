@@ -1,0 +1,442 @@
+// ============================================================================
+// AnalyticsCollector.slx — XELIS Vault v10.2 (Brainstorming Feature #8)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Collecte de métriques on-chain pour dashboards et analytics.
+//
+// RÔLE : Stocke des snapshots agrégés (TVL, volume, liquidations, etc.) que
+//        les contrats du protocole mettent à jour via hooks. Les dashboards
+//        frontend lisent ces données sans devoir scanner toute la chaîne.
+//
+// MÉTRIQUES COLLECTÉES :
+//   - TVL total (par asset et global)
+//   - Volume de swap par jour
+//   - Nombre de liquidations par jour
+//   - Distribution des health factors (buckets)
+//   - Rewards distribués (miners, providers, stakers)
+//   - Nombre d'utilisateurs actifs
+//   - Nombre de vaults ouverts/fermés
+//   - PEG de xUSD (moyenne mobile)
+//   - Gas utilisé par contrat
+//
+// PRIVACY : Aucune donnée individuelle n'est stockée. Tout est agrégé.
+//           Les buckets de health factor ne révèlent pas d'info personnelle.
+//
+// Entry IDs:
+//   0  : record_tvl_snapshot
+//   1  : record_swap_volume
+//   2  : record_liquidation
+//   3  : record_vault_opened
+//   4  : record_vault_closed
+//   5  : record_rewards_distributed
+//   6  : record_health_factor_bucket
+//   7  : record_active_user
+//   8  : get_tvl_history (pub fn)
+//   9  : get_daily_stats (pub fn)
+//   10 : get_health_distribution (pub fn)
+//   11 : get_protocol_summary (pub fn)
+//   12 : set_registry
+//   13 : set_timelock
+//   14 : set_guardian
+//   15 : transfer_admin
+//   16 : get_version
+// ============================================================================
+
+const VERSION: string = "AnalyticsCollector v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const REGISTRY_KEY: string = "reg"
+
+// TVL history (snapshot every ~1 hour = 720 blocks)
+const TVL_HISTORY_PREFIX: string = "tvl_"
+const TVL_HISTORY_COUNT_KEY: string = "tvlc"
+const TVL_HISTORY_MAX: u64 = 168        // 7 days of hourly snapshots
+
+// Daily stats (1 day = 17280 blocks at 5s)
+const DAILY_PREFIX: string = "day_"
+const DAILY_COUNT_KEY: string = "dc"
+const DAILY_MAX: u64 = 365              // 1 year of daily stats
+
+// Health factor buckets (10 buckets: 0-50%, 50-100%, 100-150%, ..., 450-500%, 500%+)
+const HEALTH_BUCKET_PREFIX: string = "hb_"
+const HEALTH_BUCKET_COUNT: u8 = 11
+
+// Global counters
+const TOTAL_SWAPS_KEY: string = "tsw"
+const TOTAL_LIQUIDATIONS_KEY: string = "tli"
+const TOTAL_VAULTS_OPENED_KEY: string = "tvo"
+const TOTAL_VAULTS_CLOSED_KEY: string = "tvc"
+const TOTAL_REWARDS_KEY: string = "trw"
+const ACTIVE_USERS_KEY: string = "au"
+const PEG_HISTORY_PREFIX: string = "peg_"
+
+struct TVLSnapshot {
+    topoheight: u64,
+    total_tvl_atomic: u64,
+    xel_tvl: u64,
+    xusd_supply: u64,
+    vlt_staked: u64
+}
+
+struct DailyStats {
+    day: u64,
+    swap_volume: u64,
+    swap_count: u64,
+    liquidation_count: u64,
+    liquidation_volume: u64,
+    vaults_opened: u64,
+    vaults_closed: u64,
+    rewards_distributed: u64,
+    active_users: u64,
+    avg_health_bps: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(TVL_HISTORY_COUNT_KEY, 0u64)
+    s.store(DAILY_COUNT_KEY, 0u64)
+    s.store(TOTAL_SWAPS_KEY, 0u64)
+    s.store(TOTAL_LIQUIDATIONS_KEY, 0u64)
+    s.store(TOTAL_VAULTS_OPENED_KEY, 0u64)
+    s.store(TOTAL_VAULTS_CLOSED_KEY, 0u64)
+    s.store(TOTAL_REWARDS_KEY, 0u64)
+    s.store(ACTIVE_USERS_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Only authorized protocol contracts can record events
+// F-06 fix (MEDIUM): was accepting ANY contract caller (only checked
+//   get_contract_caller().is_some()). Now resolves the registry and requires
+//   that the contract caller is registered under one of the known protocol
+//   contract names.
+fn only_protocol_contract() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == admin || caller == guardian { return }
+    // F-06 fix: require an explicit contract caller AND that it is registered.
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notauth")
+    let cc: Hash = cc_opt.expect("err")
+    require(is_authorized_protocol_contract(cc), "notauth")
+}
+
+// F-06 fix: check whether `caller_hash` matches one of the registered protocol contracts.
+fn is_authorized_protocol_contract(caller_hash: Hash) -> bool {
+    let s: Storage = Storage::new()
+    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+    if reg_opt.is_none() { return false }
+    let reg_hash: Hash = reg_opt.expect("err")
+    if reg_hash == Hash::zero() { return false }
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    let names: string[] = ["VaultSwapV2", "PSM", "VaultEngineV3", "FlashLoan", "VaultChat", "LendingMarket", "PeerLoan", "SyndicatePool", "InsurancePool", "SealedBidAuction", "GovernanceVault", "AirdropTracker", "XelisVaultMiner", "StakedOracle"]
+    let i: u64 = 0
+    while i < names.len() {
+        let name: string = names[i]
+        let h: Hash = reg.call(14u16, [name], {})
+        if h != Hash::zero() && h == caller_hash { return true }
+        i += 1
+    }
+    return false
+}
+
+// Helper: get day number from topoheight (1 day = 17280 blocks)
+fn get_day(topoheight: u64) -> u64 {
+    return topoheight / 17280
+}
+
+// Entry 0: Record TVL snapshot (called by keeper every hour)
+entry record_tvl_snapshot(total_tvl: u64, xel_tvl: u64, xusd_supply: u64, vlt_staked: u64) -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(TVL_HISTORY_COUNT_KEY).unwrap_or(0)
+    let idx: u64 = count % TVL_HISTORY_MAX   // ring buffer
+
+    let snap: TVLSnapshot = TVLSnapshot {
+        topoheight: get_current_topoheight(),
+        total_tvl_atomic: total_tvl,
+        xel_tvl: xel_tvl,
+        xusd_supply: xusd_supply,
+        vlt_staked: vlt_staked
+    }
+    s.store(TVL_HISTORY_PREFIX + idx.to_string(10u32), snap)
+    s.store(TVL_HISTORY_COUNT_KEY, count + 1)
+    return 0
+}
+
+// Entry 1: Record swap volume (called by VaultSwap, PSM)
+entry record_swap_volume(volume_atomic: u64) -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(TOTAL_SWAPS_KEY).unwrap_or(0)
+    s.store(TOTAL_SWAPS_KEY, total + 1)
+
+    // Update daily stats
+    let day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + day.to_string(10u32)
+    let stats_opt: optional<DailyStats> = s.load(key)
+    let stats: DailyStats = stats_opt.unwrap_or(DailyStats {
+            day: day,
+            swap_volume: volume_atomic,
+            swap_count: 1,
+            liquidation_count: 0,
+            liquidation_volume: 0,
+            vaults_opened: 0,
+            vaults_closed: 0,
+            rewards_distributed: 0,
+            active_users: 0,
+            avg_health_bps: 0
+        })
+    if stats_opt.is_some() {
+        stats.swap_volume += volume_atomic
+        stats.swap_count += 1
+    }
+    s.store(key, stats)
+    return 0
+}
+
+// Entry 2: Record liquidation (called by VaultEngine)
+entry record_liquidation(collateral_seized: u64) -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(TOTAL_LIQUIDATIONS_KEY).unwrap_or(0)
+    s.store(TOTAL_LIQUIDATIONS_KEY, total + 1)
+
+    let day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + day.to_string(10u32)
+    let stats_opt: optional<DailyStats> = s.load(key)
+    let stats: DailyStats = stats_opt.unwrap_or(DailyStats {
+            day: day,
+            swap_volume: 0,
+            swap_count: 0,
+            liquidation_count: 0,
+            liquidation_volume: 0,
+            vaults_opened: 0,
+            vaults_closed: 0,
+            rewards_distributed: 0,
+            active_users: 0,
+            avg_health_bps: 0
+        })
+    stats.liquidation_count += 1
+    stats.liquidation_volume += collateral_seized
+    s.store(key, stats)
+    return 0
+}
+
+// Entry 3: Record vault opened
+entry record_vault_opened() -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(TOTAL_VAULTS_OPENED_KEY).unwrap_or(0)
+    s.store(TOTAL_VAULTS_OPENED_KEY, total + 1)
+
+    let day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + day.to_string(10u32)
+    let stats_opt: optional<DailyStats> = s.load(key)
+    let stats: DailyStats = stats_opt.unwrap_or(DailyStats {
+            day: day,
+            swap_volume: 0,
+            swap_count: 0,
+            liquidation_count: 0,
+            liquidation_volume: 0,
+            vaults_opened: 0,
+            vaults_closed: 0,
+            rewards_distributed: 0,
+            active_users: 0,
+            avg_health_bps: 0
+        })
+    stats.vaults_opened += 1
+    s.store(key, stats)
+    return 0
+}
+
+// Entry 4: Record vault closed
+entry record_vault_closed() -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(TOTAL_VAULTS_CLOSED_KEY).unwrap_or(0)
+    s.store(TOTAL_VAULTS_CLOSED_KEY, total + 1)
+
+    let day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + day.to_string(10u32)
+    let stats_opt: optional<DailyStats> = s.load(key)
+    let stats: DailyStats = stats_opt.unwrap_or(DailyStats {
+            day: day,
+            swap_volume: 0,
+            swap_count: 0,
+            liquidation_count: 0,
+            liquidation_volume: 0,
+            vaults_opened: 0,
+            vaults_closed: 0,
+            rewards_distributed: 0,
+            active_users: 0,
+            avg_health_bps: 0
+        })
+    stats.vaults_closed += 1
+    s.store(key, stats)
+    return 0
+}
+
+// Entry 5: Record rewards distributed
+entry record_rewards_distributed(amount: u64) -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(TOTAL_REWARDS_KEY).unwrap_or(0)
+    s.store(TOTAL_REWARDS_KEY, total + amount)
+    return 0
+}
+
+// Entry 6: Record health factor bucket (anonymized distribution)
+// bucket: 0-10 corresponding to ranges 0-50%, 50-100%, ..., 500%+
+entry record_health_factor_bucket(bucket: u8) -> u64 {
+    only_protocol_contract()
+    require(bucket < HEALTH_BUCKET_COUNT, "badbucket")
+    let s: Storage = Storage::new()
+    let key: string = HEALTH_BUCKET_PREFIX + bucket.to_string(10u32)
+    let count: u64 = s.load(key).unwrap_or(0)
+    s.store(key, count + 1)
+    return 0
+}
+
+// Entry 7: Record active user (increment daily active users)
+entry record_active_user() -> u64 {
+    only_protocol_contract()
+    let s: Storage = Storage::new()
+    let day: u64 = get_day(get_current_topoheight())
+    let key: string = DAILY_PREFIX + day.to_string(10u32)
+    let stats_opt: optional<DailyStats> = s.load(key)
+    let stats: DailyStats = stats_opt.unwrap_or(DailyStats {
+            day: day,
+            swap_volume: 0,
+            swap_count: 0,
+            liquidation_count: 0,
+            liquidation_volume: 0,
+            vaults_opened: 0,
+            vaults_closed: 0,
+            rewards_distributed: 0,
+            active_users: 0,
+            avg_health_bps: 0
+        })
+    stats.active_users += 1
+    s.store(key, stats)
+    return 0
+}
+
+// Pub fn 8: Get TVL history (paginated)
+pub fn get_tvl_history(offset: u64, limit: u64) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(TVL_HISTORY_COUNT_KEY).unwrap_or(0)
+    let actual_idx: u64 = (offset + count) % TVL_HISTORY_MAX  // adjust for ring buffer
+    let snap: TVLSnapshot = s.load(TVL_HISTORY_PREFIX + actual_idx.to_string(10u32)).expect("nosnap")
+    return (snap.topoheight, snap.total_tvl_atomic, snap.xel_tvl, snap.xusd_supply, snap.vlt_staked)
+}
+
+// Pub fn 9: Get daily stats for a specific day
+pub fn get_daily_stats(day: u64) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let stats: DailyStats = s.load(DAILY_PREFIX + day.to_string(10u32)).expect("nodata")
+    return (
+        stats.day,
+        stats.swap_volume,
+        stats.swap_count,
+        stats.liquidation_count,
+        stats.liquidation_volume,
+        stats.vaults_opened,
+        stats.vaults_closed,
+        stats.rewards_distributed,
+        stats.active_users,
+        stats.avg_health_bps
+    )
+}
+
+// Pub fn 10: Get health factor distribution (returns all 11 buckets)
+pub fn get_health_distribution(bucket: u8) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(HEALTH_BUCKET_PREFIX + bucket.to_string(10u32)).unwrap_or(0)
+}
+
+// Pub fn 11: Get protocol summary (totals)
+pub fn get_protocol_summary() -> (u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(TOTAL_SWAPS_KEY).unwrap_or(0),
+        s.load(TOTAL_LIQUIDATIONS_KEY).unwrap_or(0),
+        s.load(TOTAL_VAULTS_OPENED_KEY).unwrap_or(0),
+        s.load(TOTAL_VAULTS_CLOSED_KEY).unwrap_or(0),
+        s.load(TOTAL_REWARDS_KEY).unwrap_or(0),
+        s.load(ACTIVE_USERS_KEY).unwrap_or(0)
+    )
+}
+
+// Entry 12: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 13: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 14: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 15: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 16: Get version
+entry get_version() -> string {
+    return VERSION
+}

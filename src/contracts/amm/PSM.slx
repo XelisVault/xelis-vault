@@ -1,0 +1,662 @@
+// ============================================================================
+// PSM.slx — XELIS Vault v11.5 (Peg Stability Module)
+// ----------------------------------------------------------------------------
+// FIX #12: get_xel_price() calls oracle.call(22u16, [Hash::zero()], {})
+//          (StakedOracle pub-fn get_price_for_asset, chunk 22 = All access —
+//          cross-contract calls require All chunks, NOT Entry chunks).
+// FIX #14: Two-step emergency_withdraw at IDs 11/12 with 17280-block delay.
+//
+// v11.5 PSM FIX (CRITICAL): the previous `mint` was calling
+//   `xusd.call(17u16, [self_hash, net_xusd], {})` after `s.load("sh")` which
+//   NEVER exists — reverting every mint. Restored `mint_split` (chunk 4) so
+//   `net_xusd` goes to the caller and `fee` to the treasury.
+//   `redeem` now requires a pre-deposit of xUSD (symmetric to mint's XEL pre-deposit),
+//   so the PSM has the xUSD to burn via `burn_tokens` (chunk 5).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : mint(xel_amount, min_xusd_out)
+//   1  : redeem(xusd_amount, min_xel_out)
+//   2  : get_reserves_entry
+//   3  : get_mint_fee_entry
+//   4  : get_redeem_fee_entry
+//   5  : get_daily_usage_entry
+//   6  : set_mint_fee_bps
+//   7  : set_redeem_fee_bps
+//   8  : set_daily_caps
+//   9  : pause
+//   10 : unpause
+//   11 : request_emergency_withdraw
+//   12 : execute_emergency_withdraw
+//   13 : set_xusd_contract
+//   14 : set_xusd_asset
+//   15 : set_oracle
+//   16 : set_treasury
+//   17 : set_registry
+//   18 : set_timelock
+//   19 : set_guardian
+//   20 : set_emergency
+//   21 : transfer_admin
+//   22 : get_version
+//
+// Cross-contract calls (v11.5 chunk IDs from docs/entry_chunk_ids.json):
+//   mint   : xusd.call(4u16, [caller, net_xusd, treasury, fee], {})   // xUSD.mint_split (All chunk 4)
+//   redeem : xusd.call(5u16, [xusd_amount], {})                      // xUSD.burn_tokens (All chunk 5)
+// ============================================================================
+
+const VERSION: string = "PSM v11.5"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const XUSD_CONTRACT_KEY: string = "xc"
+const XUSD_ASSET_KEY: string = "xa"
+const ORACLE_KEY: string = "or"
+const TREASURY_KEY: string = "tr"
+const MINT_FEE_BPS_KEY: string = "mfb"
+const REDEEM_FEE_BPS_KEY: string = "rfb"
+const DAILY_MINT_CAP_KEY: string = "dmc"
+const DAILY_REDEEM_CAP_KEY: string = "drc"
+const DAILY_MINT_USED_KEY: string = "dmu"
+const DAILY_REDEEM_USED_KEY: string = "dru"
+const DAILY_RESET_TOPO_KEY: string = "drt"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+fn get_xel_asset() -> Hash { return Hash::zero() }
+
+const DEFAULT_MINT_FEE_BPS: u64 = 50
+const DEFAULT_REDEEM_FEE_BPS: u64 = 10
+const DEFAULT_DAILY_MINT_CAP: u64 = 100000000000000
+const DEFAULT_DAILY_REDEEM_CAP: u64 = 100000000000000
+const DAILY_RESET_BLOCKS: u64 = 17280
+const PRICE_DECIMALS: u64 = 100000000
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(MINT_FEE_BPS_KEY, DEFAULT_MINT_FEE_BPS)
+    s.store(REDEEM_FEE_BPS_KEY, DEFAULT_REDEEM_FEE_BPS)
+    s.store(DAILY_MINT_CAP_KEY, DEFAULT_DAILY_MINT_CAP)
+    s.store(DAILY_REDEEM_CAP_KEY, DEFAULT_DAILY_REDEEM_CAP)
+    s.store(DAILY_MINT_USED_KEY, 0u64)
+    s.store(DAILY_REDEEM_USED_KEY, 0u64)
+    s.store(DAILY_RESET_TOPO_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn maybe_reset_daily() {
+    let s: Storage = Storage::new()
+    let last_reset: u64 = s.load(DAILY_RESET_TOPO_KEY).unwrap_or(0)
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo > last_reset + DAILY_RESET_BLOCKS {
+        s.store(DAILY_MINT_USED_KEY, 0u64)
+        s.store(DAILY_REDEEM_USED_KEY, 0u64)
+        s.store(DAILY_RESET_TOPO_KEY, current_topo)
+    }
+}
+
+// StakedOracle pub-fn get_price_for_asset = chunk 22 (All access — required for cross-contract calls)
+fn get_xel_price() -> u64 {
+    let s: Storage = Storage::new()
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("err")
+    let oracle: Contract = Contract::new(oracle_hash).expect("err")
+    let price: u64 = oracle.call(22u16, [Hash::zero()], {})
+    require(price > 0, "noprice")
+    return price
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: mint — Mint xUSD by depositing XEL at the oracle XEL/USD price,
+// charging a mint fee to treasury.
+// v11.5 fix: use mint_split (chunk 4) which mints `net_xusd + fee` and sends
+// `net_xusd` to the caller + `fee` to the treasury. The XEL deposit stays in
+// PSM as XEL reserve for the redeem path.
+// mint.
+entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
+    when_not_paused()
+    require(xel_amount > 0, "amtgt0")
+    require(min_xusd_out > 0, "noslippage")
+    maybe_reset_daily()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let daily_mint_used: u64 = s.load(DAILY_MINT_USED_KEY).unwrap_or(0)
+    let daily_mint_cap: u64 = s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP)
+    require(daily_mint_used + xel_amount <= daily_mint_cap, "dailycap")
+    let dep: u64 = get_deposit_for_asset(get_xel_asset()).expect("err")
+    require(dep >= xel_amount, "insdep")
+    if dep > xel_amount {
+        let _ = transfer(caller, dep - xel_amount, get_xel_asset())
+    }
+    let price: u64 = get_xel_price()
+    let gross_xusd: u64 = (xel_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
+    let mint_fee_bps: u64 = s.load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
+    let fee: u64 = (gross_xusd as u128 * mint_fee_bps as u128 / 10000u128) as u64
+    let net_xusd: u64 = gross_xusd - fee
+    require(net_xusd >= min_xusd_out, "slippage")
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let treasury: Address = s.load(TREASURY_KEY).expect("err")
+    // mint_split (chunk 4) mints `net_xusd + fee`, sends `net_xusd` to caller, `fee` to treasury.
+    let result: u64 = xusd.call(4u16, [caller, net_xusd, treasury, fee], {})
+    require(result == 0, "mintfail")
+    s.store(DAILY_MINT_USED_KEY, daily_mint_used + xel_amount)
+    return 0
+}
+
+// ID 1: redeem — Burn xUSD and receive XEL at the oracle price, charging a redeem fee to treasury.
+// v11.5 fix: requires pre-deposit of xUSD into PSM (symmetric to mint's XEL pre-deposit).
+// The PSM burns the deposited xUSD via burn_tokens (chunk 5).
+// redeem.
+entry redeem(xusd_amount: u64, min_xel_out: u64) -> u64 {
+    when_not_paused()
+    require(xusd_amount > 0, "amtgt0")
+    require(min_xel_out > 0, "noslippage")
+    maybe_reset_daily()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let daily_redeem_used: u64 = s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0)
+    let daily_redeem_cap: u64 = s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
+    require(daily_redeem_used + xusd_amount <= daily_redeem_cap, "dailycap")
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
+    // v11.5 fix: pre-deposit check — caller must have deposited xUSD into PSM first.
+    let dep: u64 = get_deposit_for_asset(xusd_asset).expect("err")
+    require(dep >= xusd_amount, "insdep")
+    if dep > xusd_amount {
+        let _ = transfer(caller, dep - xusd_amount, xusd_asset)
+    }
+    let price: u64 = get_xel_price()
+    let gross_xel: u64 = (xusd_amount as u128 * PRICE_DECIMALS as u128 / price as u128) as u64
+    let redeem_fee_bps: u64 = s.load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
+    let fee_xel: u64 = (gross_xel as u128 * redeem_fee_bps as u128 / 10000u128) as u64
+    let net_xel: u64 = gross_xel - fee_xel
+    require(net_xel >= min_xel_out, "slippage")
+    let xel_balance: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    require(xel_balance >= net_xel, "insreserve")
+    // Burn the deposited xUSD. PSM has it (from the deposit above), so burn_tokens works.
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let result: u64 = xusd.call(5u16, [xusd_amount], {})
+    require(result == 0, "burnfail")
+    let ok: bool = transfer(caller, net_xel, get_xel_asset())
+    require(ok, "txfail")
+    if fee_xel > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee_xel, get_xel_asset())
+    }
+    s.store(DAILY_REDEEM_USED_KEY, daily_redeem_used + xusd_amount)
+    return 0
+}
+
+// ID 2: get_reserves_entry
+// Return the current XEL and xUSD balances held by the PSM contract.
+// @caller: anyone
+// @returns: tuple (xel_reserve, xusd_balance)
+// @security: read-only view, no access control
+// get reserves entry.
+entry get_reserves_entry() -> (u64, u64) {
+    let s: Storage = Storage::new()
+    let xel_reserve: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
+    let xusd_balance: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
+    return (xel_reserve, xusd_balance)
+}
+
+// ID 3: get_mint_fee_entry
+// Return the current mint fee in basis points.
+// @caller: anyone
+// @returns: mint fee bps (e.g. 50 = 0.5%)
+// @security: read-only view, no access control
+// get mint fee entry.
+entry get_mint_fee_entry() -> u64 {
+    return Storage::new().load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
+}
+
+// ID 4: get_redeem_fee_entry
+// Return the current redeem fee in basis points.
+// @caller: anyone
+// @returns: redeem fee bps (e.g. 10 = 0.1%)
+// @security: read-only view, no access control
+// get redeem fee entry.
+entry get_redeem_fee_entry() -> u64 {
+    return Storage::new().load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
+}
+
+// ID 5: get_daily_usage_entry
+// Return the daily mint/redeem usage and caps (resets every DAILY_RESET_BLOCKS topoheights).
+// @caller: anyone
+// @returns: tuple (mint_used, redeem_used, mint_cap, redeem_cap)
+// @security: read-only view, no access control
+// get daily usage entry.
+entry get_daily_usage_entry() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(DAILY_MINT_USED_KEY).unwrap_or(0),
+        s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0),
+        s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP),
+        s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
+    )
+}
+
+// ID 6: set_mint_fee_bps
+// Update the mint fee in basis points (capped at 500 bps = 5%).
+// @caller: admin or timelock
+// @params: bps - new mint fee in basis points (0..=500)
+// @returns: 0 on success
+// @security: only_admin (admin EOA or timelock contract caller), bounds-checked
+// set mint fee bps.
+entry set_mint_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 500, "badval")
+    Storage::new().store(MINT_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 7: set_redeem_fee_bps
+// Update the redeem fee in basis points (capped at 500 bps = 5%).
+// @caller: admin or timelock
+// @params: bps - new redeem fee in basis points (0..=500)
+// @returns: 0 on success
+// @security: only_admin (admin EOA or timelock contract caller), bounds-checked
+// set redeem fee bps.
+entry set_redeem_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 500, "badval")
+    Storage::new().store(REDEEM_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 8: set_daily_caps
+// Update the per-day mint and redeem volume caps (must both be > 0).
+// @caller: admin or timelock
+// @params: mint_cap - maximum XEL mintable per day
+// @params: redeem_cap - maximum xUSD redeemable per day
+// @returns: 0 on success
+// @security: only_admin, both caps must be positive
+// set daily caps.
+entry set_daily_caps(mint_cap: u64, redeem_cap: u64) -> u64 {
+    only_admin()
+    require(mint_cap > 0 && redeem_cap > 0, "badval")
+    let s: Storage = Storage::new()
+    s.store(DAILY_MINT_CAP_KEY, mint_cap)
+    s.store(DAILY_REDEEM_CAP_KEY, redeem_cap)
+    return 0
+}
+
+// ID 9: pause
+// Pause all mint/redeem operations (reason recorded for auditability).
+// @caller: guardian or admin
+// @params: reason - human-readable pause reason (stored on-chain)
+// @returns: 0 on success
+// @security: only_guardian_or_admin, sets PAUSED_KEY to true blocking entry points
+// pause.
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 10: unpause
+// Resume mint/redeem operations after a pause.
+// @caller: admin or timelock
+// @returns: 0 on success
+// @security: only_admin (stricter than pause, requires full admin to resume)
+// unpause.
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 11: request_emergency_withdraw
+// First step of the 2-step emergency withdraw: record the current topoheight as request timestamp.
+// @caller: emergency role
+// @returns: 0 on success
+// @security: only_emergency, starts 17280-block (~24h) timelock before execution
+// request emergency withdraw.
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 12: execute_emergency_withdraw
+// Second step of the 2-step emergency withdraw: sweep the entire balance of an asset to the emergency role.
+// @caller: emergency role
+// @params: asset - which asset Hash to withdraw fully
+// @returns: 0 on success
+// @security: only_emergency, requires prior request_emergency_withdraw, enforced 17280-block delay, single-use (deletes request key)
+// execute emergency withdraw.
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ID 13: set_xusd_contract
+// Update the xUSD token contract hash used for mint/burn cross-contract calls.
+// @caller: admin or timelock
+// @params: xc - new xUSD contract Hash
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set xusd contract.
+entry set_xusd_contract(xc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_CONTRACT_KEY, xc)
+    return 0
+}
+
+// ID 14: set_xusd_asset
+// Update the xUSD asset Hash used for balance lookups.
+// @caller: admin or timelock
+// @params: xa - new xUSD asset Hash
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set xusd asset.
+entry set_xusd_asset(xa: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(XUSD_ASSET_KEY, xa)
+    return 0
+}
+
+// ID 15: set_oracle
+// Update the StakedOracle contract hash used to fetch the XEL/USD price.
+// @caller: admin or timelock
+// @params: oracle - new oracle contract Hash
+// @returns: 0 on success
+// @security: only_admin, privileged configuration; price source trust assumption
+// set oracle.
+entry set_oracle(oracle: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ORACLE_KEY, oracle)
+    return 0
+}
+
+// ID 16: set_treasury
+// Update the treasury address that receives mint/redeem fees.
+// @caller: admin or timelock
+// @params: t - new treasury Address
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set treasury.
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+// ID 17: set_registry
+// Update the ContractRegistry hash (reserved for future use).
+// @caller: admin or timelock
+// @params: reg - new registry contract Hash
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set registry.
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 18: set_timelock
+// Set the timelock contract hash that is allowed to invoke admin-gated entries.
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, sets the alternate admin path (timelock as contract caller)
+// set timelock.
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 19: set_guardian
+// Update the guardian address that can pause the contract.
+// @caller: admin or timelock
+// @params: g - new guardian Address
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set guardian.
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// ID 20: set_emergency
+// Hand off the emergency role to a new address (requires current emergency role to call).
+// @caller: emergency role
+// @params: e - new emergency Address
+// @returns: 0 on success
+// @security: only_emergency, two-party handoff (current emergency signer controls transfer)
+// set emergency.
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 21: transfer_admin
+// Transfer the admin role to a new address (single-step; verify new admin before calling).
+// @caller: admin or timelock
+// @params: new_admin - address that will become the new admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer — ensure new_admin is correct before committing
+// transfer admin.
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 22: get_version
+// Return the contract version string.
+// @caller: anyone
+// @returns: semantic version string (e.g. "PSM v5.0")
+// @security: read-only view, no access control
+// get version.
+entry get_version() -> string {
+    return VERSION
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+// Return the current XEL and xUSD balances held by the PSM contract.
+// @caller: anyone
+// @returns: tuple (xel_reserve, xusd_balance)
+// @security: read-only view, no access control
+// get reserves.
+pub fn get_reserves() -> (u64, u64) {
+    let s: Storage = Storage::new()
+    let xel_reserve: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
+    let xusd_balance: u64 = get_balance_for_asset(xusd_asset).unwrap_or(0)
+    return (xel_reserve, xusd_balance)
+}
+
+// Return the current mint fee in basis points.
+// @caller: anyone
+// @returns: mint fee bps
+// @security: read-only view, no access control
+// get mint fee.
+pub fn get_mint_fee() -> u64 {
+    return Storage::new().load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
+}
+
+// Return the current redeem fee in basis points.
+// @caller: anyone
+// @returns: redeem fee bps
+// @security: read-only view, no access control
+// get redeem fee.
+pub fn get_redeem_fee() -> u64 {
+    return Storage::new().load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
+}
+
+// Return the daily mint/redeem usage and caps.
+// @caller: anyone
+// @returns: tuple (mint_used, redeem_used, mint_cap, redeem_cap)
+// @security: read-only view, no access control
+// get daily usage.
+pub fn get_daily_usage() -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(DAILY_MINT_USED_KEY).unwrap_or(0),
+        s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0),
+        s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP),
+        s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
+    )
+}
+
+// Set the timelock contract hash (alternate admin path via contract-caller check).
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, mirrors the entry version for read-only callers
+// set timelock tl.
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ============================================================================
+// v11.7 — Cross-contract wrappers (Access::All)
+// ----------------------------------------------------------------------------
+// VaultSwapV2 delegates its psm_mint/psm_redeem entries to PSM via
+// Contract::call, which requires Access::All (`pub fn`). The `entry` versions
+// above are wallet-only and reverted "Chunk is not public" when called
+// cross-contract. These wrappers duplicate the entry bodies verbatim and are
+// appended at the end of the file so every existing chunk ID is preserved.
+// Compiled IDs: mint_cross = 36, redeem_cross = 37.
+// ============================================================================
+
+// Cross-contract mint — identical logic to entry mint (chunk 8).
+// @caller: VaultSwapV2 contract (or any contract holding a XEL pre-deposit here)
+pub fn mint_cross(xel_amount: u64, min_xusd_out: u64) -> u64 {
+    when_not_paused()
+    require(xel_amount > 0, "amtgt0")
+    require(min_xusd_out > 0, "noslippage")
+    maybe_reset_daily()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let daily_mint_used: u64 = s.load(DAILY_MINT_USED_KEY).unwrap_or(0)
+    let daily_mint_cap: u64 = s.load(DAILY_MINT_CAP_KEY).unwrap_or(DEFAULT_DAILY_MINT_CAP)
+    require(daily_mint_used + xel_amount <= daily_mint_cap, "dailycap")
+    let dep: u64 = get_deposit_for_asset(get_xel_asset()).expect("err")
+    require(dep >= xel_amount, "insdep")
+    if dep > xel_amount {
+        let _ = transfer(caller, dep - xel_amount, get_xel_asset())
+    }
+    let price: u64 = get_xel_price()
+    let gross_xusd: u64 = (xel_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
+    let mint_fee_bps: u64 = s.load(MINT_FEE_BPS_KEY).unwrap_or(DEFAULT_MINT_FEE_BPS)
+    let fee: u64 = (gross_xusd as u128 * mint_fee_bps as u128 / 10000u128) as u64
+    let net_xusd: u64 = gross_xusd - fee
+    require(net_xusd >= min_xusd_out, "slippage")
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let treasury: Address = s.load(TREASURY_KEY).expect("err")
+    // mint_split (chunk 4) mints `net_xusd + fee`, sends `net_xusd` to caller, `fee` to treasury.
+    let result: u64 = xusd.call(4u16, [caller, net_xusd, treasury, fee], {})
+    require(result == 0, "mintfail")
+    s.store(DAILY_MINT_USED_KEY, daily_mint_used + xel_amount)
+    return 0
+}
+
+// Cross-contract redeem — identical logic to entry redeem (chunk 9).
+// @caller: VaultSwapV2 contract (or any contract holding an xUSD pre-deposit here)
+pub fn redeem_cross(xusd_amount: u64, min_xel_out: u64) -> u64 {
+    when_not_paused()
+    require(xusd_amount > 0, "amtgt0")
+    require(min_xel_out > 0, "noslippage")
+    maybe_reset_daily()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let daily_redeem_used: u64 = s.load(DAILY_REDEEM_USED_KEY).unwrap_or(0)
+    let daily_redeem_cap: u64 = s.load(DAILY_REDEEM_CAP_KEY).unwrap_or(DEFAULT_DAILY_REDEEM_CAP)
+    require(daily_redeem_used + xusd_amount <= daily_redeem_cap, "dailycap")
+    let xusd_asset: Hash = s.load(XUSD_ASSET_KEY).expect("err")
+    // Pre-deposit check — caller must have deposited xUSD into PSM first.
+    let dep: u64 = get_deposit_for_asset(xusd_asset).expect("err")
+    require(dep >= xusd_amount, "insdep")
+    if dep > xusd_amount {
+        let _ = transfer(caller, dep - xusd_amount, xusd_asset)
+    }
+    let price: u64 = get_xel_price()
+    let gross_xel: u64 = (xusd_amount as u128 * PRICE_DECIMALS as u128 / price as u128) as u64
+    let redeem_fee_bps: u64 = s.load(REDEEM_FEE_BPS_KEY).unwrap_or(DEFAULT_REDEEM_FEE_BPS)
+    let fee_xel: u64 = (gross_xel as u128 * redeem_fee_bps as u128 / 10000u128) as u64
+    let net_xel: u64 = gross_xel - fee_xel
+    require(net_xel >= min_xel_out, "slippage")
+    let xel_balance: u64 = get_balance_for_asset(get_xel_asset()).unwrap_or(0)
+    require(xel_balance >= net_xel, "insreserve")
+    // Burn the deposited xUSD. PSM has it (from the deposit above), so burn_tokens works.
+    let xusd_hash: Hash = s.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let result: u64 = xusd.call(5u16, [xusd_amount], {})
+    require(result == 0, "burnfail")
+    let ok: bool = transfer(caller, net_xel, get_xel_asset())
+    require(ok, "txfail")
+    if fee_xel > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee_xel, get_xel_asset())
+    }
+    s.store(DAILY_REDEEM_USED_KEY, daily_redeem_used + xusd_amount)
+    return 0
+}

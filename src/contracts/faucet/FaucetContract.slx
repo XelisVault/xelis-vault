@@ -1,0 +1,400 @@
+// ============================================================================
+// FaucetContract.slx — XELIS Vault v10.6 (testnet)
+// ----------------------------------------------------------------------------
+// Faucet simplifié pour testnet.
+//
+// RÔLE :
+//   L'admin dépose des XEL et des VLT dans ce contrat.
+//   Quand un user demande du testnet XEL/VLT, l'admin appelle distribute()
+//   avec la liste des adresses à servir.
+//   Le contrat envoie 100 XEL + 200 VLT à chaque adresse, en une seule tx.
+//
+// POURQUOI simplifié :
+//   - L'ancien faucet demandait aux users d'interagir directement, mais ils
+//     n'avaient pas de XEL pour payer le gas → impossible à utiliser.
+//   - Maintenant, l'admin fait la distribution en batch (1 tx pour N users).
+//   - Coût gas divisé par N, et les users n'ont besoin de rien.
+//
+// MÉCANIQUE :
+//   1. Admin appelle refill_xel() en attachant du XEL → contrat crédité
+//   2. Admin appelle refill_vlt(amount) → VLT transférés au contrat
+//   3. User demande du testnet XEL/VLT sur Discord/Telegram
+//   4. Admin collecte les adresses, appelle distribute([addr1, addr2, ...])
+//   5. Chaque adresse reçoit 100 XEL + 200 VLT
+//   6. Anti-abus : cooldown 24h par adresse, lifetime cap 1000 XEL + 2000 VLT
+//
+// Entry IDs:
+//   0  : refill_xel (attach XEL)
+//   1  : refill_vlt (amount)
+//   2  : distribute (addresses[])
+//   3  : set_claim_amounts (xel_amount, vlt_amount)
+//   4  : set_cooldown_blocks (blocks)
+//   5  : set_lifetime_caps (xel_cap, vlt_cap)
+//   6  : pause
+//   7  : unpause
+//   8  : set_vlt_contract
+//   9  : set_vlt_asset
+//   10 : set_registry
+//   11 : set_timelock
+//   12 : set_guardian
+//   13 : transfer_admin
+//   14 : get_faucet_info (pub fn)
+//   15 : get_user_claims (pub fn)
+//   16 : get_version
+//   17 : request_emergency_withdraw
+//   18 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "FaucetContract v10.6 (testnet)"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+
+// Claim amounts (atomic, 8 decimals)
+const XEL_AMOUNT_KEY: string = "xa"
+const VLT_AMOUNT_KEY: string = "va2"
+const DEFAULT_XEL_AMOUNT: u64 = 10000000000       // 100 XEL
+const DEFAULT_VLT_AMOUNT: u64 = 20000000000       // 200 VLT
+
+// Cooldown and caps
+const COOLDOWN_KEY: string = "cd"
+const DEFAULT_COOLDOWN: u64 = 17280                // 24h (5s blocks)
+const XEL_LIFETIME_CAP_KEY: string = "xlc"
+const VLT_LIFETIME_CAP_KEY: string = "vlc"
+const DEFAULT_XEL_CAP: u64 = 100000000000          // 1000 XEL lifetime
+const DEFAULT_VLT_CAP: u64 = 200000000000          // 2000 VLT lifetime
+
+// User claim tracking
+const USER_LAST_CLAIM_PREFIX: string = "ulc_"       // addr → topoheight
+const USER_XEL_CLAIMED_PREFIX: string = "uxc_"      // addr → total XEL claimed
+const USER_VLT_CLAIMED_PREFIX: string = "uvc_"      // addr → total VLT claimed
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(XEL_AMOUNT_KEY, DEFAULT_XEL_AMOUNT)
+    s.store(VLT_AMOUNT_KEY, DEFAULT_VLT_AMOUNT)
+    s.store(COOLDOWN_KEY, DEFAULT_COOLDOWN)
+    s.store(XEL_LIFETIME_CAP_KEY, DEFAULT_XEL_CAP)
+    s.store(VLT_LIFETIME_CAP_KEY, DEFAULT_VLT_CAP)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Refill XEL — admin attaches XEL to this call
+// The XEL sent with the transaction is added to the faucet balance
+entry refill_xel() -> u64 {
+    only_admin()
+    // XEL attached automatically via get_deposit_for_asset(Hash::zero())
+    // No explicit storage needed — balance is the contract's XEL balance
+    emit_event(0u64, ["FaucetRefilled", "XEL"])
+    return 0
+}
+
+// Entry 1: Refill VLT — admin transfers VLT to this contract
+// amount: VLT amount (atomic) to transfer from admin to faucet
+entry refill_vlt(amount: u64) -> u64 {
+    only_admin()
+    require(amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("novlt")
+    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    // VLTToken entry 4 = transfer_to (transfer tokens to an address)
+    // Actually we use transfer_from if available, or assume admin pre-approved
+    // For simplicity, admin calls VLTToken.transfer_to(faucet, amount) directly
+    // This entry is just for accounting/event
+    emit_event(0u64, ["FaucetRefilled", "VLT_" + amount.to_string(10u32)])
+    return 0
+}
+
+// Entry 2: Distribute to multiple addresses (admin only, batch)
+// The admin calls this with a list of addresses that requested testnet funds.
+// Each address receives 100 XEL + 200 VLT (configurable).
+// Cooldown and lifetime caps are enforced per address.
+// F-17 fix (LOW): pre-checks the faucet's own XEL and VLT balances against
+//   addresses.len() * amount BEFORE entering the loop, so a partially-funded
+//   faucet fails fast with a clear "insufficient faucet balance" message
+//   instead of reverting partway through the batch.
+// addresses: array of addresses (max 50 per call for gas limits)
+entry distribute(addresses: Address[]) -> u64 {
+    when_not_paused()
+    only_admin()
+    require(addresses.len() > 0 && addresses.len() <= 50, "badbatch")
+
+    let s: Storage = Storage::new()
+    let xel_amount: u64 = s.load(XEL_AMOUNT_KEY).unwrap_or(DEFAULT_XEL_AMOUNT)
+    let vlt_amount: u64 = s.load(VLT_AMOUNT_KEY).unwrap_or(DEFAULT_VLT_AMOUNT)
+    let cooldown: u64 = s.load(COOLDOWN_KEY).unwrap_or(DEFAULT_COOLDOWN)
+    let xel_cap: u64 = s.load(XEL_LIFETIME_CAP_KEY).unwrap_or(DEFAULT_XEL_CAP)
+    let vlt_cap: u64 = s.load(VLT_LIFETIME_CAP_KEY).unwrap_or(DEFAULT_VLT_CAP)
+    let current_topo: u64 = get_current_topoheight()
+
+    // F-17 fix (LOW): pre-check faucet balance against total XEL needed.
+    let total_xel_needed: u64 = xel_amount * (addresses.len() as u64)
+    require(total_xel_needed >= xel_amount, "ovf")
+    let faucet_xel_balance: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
+    require(faucet_xel_balance >= total_xel_needed, "insfaucetxel")
+
+    let vlt_hash_opt: optional<Hash> = s.load(VLT_CONTRACT_KEY)
+    let vlt_asset_opt: optional<Hash> = s.load(VLT_ASSET_KEY)
+
+    // F-17 fix (LOW): pre-check faucet balance against total VLT needed (if VLT configured).
+    if vlt_hash_opt.is_some() && vlt_asset_opt.is_some() {
+        let vlt_asset: Hash = vlt_asset_opt.expect("err")
+        let total_vlt_needed: u64 = vlt_amount * (addresses.len() as u64)
+        require(total_vlt_needed >= vlt_amount, "ovf")
+        let faucet_vlt_balance: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
+        require(faucet_vlt_balance >= total_vlt_needed, "insfaucetvlt")
+    }
+
+    let i: u32 = 0
+    while i < addresses.len() {
+        let addr: Address = addresses[i]
+        if addr == Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) {
+            i += 1
+            continue
+        }
+
+        // Check cooldown
+        let last_claim_opt: optional<u64> = s.load(USER_LAST_CLAIM_PREFIX + addr.to_string())
+        if last_claim_opt.is_some() {
+            let last: u64 = last_claim_opt.expect("err")
+            require(current_topo - last >= cooldown, "cooldown")
+        }
+
+        // Check lifetime caps
+        let xel_claimed: u64 = s.load(USER_XEL_CLAIMED_PREFIX + addr.to_string()).unwrap_or(0)
+        let vlt_claimed: u64 = s.load(USER_VLT_CLAIMED_PREFIX + addr.to_string()).unwrap_or(0)
+        require(xel_claimed + xel_amount <= xel_cap, "xlcap")
+        require(vlt_claimed + vlt_amount <= vlt_cap, "vlcap")
+
+        // Transfer XEL to addr — F-17 fix: check return value.
+        let ok_xel: bool = transfer(addr, xel_amount, Hash::zero())
+        require(ok_xel, "xferfail")
+
+        // Transfer VLT to addr (if VLT configured) — F-17 fix: use native transfer()
+        // with the VLT asset hash. VLT held by this contract as a regular asset
+        // balance moves directly to addr. (Previous code called vlt.call(4u16, ...)
+        // which is VLTToken.create_asset and does not transfer anything.)
+        if vlt_hash_opt.is_some() && vlt_asset_opt.is_some() {
+            let vlt_asset: Hash = vlt_asset_opt.expect("err")
+            let ok_vlt: bool = transfer(addr, vlt_amount, vlt_asset)
+            require(ok_vlt, "vltfail")
+        }
+
+        // Update tracking
+        s.store(USER_LAST_CLAIM_PREFIX + addr.to_string(), current_topo)
+        s.store(USER_XEL_CLAIMED_PREFIX + addr.to_string(), xel_claimed + xel_amount)
+        s.store(USER_VLT_CLAIMED_PREFIX + addr.to_string(), vlt_claimed + vlt_amount)
+
+        i += 1
+    }
+
+    emit_event(0u64, ["FaucetDistributed", addresses.len().to_string(10u32)])
+    return 0
+}
+
+// Entry 3: Set claim amounts (admin only)
+entry set_claim_amounts(xel_amount: u64, vlt_amount: u64) -> u64 {
+    only_admin()
+    require(xel_amount > 0 && vlt_amount > 0, "zero")
+    let s: Storage = Storage::new()
+    s.store(XEL_AMOUNT_KEY, xel_amount)
+    s.store(VLT_AMOUNT_KEY, vlt_amount)
+    return 0
+}
+
+// Entry 4: Set cooldown (admin only)
+entry set_cooldown_blocks(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 100, "tooshort")  // min 500s = ~8min
+    let s: Storage = Storage::new()
+    s.store(COOLDOWN_KEY, blocks)
+    return 0
+}
+
+// Entry 5: Set lifetime caps (admin only)
+entry set_lifetime_caps(xel_cap: u64, vlt_cap: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(XEL_LIFETIME_CAP_KEY, xel_cap)
+    s.store(VLT_LIFETIME_CAP_KEY, vlt_cap)
+    return 0
+}
+
+// Entry 6: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 7: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 8: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 9: Set VLT asset
+entry set_vlt_asset(va: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_ASSET_KEY, va)
+    return 0
+}
+
+// Entry 10: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 11: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 12: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 13: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Pub fn 14: Get faucet info
+// Returns (xel_amount_per_claim, vlt_amount_per_claim, cooldown, xel_cap, vlt_cap, paused)
+pub fn get_faucet_info() -> (u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(XEL_AMOUNT_KEY).unwrap_or(DEFAULT_XEL_AMOUNT),
+        s.load(VLT_AMOUNT_KEY).unwrap_or(DEFAULT_VLT_AMOUNT),
+        s.load(COOLDOWN_KEY).unwrap_or(DEFAULT_COOLDOWN),
+        s.load(XEL_LIFETIME_CAP_KEY).unwrap_or(DEFAULT_XEL_CAP),
+        s.load(VLT_LIFETIME_CAP_KEY).unwrap_or(DEFAULT_VLT_CAP),
+        s.load(PAUSED_KEY).unwrap_or(false)
+    )
+}
+
+// Pub fn 15: Get user claim history
+// Returns (last_claim_topo, total_xel_claimed, total_vlt_claimed)
+pub fn get_user_claims(addr: Address) -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(USER_LAST_CLAIM_PREFIX + addr.to_string()).unwrap_or(0),
+        s.load(USER_XEL_CLAIMED_PREFIX + addr.to_string()).unwrap_or(0),
+        s.load(USER_VLT_CLAIMED_PREFIX + addr.to_string()).unwrap_or(0)
+    )
+}
+
+// Entry 16: Get version
+entry get_version() -> string {
+    return VERSION
+}
+
+// Entry 17: Request emergency withdraw (admin only, starts 24h delay)
+entry request_emergency_withdraw() -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// Entry 18: Execute emergency withdraw (admin only, after 24h delay)
+// Withdraws all XEL and VLT to admin
+entry execute_emergency_withdraw() -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).expect("norequest")
+    let current: u64 = get_current_topoheight()
+    require(current >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+
+    // Withdraw all XEL
+    let xel_balance: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
+    if xel_balance > 0 {
+        let _ = transfer(admin, xel_balance, Hash::zero())
+    }
+
+    // Withdraw all VLT
+    let vlt_hash_opt: optional<Hash> = s.load(VLT_CONTRACT_KEY)
+    if vlt_hash_opt.is_some() {
+        let vlt_hash: Hash = vlt_hash_opt.expect("err")
+        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+        let vlt_balance: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
+        if vlt_balance > 0 {
+            // F-17-related fix: use native transfer() instead of vlt.call(4u16, ...)
+            //   (chunk 4 is mint_split, not transfer_to). The faucet holds its own
+            //   VLT asset balance; native transfer() moves it directly to admin.
+            let ok_vlt: bool = transfer(admin, vlt_balance, vlt_asset)
+            require(ok_vlt, "vltfail")
+        }
+    }
+
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    emit_event(0u64, ["EmergencyWithdraw", ""])
+    return 0
+}

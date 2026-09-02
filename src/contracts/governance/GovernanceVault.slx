@@ -1,0 +1,566 @@
+// ============================================================================
+// GovernanceVault.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #4: claim_rewards() rewritten cleanly — no syntax errors.
+// FIX #10/#11: added entry wrappers for get_voting_power, get_total_voting_power
+// so Governor/OracleGovernance can call them via Contract::call.
+// ============================================================================
+const VERSION: string = "GovernanceVault v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+
+const STAKES_COUNT_KEY: string = "sc"
+const STAKE_PREFIX: string = "s_"
+const USER_STAKES_PREFIX: string = "us_"
+const USER_VP_PREFIX: string = "uvp_"
+
+const TOTAL_STAKED_KEY: string = "ts"
+const TOTAL_VP_KEY: string = "tvp"
+
+const REWARD_RATE_KEY: string = "rr"
+const PERIOD_FINISH_KEY: string = "pf"
+const LAST_UPDATE_KEY: string = "lu"
+const REWARD_PER_TOKEN_KEY: string = "rpt"
+const USER_REWARD_PREFIX: string = "ur_"
+
+const EMERGENCY_KEY: string = "ea"
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+const BLOCKS_PER_DAY: u64 = 17280
+const LOCK_BOOST_MAX_BPS: u64 = 20000
+const LOCK_BOOST_DAYS: u64 = 365
+
+struct StakePosition {
+    id: u64,
+    owner: Address,
+    amount: u64,
+    locked_until_topo: u64,
+    voting_power: u64,
+    created_at: u64,
+    unstaked: bool
+}
+
+struct RewardInfo {
+    reward_per_token_paid: u64,
+    rewards_pending: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(STAKES_COUNT_KEY, 0u64)
+    s.store(TOTAL_STAKED_KEY, 0u64)
+    s.store(TOTAL_VP_KEY, 0u64)
+    s.store(LAST_UPDATE_KEY, get_current_topoheight())
+    s.store(REWARD_PER_TOKEN_KEY, 1000000000000u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn calc_voting_power(amount: u64, lock_days: u64) -> u64 {
+    if lock_days == 0 { return amount }
+    let boost_bps: u64 = 10000 + (lock_days * (LOCK_BOOST_MAX_BPS - 10000) / LOCK_BOOST_DAYS)
+    let capped_boost: u64 = 0
+    if boost_bps > LOCK_BOOST_MAX_BPS { capped_boost = LOCK_BOOST_MAX_BPS } else { capped_boost = boost_bps }
+    return (amount as u128 * capped_boost as u128 / 10000u128) as u64
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// Stake VLT tokens to earn voting power and rewards. Optional lock-up boosts VP.
+// @caller: any user with VLT deposited to this contract
+// @params: amount - VLT atomic units to stake (must be > 0)
+// @params: lock_days - minimum 7 days; longer locks get up to 2x voting-power boost
+// @returns: the new stake position ID
+// @security: when_not_paused, refund excess deposit, lock_days >= 7 enforced
+// ID 0: stake
+entry stake(amount: u64, lock_days: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    require(lock_days >= 7, "min7d")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("err")
+    require(dep >= amount, "insdep")
+    if dep > amount { transfer(caller, dep - amount, vlt_asset) }
+
+    let id: u64 = s.load(STAKES_COUNT_KEY).unwrap_or(0)
+    let lock_blocks: u64 = lock_days * BLOCKS_PER_DAY
+    let current_topo: u64 = get_current_topoheight()
+    let vp: u64 = calc_voting_power(amount, lock_days)
+
+    let stake_pos: StakePosition = StakePosition {
+        id: id, owner: caller, amount: amount,
+        locked_until_topo: current_topo + lock_blocks,
+        voting_power: vp, created_at: current_topo, unstaked: false
+    }
+    s.store(STAKE_PREFIX + id.to_string(10u32), stake_pos)
+    s.store(STAKES_COUNT_KEY, id + 1)
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total_staked + amount)
+    let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
+    s.store(TOTAL_VP_KEY, total_vp + vp)
+
+    let user_staked: u64 = s.load(USER_STAKES_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(USER_STAKES_PREFIX + caller.to_string(), user_staked + amount)
+    let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(USER_VP_PREFIX + caller.to_string(), user_vp + vp)
+
+    return 0
+}
+
+// Unstake a fully-unlocked position, returning VLT to the owner.
+// @caller: stake position owner only
+// @params: stake_id - target stake position to unstake
+// @returns: 0 on success
+// @security: when_not_paused, owner check, lock_until_topo enforced, decrements total VP
+// ID 1: unstake
+entry unstake(stake_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let stake_pos: StakePosition = s.load(STAKE_PREFIX + stake_id.to_string(10u32)).expect("err")
+    require(stake_pos.owner == caller, "notowner")
+    require(!stake_pos.unstaked, "alreadyunstaked")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo >= stake_pos.locked_until_topo, "locked")
+
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let ok: bool = transfer(caller, stake_pos.amount, vlt_asset)
+    require(ok, "txfail")
+
+    stake_pos.unstaked = true
+    s.store(STAKE_PREFIX + stake_id.to_string(10u32), stake_pos)
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total_staked - stake_pos.amount)
+    let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
+    s.store(TOTAL_VP_KEY, total_vp - stake_pos.voting_power)
+
+    let user_staked: u64 = s.load(USER_STAKES_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(USER_STAKES_PREFIX + caller.to_string(), user_staked - stake_pos.amount)
+    let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(USER_VP_PREFIX + caller.to_string(), user_vp - stake_pos.voting_power)
+
+    return 0
+}
+
+// ============================================================================
+// FIX #4: claim_rewards rewritten cleanly
+// ============================================================================
+// Claim pending VLT rewards accrued to the caller's voting power.
+// @caller: any staker with voting power > 0
+// @returns: actual VLT amount transferred (may be less than pending if balance low)
+// @security: when_not_paused, read-only on user VP, updates RewardInfo checkpoint; remaining pending rolls over
+// ID 2: claim_rewards
+entry claim_rewards() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
+    if user_vp == 0 { return 0 }
+
+    let current_rpt: u64 = s.load(REWARD_PER_TOKEN_KEY).unwrap_or(1000000000000u64)
+    let key: string = USER_REWARD_PREFIX + caller.to_string()
+    let info_opt: optional<RewardInfo> = s.load(key)
+    let info: RewardInfo = info_opt.unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 })
+
+    let delta_rpt: u64 = 0
+    if current_rpt > info.reward_per_token_paid {
+        delta_rpt = current_rpt - info.reward_per_token_paid
+    } else {
+        delta_rpt = 0
+    }
+    let earned: u64 = (user_vp as u128 * delta_rpt as u128 / 1000000000000u128) as u64
+    let total_pending: u64 = info.rewards_pending + earned
+    if total_pending == 0 {
+        info.reward_per_token_paid = current_rpt
+        info.rewards_pending = 0
+        s.store(key, info)
+        return 0
+    }
+
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
+    let bal: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
+    let actual: u64 = total_pending
+    if total_pending > bal { actual = bal }
+    if actual > 0 { transfer(caller, actual, vlt_asset) }
+
+    info.reward_per_token_paid = current_rpt
+    info.rewards_pending = total_pending - actual
+    s.store(key, info)
+    return 0
+}
+
+// ============================================================================
+// FIX #10/#11: Entry wrappers for pub fn getters
+// ============================================================================
+
+// Returns voting power for an address (entry wrapper for cross-contract calls).
+// @caller: anyone (intended for Governor / OracleGovernance via Contract::call)
+// @params: addr - address whose voting power to return
+// @returns: voting power in atomic units
+// @security: read-only, no access restrictions
+// ID 3: get_voting_power_entry
+pub fn get_voting_power(addr: Address) -> u64 {
+    return Storage::new().load(USER_VP_PREFIX + addr.to_string()).unwrap_or(0)
+}
+
+// Returns the sum of all stakers' voting power (entry wrapper for cross-contract calls).
+// @caller: anyone (intended for Governor via Contract::call)
+// @returns: total voting power in atomic units
+// @security: read-only, no access restrictions
+// ID 4: get_total_voting_power_entry
+pub fn get_total_voting_power() -> u64 {
+    return Storage::new().load(TOTAL_VP_KEY).unwrap_or(0)
+}
+
+// Returns the sum of all staked VLT (principal only, no boost).
+// @caller: anyone
+// @returns: total staked VLT in atomic units
+// @security: read-only, no access restrictions
+// ID 5: get_total_staked_entry
+entry get_total_staked_entry() -> u64 {
+    return Storage::new().load(TOTAL_STAKED_KEY).unwrap_or(0)
+}
+
+// Returns the VLT principal staked by a user (no boost).
+// @caller: anyone
+// @params: addr - address to query
+// @returns: staked VLT amount in atomic units
+// @security: read-only, no access restrictions
+// ID 6: get_user_staked_entry
+entry get_user_staked_entry(addr: Address) -> u64 {
+    return Storage::new().load(USER_STAKES_PREFIX + addr.to_string()).unwrap_or(0)
+}
+
+// Returns the total number of stake positions ever created.
+// @caller: anyone
+// @returns: stake counter value
+// @security: read-only, no access restrictions
+// ID 7: get_stakes_count_entry
+entry get_stakes_count_entry() -> u64 {
+    return Storage::new().load(STAKES_COUNT_KEY).unwrap_or(0)
+}
+
+// Notify the contract of a fresh reward distribution, increasing reward-per-token.
+// @caller: admin OR an authorized reward distributor contract
+// @params: amount - VLT reward to distribute proportionally to current voting power
+// @returns: 0 on success
+// @security: requires admin or whitelisted distributor ("dist_" + contract_hash); no-op if total_vp == 0
+// ID 8: notify_reward_amount
+entry notify_reward_amount(amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let cc: Hash = get_contract_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let caller: Address = get_caller().expect("err")
+    if caller != admin {
+        // Only authorized distributor contracts (set via set_reward_distributor)
+        let dist_opt: optional<bool> = s.load("dist_" + cc.to_hex())
+        require(dist_opt.is_some() && dist_opt.expect("err"), "notauth")
+    }
+    require(amount > 0, "amtgt0")
+    let current_topo: u64 = get_current_topoheight()
+    let total_vp: u64 = s.load(TOTAL_VP_KEY).unwrap_or(0)
+    if total_vp > 0 {
+        let current_rpt: u64 = s.load(REWARD_PER_TOKEN_KEY).unwrap_or(1000000000000u64)
+        let increment: u64 = (amount as u128 * 1000000000000u128 / total_vp as u128) as u64
+        s.store(REWARD_PER_TOKEN_KEY, current_rpt + increment)
+    }
+    s.store(LAST_UPDATE_KEY, current_topo)
+    return 0
+}
+
+// Whitelist (or remove) a reward-distributor contract that may call notify_reward_amount.
+// @caller: admin (or timelock via contract call)
+// @params: contract_hash - distributor contract hash to whitelist
+// @params: enabled - true to allow, false to revoke
+// @returns: 0 on success
+// @security: only_admin
+// ID 9: set_reward_distributor
+entry set_reward_distributor(contract_hash: Hash, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store("dist_" + contract_hash.to_hex(), enabled)
+    return 0
+}
+
+// Set the VLT token contract hash (used for asset lookup).
+// @caller: admin (or timelock via contract call)
+// @params: vc - VLT token contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 10: set_vlt_contract
+entry set_vlt_contract(vc: Hash) -> u64 { only_admin() Storage::new().store(VLT_CONTRACT_KEY, vc) return 0 }
+
+// Set the VLT asset hash (used for transfers and balance checks).
+// @caller: admin (or timelock via contract call)
+// @params: va - VLT asset hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 11: set_vlt_asset
+entry set_vlt_asset(va: Hash) -> u64 { only_admin() Storage::new().store(VLT_ASSET_KEY, va) return 0 }
+
+// Set the ContractRegistry hash for cross-contract name resolution.
+// @caller: admin (or timelock via contract call)
+// @params: reg - ContractRegistry hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 12: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// Set the timelock contract hash (allowed to call admin entries via contract call).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 13: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// Pause staking/unstaking/claiming.
+// @caller: admin (or timelock via contract call)
+// @params: reason - free-text reason (not stored)
+// @returns: 0 on success
+// @security: only_admin, sets PAUSED_KEY=true
+// ID 14: pause
+entry pause(reason: string) -> u64 { only_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+
+// Resume staking operations after a pause.
+// @caller: admin (or timelock via contract call)
+// @returns: 0 on success
+// @security: only_admin, clears PAUSED_KEY
+// ID 15: unpause
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// Transfer admin role to a new address (single-step).
+// @caller: admin (or timelock via contract call)
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ID 16: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// Set the emergency admin address (only the current emergency admin can change it).
+// @caller: emergency admin only
+// @params: e - new emergency admin address
+// @returns: 0 on success
+// @security: only current emergency admin (self-managed role)
+// ID 17: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let c: Address = get_caller().expect("err")
+    require(c == s.load(EMERGENCY_KEY).expect("err"), "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("GovernanceVault v5.0")
+// @security: read-only, no access restrictions
+// ID 18: get_version
+entry get_version() -> string { return VERSION }
+
+// Step 1 of 2-step emergency withdrawal: record the request topoheight (starts delay window).
+// @caller: emergency admin only
+// @returns: 0 on success
+// @security: only emergency admin, stores request topo for delay verification
+// ID 19: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// Step 2 of 2-step emergency withdrawal: drain all of `asset` after EMERGENCY_DELAY_BLOCKS elapsed.
+// @caller: emergency admin only
+// @params: asset - hash of asset to withdraw (Hash::zero() for XEL)
+// @returns: 0 on success
+// @security: only emergency admin, requires prior request + EMERGENCY_DELAY_BLOCKS delay (2-step protection)
+// ID 20: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// Returns the sum of all staked VLT principal (read-only view).
+// @caller: anyone
+// @returns: total staked VLT in atomic units
+// @security: read-only, no access restrictions
+pub fn get_total_staked() -> u64 {
+    return Storage::new().load(TOTAL_STAKED_KEY).unwrap_or(0)
+}
+// Returns the VLT principal staked by a user (read-only view).
+// @caller: anyone
+// @params: addr - address to query
+// @returns: staked VLT amount in atomic units
+// @security: read-only, no access restrictions
+pub fn get_user_staked(addr: Address) -> u64 {
+    return Storage::new().load(USER_STAKES_PREFIX + addr.to_string()).unwrap_or(0)
+}
+// Returns a stake position snapshot by ID (read-only view).
+// @caller: anyone
+// @params: stake_id - target stake position to read
+// @returns: (owner, amount, locked_until_topo, voting_power, unstaked)
+// @security: read-only, no access restrictions, panics if stake missing
+pub fn get_stake(stake_id: u64) -> (Address, u64, u64, u64, bool) {
+    let s: StakePosition = Storage::new().load(STAKE_PREFIX + stake_id.to_string(10u32)).expect("err")
+    return (s.owner, s.amount, s.locked_until_topo, s.voting_power, s.unstaked)
+}
+// Legacy read-only invoke setter for the timelock hash (kept for ABI compatibility).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin — note: pub fn in Silex is read-only; prefer entry set_timelock (ID 13) for state mutation
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ============================================================================
+// Additional pub fn getters — read-only, for off-chain frontend reads
+// ============================================================================
+
+// Returns the total number of stake positions ever created (read-only view).
+// @caller: anyone
+// @returns: stake counter value
+// @security: read-only, no access restrictions
+pub fn get_stakes_count() -> u64 {
+    return Storage::new().load(STAKES_COUNT_KEY).unwrap_or(0)
+}
+
+// Returns the current global reward-per-token accumulator (1e12 scale, read-only view).
+// @caller: anyone
+// @returns: reward-per-token accumulator value
+// @security: read-only, no access restrictions
+pub fn get_reward_per_token() -> u64 {
+    return Storage::new().load(REWARD_PER_TOKEN_KEY).unwrap_or(1000000000000u64)
+}
+
+// Returns the pending VLT reward owed to an address (earned + rolled-over pending).
+// @caller: anyone
+// @params: addr - address whose pending reward to compute
+// @returns: pending VLT reward in atomic units
+// @security: read-only, no state mutation
+pub fn get_user_reward_pending(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let user_vp: u64 = s.load(USER_VP_PREFIX + addr.to_string()).unwrap_or(0)
+    if user_vp == 0 { return 0 }
+    let current_rpt: u64 = s.load(REWARD_PER_TOKEN_KEY).unwrap_or(1000000000000u64)
+    let key: string = USER_REWARD_PREFIX + addr.to_string()
+    let info_opt: optional<RewardInfo> = s.load(key)
+    let info: RewardInfo = info_opt.unwrap_or(RewardInfo { reward_per_token_paid: 0, rewards_pending: 0 })
+    let delta_rpt: u64 = 0
+    if current_rpt > info.reward_per_token_paid {
+        delta_rpt = current_rpt - info.reward_per_token_paid
+    }
+    let earned: u64 = (user_vp as u128 * delta_rpt as u128 / 1000000000000u128) as u64
+    return info.rewards_pending + earned
+}
+
+// Returns whether the contract is currently paused (read-only view).
+// @caller: anyone
+// @returns: true if paused, false otherwise
+// @security: read-only, no access restrictions
+pub fn is_paused() -> bool {
+    return Storage::new().load(PAUSED_KEY).unwrap_or(false)
+}
+
+// Returns the configured VLT asset hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: VLT asset hash
+// @security: read-only, no access restrictions
+pub fn get_vlt_asset() -> Hash {
+    return Storage::new().load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the configured VLT token contract hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: VLT contract hash
+// @security: read-only, no access restrictions
+pub fn get_vlt_contract() -> Hash {
+    return Storage::new().load(VLT_CONTRACT_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the last topo height at which rewards were updated (read-only view).
+// @caller: anyone
+// @returns: last update topoheight (0 if never updated)
+// @security: read-only, no access restrictions
+pub fn get_last_update() -> u64 {
+    return Storage::new().load(LAST_UPDATE_KEY).unwrap_or(0)
+}
+
+// List active stake IDs owned by a user with offset/limit pagination (iterates all stakes).
+// @caller: anyone
+// @params: user - address whose stake IDs to return
+// @params: offset - number of matches to skip
+// @params: limit - max IDs to return
+// @returns: array of stake IDs owned by `user` (excluding unstaked positions)
+// @security: read-only, no access restrictions; O(N) scan — prefer off-chain indexer for large N
+// List stake IDs owned by a user (off-chain pagination)
+pub fn get_stake_ids_for_user_paginated(user: Address, offset: u64, limit: u64) -> u64[] {
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(STAKES_COUNT_KEY).unwrap_or(0)
+    let result: u64[] = []
+    let i: u64 = 0
+    let skipped: u64 = 0
+    let collected: u64 = 0
+    while i < total && collected < limit {
+        let stake_opt: optional<StakePosition> = s.load(STAKE_PREFIX + i.to_string(10u32))
+        if stake_opt.is_some() {
+            let stake: StakePosition = stake_opt.expect("err")
+            if stake.owner == user && !stake.unstaked {
+                if skipped >= offset {
+                    result.push(i)
+                    collected += 1
+                } else {
+                    skipped += 1
+                }
+            }
+        }
+        i += 1
+    }
+    return result
+}

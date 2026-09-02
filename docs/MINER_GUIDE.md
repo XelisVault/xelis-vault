@@ -1,8 +1,9 @@
-# Miner Guide — XELIS Vault v5.0
+# Miner Guide — XELIS Vault v12R-3
 
 > Complete guide for becoming a XELIS Vault miner: stake 1,000 VLT, choose your
 > services (oracle, chat, or both), and earn rewards through the unified
-> `XelisVaultMiner` contract.
+> `XelisVaultMiner` contract. New: delegate VLT to miners or run a miner profile
+> via `MinerDelegation`.
 
 ---
 
@@ -677,19 +678,48 @@ accepted, so no `distribute_reward` calls happen. Your stake and reputation
 are unaffected. Mining resumes when `unpause()` (entry ID 12) is called.
 
 ### Q12. Where do I get help?
-- Discord: https://discord.gg/UHpYAWbG — `#mining` channel
+- Discord: https://discord.gg/vyXTVRNSyu — `#mining` channel
 - Twitter / X: https://x.com/xelisvault
-- Email: `mining@xelisvault.io`
 - GitHub Issues: https://github.com/XelisVault/xelis-vault/issues
 
 ---
 
-## 16. References
+## 16. Miner Delegation (v12R-3)
+
+`MinerDelegation` lets VLT holders delegate stake to miners without running
+infrastructure themselves.
+
+### 16.1 For delegators
+
+- **Minimum delegation:** 10 VLT
+- **Rewards:** proportional to your delegated stake, paid in VLT
+- **Auto-compound:** optional, reinvests rewards automatically
+- **Commission:** miners set a 0–20% commission on delegated rewards
+- **Undelegate:** queue with a 7-day delay before execution
+
+Access via `xvault-miner` → **MinerDelegation: delegate / profile**.
+
+### 16.2 For miners
+
+- **Register a profile:** name, description, commission rate (0–20%)
+- **Earn commission:** receive a cut of delegated rewards automatically
+- **Update profile:** change name, description, or commission at any time
+- **Claim rewards:** claim both your own mining rewards and commission rewards
+
+### 16.3 Smart contract integration
+
+- `XelisVaultMiner` pushes `own_stake` updates to `MinerDelegation`
+- `StakedOracle` reads total stake from `MinerDelegation` for reputation-weighted rewards
+- Contract address resolved via `ContractRegistry` — no manual configuration needed
+
+---
+
+## 17. References
 
 - [Whitepaper v5.0 — XelisVaultMiner](WHITEPAPER.md)
 - [Reward System](REWARD_SYSTEM.md) — full math + budget auto-adjustment
 - [Architecture](../README.md) — contract interactions and entry IDs
-- [Entry IDs v5.0](ENTRY_IDS.md) — canonical list of all 630 entry functions
+- [Entry IDs v12R-3](ENTRY_IDS.md) — canonical list of all entry functions
 - [Provider Guide](PROVIDER_GUIDE.md) — for the standalone `price_provider.py`
 - [User Guide](USER_GUIDE.md) — lending, swap, governance, mixer, chat
 - [XELIS Mining Documentation](https://docs.xelis.io/features/mining) — for
@@ -697,4 +727,4 @@ are unaffected. Mining resumes when `unpause()` (entry ID 12) is called.
 
 ---
 
-*Last updated: July 2026 — v5.0*
+*Last updated: September 2026 — v12R-3*

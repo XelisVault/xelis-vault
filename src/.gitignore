@@ -1,0 +1,114 @@
+# ============================================================================
+# .gitignore — XELIS Vault v7.0
+# ============================================================================
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Wallet / node local data
+wallets/
+relayer/
+miner.pid
+
+# Local config with secrets
+config/config.json
+
+# XELIS daemon data
+.xelis/
+*.db
+*.lock
+
+# Compiled contracts (if compiled locally)
+*.compiled
+contracts/**/*.compiled
+
+# Deployment artifacts
+deployment.json
+deployment-*.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation build
+docs/_build/
+site/
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# XELIS chain data (devnet/testnet nodes)
+data/
+
+# Debug / test contracts (local experiments)
+contracts/debug_*.slx
+contracts/test_*.slx
+contracts/psm_*.slx
+contracts/vault/VaultEngine_bv*.slx
+contracts/vault/VaultEngine_v5.slx
+contracts/vault/VaultEngine_v6.slx
+
+# Deployment scripts (local, one-time use)
+core_deploy.py
+
+# Agent notes (local only — contains seeds)
+AGENTS.md
+AI_WEBSITE_PROMPT.md
+test_report.md
+precomputed_tables_*.bin
+*.bin
+!docs/*.bin

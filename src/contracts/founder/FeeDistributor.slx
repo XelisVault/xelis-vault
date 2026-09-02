@@ -1,0 +1,395 @@
+// ============================================================================
+// FeeDistributor.slx — XELIS Vault v10.3
+// ----------------------------------------------------------------------------
+// Distributeur automatique des fees du protocole.
+//
+// RÔLE : Reçoit les fees de tous les contrats du protocole (VaultSwap, PSM,
+//        VaultEngine, FlashLoan, VaultChat) et les répartit automatiquement :
+//          50% → Burn (déflation, inchangé)
+//          40% → Treasury (gouvernance-controlled)
+//          10% → Founder (rémunération créateur)
+//
+// AVANTAGE vs founder fee par transaction :
+//   - PAS de taxe supplémentaire sur les utilisateurs
+//   - Les fees existent déjà (0.3% swap, 0.5% PSM, 2% APR borrow, etc.)
+//   - Le founder reçoit 10% des fees EXISTANTS, pas un nouveau coût
+//   - Transparent : tout est visible on-chain
+//   - Durable : évolue avec le succès du protocole
+//
+// PRIVACY : Pas de PII. Seuls les montants agrégés sont visibles.
+//
+// Entry IDs:
+//   0  : collect_fee
+//   1  : claim_founder_share
+//   2  : claim_treasury_share
+//   3  : burn_deflationary_share
+//   4  : get_founder_balance (pub fn)
+//   5  : get_treasury_balance (pub fn)
+//   6  : get_total_collected (pub fn)
+//   7  : get_distribution (pub fn)
+//   8  : set_founder
+//   9  : set_treasury
+//   10 : set_vlt_contract
+//   11 : set_vlt_asset
+//   12 : set_registry
+//   13 : set_timelock
+//   14 : set_guardian
+//   15 : pause
+//   16 : unpause
+//   17 : transfer_admin
+//   18 : get_version
+// ============================================================================
+
+const VERSION: string = "FeeDistributor v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const FOUNDER_KEY: string = "fa"
+const TREASURY_KEY: string = "tr"
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+
+// Distribution split (in bps, must sum to 10000)
+const BURN_BPS_KEY: string = "bb"
+const TREASURY_BPS_KEY: string = "tb"
+const FOUNDER_BPS_KEY: string = "fb"
+
+const DEFAULT_BURN_BPS: u64 = 5000       // 50%
+const DEFAULT_TREASURY_BPS: u64 = 4000   // 40%
+const DEFAULT_FOUNDER_BPS: u64 = 1000    // 10%
+
+// Pending balances (accumulated, claimable)
+const FOUNDER_PENDING_KEY: string = "fp"
+const TREASURY_PENDING_KEY: string = "tp"
+const BURN_PENDING_KEY: string = "bp"
+
+// Total collected (all-time, per asset)
+const TOTAL_COLLECTED_PREFIX: string = "tc_"
+
+
+// v10.6: Reentrancy guard
+const RG_STATUS_KEY: string = "rg"
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+
+fn non_reentrant_fd() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy_fd() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(FOUNDER_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(BURN_BPS_KEY, DEFAULT_BURN_BPS)
+    s.store(TREASURY_BPS_KEY, DEFAULT_TREASURY_BPS)
+    s.store(FOUNDER_BPS_KEY, DEFAULT_FOUNDER_BPS)
+    s.store(FOUNDER_PENDING_KEY, 0u64)
+    s.store(TREASURY_PENDING_KEY, 0u64)
+    s.store(BURN_PENDING_KEY, 0u64)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Only authorized protocol contracts can call collect_fee.
+// F-05 fix (HIGH): the previous version accepted ANY contract caller
+//   (only checked get_contract_caller().is_some()), which would let a
+//   throwaway contract pollute burn/treasury/founder accounting. Now we
+//   resolve the registry and require that the contract caller is one of the
+//   registered fee-generating protocol contracts.
+
+// F-05 fix: check whether `caller_hash` matches one of the registered
+//   protocol fee-source contracts. Returns true on match, false otherwise.
+//   Reads the registry hash from storage; if the registry is not configured,
+//   returns false (fails closed) so the admin MUST wire the registry before
+//   the protocol can send fees.
+fn is_authorized_fee_source(caller_hash: Hash) -> bool {
+    let s: Storage = Storage::new()
+    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+    if reg_opt.is_none() { return false }
+    let reg_hash: Hash = reg_opt.expect("err")
+    if reg_hash == Hash::zero() { return false }
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    // Iterate the known protocol fee-source names. Use ContractRegistry's
+    //   pub fn try_get (chunk 17, All — v11.7 fix) so a missing name
+    //   returns Hash::zero() instead of reverting. The v11.5 target chunk 14
+    //   (request_emergency_withdraw, Entry) reverted "Chunk is not public".
+    let names: string[] = ["VaultSwapV2", "PSM", "VaultEngineV3", "FlashLoan", "VaultChat", "LendingMarket", "PeerLoan", "SyndicatePool", "InsurancePool", "SealedBidAuction"]
+    let i: u32 = 0
+    while i < names.len() {
+        let name: string = names[i]
+        let h: Hash = reg.call(17u16, [name], {})
+        if h != Hash::zero() && h == caller_hash { return true }
+        i += 1
+    }
+    return false
+}
+
+
+fn only_protocol_contract() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == admin || caller == guardian { return }
+    // F-05 fix: require an explicit contract caller AND that it is registered
+    //   in the ContractRegistry under one of the known fee-source names.
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notauth")
+    let cc: Hash = cc_opt.expect("err")
+    require(is_authorized_fee_source(cc), "notauth")
+}
+
+// Entry 0: Collect fee from a protocol contract
+// Called by VaultSwap, PSM, VaultEngine, FlashLoan, VaultChat when they earn fees
+// Asset = Hash::zero() for XEL, or specific asset hash for tokens
+entry collect_fee(asset: Hash, amount: u64) -> u64 {
+    when_not_paused()
+    only_protocol_contract()
+    require(amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let burn_bps: u64 = s.load(BURN_BPS_KEY).unwrap_or(DEFAULT_BURN_BPS)
+    let treasury_bps: u64 = s.load(TREASURY_BPS_KEY).unwrap_or(DEFAULT_TREASURY_BPS)
+    let founder_bps: u64 = s.load(FOUNDER_BPS_KEY).unwrap_or(DEFAULT_FOUNDER_BPS)
+
+    // Calculate splits
+    let burn_amount: u64 = (amount * burn_bps) / 10000
+    let treasury_amount: u64 = (amount * treasury_bps) / 10000
+    let founder_amount: u64 = amount - burn_amount - treasury_amount  // remainder to avoid rounding issues
+
+    // Accumulate pending balances
+    let fp: u64 = s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+    let tp: u64 = s.load(TREASURY_PENDING_KEY).unwrap_or(0)
+    let bp: u64 = s.load(BURN_PENDING_KEY).unwrap_or(0)
+    s.store(FOUNDER_PENDING_KEY, fp + founder_amount)
+    s.store(TREASURY_PENDING_KEY, tp + treasury_amount)
+    s.store(BURN_PENDING_KEY, bp + burn_amount)
+
+    // Update total collected (all-time)
+    let tc_key: string = TOTAL_COLLECTED_PREFIX + asset.to_hex()
+    let tc: u64 = s.load(tc_key).unwrap_or(0)
+    s.store(tc_key, tc + amount)
+
+    return 0
+}
+
+// Entry 1: Founder claims their accumulated share
+entry claim_founder_share() -> u64 {
+    when_not_paused()
+    non_reentrant_fd()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let founder: Address = s.load(FOUNDER_KEY).expect("err")
+    require(caller == founder, "notfounder")
+
+    let pending: u64 = s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+    require(pending > 0, "nothing")
+
+    s.store(FOUNDER_PENDING_KEY, 0u64)
+
+    // In production: transfer `pending` amount of XEL (or asset) to founder
+    // For XEL: transfer_xel(founder, pending)
+    // For tokens: token.call(transfer_to, [founder, pending])
+    emit_event(0u64, ["FounderShareClaimed", pending.to_string(10u32)])
+    release_reentrancy_fd()
+    return 0
+}
+
+// Entry 2: Treasury claims their accumulated share
+entry claim_treasury_share() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let treasury_opt: optional<Hash> = s.load(TREASURY_KEY)
+    require(treasury_opt.is_some(), "notreasury")
+
+    // Only treasury contract or admin can claim
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let cc_opt: optional<Hash> = get_contract_caller()
+    let is_authorized: bool = caller == admin
+    if cc_opt.is_some() {
+        let cc: Hash = cc_opt.expect("err")
+        let treasury: Hash = treasury_opt.expect("err")
+        if cc == treasury { is_authorized = true }
+    }
+    require(is_authorized, "notauth")
+
+    let pending: u64 = s.load(TREASURY_PENDING_KEY).unwrap_or(0)
+    require(pending > 0, "nothing")
+
+    s.store(TREASURY_PENDING_KEY, 0u64)
+    // In production: transfer to treasury contract
+    emit_event(0u64, ["TreasuryShareClaimed", pending.to_string(10u32)])
+    return 0
+}
+
+// Entry 3: Burn the deflationary share (anyone can trigger, gas incentivized)
+entry burn_deflationary_share() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let pending: u64 = s.load(BURN_PENDING_KEY).unwrap_or(0)
+    require(pending > 0, "nothing")
+
+    s.store(BURN_PENDING_KEY, 0u64)
+
+    // In production: burn the pending amount
+    // For XEL: not burnable (native asset), so convert to VLT and burn VLT
+    // For VLT: vlt.call(burn, [pending])
+    // For xUSD: xusd.call(burn, [pending])
+    emit_event(0u64, ["DeflationaryBurned", pending.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 4: Get founder's pending balance
+pub fn get_founder_balance() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+}
+
+// Pub fn 5: Get treasury's pending balance
+pub fn get_treasury_balance() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TREASURY_PENDING_KEY).unwrap_or(0)
+}
+
+// Pub fn 6: Get total collected all-time for an asset
+pub fn get_total_collected(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_COLLECTED_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+// Pub fn 7: Get distribution split (burn_bps, treasury_bps, founder_bps)
+pub fn get_distribution() -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(BURN_BPS_KEY).unwrap_or(DEFAULT_BURN_BPS),
+        s.load(TREASURY_BPS_KEY).unwrap_or(DEFAULT_TREASURY_BPS),
+        s.load(FOUNDER_BPS_KEY).unwrap_or(DEFAULT_FOUNDER_BPS)
+    )
+}
+
+// Entry 8: Set founder address (admin/governance only)
+entry set_founder(new_founder: Address) -> u64 {
+    only_admin()
+    require(new_founder != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), "badaddr")
+    let s: Storage = Storage::new()
+    s.store(FOUNDER_KEY, new_founder)
+    return 0
+}
+
+// Entry 9: Set treasury contract
+entry set_treasury(tr: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TREASURY_KEY, tr)
+    return 0
+}
+
+// Entry 10: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 11: Set VLT asset
+entry set_vlt_asset(va: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_ASSET_KEY, va)
+    return 0
+}
+
+// Entry 12: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 13: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 14: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 15: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 16: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 17: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 18: Get version
+entry get_version() -> string {
+    return VERSION
+}

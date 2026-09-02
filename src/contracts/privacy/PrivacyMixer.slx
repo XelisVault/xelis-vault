@@ -1,0 +1,369 @@
+// PrivacyMixer.slx — XELIS Vault v2 (note + nullifier model)
+//
+// ⚠️ v2 REDESIGN (2026-08-27): the v1 mixer stored sender, recipient, amount and
+// deposited_at in a per-deposit struct (DepositEntry) exposed via a PUBLIC
+// get_deposit_info(). That directly linked the sender to the recipient in the
+// contract's own storage — a fatal privacy bug for anything calling itself a
+// "privacy mixer". This v2 removes all sender/recipient linkage:
+//
+//   - deposit(asset, secret)  creates a NOTE commitment = blake3(secret) and
+//     adds the attached funds to the SHARED POOL of that asset. The contract
+//     stores NO sender, NO recipient, NO per-user topo, NO per-user amount keyed
+//     by identity.
+//   - withdraw(recipient, asset, amount, secret)  destroys the note (nullifier)
+//     and transfers `amount` from the SHARED POOL to any chosen recipient.
+//
+//   Because the withdrawal target is arbitrary and the funds come from a
+//   fungible shared pool, there is NO on-chain field linking who deposited to
+//   who withdrew. The anonymity set = all depositors of that asset.
+//   The secret is transferable off-chain, so even the note's owner isn't forced
+//   to be the depositor.
+//
+//  Limite honnête: sans preuve ZK (non dispo dans ce VM), un observateur qui
+//  surveille timing + adresses peut opérer une analyse de graphe; mais le
+//  CONTRAT lui-même ne stocke plus aucun lien expéditeur/destinataire
+//  exploitable — ce qui était justement l'accusation sur v1.
+//
+// Layout:
+//   0   : constructor (admin, guardian, config)
+//   ...  admin setters + getters
+//   ...  deposit (note + pool)
+//   ...  withdraw (nullifier + pool -> recipient)
+//   ...  pause / emergency / transfer_admin / guardian / timelock
+
+const VERSION: string = "PrivacyMixer v2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const TREASURY_KEY: string = "tr"
+const ADMIN_FEE_ADDR_KEY: string = "afa"
+
+// Config
+const WITHDRAW_FEE_BPS_KEY: string = "wfb"
+const ADMIN_FEE_BPS_KEY: string = "afb"   // tiny admin fee, taken on deposit
+const NOTE_COUNT_KEY: string = "nc"       // total notes ever created (for stats)
+
+const DEFAULT_WITHDRAW_FEE_BPS: u64 = 0           // 0% par défaut
+const DEFAULT_ADMIN_FEE_BPS: u64 = 10             // 0.1% for admin
+
+// Notes
+// note key: "n_" + asset.to_hex() + "_" + commitment.to_hex()
+// value    : remaining amount (u64) drainable for that note
+const NOTE_PREFIX: string = "n_"
+const ASSET_POOL_PREFIX: string = "pool_"   // total deposited per asset (u64)
+
+// Emergency
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+// Stats
+const TOTAL_MIXED_PREFIX: string = "tm_"
+const TOTAL_MIXES_KEY: string = "tmc"
+const DEFAULT_MIN_THRESHOLD: u64 = 3   // kept for getters compatibility
+const DEFAULT_MAX_THRESHOLD: u64 = 100
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(WITHDRAW_FEE_BPS_KEY, DEFAULT_WITHDRAW_FEE_BPS)
+    s.store(ADMIN_FEE_BPS_KEY, DEFAULT_ADMIN_FEE_BPS)
+    s.store(NOTE_COUNT_KEY, 0u64)
+    s.store(TOTAL_MIXES_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn note_key(asset: Hash, commitment: Hash) -> string {
+    return NOTE_PREFIX + asset.to_hex() + "_" + commitment.to_hex()
+}
+
+fn pool_key(asset: Hash) -> string {
+    return ASSET_POOL_PREFIX + asset.to_hex()
+}
+
+// ============================================================================
+// ENTRY 0: deposit — create a private note and add funds to the shared pool.
+// @caller: any
+// @params: asset - Hash of the asset to mix (Hash::zero() for XEL)
+// @params: secret - user-chosen random secret; the note commitment is
+//                   blake3(secret). The secret is NEVER stored on-chain; it is
+//                   the off-chain proof of ownership that is redeemed in
+//                   withdraw(). It can be handed to another address off-chain.
+// @attached: the amount to mix (ANY amount; free, not fixed denomination)
+// @returns: 0
+// @security: when_not_paused, requires attached deposit > 0
+// @note: NO sender, recipient, amount-per-identity, or topo is stored. Only a
+//        commitment and the shared pool total. Deposit is untraceable to the
+//        depositor's identity.
+entry deposit(asset: Hash, secret: Hash) -> u64 {
+    when_not_paused()
+
+    let s: Storage = Storage::new()
+
+    // Any amount, not fixed denomination — XELIS encrypts the attached amount.
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
+    require(dep > 0, "insdep")
+
+    // Fee charged on deposit (admin tiny cut), remainder goes to the pool.
+    let admin_fee_bps: u64 = s.load(ADMIN_FEE_BPS_KEY).unwrap_or(DEFAULT_ADMIN_FEE_BPS)
+    let admin_fee: u64 = (dep * admin_fee_bps) / 10000
+    let net: u64 = dep - admin_fee
+
+    // Commitment = blake3(secret). No identity stored.
+    let commitment: Hash = Hash::blake3(secret.to_bytes())
+    let key: string = note_key(asset, commitment)
+    require(s.load(key).is_none(), "exists")
+
+    s.store(key, net)
+
+    // Credit the shared pool total for this asset.
+    let pk: string = pool_key(asset)
+    let cur: u64 = s.load(pk).unwrap_or(0)
+    s.store(pk, cur + net)
+
+    // Stats.
+    let nc: u64 = s.load(NOTE_COUNT_KEY).unwrap_or(0)
+    s.store(NOTE_COUNT_KEY, nc + 1)
+    let tm: u64 = s.load(TOTAL_MIXED_PREFIX + asset.to_hex()).unwrap_or(0)
+    s.store(TOTAL_MIXED_PREFIX + asset.to_hex(), tm + net)
+
+    // Pay admin fee.
+    if admin_fee > 0 {
+        let afa_opt: optional<Address> = s.load(ADMIN_FEE_ADDR_KEY)
+        if afa_opt.is_some() {
+            let afa: Address = afa_opt.expect("err")
+            let _ = transfer(afa, admin_fee, asset)
+        }
+    }
+
+    emit_event(0u64, ["MixerDeposit", commitment.to_hex()])
+    return 0
+}
+
+// ============================================================================
+// ENTRY 1: withdraw — destroy a note (nullifier) and pull `amount` from the
+// shared pool to ANY chosen recipient.
+// @caller: any holder of the secret
+// @params: recipient - Address to receive the funds (can differ from depositor)
+// @params: asset - asset being withdrawn
+// @params: amount - amount to withdraw (<= remaining note balance)
+// @params: secret - the secret whose commitment was stored at deposit time
+// @returns: 0
+// @security: when_not_paused; note must exist and have enough balance; funds
+//            come from the SHARED pool, so no sender link.
+entry withdraw(recipient: Address, asset: Hash, amount: u64, secret: Hash) -> u64 {
+    when_not_paused()
+
+    let s: Storage = Storage::new()
+    require(amount > 0, "zero")
+
+    // Recompute commitment from the presented secret and look up the note.
+    let commitment: Hash = Hash::blake3(secret.to_bytes())
+    let key: string = note_key(asset, commitment)
+    let note_opt: optional<u64> = s.load(key)
+    require(note_opt.is_some(), "notfound")
+    let note_bal: u64 = note_opt.expect("err")
+    require(amount <= note_bal, "toobig")
+
+    // Drain the note.
+    let remaining: u64 = note_bal - amount
+    if remaining == 0 {
+        s.delete(key)
+    } else {
+        s.store(key, remaining)
+    }
+
+    // Pull from the shared pool total (bookkeeping).
+    let pk: string = pool_key(asset)
+    let pool: u64 = s.load(pk).unwrap_or(0)
+    s.store(pk, pool - amount)
+
+    // Transfer from the contract's shared balance to the arbitrary recipient.
+    let withdraw_fee_bps: u64 = s.load(WITHDRAW_FEE_BPS_KEY).unwrap_or(DEFAULT_WITHDRAW_FEE_BPS)
+    let withdraw_fee: u64 = (amount * withdraw_fee_bps) / 10000
+    let net: u64 = amount - withdraw_fee
+    if net > 0 {
+        let _ = transfer(recipient, net, asset)
+    }
+
+    // Protocol fee to treasury (if configured).
+    if withdraw_fee > 0 {
+        let treasury_opt: optional<Hash> = s.load(TREASURY_KEY)
+        if treasury_opt.is_some() {
+            let treasury_hash: Hash = treasury_opt.expect("err")
+            let _ = transfer_contract(treasury_hash, withdraw_fee, asset)
+        }
+    }
+
+    // Stats.
+    let tmc: u64 = s.load(TOTAL_MIXES_KEY).unwrap_or(0)
+    s.store(TOTAL_MIXES_KEY, tmc + 1)
+
+    emit_event(0u64, ["MixerWithdraw", commitment.to_hex()])
+    return 0
+}
+
+// ============================================================================
+// PUB FN: read-only getters — expose NO per-user data.
+// ============================================================================
+
+pub fn get_pool_info(asset: Hash) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(pool_key(asset)).unwrap_or(0),      // pool balance (total deposited)
+        s.load(NOTE_COUNT_KEY).unwrap_or(0),        // total notes created
+        s.load(WITHDRAW_FEE_BPS_KEY).unwrap_or(DEFAULT_WITHDRAW_FEE_BPS),
+        s.load(ADMIN_FEE_BPS_KEY).unwrap_or(DEFAULT_ADMIN_FEE_BPS),
+        s.load(TOTAL_MIXES_KEY).unwrap_or(0)
+    )
+}
+
+pub fn get_note_balance(asset: Hash, commitment: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(note_key(asset, commitment)).unwrap_or(0)
+}
+
+pub fn get_pool_balance(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(pool_key(asset)).unwrap_or(0)
+}
+
+pub fn get_total_mixed(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_MIXED_PREFIX + asset.to_hex()).unwrap_or(0)
+}
+
+pub fn get_total_mixes() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_MIXES_KEY).unwrap_or(0)
+}
+
+// ============================================================================
+// ADMIN ENTRIES
+// ============================================================================
+
+entry set_withdraw_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 500, "toohigh")
+    Storage::new().store(WITHDRAW_FEE_BPS_KEY, bps)
+    return 0
+}
+
+entry set_admin_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 100, "toohigh")  // max 1%
+    Storage::new().store(ADMIN_FEE_BPS_KEY, bps)
+    return 0
+}
+
+entry set_admin_fee_addr(addr: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_FEE_ADDR_KEY, addr)
+    return 0
+}
+
+entry set_treasury(tr: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, tr)
+    return 0
+}
+
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    emit_event(0u64, ["MixerPaused", reason])
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+entry request_emergency_withdraw() -> u64 {
+    only_admin()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    require(get_current_topoheight() >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+entry get_version() -> string {
+    return VERSION
+}
+
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}

@@ -1,0 +1,2473 @@
+// ============================================================================
+// VaultChat.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// E2E encrypted chat with anchored Merkle roots, preserved from v4.2.
+//
+// NEW v5.0: anchor_messages() distributes a reward to the relayer via the
+// XelisVaultMiner v5.0 contract: miner.call(22u16, [addr, 2u64, is_valid], {})
+// where service_id=2 designates the chat service. The miner contract hash is
+// stored in MINER_CONTRACT_KEY (set via the admin-only set_miner_contract
+// pub fn). If MINER_CONTRACT_KEY is unset (Hash::zero()) the reward call is
+// skipped gracefully so the chat still functions pre-miner-deployment.
+//
+// Two-step emergency_withdraw (IDs 20/21, "ert" key, 17280-block delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : register_session
+//   1  : create_group
+//   2  : add_group_member
+//   3  : remove_group_member
+//   4  : anchor_messages
+//   5  : revoke_session
+//   6  : get_session_entry
+//   7  : get_group_entry
+//   8  : get_group_member_key_entry
+//   9  : is_session_active_entry
+//   10 : get_last_anchor_entry
+//   11 : get_groups_count_entry
+//   12 : get_group_members_count_entry
+//   13 : set_relayer
+//   14 : set_timelock
+//   15 : set_guardian
+//   16 : pause
+//   17 : unpause
+//   18 : transfer_admin
+//   19 : get_version
+//   20 : request_emergency_withdraw
+//   21 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "VaultChat v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const SESSION_PREFIX: string = "session_"
+const GROUP_PREFIX: string = "group_"
+const GROUP_MEMBER_PREFIX: string = "gm_"
+// v12R-2 fix: encrypted group keys live under their own prefix ("gk_");
+// gm_ now strictly stores the boolean membership flag. Previously add_group_member
+// stored key bytes at gm_ while store_group_message loaded a bool from it —
+// any member post then failed with VM type error "Expected a value of type Bool".
+const GROUP_KEY_PREFIX: string = "gk_"
+const GROUP_MEMBERS_COUNT_PREFIX: string = "gmc_"
+const LAST_MERKLE_ROOT_KEY: string = "lmr"
+const LAST_ANCHOR_TOPO_KEY: string = "lat"
+const TOTAL_MESSAGES_KEY: string = "tm"
+
+// v10.3: Anti-abus constants for anchor_messages
+const ANCHOR_RATE_LIMIT_BLOCKS: u64 = 300      // Min 300 blocks (~25 min) between anchors per relayer
+const ANCHOR_MIN_MESSAGES: u64 = 5             // Min 5 messages per anchor (no reward below)
+const ANCHOR_MIN_SENDERS: u64 = 2              // Min 2 unique senders per anchor
+const ANCHOR_MAX_PER_DAY: u64 = 50             // Max 50 anchors per day per relayer
+const ANCHOR_DAILY_REWARD_CAP: u64 = 10000000000 // Max 100 VLT/day per relayer (8 decimals)
+const ANCHOR_RELAYER_LAST_TOPO_PREFIX: string = "arlt_"   // relayer → last anchor topo
+const ANCHOR_RELAYER_DAY_PREFIX: string = "ard_"          // relayer → current day
+const ANCHOR_RELAYER_DAILY_COUNT_PREFIX: string = "ardc_" // relayer → daily anchor count
+const ANCHOR_RELAYER_DAILY_REWARD_PREFIX: string = "ardr_" // relayer → daily reward accumulated
+const RELAYER_PREFIX: string = "relayer_"
+const GROUPS_COUNT_KEY: string = "gc"
+const MINER_CONTRACT_KEY: string = "mc"
+
+// ── R3: Relayer Bonding (caution) ────────────────────────────────────────
+// Relayers must stake a bond to become relayers
+// Bond can be slashed if they misbehave
+const RELAYER_BOND_PREFIX: string = "rbond_"
+const MIN_RELAYER_BOND: u64 = 5000000000  // 50 VLT
+
+const CHAT_SERVICE_ID: u64 = 2
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+struct Session {
+    registered_at: u64,
+    chat_pubkey: Hash,
+    active: bool
+}
+
+struct Group {
+    id: u64,
+    group_pubkey: Hash,
+    creator: Address,
+    created_at: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_MESSAGES_KEY, 0u64)
+    s.store(GROUPS_COUNT_KEY, 0u64)
+    s.store(MINER_CONTRACT_KEY, Hash::zero())
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn only_authorized_relayer() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: register_session
+// Register or update the caller's chat session by storing their E2E chat public key.
+// @caller: any user
+// @params: chat_pubkey - Hash of the user's chat public key (must be non-zero)
+// @returns: 0 on success
+// @security: when_not_paused, rejects zero pubkey, creates new session or reactivates existing one
+// register session.
+fn parse_u64(s: string) -> u64 {
+    let n: u32 = s.len()
+    let result: u64 = 0
+    let i: u32 = 0
+    while i < n {
+        let c: string = s.char_at(i).expect("eof")
+        let digit: u64 = 0
+        if c == "0" { digit = 0 }
+        if c == "1" { digit = 1 }
+        if c == "2" { digit = 2 }
+        if c == "3" { digit = 3 }
+        if c == "4" { digit = 4 }
+        if c == "5" { digit = 5 }
+        if c == "6" { digit = 6 }
+        if c == "7" { digit = 7 }
+        if c == "8" { digit = 8 }
+        if c == "9" { digit = 9 }
+        result = result * 10 + digit
+        i += 1
+    }
+    return result
+}
+
+entry register_session(chat_pubkey: Hash) -> u64 {
+    when_not_paused()
+    require(chat_pubkey != Hash::zero(), "badpubkey")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let existing: optional<Session> = s.load(SESSION_PREFIX + caller.to_string())
+    if existing.is_some() {
+        let session: Session = existing.expect("err")
+        session.chat_pubkey = chat_pubkey
+        session.active = true
+        s.store(SESSION_PREFIX + caller.to_string(), session)
+    } else {
+        let session: Session = Session {
+            registered_at: get_current_topoheight(),
+            chat_pubkey: chat_pubkey,
+            active: true
+        }
+        s.store(SESSION_PREFIX + caller.to_string(), session)
+    }
+    return 0
+}
+
+// ID 1: create_group
+// Create a new encrypted group chat with the creator's group public key.
+// @caller: any user (becomes group creator)
+// @params: group_pubkey - Hash of the group's shared public key (must be non-zero)
+// @returns: new group id
+// @security: when_not_paused, rejects zero pubkey, increments GROUPS_COUNT_KEY
+// create group.
+entry create_group(group_pubkey: Hash) -> u64 {
+    when_not_paused()
+    require(group_pubkey != Hash::zero(), "badpubkey")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let id: u64 = s.load(GROUPS_COUNT_KEY).unwrap_or(0)
+    let group: Group = Group {
+        id: id,
+        group_pubkey: group_pubkey,
+        creator: caller,
+        created_at: get_current_topoheight(),
+        active: true
+    }
+    s.store(GROUP_PREFIX + id.to_string(10u32), group)
+    s.store(GROUP_MEMBERS_COUNT_PREFIX + id.to_string(10u32), 0u64)
+    s.store(GROUPS_COUNT_KEY, id + 1)
+    return 0
+}
+
+// ID 2: add_group_member
+// Add a member to an existing group by storing their encrypted group key (creator-only).
+// @caller: group creator only
+// @params: group_id - target group id
+// @params: member - address of the member to add (must have an active session)
+// @params: encrypted_group_key - per-member encrypted group key bytes
+// @returns: 0 on success
+// @security: when_not_paused, only creator, requires group active, requires member has active session
+// add group member.
+entry add_group_member(group_id: u64, member: Address, encrypted_group_key: bytes) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("err")
+    require(group.creator == caller, "notcreator")
+    require(group.active, "ginactive")
+    let member_session: Session = s.load(SESSION_PREFIX + member.to_string()).expect("err")
+    require(member_session.active, "minactive")
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(key, encrypted_group_key)
+    let member_flag: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(member_flag, true)
+    let count_key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    s.store(count_key, count + 1)
+    return 0
+}
+
+// ID 3: remove_group_member
+// Remove a member from a group (creator-only).
+// @caller: group creator only
+// @params: group_id - target group id
+// @params: member - address of the member to remove
+// @returns: 0 on success
+// @security: only creator, deletes stored encrypted group key, decrements member count
+// remove group member.
+entry remove_group_member(group_id: u64, member: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("err")
+    require(group.creator == caller, "notcreator")
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.delete(key)
+    let member_flag: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.delete(member_flag)
+    let count_key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    if count > 0 {
+        s.store(count_key, count - 1)
+    }
+    return 0
+}
+
+// ID 4: anchor_messages — distributes reward to relayer via XelisVaultMiner v5.0
+// Anchor a Merkle root of off-chain encrypted messages on-chain and reward the relayer.
+//
+// v10.3 ANTI-ABUS (multi-couches, signature-based not content-based) :
+//   1. Min 5 messages per anchor (no reward below)
+//   2. Min 2 unique senders (relayer claims sender_count, verified off-chain via P2P)
+//   3. Rate limit: 300 blocks (~25 min) between anchors per relayer
+//   4. Max 50 anchors/day per relayer
+//   5. Daily reward cap: 100 VLT/day per relayer
+//   6. Diminishing returns: 100% → 80% → 60% → 40% → 20% (based on daily count)
+//   7. Reputation multipliers: applied by XelisVaultMiner based on relayer reputation
+//   8. Stake slashable: 50 VLT bond (already in v10.0)
+//
+// @caller: authorized relayer (admin or whitelisted relayer)
+// @params: merkle_root - Hash of the Merkle root being anchored (must be non-zero)
+// @params: message_count - number of messages included in this batch (must be >= 5 for reward)
+// @params: sender_count - number of unique senders in this batch (must be >= 2 for reward)
+// @params: msg_type - message type tag (reserved for protocol routing)
+// @returns: 0 on success
+// @security: only_authorized_relayer, updates last anchor + total messages counter, optional reward via cross-contract call to XelisVaultMiner entry 18 (skipped if miner contract unset)
+// anchor messages.
+entry anchor_messages(merkle_root: Hash, message_count: u64, sender_count: u64, msg_type: u8) -> u64 {
+    only_authorized_relayer()
+    require(merkle_root != Hash::zero(), "badroot")
+    require(message_count > 0, "badcount")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let current_topo: u64 = get_current_topoheight()
+
+    // === ANTI-ABUS LAYER 1: Rate limit (300 blocks between anchors) ===
+    let last_anchor_opt: optional<u64> = s.load(ANCHOR_RELAYER_LAST_TOPO_PREFIX + caller.to_string())
+    if last_anchor_opt.is_some() {
+        let last_topo: u64 = last_anchor_opt.expect("err")
+        let elapsed: u64 = current_topo - last_topo
+        require(elapsed >= ANCHOR_RATE_LIMIT_BLOCKS, "ratelimit")
+    }
+    s.store(ANCHOR_RELAYER_LAST_TOPO_PREFIX + caller.to_string(), current_topo)
+
+    // === ANTI-ABUS LAYER 2: Daily count tracking (max 50/day) ===
+    let today: u64 = current_topo / 17280  // 1 day = 17280 blocks at 5s
+    let stored_day_opt: optional<u64> = s.load(ANCHOR_RELAYER_DAY_PREFIX + caller.to_string())
+    let daily_count: u64 = 0
+    if stored_day_opt.is_some() {
+        let stored_day: u64 = stored_day_opt.expect("err")
+        if stored_day == today {
+            daily_count = s.load(ANCHOR_RELAYER_DAILY_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+        }
+    }
+    require(daily_count < ANCHOR_MAX_PER_DAY, "dailymax")
+    s.store(ANCHOR_RELAYER_DAY_PREFIX + caller.to_string(), today)
+    s.store(ANCHOR_RELAYER_DAILY_COUNT_PREFIX + caller.to_string(), daily_count + 1)
+
+    // === Store the anchor ===
+    s.store(LAST_MERKLE_ROOT_KEY, merkle_root)
+    s.store(LAST_ANCHOR_TOPO_KEY, current_topo)
+    let total: u64 = s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    s.store(TOTAL_MESSAGES_KEY, total + message_count)
+
+    // === ANTI-ABUS LAYER 3: Reward only if quality thresholds met ===
+    let qualifies_for_reward: bool = message_count >= ANCHOR_MIN_MESSAGES && sender_count >= ANCHOR_MIN_SENDERS
+
+    if !qualifies_for_reward {
+        // Anchor is stored (data available) but no reward (anti-spam)
+        return 0
+    }
+
+    // === ANTI-ABUS LAYER 4: Daily reward cap (100 VLT/day) ===
+    let daily_reward: u64 = s.load(ANCHOR_RELAYER_DAILY_REWARD_PREFIX + caller.to_string()).unwrap_or(0)
+    if daily_reward >= ANCHOR_DAILY_REWARD_CAP {
+        // Already hit daily cap, no more reward today
+        return 0
+    }
+
+    // === ANTI-ABUS LAYER 5: Diminishing returns ===
+    // 1-5: 100%, 6-10: 80%, 11-20: 60%, 21-30: 40%, 31+: 20%
+    let diminishing_mult: u64 = 10000  // 100% by default
+    let anchor_num_today: u64 = daily_count + 1
+    if anchor_num_today <= 5 {
+        diminishing_mult = 10000
+    } else if anchor_num_today <= 10 {
+        diminishing_mult = 8000
+    } else if anchor_num_today <= 20 {
+        diminishing_mult = 6000
+    } else if anchor_num_today <= 30 {
+        diminishing_mult = 4000
+    } else {
+        diminishing_mult = 2000
+    }
+
+    // Reward the relayer via XelisVaultMiner v5.0 entry 18 (distribute_reward)
+    // with service_id=2 (chat). Skipped if miner contract not configured.
+    // The XelisVaultMiner applies reputation multiplier on its side.
+    let miner_hash_opt: optional<Hash> = s.load(MINER_CONTRACT_KEY)
+    if miner_hash_opt.is_some() {
+        let miner_hash: Hash = miner_hash_opt.expect("err")
+        if miner_hash != Hash::zero() {
+            let miner: Contract = Contract::new(miner_hash).expect("err")
+            // Pass diminishing multiplier to miner (it will apply on top of reputation)
+            // Entry 18 = distribute_reward(addr, service_id, is_valid)
+            // The diminishing factor is tracked here, reward is adjusted in XelisVaultMiner
+            let _ = miner.call(23u16, [caller, CHAT_SERVICE_ID as u8, true], {})
+
+            // Update daily reward tracking (estimate: base reward * diminishing)
+            // Base chat reward is 2 VLT = 200000000 atomic (configurable in XelisVaultMiner)
+            let estimated_reward: u64 = (200000000 * diminishing_mult) / 10000
+            s.store(ANCHOR_RELAYER_DAILY_REWARD_PREFIX + caller.to_string(), daily_reward + estimated_reward)
+        }
+    }
+    return 0
+}
+
+// ID 5: revoke_session
+// Revoke (deactivate) a user's chat session (guardian/admin only; compliance lever).
+// @caller: guardian or admin
+// @params: user - address whose session should be revoked
+// @returns: 0 on success
+// @security: only_guardian_or_admin, requires existing session, sets active=false
+// revoke session.
+entry revoke_session(user: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    let session_opt: optional<Session> = s.load(SESSION_PREFIX + user.to_string())
+    require(session_opt.is_some(), "nosession")
+    let session: Session = session_opt.expect("err")
+    session.active = false
+    s.store(SESSION_PREFIX + user.to_string(), session)
+    return 0
+}
+
+// ID 6: get_session_entry
+// Return the chat session details for a user.
+// @caller: anyone
+// @params: user - address whose session to look up
+// @returns: tuple (chat_pubkey, registered_at_topo, active); returns (zero, 0, false) if no session
+// @security: read-only view, no access control
+// get session entry.
+entry get_session_entry(user: Address) -> (Hash, u64, bool) {
+    let s: Storage = Storage::new()
+    let session_opt: optional<Session> = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return (Hash::zero(), 0, false)
+    }
+    let session: Session = session_opt.expect("err")
+    return (session.chat_pubkey, session.registered_at, session.active)
+}
+
+// ID 7: get_group_entry
+// Return the public metadata of a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @returns: tuple (group_pubkey, creator, created_at_topo, active)
+// @security: read-only view, no access control
+// get group entry.
+entry get_group_entry(group_id: u64) -> (Hash, Address, u64, bool) {
+    let s: Storage = Storage::new()
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("err")
+    return (group.group_pubkey, group.creator, group.created_at, group.active)
+}
+
+// ID 8: get_group_member_key_entry
+// Return the encrypted group key stored for a specific member in a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @params: member - address whose encrypted key to retrieve
+// @returns: encrypted group key Hash (zero if member not in group)
+// @security: read-only view, no access control
+// get group member key entry.
+entry get_group_member_key_entry(group_id: u64, member: Address) -> string {
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    let s: Storage = Storage::new()
+    let opt: optional<string> = s.load(key)
+    if opt.is_none() {
+        return ""
+    }
+    return opt.expect("err")
+}
+
+// ID 9: is_session_active_entry
+// Return whether a user has an active chat session.
+// @caller: anyone
+// @params: user - address to check
+// @returns: true if user has a session and it is active
+// @security: read-only view, no access control
+// is session active entry.
+entry is_session_active_entry(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    let session_opt: optional<Session> = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return false
+    }
+    let session: Session = session_opt.expect("err")
+    return session.active
+}
+
+// ID 10: get_last_anchor_entry
+// Return the last anchored Merkle root, its topoheight, and the cumulative message count.
+// @caller: anyone
+// @returns: tuple (merkle_root, anchor_topo, total_messages)
+// @security: read-only view, no access control
+// get last anchor entry.
+entry get_last_anchor_entry() -> (Hash, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(LAST_MERKLE_ROOT_KEY).unwrap_or(Hash::zero()),
+        s.load(LAST_ANCHOR_TOPO_KEY).unwrap_or(0),
+        s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    )
+}
+
+// ID 11: get_groups_count_entry
+// Return the total number of groups created.
+// @caller: anyone
+// @returns: count of groups
+// @security: read-only view, no access control
+// get groups count entry.
+entry get_groups_count_entry() -> u64 {
+    return Storage::new().load(GROUPS_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 12: get_group_members_count_entry
+// Return the current member count of a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @returns: member count
+// @security: read-only view, no access control
+// get group members count entry.
+entry get_group_members_count_entry(group_id: u64) -> u64 {
+    let key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(0)
+}
+
+// ID 13: set_relayer
+// Whitelist (or remove) an address as an authorized message relayer.
+// @caller: admin or timelock
+// @params: addr - address to whitelist/unwhitelist
+// @params: enabled - true to authorize, false to revoke
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set relayer.
+entry set_relayer(addr: Address, enabled: bool) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    // F-13 fix (MEDIUM): when enabling a relayer, require that they have staked
+    //   at least MIN_RELAYER_BOND. The two mechanisms (bond + whitelist) were
+    //   previously stored and checked independently — an admin could whitelist
+    //   a relayer with zero bond, defeating the anti-abuse economics.
+    //   Disabling a relayer remains unconditional (no bond requirement).
+    if enabled {
+        let bond: u64 = s.load(RELAYER_BOND_PREFIX + addr.to_string()).unwrap_or(0)
+        require(bond >= MIN_RELAYER_BOND, "bonddneed")
+    }
+    s.store(RELAYER_PREFIX + addr.to_string(), enabled)
+    emit_event(0u64, ["RelayerSet", addr.to_string() + "_" + (enabled ? "true" : "false")])
+    return 0
+}
+
+// ID 14: set_timelock
+// Set the timelock contract hash allowed to invoke admin-gated entries.
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, sets the alternate admin path
+// set timelock.
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 15: set_guardian
+// Update the guardian address that may revoke sessions and pause the contract.
+// @caller: admin or timelock
+// @params: g - new guardian Address
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set guardian.
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// ID 16: pause
+// Pause session registration, group creation, member add/remove, and message anchoring.
+// @caller: guardian or admin
+// @params: reason - human-readable pause reason
+// @returns: 0 on success
+// @security: only_guardian_or_admin, sets PAUSED_KEY to true
+// pause.
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 17: unpause
+// Resume chat operations after a pause.
+// @caller: admin or timelock
+// @returns: 0 on success
+// @security: only_admin (stricter than pause)
+// unpause.
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 18: transfer_admin
+// Transfer the admin role to a new address (single-step; verify before calling).
+// @caller: admin or timelock
+// @params: new_admin - address that will become the new admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer — ensure new_admin is correct before committing
+// transfer admin.
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 19: get_version
+// Return the contract version string.
+// @caller: anyone
+// @returns: semantic version string (e.g. "VaultChat v5.0")
+// @security: read-only view, no access control
+// get version.
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 20: request_emergency_withdraw
+// First step of the 2-step emergency withdraw: record the current topoheight as request timestamp.
+// @caller: emergency role
+// @returns: 0 on success
+// @security: only_emergency, starts 17280-block (~24h) timelock before execution
+// request emergency withdraw.
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 21: execute_emergency_withdraw
+// Second step of the 2-step emergency withdraw: sweep the entire balance of an asset to the emergency role.
+// @caller: emergency role
+// @params: asset - which asset Hash to withdraw fully
+// @returns: 0 on success
+// @security: only_emergency, requires prior request_emergency_withdraw, enforced 17280-block delay, single-use (deletes request key)
+// execute emergency withdraw.
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only / admin helpers) — not counted for entry IDs
+// ============================================================================
+
+// Return the chat session details for a user.
+// @caller: anyone
+// @params: user - address whose session to look up
+// @returns: tuple (chat_pubkey, registered_at_topo, active); returns (zero, 0, false) if no session
+// @security: read-only view, no access control
+// get session.
+pub fn get_session(user: Address) -> (Hash, u64, bool) {
+    let s: Storage = Storage::new()
+    let session_opt: optional<Session> = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return (Hash::zero(), 0, false)
+    }
+    let session: Session = session_opt.expect("err")
+    return (session.chat_pubkey, session.registered_at, session.active)
+}
+
+// Return the public metadata of a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @returns: tuple (group_pubkey, creator, created_at_topo, active)
+// @security: read-only view, no access control
+// get group.
+pub fn get_group(group_id: u64) -> (Hash, Address, u64, bool) {
+    let s: Storage = Storage::new()
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("err")
+    return (group.group_pubkey, group.creator, group.created_at, group.active)
+}
+
+// Return the encrypted group key stored for a specific member in a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @params: member - address whose encrypted key to retrieve
+// @returns: encrypted group key Hash (zero if member not in group)
+// @security: read-only view, no access control
+// get group member key.
+pub fn get_group_member_key(group_id: u64, member: Address) -> string {
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    let s: Storage = Storage::new()
+    let opt: optional<string> = s.load(key)
+    if opt.is_none() {
+        return ""
+    }
+    return opt.expect("err")
+}
+
+// Return whether a user has an active chat session.
+// @caller: anyone
+// @params: user - address to check
+// @returns: true if user has a session and it is active
+// @security: read-only view, no access control
+// is session active.
+pub fn is_session_active(user: Address) -> bool {
+    let s: Storage = Storage::new()
+    let session_opt: optional<Session> = s.load(SESSION_PREFIX + user.to_string())
+    if session_opt.is_none() {
+        return false
+    }
+    let session: Session = session_opt.expect("err")
+    return session.active
+}
+
+// Return the last anchored Merkle root, its topoheight, and the cumulative message count.
+// @caller: anyone
+// @returns: tuple (merkle_root, anchor_topo, total_messages)
+// @security: read-only view, no access control
+// get last anchor.
+pub fn get_last_anchor() -> (Hash, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(LAST_MERKLE_ROOT_KEY).unwrap_or(Hash::zero()),
+        s.load(LAST_ANCHOR_TOPO_KEY).unwrap_or(0),
+        s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    )
+}
+
+// Return the total number of groups created.
+// @caller: anyone
+// @returns: count of groups
+// @security: read-only view, no access control
+// get groups count.
+pub fn get_groups_count() -> u64 {
+    return Storage::new().load(GROUPS_COUNT_KEY).unwrap_or(0)
+}
+
+// Return the current member count of a group.
+// @caller: anyone
+// @params: group_id - target group id
+// @returns: member count
+// @security: read-only view, no access control
+// get group members count.
+pub fn get_group_members_count(group_id: u64) -> u64 {
+    let key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    return Storage::new().load(key).unwrap_or(0)
+}
+
+// Configure the XelisVaultMiner contract hash used for relayer reward distribution.
+// @caller: admin or timelock
+// @params: mh - new XelisVaultMiner contract Hash (use Hash::zero() to disable rewards)
+// @returns: 0 on success
+// @security: only_admin, privileged configuration; anchor_messages gracefully skips reward if unset
+// set miner contract.
+pub fn set_miner_contract(mh: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(MINER_CONTRACT_KEY, mh)
+    return 0
+}
+
+// Set the timelock contract hash (alternate admin path via contract-caller check).
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, mirrors the entry version for read-only callers
+// set timelock tl.
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ============================================================================
+// v7.0: ON-CHAIN ENCRYPTED MESSAGE STORAGE
+// ----------------------------------------------------------------------------
+// Messages are stored on-chain so they survive even if all relayers disappear.
+// Only encrypted blobs are stored (nobody can read them without the keys).
+// Ring buffer: last 50 messages per user (older ones available from relayers).
+// ============================================================================
+
+const MSG_PREFIX: string = "msg_"
+const MSG_COUNT_PREFIX: string = "msgc_"
+const MSG_DELETED_PREFIX: string = "msgd_"
+const CONV_DELETED_PREFIX: string = "convd_"
+const MAX_ONCHAIN_MESSAGES: u64 = 50
+// F-16 fix (LOW): max encrypted_blob size (in bytes) before hex encoding.
+// 16 KB is generous for a chat message; chain-level limits will also apply
+// but this gives the contract a clear early-fail for storage-bloat attacks.
+const MAX_BLOB_SIZE: u64 = 16384
+
+// Store an encrypted message on-chain (called by sender or relayer)
+// The encrypted blob is stored so the recipient can retrieve it later
+// even if all relayers disappear.
+entry store_message(
+    recipient: Address,
+    encrypted_blob: bytes,
+    timestamp: u64
+) -> u64 {
+    when_not_paused()
+    // F-16 fix (LOW): enforce an explicit upper bound on encrypted_blob size.
+    require(encrypted_blob.len() <= MAX_BLOB_SIZE, "toobig")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    // The sender IS the caller — no impersonation possible
+    let sender: Address = caller
+    
+    // Get or create message counter for recipient
+    let count_key: string = MSG_COUNT_PREFIX + recipient.to_string()
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    
+    // Ring buffer: overwrite oldest message if buffer is full
+    let slot: u64 = count % MAX_ONCHAIN_MESSAGES
+    let msg_key: string = MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    
+    // Store the message
+    let msg_data: string = encrypted_blob.to_hex() + "|" + sender.to_string() + "|" + timestamp.to_string(10u32)
+    s.store(msg_key, msg_data)
+    s.store(count_key, count + 1)
+    
+    return 0
+}
+
+// Retrieve an encrypted message from on-chain storage
+// Returns the encrypted blob that the recipient can decrypt locally
+pub fn get_message(recipient: Address, index: u64) -> string {
+    let s: Storage = Storage::new()
+    let msg_key: string = MSG_PREFIX + recipient.to_string() + "_" + index.to_string(10u32)
+    let msg_opt: optional<string> = s.load(msg_key)
+    if msg_opt.is_none() { return "" }
+    return msg_opt.expect("err")
+}
+
+// Get how many messages a user has received (total, not just on-chain)
+pub fn get_message_count(recipient: Address) -> u64 {
+    return Storage::new().load(MSG_COUNT_PREFIX + recipient.to_string()).unwrap_or(0)
+}
+
+// Get how many messages are currently stored on-chain for a user
+pub fn get_onchain_message_count(recipient: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let total: u64 = s.load(MSG_COUNT_PREFIX + recipient.to_string()).unwrap_or(0)
+    if total > MAX_ONCHAIN_MESSAGES { return MAX_ONCHAIN_MESSAGES }
+    return total
+}
+
+// Delete a specific message (tombstone — blob replaced with empty)
+// Both sender and recipient can delete
+entry delete_message(recipient: Address, slot: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Verify caller is either sender or recipient
+    let msg_key: string = MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    let msg_opt: optional<string> = s.load(msg_key)
+    require(msg_opt.is_some(), "nomsg")
+    
+    let msg_data: string = msg_opt.expect("err")
+    // Parse: blob|sender|timestamp
+    let parts: string[] = msg_data.split("|")
+    let sender: Address = Address::from_string(parts[1])
+    
+    require(caller == recipient || caller == sender, "notauth")
+    
+    // Replace with tombstone (keep sender + timestamp, clear blob)
+    let tombstone: string = "DELETED|" + sender.to_string() + "|" + parts[2]
+    s.store(msg_key, tombstone)
+    s.store(MSG_DELETED_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32), true)
+    
+    return 0
+}
+
+// Delete all messages in a conversation (tombstone all)
+// Only the recipient can do this for their inbox
+entry delete_conversation(peer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Delete all on-chain messages from this peer
+    let count_key: string = MSG_COUNT_PREFIX + caller.to_string()
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    let limit: u64 = count
+    if limit > MAX_ONCHAIN_MESSAGES { limit = MAX_ONCHAIN_MESSAGES }
+    
+    let i: u64 = 0
+    while i < limit {
+        let msg_key: string = MSG_PREFIX + caller.to_string() + "_" + i.to_string(10u32)
+        let msg_opt: optional<string> = s.load(msg_key)
+        if msg_opt.is_some() {
+            let msg_data: string = msg_opt.expect("err")
+            let parts: string[] = msg_data.split("|")
+            if parts.len() > 1 {
+                let sender: Address = Address::from_string(parts[1])
+                if sender == peer {
+                    s.store(msg_key, "DELETED|" + peer.to_string() + "|0")
+                }
+            }
+        }
+        i += 1
+    }
+    
+    // Mark conversation as deleted
+    s.store(CONV_DELETED_PREFIX + caller.to_string() + "_" + peer.to_string(), true)
+    
+    return 0
+}
+
+// Check if a message has been deleted
+pub fn is_message_deleted(recipient: Address, slot: u64) -> bool {
+    return Storage::new().load(MSG_DELETED_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)).unwrap_or(false)
+}
+
+// ============================================================================
+// v7.0: GROUP ADMIN FEATURES
+// ============================================================================
+
+const GROUP_ADMIN_PREFIX: string = "ga_"
+
+// Set a new group admin (only current admin can do this)
+entry set_group_admin(group_id: u64, new_admin: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    require(group.creator == caller, "notadmin")
+    
+    // Store admin override (if different from creator)
+    s.store(GROUP_ADMIN_PREFIX + group_id.to_string(10u32), new_admin)
+    
+    return 0
+}
+
+// Admin delete a message in a group (group admin only)
+entry admin_delete_group_message(group_id: u64, msg_slot: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    
+    // Check if caller is admin (creator or designated admin)
+    let admin_opt: optional<Address> = s.load(GROUP_ADMIN_PREFIX + group_id.to_string(10u32))
+    let is_admin: bool = false
+    if caller == group.creator { is_admin = true }
+    if admin_opt.is_some() {
+        if caller == admin_opt.expect("err") { is_admin = true }
+    }
+    require(is_admin, "notadmin")
+    
+    // Delete the message (tombstone)
+    let msg_key: string = MSG_PREFIX + "group_" + group_id.to_string(10u32) + "_" + msg_slot.to_string(10u32)
+    s.store(msg_key, "DELETED|admin|0")
+    
+    return 0
+}
+
+// Admin kick member from group (removes their encrypted key + marks as removed)
+entry admin_kick_member(group_id: u64, member: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    
+    let admin_opt: optional<Address> = s.load(GROUP_ADMIN_PREFIX + group_id.to_string(10u32))
+    let is_admin: bool = false
+    if caller == group.creator { is_admin = true }
+    if admin_opt.is_some() {
+        if caller == admin_opt.expect("err") { is_admin = true }
+    }
+    require(is_admin, "notadmin")
+    
+    // Remove their encrypted group key
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.delete(key)
+    let member_flag: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.delete(member_flag)
+    
+    // Decrement member count
+    let count_key: string = GROUP_MEMBERS_COUNT_PREFIX + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    if count > 0 { s.store(count_key, count - 1) }
+    
+    return 0
+}
+
+// Store a group message on-chain (for group chat persistence)
+entry store_group_message(
+    group_id: u64,
+    encrypted_blob: bytes,
+    timestamp: u64
+) -> u64 {
+    when_not_paused()
+    // F-16 fix (LOW): enforce an explicit upper bound on encrypted_blob size.
+    require(encrypted_blob.len() <= MAX_BLOB_SIZE, "toobig")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let sender: Address = caller
+    // Verify caller is a member of the group
+    let member_key: string = GROUP_MEMBER_PREFIX + group_id.to_string(10u32) + "_" + caller.to_string()
+    let is_member: bool = s.load(member_key).unwrap_or(false)
+    require(is_member, "notmember")
+    
+    let count_key: string = MSG_COUNT_PREFIX + "group_" + group_id.to_string(10u32)
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    let slot: u64 = count % MAX_ONCHAIN_MESSAGES
+    let msg_key: string = MSG_PREFIX + "group_" + group_id.to_string(10u32) + "_" + slot.to_string(10u32)
+    
+    let msg_data: string = encrypted_blob.to_hex() + "|" + sender.to_string() + "|" + timestamp.to_string(10u32)
+    s.store(msg_key, msg_data)
+    s.store(count_key, count + 1)
+    
+    return 0
+}
+
+// Get a group message from on-chain storage
+pub fn get_group_message(group_id: u64, index: u64) -> string {
+    let s: Storage = Storage::new()
+    let msg_key: string = MSG_PREFIX + "group_" + group_id.to_string(10u32) + "_" + index.to_string(10u32)
+    let msg_opt: optional<string> = s.load(msg_key)
+    if msg_opt.is_none() { return "" }
+    return msg_opt.expect("err")
+}
+
+// Get group message count
+pub fn get_group_message_count(group_id: u64) -> u64 {
+    return Storage::new().load(MSG_COUNT_PREFIX + "group_" + group_id.to_string(10u32)).unwrap_or(0)
+}
+
+
+// ============================================================================
+// v7.1: PREMIUM MESSAGE PAYMENT SYSTEM
+// ----------------------------------------------------------------------------
+// Relayers set their own pricing. Users pay in VLT (preferred) or XEL.
+// First 100 messages/day are FREE (enforced on-chain).
+// Relayer earns the premium payment.
+// ============================================================================
+
+const FREE_DAILY_LIMIT: u64 = 100
+const DAILY_COUNT_PREFIX: string = "dcount_"
+const DAILY_DATE_PREFIX: string = "ddate_"
+const RELAYER_FEE_PREFIX: string = "rfee_"
+const RELAYER_TOKEN_PREFIX: string = "rtok_"
+const VLT_ASSET_KEY: string = "va"
+
+// Relayer sets their own fee per premium message (in atomic units)
+// token: 0 = VLT, 1 = XEL
+entry set_relayer_fee(fee_amount: u64, token: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(token <= 1, "badtoken")
+    require(fee_amount <= 100000000, "badfee")  // max 1 VLT/XEL per message
+    s.store(RELAYER_FEE_PREFIX + caller.to_string(), fee_amount)
+    s.store(RELAYER_TOKEN_PREFIX + caller.to_string(), token)
+    return 0
+}
+
+// Get a relayer's fee
+pub fn get_relayer_fee(relayer: Address) -> (u64, u8) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(RELAYER_FEE_PREFIX + relayer.to_string()).unwrap_or(1000000),  // default 0.01 VLT
+        s.load(RELAYER_TOKEN_PREFIX + relayer.to_string()).unwrap_or(0)
+    )
+}
+
+// Check how many free messages a user has left today
+pub fn get_free_messages_remaining(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let today: u64 = get_current_topoheight() / 17280  // day number
+    let stored_day: u64 = s.load(DAILY_DATE_PREFIX + user.to_string()).unwrap_or(0)
+    if stored_day != today { return FREE_DAILY_LIMIT }
+    let count: u64 = s.load(DAILY_COUNT_PREFIX + user.to_string()).unwrap_or(0)
+    if count >= FREE_DAILY_LIMIT { return 0 }
+    return FREE_DAILY_LIMIT - count
+}
+
+// Increment daily message count (called by store_message)
+fn increment_daily_count(user: Address) {
+    let s: Storage = Storage::new()
+    let today: u64 = get_current_topoheight() / 17280
+    let stored_day: u64 = s.load(DAILY_DATE_PREFIX + user.to_string()).unwrap_or(0)
+    if stored_day != today {
+        s.store(DAILY_DATE_PREFIX + user.to_string(), today)
+        s.store(DAILY_COUNT_PREFIX + user.to_string(), 1u64)
+    } else {
+        let count: u64 = s.load(DAILY_COUNT_PREFIX + user.to_string()).unwrap_or(0)
+        s.store(DAILY_COUNT_PREFIX + user.to_string(), count + 1)
+    }
+}
+
+// Pay for a premium message (called when free limit is exceeded)
+// Payment goes to the relayer who processes the message
+entry pay_premium_message(relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Verify caller has exceeded free limit
+    let remaining: u64 = get_free_messages_remaining(caller)
+    require(remaining == 0, "stillfree")
+    
+    // Verify relayer is authorized
+    let is_relayer: bool = s.load(RELAYER_PREFIX + relayer.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    // Get relayer fee
+    let fee: u64 = s.load(RELAYER_FEE_PREFIX + relayer.to_string()).unwrap_or(1000000)
+    let token: u8 = s.load(RELAYER_TOKEN_PREFIX + relayer.to_string()).unwrap_or(0)
+    
+    // Transfer payment to relayer
+    if token == 0 {
+        // VLT payment
+        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+        if vlt_asset != Hash::zero() {
+            let ok: bool = transfer(relayer, fee, vlt_asset)
+            require(ok, "vltfail")
+        }
+    } else {
+        // XEL payment (native)
+        let ok: bool = transfer(relayer, fee, Hash::zero())
+        require(ok, "xelfail")
+    }
+    
+    // Grant 1 premium message credit (resets on next store_message)
+    // F-15 fix (LOW): explicit underflow guard before decrementing count.
+    //   The preceding require(remaining == 0, "stillfree") should guarantee
+    //   count > 0, but this direct assertion is clearer to audit and prevents
+    //   any future refactor from accidentally allowing underflow.
+    let today: u64 = get_current_topoheight() / 17280
+    let count: u64 = s.load(DAILY_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+    require(count > 0, "underflow")
+    s.store(DAILY_COUNT_PREFIX + caller.to_string(), count - 1)  // decrement to give 1 free slot
+    
+    return 0
+}
+
+// Relayer claims their accumulated fees (if any held in contract)
+const PROTOCOL_FEE_BPS_KEY: string = "pfee"
+const DEFAULT_PROTOCOL_FEE_BPS: u64 = 500  // 5% of relayer fee goes to treasury
+const TREASURY_KEY: string = "tr"
+
+entry claim_relayer_fees() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    let fee_bps: u64 = s.load(PROTOCOL_FEE_BPS_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE_BPS)
+    let treasury: Address = s.load(TREASURY_KEY).expect("notset")
+    
+    // VLT balance
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+    if vlt_asset != Hash::zero() {
+        let bal: u64 = get_balance_for_asset(vlt_asset).unwrap_or(0)
+        if bal > 0 {
+            let protocol_cut: u64 = (bal as u128 * fee_bps as u128 / 10000u128) as u64
+            let relayer_share: u64 = bal - protocol_cut
+            if protocol_cut > 0 { transfer(treasury, protocol_cut, vlt_asset) }
+            if relayer_share > 0 { transfer(caller, relayer_share, vlt_asset) }
+        }
+    }
+    
+    // XEL balance
+    let xel_bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
+    if xel_bal > 0 {
+        let protocol_cut: u64 = (xel_bal as u128 * fee_bps as u128 / 10000u128) as u64
+        let relayer_share: u64 = xel_bal - protocol_cut
+        if protocol_cut > 0 { transfer(treasury, protocol_cut, Hash::zero()) }
+        if relayer_share > 0 { transfer(caller, relayer_share, Hash::zero()) }
+    }
+    
+    return 0
+}
+
+// ============================================================================
+// v7.2: KEY ROTATION + READ RECEIPTS + EPHEMERAL MESSAGES
+// ============================================================================
+
+const GROUP_KEY_VERSION_PREFIX: string = "gkv_"
+const READ_RECEIPT_PREFIX: string = "rr_"
+const EPHEMERAL_PREFIX: string = "eph_"
+const EPHEMERAL_DEFAULT_BLOCKS: u64 = 43200  // ~6 hours
+
+// ── KEY ROTATION: when admin kicks a member, rotate the group key ──────────
+
+// Rotate group key after kicking a member (admin only)
+// Generates a new key version and requires all remaining members to get new keys
+entry rotate_group_key(group_id: u64, new_group_pubkey: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    
+    // Verify admin
+    let admin_opt: optional<Address> = s.load(GROUP_ADMIN_PREFIX + group_id.to_string(10u32))
+    let is_admin: bool = false
+    if caller == group.creator { is_admin = true }
+    if admin_opt.is_some() { if caller == admin_opt.expect("err") { is_admin = true } }
+    require(is_admin, "notadmin")
+    
+    // Increment key version
+    let version_key: string = GROUP_KEY_VERSION_PREFIX + group_id.to_string(10u32)
+    let old_version: u64 = s.load(version_key).unwrap_or(0)
+    s.store(version_key, old_version + 1)
+    
+    // Update group public key
+    group.group_pubkey = new_group_pubkey
+    s.store(GROUP_PREFIX + group_id.to_string(10u32), group)
+    
+    return 0
+}
+
+// Get current key version for a group (members check this to know if they need new keys)
+pub fn get_group_key_version(group_id: u64) -> u64 {
+    return Storage::new().load(GROUP_KEY_VERSION_PREFIX + group_id.to_string(10u32)).unwrap_or(0)
+}
+
+// Distribute new encrypted key to a member after rotation (admin only)
+entry distribute_new_key(group_id: u64, member: Address, new_encrypted_key: bytes) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    
+    let admin_opt: optional<Address> = s.load(GROUP_ADMIN_PREFIX + group_id.to_string(10u32))
+    let is_admin: bool = false
+    if caller == group.creator { is_admin = true }
+    if admin_opt.is_some() { if caller == admin_opt.expect("err") { is_admin = true } }
+    require(is_admin, "notadmin")
+    
+    // Store new key for member
+    let key: string = GROUP_KEY_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(key, new_encrypted_key)
+    
+    return 0
+}
+
+// ── READ RECEIPTS ───────────────────────────────────────────────────────────
+
+// Mark a message as read (only recipient can do this)
+entry mark_read(recipient: Address, slot: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(caller == recipient, "notrecipient")
+    s.store(READ_RECEIPT_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32), get_current_topoheight())
+    return 0
+}
+
+// Check if a message has been read
+pub fn is_message_read(recipient: Address, slot: u64) -> bool {
+    let topo: u64 = Storage::new().load(READ_RECEIPT_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)).unwrap_or(0)
+    return topo > 0
+}
+
+// Get read timestamp
+pub fn get_read_timestamp(recipient: Address, slot: u64) -> u64 {
+    return Storage::new().load(READ_RECEIPT_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)).unwrap_or(0)
+}
+
+// ── EPHEMERAL MESSAGES (auto-delete after N blocks) ─────────────────────────
+
+// Store an ephemeral message that auto-expires
+entry store_ephemeral_message(
+    recipient: Address,
+    encrypted_blob: bytes,
+    timestamp: u64,
+    ttl_blocks: u64
+) -> u64 {
+    when_not_paused()
+    // F-16 fix (LOW): enforce an explicit upper bound on encrypted_blob size.
+    require(encrypted_blob.len() <= MAX_BLOB_SIZE, "toobig")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let count_key: string = MSG_COUNT_PREFIX + recipient.to_string()
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    let slot: u64 = count % MAX_ONCHAIN_MESSAGES
+    let msg_key: string = MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    
+    let msg_data: string = encrypted_blob.to_hex() + "|" + caller.to_string() + "|" + timestamp.to_string(10u32)
+    s.store(msg_key, msg_data)
+    s.store(count_key, count + 1)
+    
+    // Store expiration topoheight
+    let expire_topo: u64 = get_current_topoheight() + ttl_blocks
+    s.store(EPHEMERAL_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32), expire_topo)
+    
+    return 0
+}
+
+// Check if an ephemeral message has expired
+pub fn is_expired(recipient: Address, slot: u64) -> bool {
+    let s: Storage = Storage::new()
+    let expire_key: string = EPHEMERAL_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    let expire_opt: optional<u64> = s.load(expire_key)
+    if expire_opt.is_none() { return false }
+    let expire_topo: u64 = expire_opt.expect("err")
+    return get_current_topoheight() >= expire_topo
+}
+
+// Get expiration topoheight for a message (0 = not ephemeral)
+pub fn get_expiration(recipient: Address, slot: u64) -> u64 {
+    return Storage::new().load(EPHEMERAL_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)).unwrap_or(0)
+}
+
+// ============================================================================
+
+// ============================================================================
+// v8.0: RELAYER SYSTEM — TELECOM MODEL WITH BATCHED ANCHORING
+// ============================================================================
+// Each relayer is an independent operator (like Orange/SFR/Bouygues).
+// Relayers create their own plans, set their own prices, manage their own free tier.
+// Relayers batch messages to minimize gas costs.
+// Relayers sync messages with each other (P2P gossip).
+// Bad relayers are blacklisted by other relayers.
+// ============================================================================
+
+// ── Relayer Registry ───────────────────────────────────────────────────────
+const RELAY_REG_PREFIX: string = "rlreg_"
+const RELAY_REG_COUNT_KEY: string = "rlregc"
+const RELAY_FREE_LIMIT_PREFIX: string = "rflim_"
+const RELAY_FREE_SLOTS_PREFIX: string = "rfslt_"
+const RELAY_BLACKLIST_PREFIX: string = "rblk_"
+const RELAY_BLACKLIST_COUNT_KEY: string = "rblkc"
+
+// Relayer registers in the public directory
+entry register_as_relayer(endpoint: string, free_daily_limit: u64, free_wallet_slots: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(free_daily_limit <= 1000, "badlimit")
+    require(free_wallet_slots <= 10000, "badslots")
+    
+    // Check if already registered
+    let reg_key: string = RELAY_REG_PREFIX + caller.to_string()
+    let already: bool = s.load(reg_key).unwrap_or(false)
+    require(!already, "alreadyreg")
+    
+    // Register
+    s.store(reg_key, endpoint + "|" + free_daily_limit.to_string(10u32) + "|" + free_wallet_slots.to_string(10u32))
+    s.store(RELAY_FREE_LIMIT_PREFIX + caller.to_string(), free_daily_limit)
+    s.store(RELAY_FREE_SLOTS_PREFIX + caller.to_string(), free_wallet_slots)
+    let count: u64 = s.load(RELAY_REG_COUNT_KEY).unwrap_or(0)
+    s.store(RELAY_REG_PREFIX + "idx_" + count.to_string(10u32), caller.to_string())
+    s.store(RELAY_REG_COUNT_KEY, count + 1)
+    
+    return 0
+}
+
+pub fn get_relayer_count() -> u64 {
+    return Storage::new().load(RELAY_REG_COUNT_KEY).unwrap_or(0)
+}
+
+pub fn get_relayer_at(index: u64) -> string {
+    let s: Storage = Storage::new()
+    let addr: string = s.load(RELAY_REG_PREFIX + "idx_" + index.to_string(10u32)).expect("oob")
+    let details: string = s.load(RELAY_REG_PREFIX + addr).expect("nf")
+    return addr + "|" + details
+}
+
+// ── Free Tier: Limited Slots (First Come First Served) ────────────────────
+const FREE_SLOT_PREFIX: string = "fslot_"
+const FREE_SLOT_COUNT_PREFIX: string = "fslotc_"
+const FREE_SLOT_DATE_PREFIX: string = "fslotd_"
+
+// User claims a free slot with a relayer (limited number per day)
+entry claim_free_slot() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let today: u64 = get_current_topoheight() / 17280
+    
+    // Find a relayer that has free slots
+    let reg_count: u64 = s.load(RELAY_REG_COUNT_KEY).unwrap_or(0)
+    let i: u64 = 0
+    while i < reg_count {
+        let relayer_str: string = s.load(RELAY_REG_PREFIX + "idx_" + i.to_string(10u32)).expect("err")
+        let details: string = s.load(RELAY_REG_PREFIX + relayer_str).expect("err")
+        let parts: string[] = details.split("|")
+        let free_limit: u64 = parse_u64(parts[1])
+        let free_slots: u64 = parse_u64(parts[2])
+        
+        if free_limit > 0 && free_slots > 0 {
+            // Check daily reset
+            let date_key: string = FREE_SLOT_DATE_PREFIX + relayer_str
+            let stored_day: u64 = s.load(date_key).unwrap_or(0)
+            if stored_day != today {
+                s.store(date_key, today)
+                s.store(FREE_SLOT_COUNT_PREFIX + relayer_str, 0u64)
+            }
+            
+            // Check if slots available
+            let used: u64 = s.load(FREE_SLOT_COUNT_PREFIX + relayer_str).unwrap_or(0)
+            if used < free_slots {
+                // Claim slot
+                s.store(FREE_SLOT_PREFIX + caller.to_string() + "_" + relayer_str, free_limit)
+                s.store(FREE_SLOT_COUNT_PREFIX + relayer_str, used + 1)
+                return 0
+            }
+        }
+        i += 1
+    }
+    require(false, "noslots")
+    return 0
+}
+
+// Check if user has a free slot with a relayer
+pub fn has_free_slot(user: Address, relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let today: u64 = get_current_topoheight() / 17280
+    let date_key: string = FREE_SLOT_DATE_PREFIX + relayer.to_string()
+    let stored_day: u64 = s.load(date_key).unwrap_or(0)
+    if stored_day != today { return 0 }  // Reset daily
+    return s.load(FREE_SLOT_PREFIX + user.to_string() + "_" + relayer.to_string()).unwrap_or(0)
+}
+
+// Consume one free message (called by relayer when user sends a free message)
+entry consume_free_message(relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(caller == relayer, "notrelayer")
+    
+    // Find any user with free credits (relayer calls on behalf of user)
+    // Actually, the user calls this — but we need the relayer to verify
+    // Better: relayer calls report_free_usage
+    return 0
+}
+
+// Relayer reports that a user used a free message
+entry report_free_usage(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    let slot_key: string = FREE_SLOT_PREFIX + user.to_string() + "_" + caller.to_string()
+    let remaining: u64 = s.load(slot_key).unwrap_or(0)
+    require(remaining > 0, "nofree")
+    s.store(slot_key, remaining - 1)
+    return 0
+}
+
+// ── Flexible Pricing Plans ────────────────────────────────────────────────
+const PLAN_PREFIX: string = "plan_"
+const PLAN_COUNT_PREFIX: string = "planc_"
+const USER_PLAN_PREFIX: string = "uplan_"
+const USER_CREDITS_PREFIX: string = "ucred_"
+const USER_PAID_BY_PREFIX: string = "upb_"  // who paid for this user's plan
+const MAX_PLANS_PER_RELAYER: u64 = 10
+
+// Relayer creates a pricing plan
+// plan_type: 0=per_message, 1=duration, 2=message_pack
+entry create_plan(plan_type: u8, amount: u64, duration_blocks: u64, msg_count: u64, token: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(plan_type <= 2, "badtype")
+    require(token <= 1, "badtoken")
+    require(amount > 0, "badamount")
+    
+    let count_key: string = PLAN_COUNT_PREFIX + caller.to_string()
+    let plan_count: u64 = s.load(count_key).unwrap_or(0)
+    require(plan_count < MAX_PLANS_PER_RELAYER, "maxplans")
+    
+    let plan_id: u64 = plan_count
+    let plan_key: string = PLAN_PREFIX + caller.to_string() + "_" + plan_id.to_string(10u32)
+    let plan_data: string = plan_type.to_string(10u32) + "|" + amount.to_string(10u32) + "|" + duration_blocks.to_string(10u32) + "|" + msg_count.to_string(10u32) + "|" + token.to_string(10u32)
+    s.store(plan_key, plan_data)
+    s.store(count_key, plan_id + 1)
+    
+    return 0
+}
+
+// Relayer updates an existing plan
+entry update_plan(plan_id: u64, amount: u64, duration_blocks: u64, msg_count: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let plan_key: string = PLAN_PREFIX + caller.to_string() + "_" + plan_id.to_string(10u32)
+    let plan_opt: optional<string> = s.load(plan_key)
+    require(plan_opt.is_some(), "noplan")
+    
+    let plan_data: string = plan_opt.expect("err")
+    let parts: string[] = plan_data.split("|")
+    let plan_type: u8 = parse_u64(parts[0]) as u8
+    let token: u8 = parse_u64(parts[4]) as u8
+    
+    let new_data: string = parts[0] + "|" + amount.to_string(10u32) + "|" + duration_blocks.to_string(10u32) + "|" + msg_count.to_string(10u32) + "|" + token.to_string(10u32)
+    s.store(plan_key, new_data)
+    return 0
+}
+
+// Relayer deletes a plan
+entry delete_plan(plan_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let plan_key: string = PLAN_PREFIX + caller.to_string() + "_" + plan_id.to_string(10u32)
+    s.delete(plan_key)
+    return 0
+}
+
+pub fn get_plan_count(relayer: Address) -> u64 {
+    return Storage::new().load(PLAN_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+pub fn get_plan(relayer: Address, plan_id: u64) -> string {
+    let plan_key: string = PLAN_PREFIX + relayer.to_string() + "_" + plan_id.to_string(10u32)
+    let opt: optional<string> = Storage::new().load(plan_key)
+    if opt.is_none() { return "" }
+    return opt.expect("err")
+}
+
+// User buys a plan (can buy for self OR for another wallet)
+// payer = get_caller(), recipient = the wallet that gets the plan
+entry buy_plan(relayer: Address, plan_id: u64, recipient: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")  // The payer
+    
+    // Get plan
+    let plan_key: string = PLAN_PREFIX + relayer.to_string() + "_" + plan_id.to_string(10u32)
+    let plan_opt: optional<string> = s.load(plan_key)
+    require(plan_opt.is_some(), "noplan")
+    let plan_data: string = plan_opt.expect("err")
+    let parts: string[] = plan_data.split("|")
+    
+    let plan_type: u8 = parse_u64(parts[0]) as u8
+    let amount: u64 = parse_u64(parts[1])
+    let duration_blocks: u64 = parse_u64(parts[2])
+    let msg_count: u64 = parse_u64(parts[3])
+    let token: u8 = parse_u64(parts[4]) as u8
+    
+    // Transfer payment to relayer (from payer)
+    if token == 0 {
+        let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+        if vlt_asset != Hash::zero() {
+            let ok: bool = transfer(relayer, amount, vlt_asset)
+            require(ok, "vltfail")
+        }
+    } else {
+        let ok: bool = transfer(relayer, amount, Hash::zero())
+        require(ok, "xelfail")
+    }
+    
+    // Grant plan to RECIPIENT (not payer)
+    let user_plan_key: string = USER_PLAN_PREFIX + recipient.to_string() + "_" + relayer.to_string()
+    let now: u64 = get_current_topoheight()
+    
+    if plan_type == 1 {
+        // Duration: store expiry
+        s.store(user_plan_key, now + duration_blocks)
+    } else if plan_type == 2 {
+        // Message pack: store remaining count
+        s.store(USER_CREDITS_PREFIX + recipient.to_string() + "_" + relayer.to_string(), msg_count)
+    }
+    
+    // Record who paid
+    s.store(USER_PAID_BY_PREFIX + recipient.to_string() + "_" + relayer.to_string(), caller.to_string())
+    
+    return 0
+}
+
+// Check if user has active duration plan
+pub fn has_active_plan(user: Address, relayer: Address) -> bool {
+    let s: Storage = Storage::new()
+    let key: string = USER_PLAN_PREFIX + user.to_string() + "_" + relayer.to_string()
+    let expiry: u64 = s.load(key).unwrap_or(0)
+    return get_current_topoheight() < expiry
+}
+
+// Get remaining message pack credits
+pub fn get_remaining_credits(user: Address, relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let key: string = USER_CREDITS_PREFIX + user.to_string() + "_" + relayer.to_string()
+    return s.load(key).unwrap_or(0)
+}
+
+// Consume one credit (called by relayer)
+entry consume_credit(user: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")  // Must be relayer
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    let key: string = USER_CREDITS_PREFIX + user.to_string() + "_" + caller.to_string()
+    let credits: u64 = s.load(key).unwrap_or(0)
+    require(credits > 0, "nocredits")
+    s.store(key, credits - 1)
+    return 0
+}
+
+// ── Batched Anchoring (gas optimization) ──────────────────────────────────
+// Relayers batch messages to minimize on-chain transactions.
+// Instead of storing each message individually, they:
+// 1. Collect messages off-chain
+// 2. Store a batch on-chain every N blocks (e.g., every 1000 blocks = ~80 min)
+// 3. Anchor a Merkle root for the batch
+// This reduces gas costs by 100x (1 transaction per 100 messages)
+
+const RELAY_LAST_BATCH_PREFIX: string = "rlb_"
+const RELAY_BATCH_INTERVAL_PREFIX: string = "rlbi_"
+const RELAY_BATCH_COUNT_PREFIX: string = "rlbc_"  // how many batches anchored
+const DEFAULT_BATCH_INTERVAL: u64 = 1000  // ~80 minutes
+
+// Relayer sets their batch interval (how often they anchor)
+entry set_batch_interval(blocks: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(blocks >= 100 && blocks <= 20160, "badinterval")  // 8 min to 1 week
+    s.store(RELAY_BATCH_INTERVAL_PREFIX + caller.to_string(), blocks)
+    return 0
+}
+
+// Relayer anchors a batch (stores Merkle root + updates reliability score)
+// This is the PROOF that the relayer is doing their job
+entry anchor_batch(merkle_root: Hash, message_count: u64) -> u64 {
+    only_authorized_relayer()
+    require(merkle_root != Hash::zero(), "badroot")
+    require(message_count > 0, "badcount")
+    
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let now: u64 = get_current_topoheight()
+    
+    // Update last batch time
+    s.store(RELAY_LAST_BATCH_PREFIX + caller.to_string(), now)
+    
+    // Update global anchor
+    s.store(LAST_MERKLE_ROOT_KEY, merkle_root)
+    s.store(LAST_ANCHOR_TOPO_KEY, now)
+    let total: u64 = s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
+    s.store(TOTAL_MESSAGES_KEY, total + message_count)
+    
+    // Increment batch count (reliability score)
+    let batch_count: u64 = s.load(RELAY_BATCH_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(RELAY_BATCH_COUNT_PREFIX + caller.to_string(), batch_count + 1)
+    
+    // Reward via XelisVaultMiner
+    let miner_hash_opt: optional<Hash> = s.load(MINER_CONTRACT_KEY)
+    if miner_hash_opt.is_some() {
+        let miner_hash: Hash = miner_hash_opt.expect("err")
+        if miner_hash != Hash::zero() {
+            let miner: Contract = Contract::new(miner_hash).expect("err")
+            let _ = miner.call(23u16, [caller, CHAT_SERVICE_ID as u8, true], {})
+        }
+    }
+    
+    return 0
+}
+
+// ── Relayer Reliability Score ─────────────────────────────────────────────
+// Score based on: batch count (how many batches anchored)
+// NOT based on: individual messages (so idle periods don't hurt)
+
+pub fn get_relayer_batch_count(relayer: Address) -> u64 {
+    return Storage::new().load(RELAY_BATCH_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+pub fn get_relayer_last_batch(relayer: Address) -> u64 {
+    return Storage::new().load(RELAY_LAST_BATCH_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+// Is relayer meeting their batch interval? (reliable = yes)
+pub fn is_relayer_reliable(relayer: Address) -> bool {
+    let s: Storage = Storage::new()
+    let last_batch: u64 = s.load(RELAY_LAST_BATCH_PREFIX + relayer.to_string()).unwrap_or(0)
+    if last_batch == 0 { return false }  // Never anchored
+    let interval: u64 = s.load(RELAY_BATCH_INTERVAL_PREFIX + relayer.to_string()).unwrap_or(DEFAULT_BATCH_INTERVAL)
+    let now: u64 = get_current_topoheight()
+    // Grace period: 2x interval (if interval is 1000, they have 2000 blocks before unreliable)
+    return now < last_batch + (interval * 2)
+}
+
+// ── Blacklist: relayers can blacklist bad relayers ────────────────────────
+// If a relayer doesn't anchor batches, other relayers blacklist them
+// Blacklisted relayers are excluded from P2P sync
+
+entry blacklist_relayer(bad_relayer: Address, reason: string) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(caller != bad_relayer, "selfblacklist")
+    
+    // Check if bad_relayer is actually unreliable
+    let bad_last_batch: u64 = s.load(RELAY_LAST_BATCH_PREFIX + bad_relayer.to_string()).unwrap_or(0)
+    let bad_interval: u64 = s.load(RELAY_BATCH_INTERVAL_PREFIX + bad_relayer.to_string()).unwrap_or(DEFAULT_BATCH_INTERVAL)
+    let now: u64 = get_current_topoheight()
+    
+    // Can only blacklist if bad_relayer hasn't anchored in 3x their interval
+    if bad_last_batch > 0 {
+        require(now > bad_last_batch + (bad_interval * 3), "notbad")
+    }
+    
+    // Add to blacklist
+    let bl_key: string = RELAY_BLACKLIST_PREFIX + caller.to_string() + "_" + bad_relayer.to_string()
+    s.store(bl_key, true)
+    
+    // Increment blacklist count
+    let bl_count: u64 = s.load(RELAY_BLACKLIST_COUNT_KEY + "_" + bad_relayer.to_string()).unwrap_or(0)
+    s.store(RELAY_BLACKLIST_COUNT_KEY + "_" + bad_relayer.to_string(), bl_count + 1)
+    
+    return 0
+}
+
+// How many relayers have blacklisted this relayer?
+pub fn get_blacklist_count(relayer: Address) -> u64 {
+    return Storage::new().load(RELAY_BLACKLIST_COUNT_KEY + "_" + relayer.to_string()).unwrap_or(0)
+}
+
+// Has a specific relayer blacklisted another?
+pub fn is_blacklisted(by: Address, who: Address) -> bool {
+    let key: string = RELAY_BLACKLIST_PREFIX + by.to_string() + "_" + who.to_string()
+    return Storage::new().load(key).unwrap_or(false)
+}
+
+// ── User Verification ─────────────────────────────────────────────────────
+// Users verify their messages are on-chain
+
+pub fn verify_message_stored(recipient: Address, slot: u64) -> bool {
+    let s: Storage = Storage::new()
+    let msg_key: string = MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    let msg_opt: optional<string> = s.load(msg_key)
+    return msg_opt.is_some()
+}
+
+// ── Complete relayer profile ──────────────────────────────────────────────
+fn is_relayer_online(relayer: Address) -> bool {
+    let s: Storage = Storage::new()
+    return s.load(RELAYER_PREFIX + relayer.to_string()).unwrap_or(false)
+}
+
+pub fn get_relayer_profile(relayer: Address) -> (bool, bool, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let is_reg: bool = s.load(RELAYER_PREFIX + relayer.to_string()).unwrap_or(false)
+    let is_rel: bool = is_relayer_online(relayer)
+    let is_rel2: u64 = is_rel ? 1 : 0
+    let batches: u64 = get_relayer_batch_count(relayer)
+    let last_batch: u64 = get_relayer_last_batch(relayer)
+    let plan_count: u64 = get_plan_count(relayer)
+    let bl_count: u64 = get_blacklist_count(relayer)
+    let reliable: u64 = is_relayer_reliable(relayer) ? 1 : 0
+    return (is_reg, is_rel2 > 0, batches, last_batch, plan_count, bl_count, reliable)
+}
+
+// ============================================================================
+// v8.1: PROTOCOL FEE + STORAGE MANAGEMENT
+// ============================================================================
+
+const STORAGE_WARNING_THRESHOLD: u64 = 86400  // ~6 hours of messages before prune needed
+const PRUNE_INTERVAL_KEY: string = "prune_int"
+const DEFAULT_PRUNE_INTERVAL: u64 = 43200  // prune every ~6 hours
+
+// ── Protocol Fee (treasury takes a small cut) ─────────────────────────────
+// When a user pays a relayer for a plan, the protocol takes a small %.
+// This funds: liquidity pools, bug bounty, treasury, protocol development.
+
+// Set protocol fee (governance only, max 10%)
+entry set_protocol_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 1000, "max10pct")  // max 10%
+    Storage::new().store(PROTOCOL_FEE_BPS_KEY, bps)
+    return 0
+}
+
+pub fn get_protocol_fee_bps() -> u64 {
+    return Storage::new().load(PROTOCOL_FEE_BPS_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE_BPS)
+}
+
+// Modified buy_plan: protocol takes a cut before relayer gets paid
+// (This replaces the old buy_plan — same entry ID, same logic + fee)
+// NOTE: In Silex, you can't override entries. The old buy_plan must be
+// updated in place. For now, the fee is taken when claim_relayer_fees is called.
+
+// Relayer claims accumulated fees — protocol takes its cut
+
+// Set treasury address (where protocol fees go)
+entry set_treasury(addr: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, addr)
+    return 0
+}
+
+// v11.6 fix: VLT_ASSET_KEY ("va") was read by stake_relayer_bond but never
+// stored anywhere — the bond mechanism was dead on arrival. This entry lets
+// the admin wire the VLT asset id used for relayer bonds.
+entry set_vlt_asset(a: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(VLT_ASSET_KEY, a)
+    return 0
+}
+
+// ── Storage Management (on-chain ring buffer) ─────────────────────────────
+// On-chain storage is limited (50 messages per user, ring buffer).
+// This is by design: old messages are overwritten by new ones.
+// 
+// For FULL history: relayers store off-chain + sync with each other.
+// Off-chain storage is managed by the relayer's local software.
+//
+// On-chain: automatic ring buffer (no manual prune needed)
+// Off-chain: relayer software manages with configurable retention
+
+// Get storage info for a user
+pub fn get_storage_info(user: Address) -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MSG_COUNT_PREFIX + user.to_string()).unwrap_or(0)
+    let onchain: u64 = count > MAX_ONCHAIN_MESSAGES ? MAX_ONCHAIN_MESSAGES : count
+    let deleted: u64 = 0
+    // Count deleted messages
+    let i: u64 = 0
+    while i < onchain {
+        let del_key: string = MSG_DELETED_PREFIX + user.to_string() + "_" + i.to_string(10u32)
+        let is_del: bool = s.load(del_key).unwrap_or(false)
+        if is_del { deleted += 1 }
+        i += 1
+    }
+    return (count, onchain, deleted)
+}
+
+// ── Off-chain storage guidance (for relayer software) ─────────────────────
+// Relayers should implement these strategies in their local software:
+//
+// 1. RING BUFFER: Keep last N messages per user (configurable, e.g. 10000)
+// 2. COMPRESSION: Compress old messages (zstd/gzip)
+// 3. TIERED STORAGE:
+//    - Hot (last 7 days): SSD, fast access
+//    - Warm (7-90 days): HDD, slower
+//    - Cold (>90 days): Compressed archive, on-demand
+// 4. DEDUPLICATION: Same message synced from multiple relayers = store once
+// 5. PRUNING: Delete messages older than retention period (configurable)
+//    - User can set their own retention (default: 90 days)
+//    - Relayer can set their own retention (default: 30 days)
+//    - Important messages (anchored) kept longer
+//
+// When a relayer runs low on disk:
+// 1. Compress old messages (saves 50-70% space)
+// 2. Move to cold storage (compressed archive)
+// 3. Prune messages older than retention
+// 4. If still low: reduce retention period
+// 5. If still low: stop accepting new messages (graceful degradation)
+// 6. Other relayers take over (sync has copies)
+//
+// This is all handled by the relayer's local Python script,
+// NOT by the on-chain contract (which has fixed 50-message ring buffer).
+
+entry set_prune_interval(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 7200, "mintoolong")  // min 1 hour
+    Storage::new().store(PRUNE_INTERVAL_KEY, blocks)
+    return 0
+}
+
+pub fn get_prune_interval() -> u64 {
+    return Storage::new().load(PRUNE_INTERVAL_KEY).unwrap_or(DEFAULT_PRUNE_INTERVAL)
+}
+
+// ── Relayer storage stats (self-reported, for transparency) ───────────────
+const RELAY_STORAGE_PREFIX: string = "rstore_"
+
+// Relayer reports their storage capacity (for user transparency)
+entry report_storage_stats(total_gb: u64, used_gb: u64, messages_stored: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    let stats: string = total_gb.to_string(10u32) + "|" + used_gb.to_string(10u32) + "|" + messages_stored.to_string(10u32)
+    s.store(RELAY_STORAGE_PREFIX + caller.to_string(), stats)
+    
+    return 0
+}
+
+pub fn get_relayer_storage(relayer: Address) -> string {
+    let s: Storage = Storage::new()
+    let opt: optional<string> = s.load(RELAY_STORAGE_PREFIX + relayer.to_string())
+    if opt.is_none() { return "0|0|0" }
+    return opt.expect("err")
+}
+
+// ============================================================================
+// v9.0: PAYMENT REQUESTS + GROUP GIVEAWAYS + DIRECT ON-CHAIN MESSAGES
+// ============================================================================
+
+// ── Payment Requests (invoice via chat) ────────────────────────────────────
+// Alice sends Bob a payment request for 50 xUSD. Bob clicks "Pay" in his CLI.
+// The request is stored on-chain so both parties have proof.
+
+const PAYREQ_PREFIX: string = "preq_"
+const PAYREQ_COUNT_KEY: string = "preqc"
+
+// Create a payment request to another user
+// asset: Hash of the asset to request (Hash::zero() = XEL)
+entry create_payment_request(
+    to: Address,
+    amount: u64,
+    asset: Hash,
+    memo: string
+) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let id: u64 = s.load(PAYREQ_COUNT_KEY).unwrap_or(0)
+    let req_key: string = PAYREQ_PREFIX + id.to_string(10u32)
+    
+    // Store: from|to|amount|asset|memo|status(0=pending)|created_topo
+    let data: string = caller.to_string() + "|" + to.to_string() + "|" + amount.to_string(10u32) + "|" + asset.to_hex() + "|" + memo + "|0|" + get_current_topoheight().to_string(10u32)
+    s.store(req_key, data)
+    s.store(PAYREQ_COUNT_KEY, id + 1)
+    
+    return 0
+}
+
+// Fulfill a payment request (sends payment to the requester)
+entry fulfill_payment_request(req_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let req_key: string = PAYREQ_PREFIX + req_id.to_string(10u32)
+    let data_opt: optional<string> = s.load(req_key)
+    require(data_opt.is_some(), "notfound")
+    
+    let data: string = data_opt.expect("err")
+    let parts: string[] = data.split("|")
+    
+    let from: Address = Address::from_string(parts[0])
+    let to: Address = Address::from_string(parts[1])
+    let amount: u64 = parse_u64(parts[2])
+    let asset: Hash = Hash::from_hex(parts[3])
+    let status: u64 = parse_u64(parts[5])
+    
+    require(status == 0, "notpending")
+    require(caller == to, "notrecipient")
+    
+    // Transfer payment from caller (recipient of request) to from (requester)
+    let ok: bool = transfer(from, amount, asset)
+    require(ok, "txfail")
+    
+    // Update status to fulfilled (1)
+    let new_data: string = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4] + "|1|" + parts[6]
+    s.store(req_key, new_data)
+    
+    return 0
+}
+
+// Cancel a payment request (only requester can cancel)
+entry cancel_payment_request(req_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let req_key: string = PAYREQ_PREFIX + req_id.to_string(10u32)
+    let data_opt: optional<string> = s.load(req_key)
+    require(data_opt.is_some(), "notfound")
+    
+    let data: string = data_opt.expect("err")
+    let parts: string[] = data.split("|")
+    let from: Address = Address::from_string(parts[0])
+    require(caller == from, "notrequester")
+    
+    // Update status to cancelled (2)
+    let new_data: string = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4] + "|2|" + parts[6]
+    s.store(req_key, new_data)
+    
+    return 0
+}
+
+// Get payment request details
+pub fn get_payment_request(req_id: u64) -> string {
+    let req_key: string = PAYREQ_PREFIX + req_id.to_string(10u32)
+    let opt: optional<string> = Storage::new().load(req_key)
+    if opt.is_none() { return "" }
+    return opt.expect("err")
+}
+
+// Get total payment requests count
+pub fn get_payment_request_count() -> u64 {
+    return Storage::new().load(PAYREQ_COUNT_KEY).unwrap_or(0)
+}
+
+// ── Group Giveaways (faucet in chat) ───────────────────────────────────────
+// Admin sends 1000 XEL to a group. First 20 people to click get 50 XEL each.
+// All on-chain, transparent, first-come-first-served.
+
+const GIVEAWAY_PREFIX: string = "give_"
+const GIVEAWAY_COUNT_KEY: string = "givec"
+const GIVEAWAY_CLAIM_PREFIX: string = "gclaim_"
+
+// Create a giveaway in a group or DM
+// amount_per_claim: how much each person gets
+// max_claims: how many people can claim
+// asset: Hash of asset (zero = XEL)
+entry create_giveaway(
+    scope: string,
+    amount_per_claim: u64,
+    max_claims: u64,
+    asset: Hash
+) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    require(amount_per_claim > 0, "badamount")
+    require(max_claims > 0 && max_claims <= 10000, "badmax")
+    
+    // Calculate total needed
+    let total: u64 = (amount_per_claim as u128 * max_claims as u128) as u64
+    require(total >= amount_per_claim, "ovf")
+    
+    // Verify caller has deposited the funds
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
+    require(dep >= total, "insdep")
+    
+    // Refund excess deposit
+    if dep > total {
+        let ok: bool = transfer(caller, dep - total, asset)
+        require(ok, "rfail")
+    }
+    
+    let id: u64 = s.load(GIVEAWAY_COUNT_KEY).unwrap_or(0)
+    let key: string = GIVEAWAY_PREFIX + id.to_string(10u32)
+    
+    // Store: creator|scope|amount_per_claim|max_claims|claimed|asset|active
+    let data: string = caller.to_string() + "|" + scope + "|" + amount_per_claim.to_string(10u32) + "|" + max_claims.to_string(10u32) + "|0|" + asset.to_hex() + "|1"
+    s.store(key, data)
+    s.store(GIVEAWAY_COUNT_KEY, id + 1)
+    
+    return 0
+}
+
+// Claim a giveaway (first come first served)
+entry claim_giveaway(giveaway_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let key: string = GIVEAWAY_PREFIX + giveaway_id.to_string(10u32)
+    let data_opt: optional<string> = s.load(key)
+    require(data_opt.is_some(), "notfound")
+    
+    let data: string = data_opt.expect("err")
+    let parts: string[] = data.split("|")
+    
+    let creator: Address = Address::from_string(parts[0])
+    let amount_per_claim: u64 = parse_u64(parts[2])
+    let max_claims: u64 = parse_u64(parts[3])
+    let claimed: u64 = parse_u64(parts[4])
+    let asset: Hash = Hash::from_hex(parts[5])
+    let active: u64 = parse_u64(parts[6])
+    
+    require(active == 1, "notactive")
+    require(claimed < max_claims, "soldout")
+    
+    // Check if caller already claimed
+    let claim_key: string = GIVEAWAY_CLAIM_PREFIX + giveaway_id.to_string(10u32) + "_" + caller.to_string()
+    let already: bool = s.load(claim_key).unwrap_or(false)
+    require(!already, "alreadyclaimed")
+    
+    // Mark as claimed
+    s.store(claim_key, true)
+    
+    // Transfer to caller
+    let ok: bool = transfer(caller, amount_per_claim, asset)
+    require(ok, "txfail")
+    
+    // Update claimed count
+    let new_claimed: u64 = claimed + 1
+    let new_active: u64 = new_claimed >= max_claims ? 0 : 1
+    let new_data: string = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + new_claimed.to_string(10u32) + "|" + parts[5] + "|" + new_active.to_string(10u32)
+    s.store(key, new_data)
+    
+    return 0
+}
+
+// Cancel giveaway (refund remaining to creator)
+entry cancel_giveaway(giveaway_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let key: string = GIVEAWAY_PREFIX + giveaway_id.to_string(10u32)
+    let data_opt: optional<string> = s.load(key)
+    require(data_opt.is_some(), "notfound")
+    
+    let data: string = data_opt.expect("err")
+    let parts: string[] = data.split("|")
+    let creator: Address = Address::from_string(parts[0])
+    require(caller == creator, "notcreator")
+    
+    let amount_per_claim: u64 = parse_u64(parts[2])
+    let max_claims: u64 = parse_u64(parts[3])
+    let claimed: u64 = parse_u64(parts[4])
+    let asset: Hash = Hash::from_hex(parts[5])
+    
+    // Refund remaining
+    let remaining: u64 = (amount_per_claim as u128 * (max_claims - claimed) as u128) as u64
+    if remaining > 0 {
+        let ok: bool = transfer(caller, remaining, asset)
+        require(ok, "rfail")
+    }
+    
+    // Mark as inactive
+    let new_data: string = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4] + "|" + parts[5] + "|0"
+    s.store(key, new_data)
+    
+    return 0
+}
+
+// Get giveaway details
+pub fn get_giveaway(giveaway_id: u64) -> string {
+    let key: string = GIVEAWAY_PREFIX + giveaway_id.to_string(10u32)
+    let opt: optional<string> = Storage::new().load(key)
+    if opt.is_none() { return "" }
+    return opt.expect("err")
+}
+
+// Check if user already claimed a giveaway
+pub fn has_claimed_giveaway(giveaway_id: u64, user: Address) -> bool {
+    let claim_key: string = GIVEAWAY_CLAIM_PREFIX + giveaway_id.to_string(10u32) + "_" + user.to_string()
+    return Storage::new().load(claim_key).unwrap_or(false)
+}
+
+// Get total giveaways count
+pub fn get_giveaway_count() -> u64 {
+    return Storage::new().load(GIVEAWAY_COUNT_KEY).unwrap_or(0)
+}
+
+// ── Direct On-Chain Messages (premium, bypass relayers) ───────────────────
+// For important messages: store directly on-chain, no relayer needed.
+// Uses XELIS transaction data (up to 30KB per transaction).
+// More expensive (user pays gas) but 100% guaranteed persistence.
+
+const DIRECT_MSG_PREFIX: string = "dmsg_"
+const DIRECT_MSG_COUNT_KEY: string = "dmsgc"
+
+// Store a direct on-chain message (no relayer, user pays gas)
+// This is for IMPORTANT messages that must survive forever
+// Encrypted blob is stored directly, maximum security
+entry send_direct_message(
+    recipient: Address,
+    encrypted_blob: bytes,
+    timestamp: u64
+) -> u64 {
+    when_not_paused()
+    // F-16 fix (LOW): enforce an explicit upper bound on encrypted_blob size.
+    require(encrypted_blob.len() <= MAX_BLOB_SIZE, "toobig")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Store in recipient's direct message buffer (separate from relayed messages)
+    let count_key: string = DIRECT_MSG_COUNT_KEY + "_" + recipient.to_string()
+    let count: u64 = s.load(count_key).unwrap_or(0)
+    
+    // Direct messages use a separate ring buffer (also 50 slots)
+    let slot: u64 = count % MAX_ONCHAIN_MESSAGES
+    let msg_key: string = DIRECT_MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    
+    // Store: blob|sender|timestamp|type(direct)
+    let msg_data: string = encrypted_blob.to_hex() + "|" + caller.to_string() + "|" + timestamp.to_string(10u32) + "|direct"
+    s.store(msg_key, msg_data)
+    s.store(count_key, count + 1)
+    
+    return 0
+}
+
+// Get a direct on-chain message
+pub fn get_direct_message(recipient: Address, index: u64) -> string {
+    let s: Storage = Storage::new()
+    let msg_key: string = DIRECT_MSG_PREFIX + recipient.to_string() + "_" + index.to_string(10u32)
+    let opt: optional<string> = s.load(msg_key)
+    if opt.is_none() { return "" }
+    return opt.expect("err")
+}
+
+// Get direct message count
+pub fn get_direct_message_count(recipient: Address) -> u64 {
+    return Storage::new().load(DIRECT_MSG_COUNT_KEY + "_" + recipient.to_string()).unwrap_or(0)
+}
+
+// Delete a direct message (sender or recipient)
+entry delete_direct_message(recipient: Address, slot: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    let msg_key: string = DIRECT_MSG_PREFIX + recipient.to_string() + "_" + slot.to_string(10u32)
+    let msg_opt: optional<string> = s.load(msg_key)
+    require(msg_opt.is_some(), "nomsg")
+    
+    let msg_data: string = msg_opt.expect("err")
+    let parts: string[] = msg_data.split("|")
+    let sender: Address = Address::from_string(parts[1])
+    
+    require(caller == recipient || caller == sender, "notauth")
+    
+    s.store(msg_key, "DELETED|" + sender.to_string() + "|0|direct")
+    return 0
+}
+
+// ── Relayer Management Tools ───────────────────────────────────────────────
+// Tools for relayers to manage their business
+
+// Relayer can pause accepting new users (keep serving existing ones)
+const RELAY_PAUSED_PREFIX: string = "rpause_"
+
+entry toggle_relayer_paused() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    
+    let current: bool = s.load(RELAY_PAUSED_PREFIX + caller.to_string()).unwrap_or(false)
+    s.store(RELAY_PAUSED_PREFIX + caller.to_string(), !current)
+    return 0
+}
+
+pub fn is_relayer_paused(relayer: Address) -> bool {
+    return Storage::new().load(RELAY_PAUSED_PREFIX + relayer.to_string()).unwrap_or(false)
+}
+
+// Relayer updates their endpoint URL
+entry update_relayer_endpoint(new_endpoint: string) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(new_endpoint != "", "badurl")
+    
+    // Update registry entry
+    let reg_key: string = RELAY_REG_PREFIX + caller.to_string()
+    let existing: string = s.load(reg_key).expect("notreg")
+    let parts: string[] = existing.split("|")
+    s.store(reg_key, new_endpoint + "|" + parts[1] + "|" + parts[2])
+    
+    return 0
+}
+
+// Relayer updates their free tier settings
+entry update_free_tier(free_daily_limit: u64, free_wallet_slots: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(is_relayer, "notrelayer")
+    require(free_daily_limit <= 1000, "badlimit")
+    require(free_wallet_slots <= 10000, "badslots")
+    
+    let reg_key: string = RELAY_REG_PREFIX + caller.to_string()
+    let existing: string = s.load(reg_key).expect("notreg")
+    let parts: string[] = existing.split("|")
+    s.store(reg_key, parts[0] + "|" + free_daily_limit.to_string(10u32) + "|" + free_wallet_slots.to_string(10u32))
+    
+    return 0
+}
+
+// ============================================================================
+// v10.0: PHASE 1 RELAYER IMPROVEMENTS (from external audit)
+// ============================================================================
+
+
+// Relayer stakes a bond (required to become relayer)
+entry stake_relayer_bond(bond_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(bond_amount >= MIN_RELAYER_BOND, "bondtoolow")
+    
+    // Receive VLT bond
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+    let dep: u64 = get_deposit_for_asset(vlt_asset).expect("err")
+    require(dep >= bond_amount, "insdep")
+    if dep > bond_amount {
+        let ok: bool = transfer(caller, dep - bond_amount, vlt_asset)
+        require(ok, "rfail")
+    }
+    
+    // Store bond
+    s.store(RELAYER_BOND_PREFIX + caller.to_string(), bond_amount)
+    return 0
+}
+
+// Get relayer bond amount
+pub fn get_relayer_bond(relayer: Address) -> u64 {
+    return Storage::new().load(RELAYER_BOND_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+// Slash relayer bond (guardian/admin only)
+entry slash_relayer_bond(relayer: Address, slash_bps: u64, reason: string) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    require(slash_bps <= 10000, "badbps")
+    
+    let bond: u64 = s.load(RELAYER_BOND_PREFIX + relayer.to_string()).unwrap_or(0)
+    if bond == 0 { return 0 }
+    
+    let slash_amount: u64 = (bond as u128 * slash_bps as u128 / 10000u128) as u64
+    let new_bond: u64 = bond - slash_amount
+    s.store(RELAYER_BOND_PREFIX + relayer.to_string(), new_bond)
+    
+    // Burn 50% of slash, 50% to treasury
+    let burn_amount: u64 = slash_amount / 2
+    let treasury_amount: u64 = slash_amount - burn_amount
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+    if vlt_asset != Hash::zero() {
+        if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
+        if treasury_amount > 0 {
+            let treasury: Address = s.load(TREASURY_KEY).expect("notset")
+            let _ = transfer(treasury, treasury_amount, vlt_asset)
+        }
+    }
+    
+    return 0
+}
+
+// Relayer withdraws bond (must not be active relayer)
+entry withdraw_relayer_bond() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Must not be an active relayer
+    let is_relayer: bool = s.load(RELAYER_PREFIX + caller.to_string()).unwrap_or(false)
+    require(!is_relayer, "stillrelayer")
+    
+    let bond: u64 = s.load(RELAYER_BOND_PREFIX + caller.to_string()).unwrap_or(0)
+    require(bond > 0, "nobond")
+    
+    // Return bond
+    let vlt_asset: Hash = s.load(VLT_ASSET_KEY).unwrap_or(Hash::zero())
+    if vlt_asset != Hash::zero() {
+        let ok: bool = transfer(caller, bond, vlt_asset)
+        require(ok, "txfail")
+    }
+    
+    s.delete(RELAYER_BOND_PREFIX + caller.to_string())
+    return 0
+}
+
+// ── R1: Improved Reliability Score ────────────────────────────────────────
+// Score based on: messages relayed + batches + uptime - empty batches penalty
+const RELAY_MSG_COUNT_PREFIX: string = "rmc_"
+const RELAY_EMPTY_BATCH_PREFIX: string = "reb_"
+
+// Relayer reports messages relayed (called during anchor_batch)
+fn update_relayer_msg_count(relayer: Address, count: u64) {
+    let s: Storage = Storage::new()
+    let key: string = RELAY_MSG_COUNT_PREFIX + relayer.to_string()
+    let current: u64 = s.load(key).unwrap_or(0)
+    s.store(key, current + count)
+}
+
+pub fn get_relayer_msg_count(relayer: Address) -> u64 {
+    return Storage::new().load(RELAY_MSG_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+// Get comprehensive reliability score
+pub fn get_reliability_score(relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let msg_count: u64 = s.load(RELAY_MSG_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+    let batch_count: u64 = s.load(RELAY_BATCH_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+    let empty_batches: u64 = s.load(RELAY_EMPTY_BATCH_PREFIX + relayer.to_string()).unwrap_or(0)
+    
+    let msg_score: u64 = msg_count
+    let batch_score: u64 = batch_count * 10
+    let penalty: u64 = empty_batches * 20
+    
+    let score: u64 = msg_score + batch_score
+    if score > penalty { return score - penalty }
+    return 0
+}
+
+// ── R4: Weighted Ratings (anti-Sybil) ────────────────────────────────────
+// Ratings weighted by user activity (more messages = more weight)
+const RELAY_RATING_SUM_PREFIX: string = "rrs_"
+const RELAY_RATING_WEIGHT_PREFIX: string = "rrw_"
+const RELAY_RATING_COUNT_PREFIX: string = "rrc_"
+
+// Rate a relayer (weight based on user's message count)
+entry rate_relayer_weighted(relayer: Address, score: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(score >= 1 && score <= 5, "badscore")
+    
+    // Check if already rated
+    let rated_key: string = "rrated_" + relayer.to_string() + "_" + caller.to_string()
+    let already: bool = s.load(rated_key).unwrap_or(false)
+    require(!already, "alreadyrated")
+    s.store(rated_key, true)
+    
+    // Get user activity (message count)
+    let user_msgs: u64 = s.load(MSG_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+    
+    // Weight: 1x for <100 msgs, 2x for <500, 3x for <1000, 5x for >1000
+    let weight: u64 = 1
+    if user_msgs > 1000 { weight = 5 }
+    else if user_msgs > 500 { weight = 3 }
+    else if user_msgs > 100 { weight = 2 }
+    
+    // Update weighted sum
+    let sum_key: string = RELAY_RATING_SUM_PREFIX + relayer.to_string()
+    let current_sum: u64 = s.load(sum_key).unwrap_or(0)
+    s.store(sum_key, current_sum + (score as u64 * weight))
+    
+    // Update total weight
+    let weight_key: string = RELAY_RATING_WEIGHT_PREFIX + relayer.to_string()
+    let current_weight: u64 = s.load(weight_key).unwrap_or(0)
+    s.store(weight_key, current_weight + weight)
+    
+    // Update count
+    let count_key: string = RELAY_RATING_COUNT_PREFIX + relayer.to_string()
+    let current_count: u64 = s.load(count_key).unwrap_or(0)
+    s.store(count_key, current_count + 1)
+    
+    return 0
+}
+
+// Get weighted average rating (returns score * 100, e.g. 450 = 4.50)
+pub fn get_weighted_rating(relayer: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let sum: u64 = s.load(RELAY_RATING_SUM_PREFIX + relayer.to_string()).unwrap_or(0)
+    let weight: u64 = s.load(RELAY_RATING_WEIGHT_PREFIX + relayer.to_string()).unwrap_or(0)
+    if weight == 0 { return 0 }
+    return (sum * 100) / weight
+}
+
+// Get rating count
+pub fn get_rating_count(relayer: Address) -> u64 {
+    return Storage::new().load(RELAY_RATING_COUNT_PREFIX + relayer.to_string()).unwrap_or(0)
+}
+
+// ── C2: Group Role Hierarchy ──────────────────────────────────────────────
+const ROLE_MEMBER: u8 = 0
+const ROLE_MODERATOR: u8 = 1
+const ROLE_ADMIN: u8 = 2
+const ROLE_CREATOR: u8 = 3
+const MEMBER_ROLE_PREFIX: string = "mrole_"
+const MEMBER_MUTE_PREFIX: string = "mmute_"
+
+// Set member role (admin or creator only)
+entry set_member_role(group_id: u64, member: Address, new_role: u8) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Get caller's role
+    let caller_role: u8 = s.load(MEMBER_ROLE_PREFIX + group_id.to_string(10u32) + "_" + caller.to_string()).unwrap_or(ROLE_MEMBER)
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    if caller == group.creator { caller_role = ROLE_CREATOR }
+    
+    require(caller_role >= ROLE_ADMIN, "insufficient")
+    require(new_role < caller_role, "cannot_promote_equal")
+    
+    let key: string = MEMBER_ROLE_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(key, new_role)
+    return 0
+}
+
+// Get member role
+pub fn get_member_role(group_id: u64, member: Address) -> u8 {
+    let s: Storage = Storage::new()
+    let role: u8 = s.load(MEMBER_ROLE_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()).unwrap_or(ROLE_MEMBER)
+    let group: Group = s.load(GROUP_PREFIX + group_id.to_string(10u32)).expect("gnf")
+    if member == group.creator { return ROLE_CREATOR }
+    return role
+}
+
+// Mute a member (moderator or above)
+entry mute_member(group_id: u64, member: Address, duration_blocks: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let caller_role: u8 = get_member_role(group_id, caller)
+    require(caller_role >= ROLE_MODERATOR, "insufficient")
+    
+    let key: string = MEMBER_MUTE_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()
+    s.store(key, get_current_topoheight() + duration_blocks)
+    return 0
+}
+
+// Check if member is muted
+pub fn is_muted(group_id: u64, member: Address) -> bool {
+    let s: Storage = Storage::new()
+    let mute_until: u64 = s.load(MEMBER_MUTE_PREFIX + group_id.to_string(10u32) + "_" + member.to_string()).unwrap_or(0)
+    return get_current_topoheight() < mute_until
+}

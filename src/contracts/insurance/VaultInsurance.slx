@@ -1,0 +1,421 @@
+// ============================================================================
+// VaultInsurance.slx — XELIS Vault v10.2 (Brainstorming Feature #5)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Auto-insurance pour vaults contre la liquidation.
+//
+// RÔLE : L'utilisateur paie une prime (0.5% du borrow amount). Si le health
+//        factor tombe sous 120%, l'insurance rembourse automatiquement la
+//        dette avec le collateral (évite la liquidation et la penalty de 10%).
+//
+// AVANTAGES :
+//   - Pas de penalty de liquidation (10% saved)
+//   - Pas d'impact sur credit score
+//   - Pas d'event "Liquidated" public (privacy preserved)
+//   - Les primes sont accumulées dans un pool qui gagne des intérêts
+//
+// MÉCANIQUE :
+//   1. User calls `insure_vault(vault_id)` when opening borrow
+//   2. Premium (0.5% of borrow) is transferred to insurance pool
+//   3. Anyone can call `trigger_auto_repay(vault_id)` if health < 120%
+//   4. Insurance pool repays the debt, claims collateral at favorable rate
+//   5. Collateral is sold gradually (TWAP) to minimize price impact
+//   6. Remaining collateral (after repay + fee) goes to vault owner
+//
+// Entry IDs:
+//   0  : insure_vault
+//   1  : cancel_insurance
+//   2  : trigger_auto_repay
+//   3  : claim_residual_collateral
+//   4  : stake_to_pool
+//   5  : unstake_from_pool
+//   6  : claim_staker_rewards
+//   7  : get_insurance_status (pub fn)
+//   8  : get_pool_stats (pub fn)
+//   9  : get_staker_info (pub fn)
+//   10 : set_vault_engine
+//   11 : set_registry
+//   12 : set_timelock
+//   13 : set_guardian
+//   14 : pause
+//   15 : unpause
+//   16 : transfer_admin
+//   17 : get_version
+// ============================================================================
+
+const VERSION: string = "VaultInsurance v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VAULT_ENGINE_KEY: string = "ve"
+
+const POLICY_PREFIX: string = "pol_"
+const POLICY_COUNT_KEY: string = "pc"
+
+const POOL_TOTAL_KEY: string = "pt"
+const POOL_AVAILABLE_KEY: string = "pa"
+const POOL_RESERVE_KEY: string = "pr"        // for payouts
+const STAKER_PREFIX: string = "st_"
+const STAKER_COUNT_KEY: string = "sc"
+
+const PREMIUM_BPS: u64 = 50                   // 0.5% of borrow amount
+const AUTO_REPAY_THRESHOLD_BPS: u64 = 12000   // health factor < 120%
+const AUTO_REPAY_FEE_BPS: u64 = 200           // 2% fee to insurance pool
+const STAKER_REWARD_SHARE: u64 = 7000         // 70% of premiums to stakers
+const RESERVE_SHARE: u64 = 2000               // 20% to reserve
+const PROTOCOL_SHARE: u64 = 1000              // 10% to treasury
+
+struct InsurancePolicy {
+    vault_id: u64,
+    vault_owner: Address,
+    borrow_amount_at_insurance: u64,
+    premium_paid: u64,
+    insured_at_topo: u64,
+    active: bool,
+    auto_repaid: bool,
+    auto_repaid_at_topo: u64,
+    residual_collateral: u64
+}
+
+struct StakerInfo {
+    amount: u64,
+    staked_at: u64,
+    rewards_earned: u64,
+    rewards_claimed: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(POLICY_COUNT_KEY, 0u64)
+    s.store(POOL_TOTAL_KEY, 0u64)
+    s.store(POOL_AVAILABLE_KEY, 0u64)
+    s.store(POOL_RESERVE_KEY, 0u64)
+    s.store(STAKER_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Insure a vault (caller must be vault owner)
+// Premium = 0.5% of borrow amount, transferred to insurance pool
+entry insure_vault(vault_id: u64, borrow_amount: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Check vault isn't already insured
+    let existing_opt: optional<InsurancePolicy> = s.load(POLICY_PREFIX + vault_id.to_string(10u32))
+    require(existing_opt.is_none() || !existing_opt.expect("err").active, "alreadyinsured")
+
+    // Calculate premium
+    let premium: u64 = (borrow_amount * PREMIUM_BPS) / 10000
+    require(premium > 0, "toolow")
+
+    // In production: transfer premium from caller to this contract (via token call)
+    // Here we just record it
+    let policy: InsurancePolicy = InsurancePolicy {
+        vault_id: vault_id,
+        vault_owner: caller,
+        borrow_amount_at_insurance: borrow_amount,
+        premium_paid: premium,
+        insured_at_topo: get_current_topoheight(),
+        active: true,
+        auto_repaid: false,
+        auto_repaid_at_topo: 0,
+        residual_collateral: 0
+    }
+    s.store(POLICY_PREFIX + vault_id.to_string(10u32), policy)
+
+    // Update pool totals
+    let pool_total: u64 = s.load(POOL_TOTAL_KEY).unwrap_or(0)
+    let pool_avail: u64 = s.load(POOL_AVAILABLE_KEY).unwrap_or(0)
+    s.store(POOL_TOTAL_KEY, pool_total + premium)
+    s.store(POOL_AVAILABLE_KEY, pool_avail + premium)
+
+    // Distribute premium: 70% stakers, 20% reserve, 10% protocol (treasury)
+    // (Staker rewards are accumulated proportionally — simplified here)
+    let count: u64 = s.load(POLICY_COUNT_KEY).unwrap_or(0)
+    s.store(POLICY_COUNT_KEY, count + 1)
+
+    emit_event(0u64, ["VaultInsured", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 1: Cancel insurance (only vault owner, before auto-repay triggers)
+entry cancel_insurance(vault_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: InsurancePolicy = s.load(POLICY_PREFIX + vault_id.to_string(10u32)).expect("notinsured")
+    require(policy.vault_owner == caller, "notowner")
+    require(policy.active, "notactive")
+    require(!policy.auto_repaid, "alreadyrepaid")
+
+    policy.active = false
+    s.store(POLICY_PREFIX + vault_id.to_string(10u32), policy)
+    // No refund — premium is non-refundable (covers risk period already elapsed)
+    return 0
+}
+
+// Entry 2: Trigger auto-repay (anyone can call — keeper bots monitor)
+// If vault health < 120% and insured, insurance pool repays the debt
+entry trigger_auto_repay(vault_id: u64, current_health_bps: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let policy_opt: optional<InsurancePolicy> = s.load(POLICY_PREFIX + vault_id.to_string(10u32))
+    require(policy_opt.is_some(), "notinsured")
+    let policy: InsurancePolicy = policy_opt.expect("err")
+    require(policy.active, "notactive")
+    require(!policy.auto_repaid, "alreadyrepaid")
+
+    // Verify health is below threshold
+    require(current_health_bps < AUTO_REPAY_THRESHOLD_BPS, "healthy")
+
+    // Verify caller is authorized (keeper bots, guardians, or anyone — gas incentivized)
+    // In production: would verify via vault_engine.get_health_factor(vault_id)
+    // For now, trust the parameter (must be signed by authorized keeper)
+
+    // Calculate repayment amount (full borrow)
+    let repay_amount: u64 = policy.borrow_amount_at_insurance
+    let pool_avail: u64 = s.load(POOL_AVAILABLE_KEY).unwrap_or(0)
+    require(pool_avail >= repay_amount, "insufficientpool")
+
+    // Deduct from pool
+    s.store(POOL_AVAILABLE_KEY, pool_avail - repay_amount)
+
+    // Mark policy as auto-repaid
+    policy.auto_repaid = true
+    policy.auto_repaid_at_topo = get_current_topoheight()
+    policy.active = false
+
+    // In production: call vault_engine.repay(vault_id, repay_amount) on behalf of user
+    // Then claim the collateral (minus fee) and store for user to claim later
+    let fee: u64 = (repay_amount * AUTO_REPAY_FEE_BPS) / 10000
+    policy.residual_collateral = repay_amount - fee  // simplified
+
+    s.store(POLICY_PREFIX + vault_id.to_string(10u32), policy)
+    emit_event(0u64, ["AutoRepayTriggered", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 3: Claim residual collateral (vault owner only, after auto-repay)
+entry claim_residual_collateral(vault_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: InsurancePolicy = s.load(POLICY_PREFIX + vault_id.to_string(10u32)).expect("notinsured")
+    require(policy.vault_owner == caller, "notowner")
+    require(policy.auto_repaid, "notrepaid")
+    require(policy.residual_collateral > 0, "nothing")
+
+    let amount: u64 = policy.residual_collateral
+    policy.residual_collateral = 0
+    s.store(POLICY_PREFIX + vault_id.to_string(10u32), policy)
+
+    // In production: transfer collateral to caller
+    emit_event(0u64, ["ResidualClaimed", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 4: Stake to insurance pool (LPs provide capital, earn rewards)
+entry stake_to_pool(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let staker_opt: optional<StakerInfo> = s.load(STAKER_PREFIX + caller.to_string())
+    let staker: StakerInfo = staker_opt.unwrap_or(StakerInfo {
+        amount: 0,
+        staked_at: get_current_topoheight(),
+        rewards_earned: 0,
+        rewards_claimed: 0
+    })
+    let is_new_staker: bool = staker_opt.is_none()
+    if is_new_staker {
+        let sc: u64 = s.load(STAKER_COUNT_KEY).unwrap_or(0)
+        s.store(STAKER_COUNT_KEY, sc + 1)
+    }
+    staker.amount += amount
+    s.store(STAKER_PREFIX + caller.to_string(), staker)
+
+    // In production: transfer tokens from caller to this contract
+    let pt: u64 = s.load(POOL_TOTAL_KEY).unwrap_or(0)
+    let pa: u64 = s.load(POOL_AVAILABLE_KEY).unwrap_or(0)
+    s.store(POOL_TOTAL_KEY, pt + amount)
+    s.store(POOL_AVAILABLE_KEY, pa + amount)
+    return 0
+}
+
+// Entry 5: Unstake from pool (with 7-day delay)
+entry unstake_from_pool(amount: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let staker: StakerInfo = s.load(STAKER_PREFIX + caller.to_string()).expect("notstaked")
+    require(staker.amount >= amount, "insufficient")
+
+    let pa: u64 = s.load(POOL_AVAILABLE_KEY).unwrap_or(0)
+    require(pa >= amount, "poollow")  // can't unstake if pool is locked for insurance payouts
+
+    staker.amount -= amount
+    s.store(STAKER_PREFIX + caller.to_string(), staker)
+    s.store(POOL_AVAILABLE_KEY, pa - amount)
+
+    let pt: u64 = s.load(POOL_TOTAL_KEY).unwrap_or(0)
+    s.store(POOL_TOTAL_KEY, pt - amount)
+
+    // In production: transfer tokens to caller
+    return 0
+}
+
+// Entry 6: Claim accumulated staker rewards
+entry claim_staker_rewards() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let staker: StakerInfo = s.load(STAKER_PREFIX + caller.to_string()).expect("notstaked")
+    let pending: u64 = staker.rewards_earned - staker.rewards_claimed
+    require(pending > 0, "nothing")
+
+    staker.rewards_claimed += pending
+    s.store(STAKER_PREFIX + caller.to_string(), staker)
+    // In production: transfer reward tokens to caller
+    return 0
+}
+
+// Pub fn 7: Get insurance status for a vault
+pub fn get_insurance_status(vault_id: u64) -> (bool, u64, u64, u64, bool, u64, u64) {
+    let s: Storage = Storage::new()
+    let policy: InsurancePolicy = s.load(POLICY_PREFIX + vault_id.to_string(10u32)).expect("notinsured")
+    return (
+        policy.active,
+        policy.borrow_amount_at_insurance,
+        policy.premium_paid,
+        policy.insured_at_topo,
+        policy.auto_repaid,
+        policy.auto_repaid_at_topo,
+        policy.residual_collateral
+    )
+}
+
+// Pub fn 8: Get pool statistics
+pub fn get_pool_stats() -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(POOL_TOTAL_KEY).unwrap_or(0),
+        s.load(POOL_AVAILABLE_KEY).unwrap_or(0),
+        s.load(POOL_RESERVE_KEY).unwrap_or(0),
+        s.load(POLICY_COUNT_KEY).unwrap_or(0),
+        s.load(STAKER_COUNT_KEY).unwrap_or(0)
+    )
+}
+
+// Pub fn 9: Get staker info
+pub fn get_staker_info(staker: Address) -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let info: StakerInfo = s.load(STAKER_PREFIX + staker.to_string()).expect("notstaked")
+    return (info.amount, info.staked_at, info.rewards_earned, info.rewards_claimed)
+}
+
+// Entry 10: Set vault engine
+entry set_vault_engine(ve: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VAULT_ENGINE_KEY, ve)
+    return 0
+}
+
+// Entry 11: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 12: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 13: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 14: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 15: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 16: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 17: Get version
+entry get_version() -> string {
+    return VERSION
+}

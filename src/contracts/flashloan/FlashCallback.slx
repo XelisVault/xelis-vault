@@ -1,0 +1,145 @@
+// ============================================================================
+// FlashCallback.slx — XELIS Vault v11.7
+// ----------------------------------------------------------------------------
+// Trivial flash-loan callback interface.
+//
+// v11.7 FIX (CRITICAL, corrects the incorrect F-02 v11.5 "fix"):
+//   Cross-contract calls (Contract::call) require Access::All (`pub fn`).
+//   Access::Entry chunks are ONLY invokable by external wallet transactions.
+//   The v11.5 F-02 change converted on_flash_loan from `pub fn` to `entry`,
+//   which made it impossible for FlashLoan to invoke (revert
+//   "Chunk is not public"). It is now `pub fn` again, still protected by the
+//   explicit get_contract_caller() == registered FlashLoan hash check.
+//   Chunk id is unchanged (2) — only the access kind differs.
+//
+// Chunk IDs (see docs/entry_chunk_ids.json after recompile):
+//   0=constructor(hook) 1=only_admin(internal) 2=on_flash_loan(All)
+//   3=claim_profit 4=set_flash_loan 5=set_registry 6=transfer_admin 7=get_version
+// ============================================================================
+
+const VERSION: string = "FlashCallback v11.5"
+
+const ADMIN_KEY: string = "a"
+const FLASH_LOAN_KEY: string = "fl"
+const REGISTRY_KEY: string = "reg"
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    require(caller == admin, "notauth")
+}
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 2: on_flash_loan — invoked by FlashLoan.flash_loan (cross-contract).
+// v11.7 fix: declared `pub fn` (Access::All) — the ONLY visibility callable
+//   cross-contract. The v11.5 `entry` version reverted with
+//   "Chunk is not public" when FlashLoan invoked it.
+//   Protected by explicit cc == flash_loan_hash check below.
+// on flash loan.
+// @caller: FlashLoan contract (cross-contract)
+// @params: asset - Hash
+// @params: amount - u64
+// @params: fee - u64
+// @params: caller - Address
+// @params: data - bytes
+// @returns: u
+// @security: caller must be the registered FlashLoan contract (FLASH_LOAN_KEY)
+pub fn on_flash_loan(
+    asset: Hash,
+    amount: u64,
+    fee: u64,
+    caller: Address,
+    data: bytes
+) -> u64 {
+    let s: Storage = Storage::new()
+    let flash_loan_hash: Hash = s.load(FLASH_LOAN_KEY).expect("err")
+
+    // F-02 fix: ensure only the registered FlashLoan contract can invoke this entry.
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notfl")
+    let cc: Hash = cc_opt.expect("err")
+    require(cc == flash_loan_hash, "notfl")
+
+    let total_repay: u64 = amount + fee
+    require(total_repay >= amount, "ovf")
+
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(bal >= total_repay, "insrepay")
+
+    // v11.1: Use native transfer_contract instead of calling FlashLoan entry
+    // (entry functions cannot be called cross-contract — only pub fn can)
+    require(transfer_contract(flash_loan_hash, total_repay, asset), "repayfailed")
+
+    return 0
+}
+
+// ID 1: claim_profit
+// claim profit.
+// @caller: any user
+// @params: asset - Hash
+// @returns: u
+// @security: only_admin
+entry claim_profit(asset: Hash) -> u64 {
+    only_admin()
+    let caller: Address = get_caller().expect("err")
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(bal > 0, "noprofit")
+    let _ = transfer(caller, bal, asset)
+    return 0
+}
+
+// ID 2: set_flash_loan
+// set flash loan.
+// @caller: admin (or timelock)
+// @params: fl - Hash
+// @returns: u
+// @security: only_admin
+entry set_flash_loan(fl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(FLASH_LOAN_KEY, fl)
+    return 0
+}
+
+// ID 3: set_registry
+// set registry.
+// @caller: admin (or timelock)
+// @params: reg - Hash
+// @returns: u
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 4: transfer_admin
+// transfer admin.
+// @caller: admin (or timelock)
+// @params: new_admin - Address
+// @returns: u
+// @security: only_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 5: get_version
+// get version.
+// @caller: user / authorized caller
+// @returns: s
+// @security: standard access control
+entry get_version() -> string {
+    return VERSION
+}

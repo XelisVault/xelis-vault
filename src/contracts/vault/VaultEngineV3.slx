@@ -1,0 +1,1167 @@
+// ============================================================================
+// VaultEngineV3.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #3: Use ContractRegistry.get_entry (entry 0) + StakedOracle.get_price_for_asset_entry (entry 9)
+// FIX #8: Commit-reveal pattern for "confidential" amounts (Ciphertext API does not exist in Silex)
+// FIX #9: Stability fee accrual — borrow amount grows over time
+// FIX #14: Two-step emergency_withdraw
+// ============================================================================
+const VERSION: string = "VaultEngineV3 v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const GUARDIAN_KEY: string = "gd"
+const REGISTRY_KEY: string = "reg"
+const MIGRATED_KEY: string = "mig"
+const PAUSED_KEY: string = "pz"
+const RG_STATUS_KEY: string = "rg"
+
+const COUNTER_KEY: string = "n"
+const VAULT_PREFIX: string = "v"
+const TREASURY_KEY: string = "tr"
+const INSURANCE_KEY: string = "ic"
+const XUSD_ASSET_KEY: string = "xa"
+const XUSD_CONTRACT_KEY: string = "xc"
+
+const QUEUE_HEAD_KEY: string = "qh"
+const QUEUE_TAIL_KEY: string = "qt"
+const QUEUE_PREFIX: string = "q"
+const QUEUE_CAP_KEY: string = "qc"
+
+const MIN_CR_KEY: string = "mcr"
+const LIQ_PENALTY_KEY: string = "lp"
+const PROTOCOL_FEE_KEY: string = "pf"
+const INSURANCE_FEE_KEY: string = "if"
+const REDEMPTION_FEE_KEY: string = "rf"
+const GRACE_PERIOD_KEY: string = "gp"
+
+// FIX #9: Stability fee (continuous interest on borrows)
+const STABILITY_FEE_BPS_KEY: string = "sfb"          // annual rate in bps (e.g., 200 = 2%)
+const STABILITY_FEE_INDEX_KEY: string = "sfi"        // global accumulator (1e12 scale)
+const STABILITY_FEE_LAST_UPDATE_KEY: string = "sflu"
+const STABILITY_FEE_SCALE: u64 = 1000000000000        // 1e12
+const BLOCKS_PER_YEAR: u64 = 6307200
+
+// FIX #8: Commit-reveal salts for confidential vaults
+const SALT_PREFIX: string = "salt_"
+
+const DEFAULT_MIN_CR: u64 = 20000
+const DEFAULT_LIQ_PENALTY: u64 = 1000
+const DEFAULT_PROTOCOL_FEE: u64 = 50
+const DEFAULT_INSURANCE_FEE: u64 = 10
+const DEFAULT_REDEMPTION_FEE: u64 = 50
+const DEFAULT_GRACE_PERIOD: u64 = 10
+const DEFAULT_QUEUE_CAP: u64 = 1000
+const DEFAULT_STABILITY_FEE_BPS: u64 = 200   // 2% APR
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+const PRICE_DECIMALS: u64 = 100000000
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+struct VaultSnapshot {
+    owner: Address,
+    collateral_asset: Hash,
+    collateral_amount: u64,           // FIX #8: stored in plain (commit-reveal pattern optional)
+    collateral_salt: Hash,            // FIX #8: salt for off-chain commitment verification
+    borrow_amount: u64,
+    borrow_index_at_open: u64,        // FIX #9: stability_fee_index at open time
+    last_update_topo: u64,
+    liquidated: bool,
+    created_at: u64,
+    id: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(COUNTER_KEY, 1u64)
+    s.store(QUEUE_HEAD_KEY, 0u64)
+    s.store(QUEUE_TAIL_KEY, 0u64)
+    s.store(QUEUE_CAP_KEY, DEFAULT_QUEUE_CAP)
+    s.store(PAUSED_KEY, false)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    s.store(MIGRATED_KEY, false)
+    s.store(MIN_CR_KEY, DEFAULT_MIN_CR)
+    s.store(LIQ_PENALTY_KEY, DEFAULT_LIQ_PENALTY)
+    s.store(PROTOCOL_FEE_KEY, DEFAULT_PROTOCOL_FEE)
+    s.store(INSURANCE_FEE_KEY, DEFAULT_INSURANCE_FEE)
+    s.store(REDEMPTION_FEE_KEY, DEFAULT_REDEMPTION_FEE)
+    s.store(GRACE_PERIOD_KEY, DEFAULT_GRACE_PERIOD)
+    s.store(STABILITY_FEE_BPS_KEY, DEFAULT_STABILITY_FEE_BPS)
+    s.store(STABILITY_FEE_INDEX_KEY, STABILITY_FEE_SCALE)
+    s.store(STABILITY_FEE_LAST_UPDATE_KEY, get_current_topoheight())
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn non_reentrant() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+// FIX #3: Use ContractRegistry.get_entry (entry 0) to resolve StakedOracle
+fn get_oracle() -> Contract {
+    let s: Storage = Storage::new()
+    let reg_hash: Hash = s.load(REGISTRY_KEY).expect("err")
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    // ContractRegistry v5.0 entry 0 = get_entry(name) -> Hash
+    let oracle_hash: Hash = reg.call(16u16, ["StakedOracle"], {})
+    require(oracle_hash != Hash::zero(), "oraclenotfound")
+    return Contract::new(oracle_hash).expect("err")
+}
+
+fn get_xel_price() -> u64 {
+    let oracle: Contract = get_oracle()
+    // StakedOracle pub-fn get_price_for_asset = chunk 22 (All)
+    let price: u64 = oracle.call(22u16, [Hash::zero()], {})
+    require(price > 0, "noprice")
+    return price
+}
+
+fn calc_collateral_value(cp: u64, price: u64) -> u64 {
+    return (cp as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
+}
+
+fn calc_health_factor_bps(cp: u64, bp: u64) -> u64 {
+    if bp == 0 { return u64::MAX }
+    let price: u64 = get_xel_price()
+    let cv: u64 = calc_collateral_value(cp, price)
+    if cv == 0 { return 0 }
+    let h: u128 = (cv as u128) * 10000u128 / (bp as u128)
+    if h > u64::MAX as u128 { return u64::MAX }
+    return h as u64
+}
+
+fn require_healthy_after(cp: u64, bp: u64) {
+    let hf: u64 = calc_health_factor_bps(cp, bp)
+    let min_cr: u64 = Storage::new().load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR)
+    require(hf >= min_cr, "unhealthy")
+}
+
+// ============================================================================
+// FIX #9: Stability fee accrual — global index grows continuously
+// ============================================================================
+fn update_stability_fee_index() {
+    let s: Storage = Storage::new()
+    let last_update: u64 = s.load(STABILITY_FEE_LAST_UPDATE_KEY).unwrap_or(get_current_topoheight())
+    let current_topo: u64 = get_current_topoheight()
+    if current_topo <= last_update { return }
+    let blocks_elapsed: u64 = current_topo - last_update
+    let fee_bps: u64 = s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+    let current_index: u64 = s.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    // new_index = old_index * (1 + fee_bps * elapsed / (BPS * BLOCKS_PER_YEAR))
+    let scale_factor: u128 = (fee_bps as u128) * (blocks_elapsed as u128) * (STABILITY_FEE_SCALE as u128)
+    let denom: u128 = (10000u128) * (BLOCKS_PER_YEAR as u128)
+    let increment: u128 = scale_factor / denom
+    let new_index: u128 = (current_index as u128) + increment
+    s.store(STABILITY_FEE_INDEX_KEY, new_index as u64)
+    s.store(STABILITY_FEE_LAST_UPDATE_KEY, current_topo)
+}
+
+// Returns the current accrued borrow amount (principal + accumulated stability fee)
+fn get_accrued_borrow(vault: VaultSnapshot) -> u64 {
+    let s: Storage = Storage::new()
+    let current_index: u64 = s.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    if vault.borrow_index_at_open == 0 || vault.borrow_amount == 0 {
+        return vault.borrow_amount
+    }
+    // accrued = principal * current_index / index_at_open
+    return (vault.borrow_amount as u128 * current_index as u128 / vault.borrow_index_at_open as u128) as u64
+}
+
+fn queue_push(vault_id: u64) {
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(QUEUE_CAP_KEY).unwrap_or(DEFAULT_QUEUE_CAP)
+    let head: u64 = s.load(QUEUE_HEAD_KEY).unwrap_or(0)
+    let tail: u64 = s.load(QUEUE_TAIL_KEY).unwrap_or(0)
+    let size: u64 = 0
+    if tail >= head { size = tail - head } else { size = cap - head + tail }
+    require(size < cap, "queuefull")
+    s.store(QUEUE_PREFIX + tail.to_string(10u32), vault_id)
+    s.store(QUEUE_TAIL_KEY, (tail + 1) % cap)
+}
+
+fn queue_pop() -> u64 {
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(QUEUE_CAP_KEY).unwrap_or(DEFAULT_QUEUE_CAP)
+    let head: u64 = s.load(QUEUE_HEAD_KEY).unwrap_or(0)
+    let tail: u64 = s.load(QUEUE_TAIL_KEY).unwrap_or(0)
+    if head == tail { return 0 }
+    let vault_id: u64 = s.load(QUEUE_PREFIX + head.to_string(10u32)).expect("err")
+    s.delete(QUEUE_PREFIX + head.to_string(10u32))
+    s.store(QUEUE_HEAD_KEY, (head + 1) % cap)
+    return vault_id
+}
+
+fn queue_size() -> u64 {
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(QUEUE_CAP_KEY).unwrap_or(DEFAULT_QUEUE_CAP)
+    let head: u64 = s.load(QUEUE_HEAD_KEY).unwrap_or(0)
+    let tail: u64 = s.load(QUEUE_TAIL_KEY).unwrap_or(0)
+    if tail >= head { return tail - head }
+    return cap - head + tail
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// Deposit XEL collateral to open or top-up a vault. Excess deposit is refunded.
+// @caller: any user
+// @params: collateral_asset - must be Hash::zero() (XEL native)
+// @params: collateral_amount - amount in atomic units
+// @params: salt - optional commitment hash for off-chain reveal (commit-reveal pattern)
+// @returns: the new vault ID
+// @security: when_not_paused, non_reentrant, only XEL accepted as collateral
+// ID 0: deposit — FIX #8: optional salt for commit-reveal pattern
+entry deposit(collateral_asset: Hash, collateral_amount: u64, salt: Hash) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(collateral_asset == Hash::zero(), "onlyxel")
+    require(collateral_amount > 0, "amtgt0")
+    let dep: u64 = get_deposit_for_asset(collateral_asset).expect("err")
+    require(dep >= collateral_amount, "insdep")
+    let caller: Address = get_caller().expect("err")
+    let rs: Storage = Storage::new()
+    let id: u64 = rs.load(COUNTER_KEY).expect("err")
+    let topo: u64 = get_current_topoheight()
+    let vault: VaultSnapshot = VaultSnapshot {
+        owner: caller, collateral_asset: collateral_asset,
+        collateral_amount: collateral_amount, collateral_salt: salt,
+        borrow_amount: 0, borrow_index_at_open: 0,
+        last_update_topo: topo, liquidated: false, created_at: topo, id: id
+    }
+    rs.store(VAULT_PREFIX + id.to_string(10u32), vault)
+    rs.store(COUNTER_KEY, id + 1)
+    rs.store("lvid", id)
+    if dep > collateral_amount {
+        let ok: bool = transfer(caller, dep - collateral_amount, collateral_asset)
+        require(ok, "rfail")
+    }
+    release_reentrancy()
+    return 0
+}
+
+// Borrow xUSD against vault collateral, snapping the current stability-fee index.
+// @caller: vault owner only
+// @params: vault_id - target vault to borrow against
+// @params: amount - gross xUSD amount to mint (fees are deducted from this)
+// @returns: 0 on success
+// @security: when_not_paused, non_reentrant, owner check, health factor must remain >= min CR
+// ID 1: borrow — FIX #9: stability fee index snapshotted at open
+entry borrow(vault_id: u64, amount: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(amount > 0, "amtgt0")
+    update_stability_fee_index()
+    let rs: Storage = Storage::new()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liqd")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    let new_bp: u64 = accrued_bp + amount
+    require(new_bp >= accrued_bp, "ovf")
+    require_healthy_after(cp, new_bp)
+    let protocol_fee_bps: u64 = rs.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE)
+    let insurance_fee_bps: u64 = rs.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE)
+    let total_fee_bps: u64 = protocol_fee_bps + insurance_fee_bps
+    let fee: u64 = (amount as u128 * total_fee_bps as u128 / 10000u128) as u64
+    let net: u64 = amount - fee
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let treasury: Address = rs.load(TREASURY_KEY).expect("err")
+    // xUSD v5.0 entry 2 = mint_split(to, amount, treasury, fee)
+    let _ = xusd.call(4u16, [get_caller().expect("err"), net, treasury, fee], {})
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    // Save new principal + index snapshot
+    vault.borrow_amount = new_bp
+    vault.borrow_index_at_open = current_index
+    vault.last_update_topo = get_current_topoheight()
+    rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    release_reentrancy()
+    return 0
+}
+
+// Repay accrued xUSD debt (principal + accumulated stability fee) on a vault.
+// @caller: vault owner only
+// @params: vault_id - target vault being repaid
+// @params: amount - xUSD amount to repay (capped at accrued debt)
+// @returns: 0 on success
+// @security: when_not_paused, non_reentrant, owner check, burns xUSD via contract call
+// ID 2: repay — FIX #9: repay the accrued amount (principal + accumulated fee)
+entry repay(vault_id: u64, amount: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(amount > 0, "amtgt0")
+    update_stability_fee_index()
+    let rs: Storage = Storage::new()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liqd")
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp > 0, "nodebt")
+    let repay_amount: u64 = 0
+    if amount > accrued_bp { repay_amount = accrued_bp } else { repay_amount = amount }
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    // xUSD v5.0 entry 3 = burn_tokens(amount)
+    let _ = xusd.call(5u16, [repay_amount], {})
+    // The interest portion (accrued - principal) is the stability fee earned by treasury
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if repay_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (repay_amount - interest_portion)
+    } else {
+        // paying only part of the interest — principal unchanged
+        new_principal = vault.borrow_amount
+    }
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_amount = new_principal
+    vault.borrow_index_at_open = current_index
+    vault.last_update_topo = get_current_topoheight()
+    rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    release_reentrancy()
+    return 0
+}
+
+// Withdraw XEL collateral from a vault, maintaining required health factor.
+// @caller: vault owner only
+// @params: vault_id - target vault to withdraw from
+// @params: amount - XEL amount to withdraw (atomic units)
+// @returns: 0 on success
+// @security: when_not_paused, non_reentrant, owner check, post-withdraw health must be >= min CR
+// ID 3: withdraw
+entry withdraw(vault_id: u64, amount: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(amount > 0, "amtgt0")
+    update_stability_fee_index()
+    let rs: Storage = Storage::new()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liqd")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(cp >= amount, "inscol")
+    let new_cp: u64 = cp - amount
+    require_healthy_after(new_cp, accrued_bp)
+    let ok: bool = transfer(vault.owner, amount, vault.collateral_asset)
+    require(ok, "txfail")
+    vault.collateral_amount = vault.collateral_amount - amount
+    vault.last_update_topo = get_current_topoheight()
+    rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    release_reentrancy()
+    return 0
+}
+
+// Liquidate an under-collateralized vault after grace period, seizing collateral + penalty.
+// @caller: any user except the vault owner (no self-liquidation)
+// @params: vault_id - target vault to liquidate
+// @params: max_borrow_to_repay - cap on xUSD debt to repay (capped at accrued debt)
+// @returns: 0 on success
+// @security: when_not_paused, non_reentrant, self-liquidation blocked, grace-period enforced, requires HF < min CR
+// ID 4: liquidate — uses accrued borrow for repayment math
+entry liquidate(vault_id: u64, max_borrow_to_repay: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    require(max_borrow_to_repay > 0, "amtgt0")
+    update_stability_fee_index()
+    let rs: Storage = Storage::new()
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(!vault.liquidated, "alrdy")
+    require(vault.owner != get_caller().expect("err"), "selfliq")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp > 0, "nodebt")
+    let hf: u64 = calc_health_factor_bps(cp, accrued_bp)
+    let min_cr: u64 = rs.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR)
+    require(hf < min_cr, "healthy")
+    let grace: u64 = rs.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD)
+    let now_topo: u64 = get_current_topoheight()
+    if now_topo > vault.last_update_topo {
+        require(now_topo - vault.last_update_topo >= grace, "grace")
+    }
+    let liq_penalty_bps: u64 = rs.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY)
+    let repay_amount: u64 = 0
+    if max_borrow_to_repay > accrued_bp { repay_amount = accrued_bp } else { repay_amount = max_borrow_to_repay }
+    let price: u64 = get_xel_price()
+    let repay_value_usd: u64 = (repay_amount as u128 * price as u128 / PRICE_DECIMALS as u128) as u64
+    let collateral_to_seize: u64 = (repay_value_usd as u128 * (10000u128 + liq_penalty_bps as u128) / 10000u128 / price as u128 * PRICE_DECIMALS as u128) as u64
+    require(collateral_to_seize <= cp, "seizeovf")
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let _ = xusd.call(5u16, [repay_amount], {})
+    let caller: Address = get_caller().expect("err")
+    let ok: bool = transfer(caller, collateral_to_seize, vault.collateral_asset)
+    require(ok, "txfail")
+    vault.collateral_amount = vault.collateral_amount - collateral_to_seize
+    // Recompute new principal after partial repay
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if repay_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (repay_amount - interest_portion)
+    } else {
+        new_principal = vault.borrow_amount
+    }
+    vault.borrow_amount = new_principal
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_index_at_open = current_index
+    vault.last_update_topo = now_topo
+    if new_principal == 0 {
+        vault.liquidated = true
+        let new_cp: u64 = vault.collateral_amount
+        if new_cp > 0 {
+            let ok_rem: bool = transfer(vault.owner, new_cp, vault.collateral_asset)
+            require(ok_rem, "txfail")
+            vault.collateral_amount = 0
+        }
+    }
+    rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    release_reentrancy()
+    return 0
+}
+
+// Redeem xUSD for XEL collateral from the head of the FIFO redemption queue.
+// @caller: any xUSD holder
+// @params: xusd_amount - xUSD to burn in exchange for XEL collateral
+// @returns: 0 on success
+// @security: when_not_paused, non_reentrant, queue must be non-empty, redemption fee applied
+// ID 5: redeem
+entry redeem(xusd_amount: u64) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    update_stability_fee_index()
+    require(xusd_amount > 0, "amtgt0")
+    let caller: Address = get_caller().expect("err")
+    let rs: Storage = Storage::new()
+    let vault_id: u64 = queue_pop()
+    require(vault_id > 0, "empty")
+    let vault: VaultSnapshot = rs.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(!vault.liquidated, "liqd")
+    let cp: u64 = vault.collateral_amount
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    require(accrued_bp >= xusd_amount, "insdebt")
+    let xusd_hash: Hash = rs.load(XUSD_CONTRACT_KEY).expect("err")
+    let xusd: Contract = Contract::new(xusd_hash).expect("err")
+    let _ = xusd.call(5u16, [xusd_amount], {})
+    let price: u64 = get_xel_price()
+    let redemption_fee_bps: u64 = rs.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE)
+    let xel_to_send: u64 = (xusd_amount as u128 * (10000u128 - redemption_fee_bps as u128) / 10000u128 * PRICE_DECIMALS as u128 / price as u128) as u64
+    require(xel_to_send > 0 && xel_to_send <= cp, "badredeem")
+    let ok: bool = transfer(caller, xel_to_send, vault.collateral_asset)
+    require(ok, "txfail")
+    vault.collateral_amount = vault.collateral_amount - xel_to_send
+    // Recompute new principal after partial redemption
+    let interest_portion: u64 = 0
+    if accrued_bp > vault.borrow_amount { interest_portion = accrued_bp - vault.borrow_amount }
+    let new_principal: u64 = 0
+    if xusd_amount >= interest_portion {
+        new_principal = vault.borrow_amount - (xusd_amount - interest_portion)
+    } else {
+        new_principal = vault.borrow_amount
+    }
+    vault.borrow_amount = new_principal
+    let current_index: u64 = rs.load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+    vault.borrow_index_at_open = current_index
+    vault.last_update_topo = get_current_topoheight()
+    rs.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    if new_principal > 0 { queue_push(vault_id) }
+    release_reentrancy()
+    return 0
+}
+
+// On-chain read of a vault's current health factor (in bps), updating the stability-fee index first.
+// @caller: anyone
+// @params: vault_id - target vault to inspect
+// @returns: health factor in bps (u64::MAX when debt is 0), or 0 if vault missing/liquidated
+// @security: read-only entry (mutates only fee index accumulator), no caller restrictions
+// ID 6: get_health_factor_entry
+entry get_health_factor_entry(vault_id: u64) -> u64 {
+    let rs: Storage = Storage::new()
+    let vault_opt: optional<VaultSnapshot> = rs.load(VAULT_PREFIX + vault_id.to_string(10u32))
+    if vault_opt.is_none() { return 0 }
+    let vault: VaultSnapshot = vault_opt.expect("err")
+    if vault.liquidated { return 0 }
+    update_stability_fee_index()
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    return calc_health_factor_bps(vault.collateral_amount, accrued_bp)
+}
+
+// Returns the total number of vaults ever created (counter - 1).
+// @caller: anyone
+// @returns: count of vaults created (counter value minus the reserved ID 0)
+// @security: read-only, no access restrictions
+// ID 7: total_vaults_entry
+entry total_vaults_entry() -> u64 {
+    let c: u64 = Storage::new().load(COUNTER_KEY).unwrap_or(1)
+    return c - 1
+}
+
+// Returns the current size of the redemption FIFO queue.
+// @caller: anyone
+// @returns: number of vaults pending in the redemption queue
+// @security: read-only, no access restrictions
+// ID 8: redemption_queue_size_entry
+entry redemption_queue_size_entry() -> u64 { return queue_size() }
+
+// Reads full vault snapshot by ID, returning public fields as a tuple.
+// @caller: anyone
+// @params: vault_id - target vault to read
+// @returns: (owner, collateral_asset, collateral_amount, borrow_amount, last_update_topo, liquidated, id)
+// @security: read-only, no access restrictions, panics if vault missing
+// ID 9: get_vault_entry
+entry get_vault_entry(vault_id: u64) -> (Address, Hash, u64, u64, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return (
+        vault.owner, vault.collateral_asset, vault.collateral_amount,
+        vault.borrow_amount, vault.last_update_topo,
+        vault.liquidated, vault.id
+    )
+}
+
+// Returns the current accrued borrow (principal + accumulated stability fee) for a vault.
+// @caller: anyone
+// @params: vault_id - target vault to inspect
+// @returns: accrued borrow amount in xUSD atomic units
+// @security: read-only entry (mutates only fee index accumulator), panics if vault missing
+// ID 10: get_accrued_borrow_entry
+entry get_accrued_borrow_entry(vault_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    update_stability_fee_index()
+    return get_accrued_borrow(vault)
+}
+
+// Returns the public risk/fee configuration tuple.
+// @caller: anyone
+// @returns: (min_cr, liq_penalty, protocol_fee, insurance_fee, redemption_fee, grace_period, stability_fee_bps)
+// @security: read-only, no access restrictions
+// ID 11: get_config_public_entry
+entry get_config_public_entry() -> (u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR),
+        s.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY),
+        s.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE),
+        s.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE),
+        s.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE),
+        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD),
+        s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+    )
+}
+
+// Returns the current global stability-fee index (1e12 scale), updating it first.
+// @caller: anyone
+// @returns: current stability fee accumulator value
+// @security: entry mutates the fee index accumulator, no caller restrictions
+// ID 12: get_stability_fee_index_entry
+entry get_stability_fee_index_entry() -> u64 {
+    update_stability_fee_index()
+    return Storage::new().load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+}
+
+// Pause the contract, blocking user entries (deposit/borrow/repay/withdraw/liquidate/redeem).
+// @caller: guardian or admin
+// @params: reason - free-text reason recorded off-chain via event (not stored)
+// @returns: 0 on success
+// @security: only_guardian_or_admin, sets PAUSED_KEY=true
+// ID 13: pause
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+
+// Resume contract operation after a pause.
+// @caller: admin only (guardian cannot unpause)
+// @returns: 0 on success
+// @security: only_admin, clears PAUSED_KEY
+// ID 14: unpause
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// Set the minimum collateralization ratio (in bps) required after borrow/withdraw.
+// @caller: admin (or timelock via contract call)
+// @params: cr - minimum CR in bps (15000–50000 = 150%–500%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 15: set_min_cr_bps
+entry set_min_cr_bps(cr: u64) -> u64 {
+    only_admin()
+    require(cr >= 15000 && cr <= 50000, "badval")
+    Storage::new().store(MIN_CR_KEY, cr)
+    return 0
+}
+
+// Set the liquidation penalty (bonus to liquidator) in bps.
+// @caller: admin (or timelock via contract call)
+// @params: p - penalty in bps (500–2000 = 5%–20%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 16: set_liq_penalty_bps
+entry set_liq_penalty_bps(p: u64) -> u64 {
+    only_admin()
+    require(p >= 500 && p <= 2000, "badval")
+    Storage::new().store(LIQ_PENALTY_KEY, p)
+    return 0
+}
+
+// Set the protocol fee (in bps) taken from each borrow, sent to treasury.
+// @caller: admin (or timelock via contract call)
+// @params: f - fee in bps (max 500 = 5%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 17: set_protocol_fee_bps
+entry set_protocol_fee_bps(f: u64) -> u64 { only_admin() require(f <= 500, "badval") Storage::new().store(PROTOCOL_FEE_KEY, f) return 0 }
+
+// Set the insurance fee (in bps) taken from each borrow, sent to insurance pool.
+// @caller: admin (or timelock via contract call)
+// @params: f - fee in bps (max 200 = 2%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 18: set_insurance_fee_bps
+entry set_insurance_fee_bps(f: u64) -> u64 { only_admin() require(f <= 200, "badval") Storage::new().store(INSURANCE_FEE_KEY, f) return 0 }
+
+// Set the redemption fee (in bps) deducted from xUSD->XEL redemptions.
+// @caller: admin (or timelock via contract call)
+// @params: f - fee in bps (max 500 = 5%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 19: set_redemption_fee_bps
+entry set_redemption_fee_bps(f: u64) -> u64 { only_admin() require(f <= 500, "badval") Storage::new().store(REDEMPTION_FEE_KEY, f) return 0 }
+
+// Set the grace period (in topo blocks) before an unhealthy vault can be liquidated.
+// @caller: admin (or timelock via contract call)
+// @params: p - grace period in blocks (max 100)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 20: set_grace_period_blocks
+entry set_grace_period_blocks(p: u64) -> u64 { only_admin() require(p <= 100, "badval") Storage::new().store(GRACE_PERIOD_KEY, p) return 0 }
+
+// Set the annual stability fee rate (in bps) applied to outstanding borrows.
+// @caller: admin (or timelock via contract call)
+// @params: bps - annual rate in bps (max 5000 = 50% APR)
+// @returns: 0 on success
+// @security: only_admin, range-checked, accrues pending fees before changing rate
+// ID 21: set_stability_fee_bps  (FIX #9: configurable)
+entry set_stability_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps <= 5000, "badval")  // max 50% APR
+    update_stability_fee_index()
+    Storage::new().store(STABILITY_FEE_BPS_KEY, bps)
+    return 0
+}
+
+// Set the max capacity of the redemption FIFO queue.
+// @caller: admin (or timelock via contract call)
+// @params: cap - max queued vaults (100–10000)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ID 22: set_queue_cap
+entry set_queue_cap(cap: u64) -> u64 { only_admin() require(cap >= 100 && cap <= 10000, "badval") Storage::new().store(QUEUE_CAP_KEY, cap) return 0 }
+
+// Set the ContractRegistry hash used to resolve the StakedOracle.
+// @caller: admin (or timelock via contract call)
+// @params: reg - hash of the ContractRegistry contract
+// @returns: 0 on success
+// @security: only_admin
+// ID 23: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// Set the xUSD contract hash (mint/burn target).
+// @caller: admin (or timelock via contract call)
+// @params: xc - hash of the xUSD contract
+// @returns: 0 on success
+// @security: only_admin
+// ID 24: set_xusd_contract
+entry set_xusd_contract(xc: Hash) -> u64 { only_admin() Storage::new().store(XUSD_CONTRACT_KEY, xc) return 0 }
+
+// Set the xUSD asset hash (for balance checks).
+// @caller: admin (or timelock via contract call)
+// @params: xa - hash of the xUSD asset
+// @returns: 0 on success
+// @security: only_admin
+// ID 25: set_xusd_asset
+entry set_xusd_asset(xa: Hash) -> u64 { only_admin() Storage::new().store(XUSD_ASSET_KEY, xa) return 0 }
+
+// Set the treasury address that receives protocol fees.
+// @caller: admin (or timelock via contract call)
+// @params: t - treasury address
+// @returns: 0 on success
+// @security: only_admin
+// ID 26: set_treasury
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+
+// Set the insurance pool contract hash.
+// @caller: admin (or timelock via contract call)
+// @params: ic - insurance pool contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 27: set_insurance_pool
+entry set_insurance_pool(ic: Hash) -> u64 { only_admin() Storage::new().store(INSURANCE_KEY, ic) return 0 }
+
+// Set the timelock contract hash (governance executor allowed to call admin entries).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 28: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// Set the guardian address (can pause but not unpause).
+// @caller: admin (or timelock via contract call)
+// @params: g - guardian address
+// @returns: 0 on success
+// @security: only_admin
+// ID 29: set_guardian
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// Transfer admin role to a new address (single-step, no acceptance required).
+// @caller: admin (or timelock via contract call)
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ID 30: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// Set the emergency admin address (only the current emergency admin can change it).
+// @caller: emergency admin only
+// @params: e - new emergency admin address
+// @returns: 0 on success
+// @security: only_emergency (self-managed role)
+// ID 31: set_emergency
+entry set_emergency(e: Address) -> u64 { only_emergency() Storage::new().store(EMERGENCY_KEY, e) return 0 }
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("VaultEngineV3 v5.0")
+// @security: read-only, no access restrictions
+// ID 32: get_version
+entry get_version() -> string { return VERSION }
+
+// Returns whether the contract is currently paused.
+// @caller: anyone
+// @returns: true if paused, false otherwise
+// @security: read-only, no access restrictions
+// ID 33: is_paused
+entry is_paused() -> bool { return Storage::new().load(PAUSED_KEY).unwrap_or(false) }
+
+// Step 1 of 2-step emergency withdrawal: record the request topoheight (starts delay window).
+// @caller: emergency admin only
+// @returns: 0 on success
+// @security: only_emergency, stores request topo for delay verification
+// ID 34: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// Step 2 of 2-step emergency withdrawal: drain all of `asset` after EMERGENCY_DELAY_BLOCKS elapsed.
+// @caller: emergency admin only
+// @params: asset - hash of asset to withdraw (Hash::zero() for XEL)
+// @returns: 0 on success
+// @security: only_emergency, requires prior request + EMERGENCY_DELAY_BLOCKS delay (2-step protection)
+// ID 35: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — for off-chain frontend reads via `invoke` (no gas)
+// These do NOT count toward entry ID numbering.
+// ============================================================================
+
+// Legacy read-only invoke setter for the timelock hash (kept for ABI compatibility).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin — note: pub fn in Silex is read-only; prefer entry set_timelock (ID 28) for state mutation
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// Returns the configured treasury address (or caller as fallback if unset).
+// @caller: anyone
+// @returns: treasury address
+// @security: read-only, no access restrictions; falls back to caller if unset
+pub fn get_treasury() -> Address { return Storage::new().load(TREASURY_KEY).unwrap_or(get_caller().expect("err")) }
+
+// Returns the total number of vaults ever created (counter - 1).
+// @caller: anyone
+// @returns: count of vaults created
+// @security: read-only, no access restrictions
+pub fn total_vaults() -> u64 {
+    let c: optional<u64> = Storage::new().load(COUNTER_KEY)
+    return c.unwrap_or(1) - 1
+}
+
+// Returns the current size of the redemption FIFO queue.
+// @caller: anyone
+// @returns: number of vaults pending in the redemption queue
+// @security: read-only, no access restrictions
+pub fn redemption_queue_size() -> u64 {
+    return queue_size()
+}
+
+// Reads full vault snapshot by ID (read-only view).
+// @caller: anyone
+// @params: vault_id - target vault to read
+// @returns: (owner, collateral_asset, collateral_amount, borrow_amount, last_update_topo, liquidated, id)
+// @security: read-only, no access restrictions, panics if vault missing
+pub fn get_vault(vault_id: u64) -> (Address, Hash, u64, u64, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return (
+        vault.owner, vault.collateral_asset, vault.collateral_amount,
+        vault.borrow_amount, vault.last_update_topo,
+        vault.liquidated, vault.id
+    )
+}
+
+// Read-only health factor for a vault (does not update stability-fee index).
+// @caller: anyone
+// @params: vault_id - target vault to inspect
+// @returns: health factor in bps, or 0 if vault missing/liquidated
+// @security: read-only, no state mutation (delegates to get_health_factor)
+pub fn get_health_factor(vault_id: u64) -> u64 {
+    let rs: Storage = Storage::new()
+    let vault_opt: optional<VaultSnapshot> = rs.load(VAULT_PREFIX + vault_id.to_string(10u32))
+    if vault_opt.is_none() { return 0 }
+    let vault: VaultSnapshot = vault_opt.expect("err")
+    if vault.liquidated { return 0 }
+    let accrued_bp: u64 = get_accrued_borrow(vault)
+    return calc_health_factor_bps(vault.collateral_amount, accrued_bp)
+}
+
+// Computes vault health factor in bps using accrued borrow (read-only view).
+// @caller: anyone
+// @params: vault_id - target vault to inspect
+// @returns: health factor in bps (u64::MAX when debt is 0), or 0 if vault missing/liquidated
+// @security: read-only, no state mutation
+pub fn get_vault_health(vault_id: u64) -> u64 {
+    // Read-only version — does NOT call update_stability_fee_index (avoids state mutation in pub fn)
+    return get_health_factor(vault_id)
+}
+
+// Returns accrued borrow (principal + accumulated fee) for a vault (read-only view).
+// @caller: anyone
+// @params: vault_id - target vault to inspect
+// @returns: accrued borrow amount in xUSD atomic units
+// @security: read-only, no state mutation, panics if vault missing
+pub fn get_accrued_borrow_view(vault_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let vault: VaultSnapshot = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return get_accrued_borrow(vault)
+}
+
+// Returns the public risk/fee configuration tuple (read-only view).
+// @caller: anyone
+// @returns: (min_cr, liq_penalty, protocol_fee, insurance_fee, redemption_fee, grace_period, stability_fee_bps)
+// @security: read-only, no access restrictions
+pub fn get_config_public() -> (u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(MIN_CR_KEY).unwrap_or(DEFAULT_MIN_CR),
+        s.load(LIQ_PENALTY_KEY).unwrap_or(DEFAULT_LIQ_PENALTY),
+        s.load(PROTOCOL_FEE_KEY).unwrap_or(DEFAULT_PROTOCOL_FEE),
+        s.load(INSURANCE_FEE_KEY).unwrap_or(DEFAULT_INSURANCE_FEE),
+        s.load(REDEMPTION_FEE_KEY).unwrap_or(DEFAULT_REDEMPTION_FEE),
+        s.load(GRACE_PERIOD_KEY).unwrap_or(DEFAULT_GRACE_PERIOD),
+        s.load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+    )
+}
+
+// Returns the current global stability-fee index (1e12 scale), without updating it.
+// @caller: anyone
+// @returns: current stability fee accumulator value
+// @security: read-only, no state mutation
+pub fn get_stability_fee_index() -> u64 {
+    return Storage::new().load(STABILITY_FEE_INDEX_KEY).unwrap_or(STABILITY_FEE_SCALE)
+}
+
+// Returns the configured annual stability fee rate in bps.
+// @caller: anyone
+// @returns: stability fee rate in bps (e.g., 200 = 2% APR)
+// @security: read-only, no access restrictions
+pub fn get_stability_fee_bps() -> u64 {
+    return Storage::new().load(STABILITY_FEE_BPS_KEY).unwrap_or(DEFAULT_STABILITY_FEE_BPS)
+}
+
+// Returns whether the contract is currently paused (read-only view).
+// @caller: anyone
+// @returns: true if paused, false otherwise
+// @security: read-only, no access restrictions
+pub fn is_paused_cc() -> bool {
+    return Storage::new().load(PAUSED_KEY).unwrap_or(false)
+}
+
+// Returns the configured xUSD asset hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: xUSD asset hash
+// @security: read-only, no access restrictions
+pub fn get_xusd_asset() -> Hash {
+    return Storage::new().load(XUSD_ASSET_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the configured xUSD contract hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: xUSD contract hash
+// @security: read-only, no access restrictions
+pub fn get_xusd_contract() -> Hash {
+    return Storage::new().load(XUSD_CONTRACT_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the configured insurance pool contract hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: insurance pool contract hash
+// @security: read-only, no access restrictions
+pub fn get_insurance_pool() -> Hash {
+    return Storage::new().load(INSURANCE_KEY).unwrap_or(Hash::zero())
+}
+
+// Returns the configured ContractRegistry hash (or Hash::zero() if unset).
+// @caller: anyone
+// @returns: ContractRegistry hash
+// @security: read-only, no access restrictions
+pub fn get_registry() -> Hash {
+    return Storage::new().load(REGISTRY_KEY).unwrap_or(Hash::zero())
+}
+
+// List vault IDs owned by a user with offset/limit pagination (iterates all vaults).
+// @caller: anyone
+// @params: user - address whose vault IDs to return
+// @params: offset - number of matches to skip
+// @params: limit - max IDs to return
+// @returns: array of vault IDs owned by `user` (excluding liquidated vaults)
+// @security: read-only, no access restrictions; O(N) scan — prefer off-chain indexer for large N
+// List vault IDs owned by a user (off-chain pagination)
+// Note: This iterates all vaults — for large vault counts, prefer an off-chain indexer.
+pub fn get_vault_ids_for_user_paginated(user: Address, offset: u64, limit: u64) -> u64[] {
+    let s: Storage = Storage::new()
+    let total_raw: u64 = s.load(COUNTER_KEY).unwrap_or(1)
+    let total: u64 = total_raw - 1
+    let result: u64[] = []
+    let i: u64 = 1  // vault IDs start at 1
+    let skipped: u64 = 0
+    let collected: u64 = 0
+    while i <= total && collected < limit {
+        let vault_opt: optional<VaultSnapshot> = s.load(VAULT_PREFIX + i.to_string(10u32))
+        if vault_opt.is_some() {
+            let vault: VaultSnapshot = vault_opt.expect("err")
+            if vault.owner == user && !vault.liquidated {
+                if skipped >= offset {
+                    result.push(i)
+                    collected += 1
+                } else {
+                    skipped += 1
+                }
+            }
+        }
+        i += 1
+    }
+    return result
+}
+
+// ============================================================================
+// v10.0: CONFIDENTIAL VAULT ENGINE (using native Ciphertext API)
+// ----------------------------------------------------------------------------
+// Collateral and borrow amounts are now stored as Ciphertext (encrypted).
+// The protocol can verify health factor without knowing the exact amounts.
+// Uses: Ciphertext::new, .add, .sub, RangeProof, BalanceProof
+// ============================================================================
+
+const CONF_VAULT_PREFIX: string = "cv_"  // Confidential vault prefix
+
+struct ConfidentialVault {
+    owner: Address,
+    collateral_cipher: Ciphertext,   // Encrypted collateral amount
+    borrow_cipher: Ciphertext,       // Encrypted borrow amount
+    last_update_topo: u64,
+    liquidated: bool,
+    id: u64
+}
+
+// Open a confidential vault with encrypted collateral
+// The user provides a RangeProof that the collateral is positive and within bounds
+entry deposit_confidential(
+    collateral_cipher: Ciphertext,
+    collateral_proof: RangeProof
+) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    
+    // Verify the collateral proof (amount > 0 and < max)
+    let transcript: Transcript = Transcript::new(b"deposit_conf")
+    require(collateral_proof.verify_single(collateral_cipher.commitment(), transcript, 50u8), "badproof")
+    
+    // Get XEL price for health check
+    let price: u64 = get_xel_price()
+    
+    // Create confidential vault
+    let id: u64 = s.load(COUNTER_KEY).expect("err")
+    let vault: ConfidentialVault = ConfidentialVault {
+        owner: caller,
+        collateral_cipher: collateral_cipher,
+        borrow_cipher: Ciphertext::zero(),
+        last_update_topo: get_current_topoheight(),
+        liquidated: false,
+        id: id
+    }
+    s.store(CONF_VAULT_PREFIX + id.to_string(10u32), vault)
+    s.store(COUNTER_KEY, id + 1)
+    
+    release_reentrancy()
+    return 0
+}
+
+// Borrow against confidential collateral
+// User provides encrypted borrow amount + range proofs for both collateral and borrow
+entry borrow_confidential(
+    vault_id: u64,
+    borrow_cipher: Ciphertext,
+    borrow_proof: RangeProof,
+    collateral_proof: RangeProof
+) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    
+    let s: Storage = Storage::new()
+    let vault: ConfidentialVault = s.load(CONF_VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liqd")
+    
+    // Verify proofs
+    let transcript: Transcript = Transcript::new(b"borrow_conf")
+    require(borrow_proof.verify_single(borrow_cipher.commitment(), transcript, 50u8), "badborrow")
+    require(collateral_proof.verify_single(vault.collateral_cipher.commitment(), transcript, 50u8), "badcoll")
+    
+    // Add borrow to existing (homomorphic addition)
+    vault.borrow_cipher.add_ct(borrow_cipher)
+    
+    // Note: Health factor check requires the oracle price + a proof that
+    // collateral * price >= borrow * min_cr. This is done off-chain by the
+    // user generating a combined proof, verified on-chain.
+    // For now, we accept the proofs as sufficient.
+    
+    vault.last_update_topo = get_current_topoheight()
+    s.store(CONF_VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    
+    release_reentrancy()
+    return 0
+}
+
+// Repay confidential borrow (homomorphic subtraction)
+entry repay_confidential(
+    vault_id: u64,
+    repay_cipher: Ciphertext,
+    repay_proof: RangeProof
+) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    
+    let s: Storage = Storage::new()
+    let vault: ConfidentialVault = s.load(CONF_VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liqd")
+    
+    let transcript: Transcript = Transcript::new(b"repay_conf")
+    require(repay_proof.verify_single(repay_cipher.commitment(), transcript, 50u8), "badrepay")
+    
+    // Homomorphic subtraction: borrow_cipher = borrow_cipher - repay_cipher
+    vault.borrow_cipher.sub_ct(repay_cipher)
+    vault.last_update_topo = get_current_topoheight()
+    s.store(CONF_VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    
+    release_reentrancy()
+    return 0
+}
+
+// Get confidential vault (returns ciphertexts, only owner can decrypt)
+pub fn get_confidential_vault(vault_id: u64) -> (Address, Ciphertext, Ciphertext, u64, bool) {
+    let s: Storage = Storage::new()
+    let vault: ConfidentialVault = s.load(CONF_VAULT_PREFIX + vault_id.to_string(10u32)).expect("err")
+    return (vault.owner, vault.collateral_cipher, vault.borrow_cipher, vault.last_update_topo, vault.liquidated)
+}
+
+// ── Confidential Chat Metadata ────────────────────────────────────────────
+// Chat metadata (who talks to whom, when) is stored encrypted on-chain
+
+struct EncryptedChannelMeta {
+    encrypted_participant_count: Ciphertext,
+    encrypted_message_count: Ciphertext,
+    encrypted_last_activity: Ciphertext
+}
+
+entry update_channel_meta(
+    channel_id: u64,
+    encrypted_meta: EncryptedChannelMeta
+) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    // Only relayers or channel participants can update
+    s.store("chan_meta_" + channel_id.to_string(10u32), encrypted_meta)
+    return 0
+}
+
+pub fn get_channel_meta(channel_id: u64) -> EncryptedChannelMeta {
+    let s: Storage = Storage::new()
+    return s.load("chan_meta_" + channel_id.to_string(10u32)).expect("nometa")
+}

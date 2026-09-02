@@ -1,0 +1,478 @@
+// ============================================================================
+// VaultNFT.slx — XELIS Vault v10.2 (Brainstorming Feature #11)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Tokenisation des positions de vault en NFTs (ERC-721 equivalent).
+//
+// RÔLE : Chaque vault devient un NFT. L'utilisateur peut :
+//   - Transférer sa vault à un autre utilisateur
+//   - Vendre sa vault sur un marché secondaire
+//   - Utiliser sa vault comme collateral dans un autre protocole
+//   - Fractionaliser une vault en plusieurs parts
+//
+// AVANTAGES :
+//   - Liquidity : vend une vault avec un bon health factor à un premium
+//   - Composabilité : vaults utilisables dans d'autres protocoles
+//   - Transferabilité : pas besoin de withdraw + re-deposit
+//   - Fractionalisation : plusieurs investors peuvent co-posséder une vault
+//
+// PRIVACY :
+//   - Le NFT pointe vers une vault dont les montants sont chiffrés (Ciphertext)
+//   - Le owner du NFT est public (comme tout NFT), mais pas les montants
+//   - Les transferts sont visibles, mais pas les détails financiers
+//
+// Entry IDs:
+//   0  : mint_nft (wrap a vault into an NFT)
+//   1  : transfer_nft
+//   2  : burn_nft (unwrap: convert NFT back to vault ownership)
+//   3  : list_for_sale
+//   4  : cancel_sale
+//   5  : buy_nft
+//   6  : make_offer
+//   7  : cancel_offer
+//   8  : accept_offer
+//   9  : fractionalize (split NFT into multiple shares)
+//   10 : get_nft_info (pub fn)
+//   11 : get_nft_owner (pub fn)
+//   12 : get_sale_info (pub fn)
+//   13 : get_offer_info (pub fn)
+//   14 : get_total_supply (pub fn)
+//   15 : set_vault_engine
+//   16 : set_registry
+//   17 : set_timelock
+//   18 : set_guardian
+//   19 : pause
+//   20 : unpause
+//   21 : transfer_admin
+//   22 : get_version
+// ============================================================================
+
+const VERSION: string = "VaultNFT v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VAULT_ENGINE_KEY: string = "ve"
+
+const TOTAL_SUPPLY_KEY: string = "ts"
+const NFT_PREFIX: string = "nft_"           // nft_id → NFT data
+const OWNER_PREFIX: string = "own_"          // nft_id → owner
+const BALANCE_PREFIX: string = "bal_"        // owner → count
+const SALE_PREFIX: string = "sale_"          // nft_id → sale info
+const OFFER_PREFIX: string = "off_"          // offer_id → offer info
+const OFFER_COUNT_KEY: string = "oc"
+const FRACTION_PREFIX: string = "frac_"      // nft_id → fraction info
+
+const PROTOCOL_FEE_BPS: u64 = 50              // 0.5% on sales
+const MIN_SALE_PRICE: u64 = 1000000           // 0.01 XEL
+
+struct VaultNFTData {
+    nft_id: u64,
+    vault_id: u64,                    // underlying VaultEngine vault
+    original_owner: Address,
+    minted_at: u64,
+    is_fractionalized: bool,
+    total_shares: u64                 // 1 if not fractionalized, >1 if split
+}
+
+struct Sale {
+    nft_id: u64,
+    seller: Address,
+    price: u64,
+    listed_at: u64,
+    active: bool
+}
+
+struct Offer {
+    offer_id: u64,
+    nft_id: u64,
+    buyer: Address,
+    price: u64,
+    created_at: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_SUPPLY_KEY, 0u64)
+    s.store(OFFER_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Mint an NFT wrapping a vault
+// Caller must own the vault (verified in production via VaultEngine)
+entry mint_nft(vault_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // In production: verify caller owns vault_id via VaultEngine
+    // Then transfer vault ownership to this contract
+
+    let nft_id: u64 = s.load(TOTAL_SUPPLY_KEY).unwrap_or(0) + 1
+    let nft: VaultNFTData = VaultNFTData {
+        nft_id: nft_id,
+        vault_id: vault_id,
+        original_owner: caller,
+        minted_at: get_current_topoheight(),
+        is_fractionalized: false,
+        total_shares: 1
+    }
+    s.store(NFT_PREFIX + nft_id.to_string(10u32), nft)
+    s.store(OWNER_PREFIX + nft_id.to_string(10u32), caller)
+
+    let bal: u64 = s.load(BALANCE_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(BALANCE_PREFIX + caller.to_string(), bal + 1)
+    s.store(TOTAL_SUPPLY_KEY, nft_id)
+
+    emit_event(0u64, ["NFTMinted", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 1: Transfer NFT to a new owner
+entry transfer_nft(nft_id: u64, to: Address) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let owner: Address = s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(owner == caller, "notowner")
+
+    // Check not listed for sale
+    let sale_opt: optional<Sale> = s.load(SALE_PREFIX + nft_id.to_string(10u32))
+    if sale_opt.is_some() {
+        require(!sale_opt.expect("err").active, "listed")
+    }
+
+    // Update owner
+    s.store(OWNER_PREFIX + nft_id.to_string(10u32), to)
+
+    // Update balances
+    let from_bal: u64 = s.load(BALANCE_PREFIX + caller.to_string()).unwrap_or(0)
+    if from_bal > 0 { s.store(BALANCE_PREFIX + caller.to_string(), from_bal - 1) }
+    let to_bal: u64 = s.load(BALANCE_PREFIX + to.to_string()).unwrap_or(0)
+    s.store(BALANCE_PREFIX + to.to_string(), to_bal + 1)
+
+    // In production: transfer vault ownership in VaultEngine
+    emit_event(0u64, ["NFTTransferred", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 2: Burn NFT (unwrap to get back vault ownership)
+entry burn_nft(nft_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let owner: Address = s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(owner == caller, "notowner")
+
+    let nft: VaultNFTData = s.load(NFT_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(!nft.is_fractionalized, "fractional")
+
+    // In production: transfer vault ownership from this contract back to caller
+    s.delete(OWNER_PREFIX + nft_id.to_string(10u32))
+    s.delete(NFT_PREFIX + nft_id.to_string(10u32))
+    s.delete(SALE_PREFIX + nft_id.to_string(10u32))
+
+    let bal: u64 = s.load(BALANCE_PREFIX + caller.to_string()).unwrap_or(0)
+    if bal > 0 { s.store(BALANCE_PREFIX + caller.to_string(), bal - 1) }
+
+    emit_event(0u64, ["NFTBurned", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 3: List NFT for sale
+entry list_for_sale(nft_id: u64, price: u64) -> u64 {
+    when_not_paused()
+    require(price >= MIN_SALE_PRICE, "toolow")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let owner: Address = s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(owner == caller, "notowner")
+
+    let sale: Sale = Sale {
+        nft_id: nft_id,
+        seller: caller,
+        price: price,
+        listed_at: get_current_topoheight(),
+        active: true
+    }
+    s.store(SALE_PREFIX + nft_id.to_string(10u32), sale)
+    emit_event(0u64, ["NFTListed", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 4: Cancel sale
+entry cancel_sale(nft_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let sale: Sale = s.load(SALE_PREFIX + nft_id.to_string(10u32)).expect("notlisted")
+    require(sale.seller == caller, "notowner")
+    require(sale.active, "notactive")
+    sale.active = false
+    s.store(SALE_PREFIX + nft_id.to_string(10u32), sale)
+    return 0
+}
+
+// Entry 5: Buy an NFT (pay price + protocol fee)
+entry buy_nft(nft_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let sale: Sale = s.load(SALE_PREFIX + nft_id.to_string(10u32)).expect("notlisted")
+    require(sale.active, "notactive")
+    require(caller != sale.seller, "selfbuy")
+
+    // In production: transfer price + fee from buyer
+    // Seller receives price - fee
+    // Protocol receives fee
+    let fee: u64 = (sale.price * PROTOCOL_FEE_BPS) / 10000
+    let seller_proceeds: u64 = sale.price - fee
+
+    sale.active = false
+    s.store(SALE_PREFIX + nft_id.to_string(10u32), sale)
+
+    // Transfer NFT
+    s.store(OWNER_PREFIX + nft_id.to_string(10u32), caller)
+    let from_bal: u64 = s.load(BALANCE_PREFIX + sale.seller.to_string()).unwrap_or(0)
+    if from_bal > 0 { s.store(BALANCE_PREFIX + sale.seller.to_string(), from_bal - 1) }
+    let to_bal: u64 = s.load(BALANCE_PREFIX + caller.to_string()).unwrap_or(0)
+    s.store(BALANCE_PREFIX + caller.to_string(), to_bal + 1)
+
+    // In production: transfer vault ownership in VaultEngine
+    emit_event(0u64, ["NFTSold", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 6: Make an offer on an NFT
+entry make_offer(nft_id: u64, price: u64) -> u64 {
+    when_not_paused()
+    require(price >= MIN_SALE_PRICE, "toolow")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let owner: Address = s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(caller != owner, "selfoffer")
+
+    let offer_id: u64 = s.load(OFFER_COUNT_KEY).unwrap_or(0) + 1
+    let offer: Offer = Offer {
+        offer_id: offer_id,
+        nft_id: nft_id,
+        buyer: caller,
+        price: price,
+        created_at: get_current_topoheight(),
+        active: true
+    }
+    s.store(OFFER_PREFIX + offer_id.to_string(10u32), offer)
+    s.store(OFFER_COUNT_KEY, offer_id)
+    return 0
+}
+
+// Entry 7: Cancel an offer
+entry cancel_offer(offer_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("notfound")
+    require(offer.buyer == caller, "notbuyer")
+    require(offer.active, "notactive")
+    offer.active = false
+    s.store(OFFER_PREFIX + offer_id.to_string(10u32), offer)
+    return 0
+}
+
+// Entry 8: Accept an offer (NFT owner only)
+entry accept_offer(offer_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("notfound")
+    require(offer.active, "notactive")
+    let owner: Address = s.load(OWNER_PREFIX + offer.nft_id.to_string(10u32)).expect("notminted")
+    require(owner == caller, "notowner")
+
+    offer.active = false
+    s.store(OFFER_PREFIX + offer_id.to_string(10u32), offer)
+
+    // Cancel any active sale
+    let sale_opt: optional<Sale> = s.load(SALE_PREFIX + offer.nft_id.to_string(10u32))
+    if sale_opt.is_some() {
+        let sale: Sale = sale_opt.expect("err")
+        sale.active = false
+        s.store(SALE_PREFIX + offer.nft_id.to_string(10u32), sale)
+    }
+
+    // Transfer NFT
+    let fee: u64 = (offer.price * PROTOCOL_FEE_BPS) / 10000
+    let seller_proceeds: u64 = offer.price - fee
+
+    s.store(OWNER_PREFIX + offer.nft_id.to_string(10u32), offer.buyer)
+    let from_bal: u64 = s.load(BALANCE_PREFIX + caller.to_string()).unwrap_or(0)
+    if from_bal > 0 { s.store(BALANCE_PREFIX + caller.to_string(), from_bal - 1) }
+    let to_bal: u64 = s.load(BALANCE_PREFIX + offer.buyer.to_string()).unwrap_or(0)
+    s.store(BALANCE_PREFIX + offer.buyer.to_string(), to_bal + 1)
+
+    emit_event(0u64, ["OfferAccepted", offer_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 9: Fractionalize an NFT (split into multiple shares)
+// Creates `share_count` ERC-20-like shares representing fractional ownership
+entry fractionalize(nft_id: u64, share_count: u64) -> u64 {
+    when_not_paused()
+    require(share_count >= 2 && share_count <= 10000, "badshare")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let owner: Address = s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(owner == caller, "notowner")
+
+    let nft: VaultNFTData = s.load(NFT_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    require(!nft.is_fractionalized, "already")
+
+    nft.is_fractionalized = true
+    nft.total_shares = share_count
+    s.store(NFT_PREFIX + nft_id.to_string(10u32), nft)
+
+    // In production: deploy an ERC-20 contract for the shares
+    // Or store balances in this contract
+    s.store(FRACTION_PREFIX + nft_id.to_string(10u32) + "_caller", caller.to_string())
+    s.store(FRACTION_PREFIX + nft_id.to_string(10u32) + "_shares", share_count)
+
+    emit_event(0u64, ["NFTFractionalized", nft_id.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 10: Get NFT info
+pub fn get_nft_info(nft_id: u64) -> (u64, Address, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    let nft: VaultNFTData = s.load(NFT_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+    return (nft.vault_id, nft.original_owner, nft.minted_at, nft.is_fractionalized, nft.total_shares)
+}
+
+// Pub fn 11: Get current NFT owner
+pub fn get_nft_owner(nft_id: u64) -> Address {
+    let s: Storage = Storage::new()
+    return s.load(OWNER_PREFIX + nft_id.to_string(10u32)).expect("notminted")
+}
+
+// Pub fn 12: Get sale info
+pub fn get_sale_info(nft_id: u64) -> (Address, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let sale: Sale = s.load(SALE_PREFIX + nft_id.to_string(10u32)).expect("notlisted")
+    return (sale.seller, sale.price, sale.listed_at, sale.active)
+}
+
+// Pub fn 13: Get offer info
+pub fn get_offer_info(offer_id: u64) -> (u64, Address, Address, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let offer: Offer = s.load(OFFER_PREFIX + offer_id.to_string(10u32)).expect("notfound")
+    return (offer.nft_id, offer.buyer, s.load(OWNER_PREFIX + offer.nft_id.to_string(10u32)).expect("err"), offer.price, offer.created_at, offer.active)
+}
+
+// Pub fn 14: Get total NFT supply
+pub fn get_total_supply() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_SUPPLY_KEY).unwrap_or(0)
+}
+
+// Entry 15: Set vault engine
+entry set_vault_engine(ve: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VAULT_ENGINE_KEY, ve)
+    return 0
+}
+
+// Entry 16: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 17: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 18: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 19: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 20: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 21: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 22: Get version
+entry get_version() -> string {
+    return VERSION
+}
