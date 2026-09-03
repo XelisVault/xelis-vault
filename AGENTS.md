@@ -1331,3 +1331,82 @@ y est indexé par chunk→{name} (pas {fn→chunk}) → passer les chunk ids en 
 - State injection `~/.xelis-vault/airdrop/airdrop_inject_state.json`.
 - `git status` montre aussi `scripts/cli_backend.py` (M) + `scripts/chat_roster.py`
   (??) — travaux en cours séparés (screen_chat), NON inclus dans ce commit.
+
+# ✅ v12 — AUTO-AIRDROP + REWARD FIX + MIXER V3 (2026-09-04, Super Z)
+
+## Contexte diagnostic (chaîne canonique vérifiée via nœud public)
+- **Bug récompenses quantifié** : `dist=485,647,286` (4.86 VLT distribués au total
+  avec 6 mineurs sur ~2 semaines) vs cible tokenomique 2.75M VLT/an. Cause racine :
+  récompense payée PAR SOUMISSION (~57/jour avec le keeper) au lieu de PAR BLOC,
+  + STAKE_FLOOR=100k VLT en dénominateur (6000 VLT réellement stakés → 6%).
+- **Bug airdrop confirmé** : AUCUN contrat n'appelait les record_* (entrées
+  wallet-only — les contrats ne peuvent PAS les invoquer). Tout était injecté
+  à la main. 43 users / 316,220 pts / 0 qualifieds on-chain à date.
+- 2 contrats jamais compilés (AnalyticsCollector, CreditScore) : erreurs
+  before-use + index u32 pré-existantes.
+
+## v12.0 — contrats (11 upgrade, 51/51 compilent — build/chunkmap_*.txt)
+- **AirdropTracker v12** : `pub fn record_activity_cross` (chunk **77**, All,
+  FAIL-SAFE : pause/freeze/inconnu → no-op silencieux, jamais de revert du
+  caller). `import_user_state` (**78**) + `finalize_migration` (**79**) pour
+  migrer une saison existante AVEC days_active + mainnet (correctif du défaut
+  structurel days_active=1). Chunks 0-76 inchangés (injecteur/CLI compatibles).
+- **XelisVaultMiner v12.1** : settle paresseux PAR BLOC.
+  `settle_rewards_cross` (**90**, All) — appelé par StakedOracle.reward_miner
+  et VaultChat.anchor AVANT distribute_reward(23) (appels cross-contract par
+  NUMÉRO de chunk : pas de contrainte before-use inter-contrats).
+  `claim_rewards` (**91**). Vue de gains CONFIDENTIELLE : `ect_<addr>` =
+  Ciphertext ElGamal chiffré pour le mineur (add homomorphique,
+  Ciphertext::generate — PAS ::new, l'API docs est en avance sur le code).
+  Tous les pub fn mutants retournent 0 (slash_miner, auto_slash_offline,
+  emergency_slash_cross). Chunks 0-87 inchangés (StakedOracle 22/23/24,
+  MinerPool 66/67, CLI, keeper : OK).
+- **StakedOracle v12** : reward_miner = settle(90) puis distribute(23) ;
+  1 pt MINING par submit_price accepté (INLINE — chunks stables pour
+  Lending/Peer/Syndicate/PSM/VS/VE3 qui appellent le chunk 22).
+  set_airdrop_tracker = **60** (pas 49).
+- **VaultChat v12** : points CHAT/RELAYER inline (9 sites) ; anchor =
+  settle(90) + distribute(23). set_airdrop_tracker = **135**.
+- **Governor(23)/GovernanceVault(37)/PSM(38)/VaultSwapV2(58)/
+  SavingsRate(33)/VaultEngineV3(76)** : points GOV/LIQ inline + set_airdrop_tracker.
+- **PrivacyMixer v3** (redesign complet) : Tornado-style — dénominations fixes
+  1/10/100, nullifier `n_<asset>_<class>_<blake3(secret)>`, ZÉRO montant/identité
+  stockés, consommations atomiques, sans intermédiaire, frais 0 par défaut.
+  deposit=**7**, withdraw=**8**, get_denominations=14.
+- RÈGLE SILEX DÉCOUVERTE/VALIDÉE : intra-contrat = déclaration avant usage
+  (les helpers appended ne peuvent PAS être appelés par les entries
+  précédentes) ; inter-contrats = par numéro de chunk (aucune contrainte).
+  → d'où le pattern INLINE + settle cross.
+
+## CLI v12
+- xvault : écran **Doctor** (8 familles de checks, auto-réparation, étapes
+  numérotées) + guides d'erreur pas-à-pas sur chaque échec de tx (15
+  signatures connues) ; Privacy v3 (dénominations, XEL/VLT) ; Miner tools :
+  claim + earnings confidentiels + fenêtre d'accrual.
+- xvault-miner : action Claim accrued rewards.
+- protocol.py : WalletClient.decrypt_ciphertext ; cli_backend : CHUNKS v12
+  (mixer 7/8, miner claim 91), mixer_note_balance v3 (3 classes),
+  miner_confidential_earnings, airdrop_recorder_check.
+- installers : xvault-relayer → relayer_server.py (l'ancien pointait vers
+  relayer_daemon.py obsolète).
+- airdrop_offchain_indexer : hash LIVE depuis network/testnet.json (les
+  anciens hash deviennent legacy automatiquement).
+
+## Repo
+- **src/ SUPPRIMÉ** (duplication v11.5 dérivée — cause documentée des bugs
+  runtime stale). scripts/legacy/ pour les scripts remplacés.
+- build/ : bytecode + chunkmaps des 51 contrats (preuve de compilation).
+- docs/entry_chunk_ids.json : régénéré depuis la compilation RÉELLE.
+- deploy/upgrade_v12.py : phases A(déploiement)→B(registry upgrade entry 4)
+  →C(config complète incl. set_authorized_recorder x10 + set_airdrop_tracker
+  sur les 10 contrats)→D(migration airdrop avec import_user_state)→E(maj
+  network/testnet.json). Résumable/idempotent.
+- docs/UPGRADE_v12.md : guide précis de remplacement testnet (chunks vérifiés).
+
+## À FAIRE PAR L'OWNER (voir docs/UPGRADE_v12.md)
+1. Compiler avec le tool local (ou utiliser build/*.hex — vérifier les chunk
+   maps stderr), lancer upgrade_v12.py phases A→E.
+2. Mineurs : se ré-enregistrer (nouveau contrat = storage vierge).
+3. Relancer keeper + indexer ; arrêter l'injecteur manuel.
+4. Doctor : tout vert, puis E2E (submit prix → point MINING on-chain ;
+   settle → dist qui grimpe réellement).

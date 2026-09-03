@@ -6,7 +6,8 @@
 // FIX #9: Stability fee accrual — borrow amount grows over time
 // FIX #14: Two-step emergency_withdraw
 // ============================================================================
-const VERSION: string = "VaultEngineV3 v11.3"
+const VERSION: string = "VaultEngineV3 v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AIRDROP wiring
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -280,6 +281,15 @@ entry deposit(collateral_asset: Hash, collateral_amount: u64, salt: Hash) -> u64
     if dep > collateral_amount {
         let ok: bool = transfer(caller, dep - collateral_amount, collateral_asset)
         require(ok, "rfail")
+    }
+    // v12.0: airdrop LIQ points — 10 per XEL of collateral deposited (inline)
+    let ad_t: optional<Hash> = rs.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 5u8, (collateral_amount / 100000000) * 10u64, 403u64], {})
+        }
     }
     release_reentrancy()
     return 0
@@ -1164,4 +1174,17 @@ entry update_channel_meta(
 pub fn get_channel_meta(channel_id: u64) -> EncryptedChannelMeta {
     let s: Storage = Storage::new()
     return s.load("chan_meta_" + channel_id.to_string(10u32)).expect("nometa")
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

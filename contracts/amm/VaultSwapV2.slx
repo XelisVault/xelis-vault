@@ -41,7 +41,8 @@
 //   30 : execute_emergency_withdraw
 // ============================================================================
 
-const VERSION: string = "VaultSwapV2 v11.3"
+const VERSION: string = "VaultSwapV2 v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AIRDROP wiring
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -356,6 +357,17 @@ entry add_liquidity(asset_a: Hash, asset_b: Hash, amount_a: u64, amount_b: u64) 
         twap_push(key, pool.last_price)
     }
     s.store(key, pool)
+
+    // v12.0: airdrop LIQ points — 10 per XEL of liquidity added (side a)
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 5u8, (amount_a / 100000000) * 10u64, 401u64], {})
+        }
+    }
 
     release_reentrancy()
     return 0
@@ -1069,4 +1081,17 @@ pub fn get_psm_contract() -> Hash {
     let psm_opt: optional<Hash> = s.load(PSM_CONTRACT_KEY)
     if psm_opt.is_none() { return Hash::zero() }
     return psm_opt.expect("err")
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

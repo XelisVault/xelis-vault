@@ -1,0 +1,290 @@
+{
+  "data": [
+    {
+      "entry_id": 18,
+      "name": "create_pool",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_asset",
+          "type": "Hash"
+        },
+        {
+          "name": "borrow_asset",
+          "type": "Hash"
+        },
+        {
+          "name": "collateral_factor_bps",
+          "type": "u64"
+        },
+        {
+          "name": "liquidation_threshold_bps",
+          "type": "u64"
+        },
+        {
+          "name": "liquidation_penalty_bps",
+          "type": "u64"
+        },
+        {
+          "name": "reserve_factor_bps",
+          "type": "u64"
+        },
+        {
+          "name": "interest_rate_model",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "supply",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "borrow",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "repay",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "liquidate",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "repay_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "get_pool_info_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "get_user_position_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pool_id",
+          "type": "u64"
+        },
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "get_pools_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "set_oracle",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "oracle",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "t",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 34,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 35,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 36,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 37,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

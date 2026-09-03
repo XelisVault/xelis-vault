@@ -25,7 +25,8 @@
 //   12 : get_version() -> string
 // ============================================================================
 
-const VERSION: string = "Governor v11.3"
+const VERSION: string = "Governor v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AirdropTracker wiring
 
 const ADMIN_KEY: string = "a"
 const GOVERNANCE_VAULT_KEY: string = "gv"
@@ -142,6 +143,16 @@ entry propose(
     }
     s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
     s.store(PROPOSALS_COUNT_KEY, id + 1)
+    // v12.0: airdrop GOV 500 pts for creating a proposal
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 3u8, 500u64, 500u64], {})
+        }
+    }
     return 0
 }
 
@@ -181,6 +192,16 @@ entry vote(proposal_id: u64, support: u8) -> u64 {
     }
     s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
     s.store(vote_key, true)
+    // v12.0: airdrop GOV 50 pts for voting
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 3u8, 50u64, 501u64], {})
+        }
+    }
     return 0
 }
 
@@ -458,4 +479,17 @@ pub fn get_governance_vault() -> Hash {
 // @security: read-only, no access restrictions
 pub fn get_timelock() -> Hash {
     return Storage::new().load(TIMELOCK_KEY).unwrap_or(Hash::zero())
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

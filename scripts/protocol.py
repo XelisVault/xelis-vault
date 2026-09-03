@@ -379,6 +379,18 @@ class WalletClient:
                 pass
             time.sleep(5)
 
+    def decrypt_ciphertext(self, ct_hex: str, max_supply: int = 1000000000000000) -> int | None:
+        """Decrypt a 64-byte compressed ElGamal ciphertext (128 hex chars)
+        stored by a contract and encrypted for THIS wallet. Returns the
+        plaintext amount in atomic units, or None if the wallet cannot
+        decrypt (not the owner / RPC unsupported)."""
+        try:
+            res = self._call("decrypt_ciphertext",
+                             {"ciphertext": ct_hex, "max_supply": max_supply})
+            return int(res) if res is not None else None
+        except Exception:
+            return None
+
     def transfer(self, to: str, amount: int, asset: str = XEL_ASSET,
                  fee: int = INVOKE_FEE) -> str:
         self._wait_nonce_catchup()

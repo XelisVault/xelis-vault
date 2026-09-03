@@ -1,37 +1,59 @@
-// PrivacyMixer.slx — XELIS Vault v2 (note + nullifier model)
+// PrivacyMixer.slx — XELIS Vault v3 (Tornado-style fixed denominations)
 //
-// ⚠️ v2 REDESIGN (2026-08-27): the v1 mixer stored sender, recipient, amount and
-// deposited_at in a per-deposit struct (DepositEntry) exposed via a PUBLIC
-// get_deposit_info(). That directly linked the sender to the recipient in the
-// contract's own storage — a fatal privacy bug for anything calling itself a
-// "privacy mixer". This v2 removes all sender/recipient linkage:
+// ============================================================================
+// DESIGN (v3, 2026-09) — "sans intermédiaire", montants jamais stockés
+// ============================================================================
+// v1 stored sender/recipient/amount per deposit (fatal linkability, removed).
+// v2 replaced it with secret notes carrying a PLAINTEXT u64 balance: the
+// contract storage itself leaked every note's amount, and distinctive
+// amounts could correlate a deposit with its withdrawal.
 //
-//   - deposit(asset, secret)  creates a NOTE commitment = blake3(secret) and
-//     adds the attached funds to the SHARED POOL of that asset. The contract
-//     stores NO sender, NO recipient, NO per-user topo, NO per-user amount keyed
-//     by identity.
-//   - withdraw(recipient, asset, amount, secret)  destroys the note (nullifier)
-//     and transfers `amount` from the SHARED POOL to any chosen recipient.
+// v3 is the classic Tornado model, which needs NO zero-knowledge proof
+// because notes are consumed atomically:
 //
-//   Because the withdrawal target is arbitrary and the funds come from a
-//   fungible shared pool, there is NO on-chain field linking who deposited to
-//   who withdrew. The anonymity set = all depositors of that asset.
-//   The secret is transferable off-chain, so even the note's owner isn't forced
-//   to be the depositor.
+//   deposit(asset, secret)
+//     - the attached amount must be EXACTLY one of the fixed denominations
+//       (1, 10 or 100 units => 1e8 / 1e9 / 1e10 atomic, 8-decimals assets);
+//     - the only thing written on-chain is a nullifier-ready commitment:
+//         n_<asset>_<class>_<blake3(secret)> = true
+//       NO sender, NO recipient, NO amount, NO timestamp, NO pubkey.
+//     - funds join the SHARED pool of the asset.
 //
-//  Limite honnête: sans preuve ZK (non dispo dans ce VM), un observateur qui
-//  surveille timing + adresses peut opérer une analyse de graphe; mais le
-//  CONTRAT lui-même ne stocke plus aucun lien expéditeur/destinataire
-//  exploitable — ce qui était justement l'accusation sur v1.
+//   withdraw(recipient, asset, amount, secret)
+//     - `amount` must be exactly one of the fixed denominations;
+//     - the commitment is recomputed from the presented secret, the note is
+//       consumed (nullified) and the denomination is transferred from the
+//       shared pool to ANY address.
 //
-// Layout:
-//   0   : constructor (admin, guardian, config)
-//   ...  admin setters + getters
-//   ...  deposit (note + pool)
-//   ...  withdraw (nullifier + pool -> recipient)
-//   ...  pause / emergency / transfer_admin / guardian / timelock
+// WHY THIS IS SOUND WITHOUT ZK:
+//   - fixed denominations => all deposits of a class are perfectly fungible;
+//     there is no amount-based correlation inside a class;
+//   - atomic nullifier consumption => no "remaining balance" arithmetic, so
+//     no over-withdraw is possible and no balance proof is needed;
+//   - XELIS L1 confidentiality encrypts every transfer amount, so neither
+//     the deposit attachment nor the withdrawal transfer is readable;
+//   - the withdrawal recipient is arbitrary (a fresh address), and the
+//     secret is a bearer instrument transferable off-chain.
+//   Anonymity set = every depositor of the same (asset, denomination).
+//
+// LIMITS (honest): timing/graph analysis by a determined observer remains
+// theoretically possible (as on every non-ZK mixer); a same-address reuse
+// between deposit and withdraw obviously links the two (use a fresh
+// address); the VM exposes no BalanceProof/OwnershipProof yet on this
+// network version, so relayed withdrawals (relayer paying gas for you)
+// would require handing the secret to the relayer — do NOT do that, call
+// withdraw directly from your own wallet.
+//
+// Chunk layout (identical prefix to v2 — CLI keep deposit=6, withdraw=7):
+//   0  constructor          6  deposit           12 get_total_mixes
+//   1  when_not_paused      7  withdraw          13 set_withdraw_fee_bps
+//   2  only_admin           8  get_pool_info     14 set_admin_fee_bps (no-op)
+//   3  only_guardian_or_adm 9  get_note_balance  15 set_admin_fee_addr
+//   4  note_key            10  get_pool_balance  16 set_treasury
+//   5  pool_key            11  get_total_mixed   17 set_registry ...
+// ============================================================================
 
-const VERSION: string = "PrivacyMixer v2"
+const VERSION: string = "PrivacyMixer v3"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -41,19 +63,26 @@ const REGISTRY_KEY: string = "reg"
 const TREASURY_KEY: string = "tr"
 const ADMIN_FEE_ADDR_KEY: string = "afa"
 
-// Config
+// Config (kept for ABI compat; v3 charges no deposit fee — see header)
 const WITHDRAW_FEE_BPS_KEY: string = "wfb"
-const ADMIN_FEE_BPS_KEY: string = "afb"   // tiny admin fee, taken on deposit
-const NOTE_COUNT_KEY: string = "nc"       // total notes ever created (for stats)
+const ADMIN_FEE_BPS_KEY: string = "afb"
+const NOTE_COUNT_KEY: string = "nc"
 
-const DEFAULT_WITHDRAW_FEE_BPS: u64 = 0           // 0% par défaut
-const DEFAULT_ADMIN_FEE_BPS: u64 = 10             // 0.1% for admin
+const DEFAULT_WITHDRAW_FEE_BPS: u64 = 0
+const DEFAULT_ADMIN_FEE_BPS: u64 = 0
 
-// Notes
-// note key: "n_" + asset.to_hex() + "_" + commitment.to_hex()
-// value    : remaining amount (u64) drainable for that note
+// Fixed denominations (atomic units, 8-decimals assets: 1, 10 and 100 units)
+const DENOM_1: u64 = 100000000
+const DENOM_2: u64 = 1000000000
+const DENOM_3: u64 = 10000000000
+
+// Notes: "n_" + asset_hex + "_" + class + "_" + commitment_hex -> true
+// class: 1 = DENOM_1, 2 = DENOM_2, 3 = DENOM_3
 const NOTE_PREFIX: string = "n_"
-const ASSET_POOL_PREFIX: string = "pool_"   // total deposited per asset (u64)
+const ASSET_POOL_PREFIX: string = "pool_"
+
+// Airdrop wiring (v12)
+const AIRDROP_TRACKER_KEY: string = "atk"
 
 // Emergency
 const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
@@ -62,8 +91,6 @@ const EMERGENCY_DELAY_BLOCKS: u64 = 17280
 // Stats
 const TOTAL_MIXED_PREFIX: string = "tm_"
 const TOTAL_MIXES_KEY: string = "tmc"
-const DEFAULT_MIN_THRESHOLD: u64 = 3   // kept for getters compatibility
-const DEFAULT_MAX_THRESHOLD: u64 = 100
 
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
@@ -104,66 +131,65 @@ fn only_guardian_or_admin() {
     only_admin()
 }
 
-fn note_key(asset: Hash, commitment: Hash) -> string {
-    return NOTE_PREFIX + asset.to_hex() + "_" + commitment.to_hex()
+fn note_key(asset: Hash, class: u8, commitment: Hash) -> string {
+    return NOTE_PREFIX + asset.to_hex() + "_" + class.to_string(10u32) + "_" + commitment.to_hex()
 }
 
 fn pool_key(asset: Hash) -> string {
     return ASSET_POOL_PREFIX + asset.to_hex()
 }
 
+// Map an atomic amount to its denomination class (0 = not a denomination)
+fn class_of(amount: u64) -> u8 {
+    if amount == DENOM_1 { return 1 }
+    if amount == DENOM_2 { return 2 }
+    if amount == DENOM_3 { return 3 }
+    return 0
+}
+
 // ============================================================================
-// ENTRY 0: deposit — create a private note and add funds to the shared pool.
+// ENTRY 0 (chunk 6): deposit — create a private note and join the shared pool.
 // @caller: any
 // @params: asset - Hash of the asset to mix (Hash::zero() for XEL)
-// @params: secret - user-chosen random secret; the note commitment is
-//                   blake3(secret). The secret is NEVER stored on-chain; it is
-//                   the off-chain proof of ownership that is redeemed in
-//                   withdraw(). It can be handed to another address off-chain.
-// @attached: the amount to mix (ANY amount; free, not fixed denomination)
+// @params: secret - user-chosen random secret (bearer instrument, kept
+//                   off-chain; the note commitment is blake3(secret))
+// @attached: EXACTLY one of the fixed denominations (1, 10 or 100 units)
 // @returns: 0
-// @security: when_not_paused, requires attached deposit > 0
-// @note: NO sender, recipient, amount-per-identity, or topo is stored. Only a
-//        commitment and the shared pool total. Deposit is untraceable to the
-//        depositor's identity.
+// @security: when_not_paused; rejects non-denomination amounts and reused
+//            commitments. Nothing but the commitment marker is stored.
+// ============================================================================
 entry deposit(asset: Hash, secret: Hash) -> u64 {
     when_not_paused()
-
     let s: Storage = Storage::new()
 
-    // Any amount, not fixed denomination — XELIS encrypts the attached amount.
     let dep: u64 = get_deposit_for_asset(asset).expect("err")
-    require(dep > 0, "insdep")
+    let class: u8 = class_of(dep)
+    require(class > 0, "baddenom")
 
-    // Fee charged on deposit (admin tiny cut), remainder goes to the pool.
-    let admin_fee_bps: u64 = s.load(ADMIN_FEE_BPS_KEY).unwrap_or(DEFAULT_ADMIN_FEE_BPS)
-    let admin_fee: u64 = (dep * admin_fee_bps) / 10000
-    let net: u64 = dep - admin_fee
-
-    // Commitment = blake3(secret). No identity stored.
     let commitment: Hash = Hash::blake3(secret.to_bytes())
-    let key: string = note_key(asset, commitment)
+    let key: string = note_key(asset, class, commitment)
     require(s.load(key).is_none(), "exists")
+    s.store(key, true)
 
-    s.store(key, net)
-
-    // Credit the shared pool total for this asset.
+    // Credit the shared pool (aggregate only — no per-user data).
     let pk: string = pool_key(asset)
     let cur: u64 = s.load(pk).unwrap_or(0)
-    s.store(pk, cur + net)
+    s.store(pk, cur + dep)
 
     // Stats.
     let nc: u64 = s.load(NOTE_COUNT_KEY).unwrap_or(0)
     s.store(NOTE_COUNT_KEY, nc + 1)
     let tm: u64 = s.load(TOTAL_MIXED_PREFIX + asset.to_hex()).unwrap_or(0)
-    s.store(TOTAL_MIXED_PREFIX + asset.to_hex(), tm + net)
+    s.store(TOTAL_MIXED_PREFIX + asset.to_hex(), tm + dep)
 
-    // Pay admin fee.
-    if admin_fee > 0 {
-        let afa_opt: optional<Address> = s.load(ADMIN_FEE_ADDR_KEY)
-        if afa_opt.is_some() {
-            let afa: Address = afa_opt.expect("err")
-            let _ = transfer(afa, admin_fee, asset)
+    // v12.0: airdrop LIQ points — 10 per unit mixed (inline, fail-safe)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let ad_u: Address = get_caller().expect("err")
+            let _ = ad_c.call(77u16, [ad_u, 5u8, (dep / 100000000) * 10, 600u64], {})
         }
     }
 
@@ -172,49 +198,42 @@ entry deposit(asset: Hash, secret: Hash) -> u64 {
 }
 
 // ============================================================================
-// ENTRY 1: withdraw — destroy a note (nullifier) and pull `amount` from the
-// shared pool to ANY chosen recipient.
-// @caller: any holder of the secret
-// @params: recipient - Address to receive the funds (can differ from depositor)
+// ENTRY 1 (chunk 7): withdraw — consume a note (nullifier) and pull the
+// denomination from the shared pool to ANY chosen recipient.
+// @caller: any holder of the secret (call directly from your own wallet)
+// @params: recipient - Address receiving the funds (use a fresh address)
 // @params: asset - asset being withdrawn
-// @params: amount - amount to withdraw (<= remaining note balance)
+// @params: amount - EXACT denomination the note was created with
 // @params: secret - the secret whose commitment was stored at deposit time
 // @returns: 0
-// @security: when_not_paused; note must exist and have enough balance; funds
-//            come from the SHARED pool, so no sender link.
+// @security: when_not_paused; note must exist (atomically consumed);
+//            withdraw fee (default 0) goes to the treasury if configured.
+// ============================================================================
 entry withdraw(recipient: Address, asset: Hash, amount: u64, secret: Hash) -> u64 {
     when_not_paused()
-
     let s: Storage = Storage::new()
-    require(amount > 0, "zero")
 
-    // Recompute commitment from the presented secret and look up the note.
+    let class: u8 = class_of(amount)
+    require(class > 0, "baddenom")
+
     let commitment: Hash = Hash::blake3(secret.to_bytes())
-    let key: string = note_key(asset, commitment)
-    let note_opt: optional<u64> = s.load(key)
-    require(note_opt.is_some(), "notfound")
-    let note_bal: u64 = note_opt.expect("err")
-    require(amount <= note_bal, "toobig")
+    let key: string = note_key(asset, class, commitment)
+    require(s.load(key).is_some(), "notfound")
+    s.delete(key)
 
-    // Drain the note.
-    let remaining: u64 = note_bal - amount
-    if remaining == 0 {
-        s.delete(key)
-    } else {
-        s.store(key, remaining)
-    }
-
-    // Pull from the shared pool total (bookkeeping).
+    // Debit the shared pool (bookkeeping).
     let pk: string = pool_key(asset)
     let pool: u64 = s.load(pk).unwrap_or(0)
+    require(pool >= amount, "inspool")
     s.store(pk, pool - amount)
 
-    // Transfer from the contract's shared balance to the arbitrary recipient.
+    // Transfer the denomination from the contract's shared balance.
     let withdraw_fee_bps: u64 = s.load(WITHDRAW_FEE_BPS_KEY).unwrap_or(DEFAULT_WITHDRAW_FEE_BPS)
     let withdraw_fee: u64 = (amount * withdraw_fee_bps) / 10000
     let net: u64 = amount - withdraw_fee
     if net > 0 {
-        let _ = transfer(recipient, net, asset)
+        let ok: bool = transfer(recipient, net, asset)
+        require(ok, "txfail")
     }
 
     // Protocol fee to treasury (if configured).
@@ -238,20 +257,29 @@ entry withdraw(recipient: Address, asset: Hash, amount: u64, secret: Hash) -> u6
 // PUB FN: read-only getters — expose NO per-user data.
 // ============================================================================
 
+// (pool balance, notes created, withdraw fee bps, admin fee bps, total mixes)
 pub fn get_pool_info(asset: Hash) -> (u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
-        s.load(pool_key(asset)).unwrap_or(0),      // pool balance (total deposited)
-        s.load(NOTE_COUNT_KEY).unwrap_or(0),        // total notes created
+        s.load(pool_key(asset)).unwrap_or(0),
+        s.load(NOTE_COUNT_KEY).unwrap_or(0),
         s.load(WITHDRAW_FEE_BPS_KEY).unwrap_or(DEFAULT_WITHDRAW_FEE_BPS),
         s.load(ADMIN_FEE_BPS_KEY).unwrap_or(DEFAULT_ADMIN_FEE_BPS),
         s.load(TOTAL_MIXES_KEY).unwrap_or(0)
     )
 }
 
+// Remaining value of a note identified by its commitment: the denomination
+// if the note is still spendable, 0 once consumed. (Checks the 3 classes.)
 pub fn get_note_balance(asset: Hash, commitment: Hash) -> u64 {
     let s: Storage = Storage::new()
-    return s.load(note_key(asset, commitment)).unwrap_or(0)
+    let k1: optional<bool> = s.load(note_key(asset, 1u8, commitment))
+    if k1.is_some() { return DENOM_1 }
+    let k2: optional<bool> = s.load(note_key(asset, 2u8, commitment))
+    if k2.is_some() { return DENOM_2 }
+    let k3: optional<bool> = s.load(note_key(asset, 3u8, commitment))
+    if k3.is_some() { return DENOM_3 }
+    return 0
 }
 
 pub fn get_pool_balance(asset: Hash) -> u64 {
@@ -269,6 +297,11 @@ pub fn get_total_mixes() -> u64 {
     return s.load(TOTAL_MIXES_KEY).unwrap_or(0)
 }
 
+// v3: the three fixed denominations, for CLI/tools display.
+pub fn get_denominations() -> (u64, u64, u64) {
+    return (DENOM_1, DENOM_2, DENOM_3)
+}
+
 // ============================================================================
 // ADMIN ENTRIES
 // ============================================================================
@@ -280,9 +313,12 @@ entry set_withdraw_fee_bps(bps: u64) -> u64 {
     return 0
 }
 
+// Kept for ABI compatibility — v3 never charges a deposit fee (a fee would
+// break the exact-denomination pool accounting). The value is stored but
+// ignored by deposit().
 entry set_admin_fee_bps(bps: u64) -> u64 {
     only_admin()
-    require(bps <= 100, "toohigh")  // max 1%
+    require(bps <= 100, "toohigh")
     Storage::new().store(ADMIN_FEE_BPS_KEY, bps)
     return 0
 }
@@ -366,4 +402,17 @@ pub fn set_timelock_tl(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this mixer at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

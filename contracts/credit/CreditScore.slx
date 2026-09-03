@@ -147,6 +147,25 @@ fn only_guardian_or_admin() {
     only_admin()
 }
 
+// F-07 fix: check whether `caller_hash` matches one of the three registered lenders.
+fn is_authorized_lender(caller_hash: Hash) -> bool {
+    let s: Storage = Storage::new()
+    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+    if reg_opt.is_none() { return false }
+    let reg_hash: Hash = reg_opt.expect("err")
+    if reg_hash == Hash::zero() { return false }
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    let names: string[] = ["PeerLoan", "SyndicatePool", "LendingMarket"]
+    let i: u32 = 0
+    while i < names.len() {
+        let name: string = names[i]
+        let h: Hash = reg.call(14u16, [name], {})
+        if h != Hash::zero() && h == caller_hash { return true }
+        i += 1
+    }
+    return false
+}
+
 // Only authorized lending contracts (PeerLoan, SyndicatePool, LendingMarket) can record events
 // F-07 fix (HIGH): was accepting ANY contract caller (only checked
 //   get_contract_caller().is_some()). A forged contract could arbitrarily
@@ -167,24 +186,6 @@ fn only_authorized_lender() {
     require(is_authorized_lender(cc), "notlender")
 }
 
-// F-07 fix: check whether `caller_hash` matches one of the three registered lenders.
-fn is_authorized_lender(caller_hash: Hash) -> bool {
-    let s: Storage = Storage::new()
-    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
-    if reg_opt.is_none() { return false }
-    let reg_hash: Hash = reg_opt.expect("err")
-    if reg_hash == Hash::zero() { return false }
-    let reg: Contract = Contract::new(reg_hash).expect("err")
-    let names: string[] = ["PeerLoan", "SyndicatePool", "LendingMarket"]
-    let i: u64 = 0
-    while i < names.len() {
-        let name: string = names[i]
-        let h: Hash = reg.call(14u16, [name], {})
-        if h != Hash::zero() && h == caller_hash { return true }
-        i += 1
-    }
-    return false
-}
 
 fn get_or_init_stats(user: Address) -> CreditStats {
     let s: Storage = Storage::new()

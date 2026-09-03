@@ -139,6 +139,25 @@ fn only_guardian_or_admin() {
     only_admin()
 }
 
+// F-06 fix: check whether `caller_hash` matches one of the registered protocol contracts.
+fn is_authorized_protocol_contract(caller_hash: Hash) -> bool {
+    let s: Storage = Storage::new()
+    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+    if reg_opt.is_none() { return false }
+    let reg_hash: Hash = reg_opt.expect("err")
+    if reg_hash == Hash::zero() { return false }
+    let reg: Contract = Contract::new(reg_hash).expect("err")
+    let names: string[] = ["VaultSwapV2", "PSM", "VaultEngineV3", "FlashLoan", "VaultChat", "LendingMarket", "PeerLoan", "SyndicatePool", "InsurancePool", "SealedBidAuction", "GovernanceVault", "AirdropTracker", "XelisVaultMiner", "StakedOracle"]
+    let i: u32 = 0
+    while i < names.len() {
+        let name: string = names[i]
+        let h: Hash = reg.call(14u16, [name], {})
+        if h != Hash::zero() && h == caller_hash { return true }
+        i += 1
+    }
+    return false
+}
+
 // Only authorized protocol contracts can record events
 // F-06 fix (MEDIUM): was accepting ANY contract caller (only checked
 //   get_contract_caller().is_some()). Now resolves the registry and requires
@@ -157,24 +176,6 @@ fn only_protocol_contract() {
     require(is_authorized_protocol_contract(cc), "notauth")
 }
 
-// F-06 fix: check whether `caller_hash` matches one of the registered protocol contracts.
-fn is_authorized_protocol_contract(caller_hash: Hash) -> bool {
-    let s: Storage = Storage::new()
-    let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
-    if reg_opt.is_none() { return false }
-    let reg_hash: Hash = reg_opt.expect("err")
-    if reg_hash == Hash::zero() { return false }
-    let reg: Contract = Contract::new(reg_hash).expect("err")
-    let names: string[] = ["VaultSwapV2", "PSM", "VaultEngineV3", "FlashLoan", "VaultChat", "LendingMarket", "PeerLoan", "SyndicatePool", "InsurancePool", "SealedBidAuction", "GovernanceVault", "AirdropTracker", "XelisVaultMiner", "StakedOracle"]
-    let i: u64 = 0
-    while i < names.len() {
-        let name: string = names[i]
-        let h: Hash = reg.call(14u16, [name], {})
-        if h != Hash::zero() && h == caller_hash { return true }
-        i += 1
-    }
-    return false
-}
 
 // Helper: get day number from topoheight (1 day = 17280 blocks)
 fn get_day(topoheight: u64) -> u64 {

@@ -1,0 +1,1037 @@
+{
+  "data": [
+    {
+      "entry_id": 7,
+      "name": "register_session",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "chat_pubkey",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "create_group",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_pubkey",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "add_group_member",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        },
+        {
+          "name": "encrypted_group_key",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "remove_group_member",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "anchor_messages",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "merkle_root",
+          "type": "Hash"
+        },
+        {
+          "name": "message_count",
+          "type": "u64"
+        },
+        {
+          "name": "sender_count",
+          "type": "u64"
+        },
+        {
+          "name": "msg_type",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "revoke_session",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "get_session_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "get_group_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "get_group_member_key_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "is_session_active_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "get_last_anchor_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "get_groups_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "get_group_members_count_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "set_relayer",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "store_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "encrypted_blob",
+          "type": "bytes"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "delete_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "slot",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "delete_conversation",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "peer",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "set_group_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "admin_delete_group_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "msg_slot",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "admin_kick_member",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 48,
+      "name": "store_group_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "encrypted_blob",
+          "type": "bytes"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 51,
+      "name": "set_relayer_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "fee_amount",
+          "type": "u64"
+        },
+        {
+          "name": "token",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 55,
+      "name": "pay_premium_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 56,
+      "name": "claim_relayer_fees",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 57,
+      "name": "rotate_group_key",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "new_group_pubkey",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 59,
+      "name": "distribute_new_key",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        },
+        {
+          "name": "new_encrypted_key",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 60,
+      "name": "mark_read",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "slot",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 63,
+      "name": "store_ephemeral_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "encrypted_blob",
+          "type": "bytes"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        },
+        {
+          "name": "ttl_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 66,
+      "name": "register_as_relayer",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "endpoint",
+          "type": "string"
+        },
+        {
+          "name": "free_daily_limit",
+          "type": "u64"
+        },
+        {
+          "name": "free_wallet_slots",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 69,
+      "name": "claim_free_slot",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 71,
+      "name": "consume_free_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 72,
+      "name": "report_free_usage",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 73,
+      "name": "create_plan",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "plan_type",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "duration_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "msg_count",
+          "type": "u64"
+        },
+        {
+          "name": "token",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 74,
+      "name": "update_plan",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "plan_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "duration_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "msg_count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 75,
+      "name": "delete_plan",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "plan_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 78,
+      "name": "buy_plan",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "plan_id",
+          "type": "u64"
+        },
+        {
+          "name": "recipient",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 81,
+      "name": "consume_credit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 82,
+      "name": "set_batch_interval",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 83,
+      "name": "anchor_batch",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "merkle_root",
+          "type": "Hash"
+        },
+        {
+          "name": "message_count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 87,
+      "name": "blacklist_relayer",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bad_relayer",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 93,
+      "name": "set_protocol_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 95,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 96,
+      "name": "set_vlt_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "a",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 98,
+      "name": "set_prune_interval",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 100,
+      "name": "report_storage_stats",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "total_gb",
+          "type": "u64"
+        },
+        {
+          "name": "used_gb",
+          "type": "u64"
+        },
+        {
+          "name": "messages_stored",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 102,
+      "name": "create_payment_request",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "to",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 103,
+      "name": "fulfill_payment_request",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "req_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 104,
+      "name": "cancel_payment_request",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "req_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 107,
+      "name": "create_giveaway",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "scope",
+          "type": "string"
+        },
+        {
+          "name": "amount_per_claim",
+          "type": "u64"
+        },
+        {
+          "name": "max_claims",
+          "type": "u64"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 108,
+      "name": "claim_giveaway",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "giveaway_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 109,
+      "name": "cancel_giveaway",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "giveaway_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 113,
+      "name": "send_direct_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "encrypted_blob",
+          "type": "bytes"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 116,
+      "name": "delete_direct_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "slot",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 117,
+      "name": "toggle_relayer_paused",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 119,
+      "name": "update_relayer_endpoint",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_endpoint",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 120,
+      "name": "update_free_tier",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "free_daily_limit",
+          "type": "u64"
+        },
+        {
+          "name": "free_wallet_slots",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 121,
+      "name": "stake_relayer_bond",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bond_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 123,
+      "name": "slash_relayer_bond",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "slash_bps",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 124,
+      "name": "withdraw_relayer_bond",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 128,
+      "name": "rate_relayer_weighted",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "score",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 131,
+      "name": "set_member_role",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        },
+        {
+          "name": "new_role",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 133,
+      "name": "mute_member",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "group_id",
+          "type": "u64"
+        },
+        {
+          "name": "member",
+          "type": "Address"
+        },
+        {
+          "name": "duration_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 135,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

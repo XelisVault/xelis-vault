@@ -108,6 +108,45 @@ LEGACY_HASHES = {
 _HASH_TO_NAME = {v: k for k, v in CONTRACT_HASHES.items()}
 _HASH_TO_NAME.update(LEGACY_HASHES)
 
+# v12: prefer the LIVE hashes from network/testnet.json (auto-adapts after
+# a registry upgrade — old hashes move to LEGACY_HASHES below at runtime).
+try:
+    import json as _json
+    from pathlib import Path as _Path
+    _net = _json.loads((_Path(__file__).resolve().parent.parent
+                        / "network" / "testnet.json").read_text())
+    _KEY_TO_NAME = {
+        "airdrop_tracker": "AirdropTracker", "asset_vault": "AssetVault",
+        "compliance_module": "ComplianceModule",
+        "contract_registry": "ContractRegistry", "faucet": "FaucetContract",
+        "fee_distributor": "FeeDistributor", "flash_callback": "FlashCallback",
+        "flash_loan": "FlashLoan", "governance_vault": "GovernanceVault",
+        "governor": "Governor", "guardian_multisig": "GuardianMultisig",
+        "lending_market": "LendingMarket", "miner_pool": "MinerPool",
+        "oracle_governance": "OracleGovernance", "psm": "PSM",
+        "payroll": "Payroll", "peer_loan": "PeerLoan",
+        "privacy_mixer": "PrivacyMixer", "revenue_share": "RevenueShare",
+        "savings_rate": "SavingsRate",
+        "sealed_bid_auction": "SealedBidAuction",
+        "staked_oracle": "StakedOracle", "syndicate_pool": "SyndicatePool",
+        "timelock": "Timelock", "treasury_vault": "TreasuryVault",
+        "vlt_token": "VLTToken", "vault_chat": "VaultChat",
+        "vault_engine": "VaultEngineV3", "vault_swap": "VaultSwapV2",
+        "miner": "XelisVaultMiner", "xusd": "xUSD",
+    }
+    for _k, _name in _KEY_TO_NAME.items():
+        _h = _net.get("contracts", {}).get(_k)
+        if _h:
+            # any hash that differs from the table above is historical:
+            # keep it mapped (LEGACY) and register the live one.
+            if CONTRACT_HASHES.get(_name) and CONTRACT_HASHES[_name] != _h:
+                LEGACY_HASHES[CONTRACT_HASHES[_name]] = _name
+            CONTRACT_HASHES[_name] = _h
+    _HASH_TO_NAME = {v: k for k, v in CONTRACT_HASHES.items()}
+    _HASH_TO_NAME.update(LEGACY_HASHES)
+except Exception as _e:  # network file missing — fall back to the table
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Grille de points : (catégorie, points, description, mode)

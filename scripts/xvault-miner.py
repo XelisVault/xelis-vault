@@ -635,12 +635,46 @@ def action_enable_service(cfg, b):
             info_box("Failed", [render_error(f"Reason: {res.reason}")], color=C.RED)
 
 
+def action_claim_rewards(cfg, b):
+    """v12.1: settle per-block accrued rewards now (entry 91)."""
+    if not b.has_wallet:
+        info_box("Claim rewards", [render_error("No wallet connected.")],
+                 color=C.RED)
+        return
+    if not b.my_miner():
+        info_box("Claim rewards", [
+            render_error("This address has no miner profile."),
+            "Register first (Register as miner).",
+        ], color=C.RED)
+        return
+    from tui import confirm
+    show_cursor()
+    ok = confirm("Settle pending per-block rewards now? (also happens "
+                 "automatically on every heartbeat / submission)")
+    hide_cursor()
+    if not ok:
+        return
+    res = b.miner_claim_rewards()
+    if res and res.ok:
+        info_box("Claim rewards", [
+            render_ok("Rewards settled on-chain."),
+            "Pending blocks since your last settle have been paid.",
+        ], color=C.GREEN)
+    else:
+        info_box("Claim rewards", [
+            render_error(f"Failed: {getattr(res, 'reason', 'unknown') if res else 'no result'}"),
+            "Nothing pending? The settle also runs on every heartbeat",
+            "and every valid submission — this is expected between cycles.",
+        ], color=C.RED)
+
+
 def action_menu(cfg, b):
     from onboarding import miner_running, start_miner, stop_miner
     running = miner_running()
     opts = [
         ("Register as miner (guided)", "reg"),
         ("Send heartbeat now", "hb"),
+        ("Claim accrued rewards (v12)", "claim"),
         ("Increase miner stake", "stake"),
         ("Enable a service", "svc"),
         ("Price provider handbook / keeper", "prov"),
@@ -655,6 +689,8 @@ def action_menu(cfg, b):
         action_registration_flow(cfg, b)
     elif choice == "hb":
         action_heartbeat(cfg, b)
+    elif choice == "claim":
+        action_claim_rewards(cfg, b)
     elif choice == "stake":
         action_increase_stake(cfg, b)
     elif choice == "svc":

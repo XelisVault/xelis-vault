@@ -13,7 +13,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+# build/ is NOT ignored: it contains the compiled contracts + chunk maps
+# (v12 machine-checked proof of compilation). Python packaging artifacts
+# don't exist in this repo.
 develop-eggs/
 dist/
 downloads/

@@ -134,7 +134,7 @@ chmod +x "${BIN_DIR}/xvault"
 
 cat > "${BIN_DIR}/xvault-relayer" <<EOF
 #!/usr/bin/env bash
-exec "${VENV_DIR}/bin/python" "${INSTALL_DIR}/src/scripts/relayer_daemon.py" "\$@"
+exec "${VENV_DIR}/bin/python" "${INSTALL_DIR}/src/scripts/relayer_server.py" "\$@"
 EOF
 chmod +x "${BIN_DIR}/xvault-relayer"
 

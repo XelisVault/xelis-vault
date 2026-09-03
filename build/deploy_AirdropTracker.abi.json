@@ -1,0 +1,510 @@
+{
+  "data": [
+    {
+      "entry_id": 13,
+      "name": "record_mining_activity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "miner",
+          "type": "Address"
+        },
+        {
+          "name": "valid_submissions",
+          "type": "u64"
+        },
+        {
+          "name": "runtime_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "record_relayer_activity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "valid_anchors",
+          "type": "u64"
+        },
+        {
+          "name": "uptime_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "record_governance_vote",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "voter",
+          "type": "Address"
+        },
+        {
+          "name": "_proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "record_governance_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposer",
+          "type": "Address"
+        },
+        {
+          "name": "_proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "record_chat_message",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "sender",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "record_chat_group_created",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "creator",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "record_liquidity_provided",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "xel_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "record_bug_bounty",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reporter",
+          "type": "Address"
+        },
+        {
+          "name": "severity",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "record_manual_attribution",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "category",
+          "type": "u8"
+        },
+        {
+          "name": "points",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "record_mainnet_address",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "mainnet_addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "freeze_points",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "finalize_distribution",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "start_index",
+          "type": "u64"
+        },
+        {
+          "name": "count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "set_merkle_root",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "root",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 54,
+      "name": "record_manual_attribution_batch",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "users",
+          "type": "Address[]"
+        },
+        {
+          "name": "category",
+          "type": "u8"
+        },
+        {
+          "name": "points",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 55,
+      "name": "deduct_points",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "category",
+          "type": "u8"
+        },
+        {
+          "name": "points",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 56,
+      "name": "disqualify_user",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 57,
+      "name": "revoke_disqualification",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 58,
+      "name": "force_qualify_user",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 59,
+      "name": "revoke_force_qualification",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 60,
+      "name": "set_user_bonus_multiplier",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "multiplier_bps",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 61,
+      "name": "set_manual_attribution_cap",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_cap",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 68,
+      "name": "set_authorized_recorder",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        },
+        {
+          "name": "authorized",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 69,
+      "name": "set_vlt_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 70,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 71,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 72,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 73,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 74,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 75,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 76,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 78,
+      "name": "import_user_state",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "mining",
+          "type": "u64"
+        },
+        {
+          "name": "relayer",
+          "type": "u64"
+        },
+        {
+          "name": "governance",
+          "type": "u64"
+        },
+        {
+          "name": "chat",
+          "type": "u64"
+        },
+        {
+          "name": "liquidity",
+          "type": "u64"
+        },
+        {
+          "name": "bounty",
+          "type": "u64"
+        },
+        {
+          "name": "community",
+          "type": "u64"
+        },
+        {
+          "name": "days",
+          "type": "u64"
+        },
+        {
+          "name": "mainnet_addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 79,
+      "name": "finalize_migration",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "start_index",
+          "type": "u64"
+        },
+        {
+          "name": "count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

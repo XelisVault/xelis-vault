@@ -1,0 +1,530 @@
+{
+  "data": [
+    {
+      "entry_id": 17,
+      "name": "deposit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_asset",
+          "type": "Hash"
+        },
+        {
+          "name": "collateral_amount",
+          "type": "u64"
+        },
+        {
+          "name": "salt",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "borrow",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "repay",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "liquidate",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "max_borrow_to_repay",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "redeem",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xusd_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "get_health_factor_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "total_vaults_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "redemption_queue_size_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "get_vault_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "get_accrued_borrow_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "get_config_public_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "get_stability_fee_index_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "set_min_cr_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "cr",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "set_liq_penalty_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "p",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 34,
+      "name": "set_protocol_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 35,
+      "name": "set_insurance_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 36,
+      "name": "set_redemption_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 37,
+      "name": "set_grace_period_blocks",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "p",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "set_stability_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 39,
+      "name": "set_queue_cap",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "cap",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 40,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 41,
+      "name": "set_xusd_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "set_xusd_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xa",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "t",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 44,
+      "name": "set_insurance_pool",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "ic",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 48,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 49,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 50,
+      "name": "is_paused",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 51,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 52,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 70,
+      "name": "deposit_confidential",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_cipher",
+          "type": "Ciphertext"
+        },
+        {
+          "name": "collateral_proof",
+          "type": "RangeProof"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 71,
+      "name": "borrow_confidential",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "borrow_cipher",
+          "type": "Ciphertext"
+        },
+        {
+          "name": "borrow_proof",
+          "type": "RangeProof"
+        },
+        {
+          "name": "collateral_proof",
+          "type": "RangeProof"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 72,
+      "name": "repay_confidential",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "repay_cipher",
+          "type": "Ciphertext"
+        },
+        {
+          "name": "repay_proof",
+          "type": "RangeProof"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 74,
+      "name": "update_channel_meta",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "channel_id",
+          "type": "u64"
+        },
+        {
+          "internal_type": "EncryptedChannelMeta",
+          "name": "encrypted_meta",
+          "type": "struct"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 76,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [
+    {
+      "fields": [
+        {
+          "name": "encrypted_participant_count",
+          "type": "Ciphertext"
+        },
+        {
+          "name": "encrypted_message_count",
+          "type": "Ciphertext"
+        },
+        {
+          "name": "encrypted_last_activity",
+          "type": "Ciphertext"
+        }
+      ],
+      "kind": "struct",
+      "name": "EncryptedChannelMeta"
+    }
+  ],
+  "version": "1.1.1"
+}

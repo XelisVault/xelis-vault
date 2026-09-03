@@ -1372,3 +1372,204 @@ entry transfer_admin(new_admin: Address) -> u64 {
 entry get_version() -> string {
     return VERSION
 }
+
+// ============================================================================
+// v12.0 — AUTO-RECORDING CROSS-CONTRACT + STATE MIGRATION (APPENDED)
+// ----------------------------------------------------------------------------
+// IMPORTANT (chunk compatibility): every function below is APPENDED at the
+// end of the file. All previously-declared chunk IDs (0..76) are unchanged,
+// so existing consumers (CLI CHUNKS, injector script, cross-contract callers)
+// keep working after the registry upgrade.
+//
+// WHY THIS EXISTS: the v11.x tracker expected other contracts to call
+// record_*() entries, but entries are wallet-only in the XVM — contracts
+// cannot invoke them. As a result, NO protocol contract ever recorded points
+// and everything had to be injected manually by the admin. v12 adds a
+// `pub fn record_activity_cross` (Access::All) that authorized contracts CAN
+// call, wired end-to-end in StakedOracle, XelisVaultMiner, VaultChat,
+// Governor, GovernanceVault, PSM, VaultSwapV2, SavingsRate, VaultEngineV3
+// and PrivacyMixer.
+//
+// FAIL-SAFE CONTRACT: this function NEVER requires-fails. Paused, frozen,
+// unknown caller, bad category, zero points => silent no-op (return 0).
+// A misconfigured or paused tracker can therefore never revert (and thus
+// never break) the calling protocol entry.
+//
+// PoW block mining points (block header miner) still require the off-chain
+// indexer + injector daemons (a contract cannot observe block headers),
+// but every other activity now records itself, natively, on-chain.
+// ============================================================================
+
+// CHUNK 77: pub fn record_activity_cross — called by authorized contracts.
+// @caller: an authorized recorder contract (rec_<hash> = true) via Contract::call
+// @params: user - the address earning the points
+// @params: category - 1..7 (same categories as the record_* entries)
+// @params: points - raw points for this action (daily caps still apply)
+// @params: action_id - protocol-defined action code for analytics (free u64)
+// @returns: 0 always (fail-safe)
+pub fn record_activity_cross(user: Address, category: u8, points: u64, action_id: u64) -> u64 {
+    if points == 0 { return 0 }
+    if category < 1 || category > 7 { return 0 }
+    let s: Storage = Storage::new()
+    // Frozen or paused seasons stop accumulating — silently.
+    let at_fz: bool = s.load(FROZEN_KEY).unwrap_or(false)
+    if at_fz { return 0 }
+    let at_pz: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    if at_pz { return 0 }
+    // Only authorized contract recorders. Wallet users cannot reach pub fn
+    // chunks anyway; an unauthorized contract gets a silent no-op so that a
+    // missing set_authorized_recorder() can never break a protocol flow.
+    let cc_opt: optional<Hash> = get_contract_caller()
+    if cc_opt.is_none() { return 0 }
+    let cc: Hash = cc_opt.expect("err")
+    let is_auth: bool = s.load(RECORDER_PREFIX + cc.to_hex()).unwrap_or(false)
+    if !is_auth { return 0 }
+
+    // Same daily caps as the wallet-side record_* entries (anti-farm).
+    let capped: u64 = points
+    if category == CAT_MINING {
+        capped = check_daily_cap(user, CAT_MINING, points, CAP_MINING_DAILY)
+    } else if category == CAT_RELAYER {
+        capped = check_daily_cap(user, CAT_RELAYER, points, CAP_RELAYER_DAILY)
+    } else if category == CAT_CHAT {
+        capped = check_daily_cap(user, CAT_CHAT, points, CAP_CHAT_DAILY)
+    }
+    if capped == 0 { return 0 }
+
+    add_points(user, category, capped)
+    emit_event(1u64, ["AirdropAuto", user.to_string() + "_" + category.to_string(10u32) + "_" + capped.to_string(10u32) + "_" + action_id.to_string(10u32)])
+    return 0
+}
+
+// CHUNK 78: entry import_user_state — one-shot admin migration entry.
+// Used when upgrading the tracker contract (a new contract hash means a
+// fresh, empty storage). The migration script reads the previous tracker
+// instance via RPC and re-imports each user here — INCLUDING days_active
+// and the registered mainnet address, which record_manual_attribution
+// cannot restore (it always recomputes days from the current topo).
+// @caller: admin only
+// @security: only_admin; caps imported points per user at MANUAL_CAP_KEY;
+//            logs to the admin audit trail; idempotent (re-import overwrites).
+entry import_user_state(user: Address, mining: u64, relayer: u64, governance: u64, chat: u64, liquidity: u64, bounty: u64, community: u64, days: u64, mainnet_addr: Address) -> u64 {
+    when_not_paused()
+    when_not_frozen()
+    only_admin()
+    let s: Storage = Storage::new()
+    let cap: u64 = s.load(MANUAL_CAP_KEY).unwrap_or(DEFAULT_MANUAL_CAP)
+
+    // Get or create the user record.
+    let up: UserPoints = get_or_init_user(user)
+    up.mining = mining
+    up.relayer = relayer
+    up.governance = governance
+    up.chat = chat
+    up.liquidity = liquidity
+    up.bounty = bounty
+    up.community = community
+    let total: u64 = mining + relayer + governance + chat + liquidity + bounty + community
+    require(total <= cap, "toomuch")
+    up.total_raw = total
+    up.total_with_bonus = 0
+    up.days_active = days
+    up.last_active_day = get_day(get_current_topoheight())
+    up.mainnet_address = mainnet_addr
+    up.qualified = false
+    up.registered = true
+    s.store(USER_PREFIX + user.to_string(), up)
+
+    // NOTE: global totals (tp, ct_*) are NOT touched here — they are
+    // recomputed atomically by finalize_migration() after the last user is
+    // imported. This keeps multi-user imports consistent.
+
+    // Reverse lookup for the mainnet address.
+    if mainnet_addr != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) {
+        s.store(MAINNET_TO_TESTNET_PREFIX + mainnet_addr.to_string(), user)
+    }
+
+    log_admin_action(6u8, user, 0u8, total, 0u64, "v12 migration import")
+    emit_event(0u64, ["UserImported", user.to_string() + "_" + total.to_string(10u32) + "_" + days.to_string(10u32)])
+    return 0
+}
+
+// CHUNK 79: entry finalize_migration — recompute ALL global totals (user
+// count, total points, per-category totals) from the imported user records.
+// MUST be called once, after the last import_user_state, before resuming
+// auto-recording. Paginated like finalize_distribution for gas safety.
+// @caller: admin only
+// @security: only_admin; process at most 200 users per call; repeated calls
+//            continue from the stored cursor; idempotent per page.
+entry finalize_migration(start_index: u64, count: u64) -> u64 {
+    only_admin()
+    require(count > 0 && count <= 200, "badbatch")
+    let s: Storage = Storage::new()
+    let user_count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    require(start_index <= user_count, "oob")
+
+    // Accumulators (persisted across paginated calls).
+    let tp: u64 = s.load(FINALIZE_TOTAL_KEY).unwrap_or(0)
+    let c1: u64 = s.load("mig_c1").unwrap_or(0)
+    let c2: u64 = s.load("mig_c2").unwrap_or(0)
+    let c3: u64 = s.load("mig_c3").unwrap_or(0)
+    let c4: u64 = s.load("mig_c4").unwrap_or(0)
+    let c5: u64 = s.load("mig_c5").unwrap_or(0)
+    let c6: u64 = s.load("mig_c6").unwrap_or(0)
+    let c7: u64 = s.load("mig_c7").unwrap_or(0)
+
+    let end: u64 = start_index + count
+    if end > user_count { end = user_count }
+    let i: u64 = start_index
+    while i < end {
+        let user_opt: optional<Address> = s.load(USER_LIST_PREFIX + i.to_string(10u32))
+        if user_opt.is_some() {
+            let user: Address = user_opt.expect("err")
+            let up: UserPoints = s.load(USER_PREFIX + user.to_string()).expect("err")
+            tp += up.total_raw
+            c1 += up.mining
+            c2 += up.relayer
+            c3 += up.governance
+            c4 += up.chat
+            c5 += up.liquidity
+            c6 += up.bounty
+            c7 += up.community
+        }
+        i += 1
+    }
+    s.store(FINALIZE_TOTAL_KEY, tp)
+    s.store("mig_c1", c1)
+    s.store("mig_c2", c2)
+    s.store("mig_c3", c3)
+    s.store("mig_c4", c4)
+    s.store("mig_c5", c5)
+    s.store("mig_c6", c6)
+    s.store("mig_c7", c7)
+
+    if end >= user_count {
+        // Done — publish the recomputed globals.
+        s.store(TOTAL_POINTS_KEY, tp)
+        s.store(CAT_TOTAL_PREFIX + "1", c1)
+        s.store(CAT_TOTAL_PREFIX + "2", c2)
+        s.store(CAT_TOTAL_PREFIX + "3", c3)
+        s.store(CAT_TOTAL_PREFIX + "4", c4)
+        s.store(CAT_TOTAL_PREFIX + "5", c5)
+        s.store(CAT_TOTAL_PREFIX + "6", c6)
+        s.store(CAT_TOTAL_PREFIX + "7", c7)
+        s.delete(FINALIZE_TOTAL_KEY)
+        s.delete("mig_c1")
+        s.delete("mig_c2")
+        s.delete("mig_c3")
+        s.delete("mig_c4")
+        s.delete("mig_c5")
+        s.delete("mig_c6")
+        s.delete("mig_c7")
+        emit_event(0u64, ["MigrationFinalized", user_count.to_string(10u32) + "_" + tp.to_string(10u32)])
+    } else {
+        emit_event(0u64, ["MigrationBatch", end.to_string(10u32) + "/" + user_count.to_string(10u32)])
+    }
+    return 0
+}
+
+// CHUNK 80: pub fn get_record_authority — read-only: is a contract hash an
+// authorized recorder? (for deploy verification / CLI diagnostics)
+pub fn get_record_authority(contract_hash: Hash) -> bool {
+    return Storage::new().load(RECORDER_PREFIX + contract_hash.to_hex()).unwrap_or(false)
+}

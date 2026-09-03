@@ -127,10 +127,12 @@ def show_result(res, action: str):
                 f"{C.RESET}",
             ], color=C.RED)
         else:
-            info_box("Transaction failed", [
+            steps = _error_steps(res.reason or "")
+            info_box("Transaction failed — what to do", [
                 f"{C.RED}{action} was rejected by the chain{C.RESET}",
                 "",
-                f"Reason: {res.reason}",
+                f"Reason: {C.BOLD}{res.reason}{C.RESET}",
+                *(["", f"{C.CYAN}Next steps:{C.RESET}"] + steps if steps else []),
             ], color=C.RED)
 
 
@@ -182,10 +184,12 @@ def run_tx(b: Backend, fn, action: str):
         revert = b.verify_onchain(res.tx) if hasattr(b, "verify_onchain") else ""
     sys.stdout.write("\r\x1b[K"); sys.stdout.flush()
     if revert:
+        steps = _error_steps(revert)
         info_box("Transaction reverted by the chain", [
             f"{C.RED}{action} was REJECTED on-chain — nothing was applied.{C.RESET}",
             "",
             f"Reason: {C.BOLD}{revert}{C.RESET}",
+            *(["", f"{C.CYAN}Next steps:{C.RESET}"] + steps if steps else []),
             "",
             f"{C.GRAY}Tx hash:{C.RESET} {res.tx[:40]}…",
         ], color=C.RED)
@@ -226,6 +230,95 @@ def _friendly_error(msg: str):
             return (f"available {av / 10**DECIMALS:.6g}, "
                     f"required {req / 10**DECIMALS:.6g}")
         return "not enough funds for amount + fee"
+    return None
+
+
+# Known failure signatures -> numbered, actionable remediation steps.
+# Every entry is a substring matched (lowercase) against the raw reason.
+_ERROR_GUIDES = [
+    ("not enough funds", [
+        "1. Check your balance on the Dashboard (top-left panel).",
+        "2. The amount + network fee (~0.001 XEL) must fit the SPENDABLE",
+        "   balance (funds need ~60 blocks / 3 min after a credit).",
+        "3. Get starter funds: Faucet screen (needs >= 0.1 XEL for fees),",
+        "   or mine with Miner tools (Start built-in miner).",
+    ]),
+    ("nonce", [
+        "1. Another wallet/CLI used the same address at the same time.",
+        "2. Close duplicate xvault windows, wait ~1 min, retry.",
+        "3. Still failing: Settings > Restart wallet (resyncs the nonce).",
+    ]),
+    ("proof verification", [
+        "1. Two transactions raced on the same funds.",
+        "2. Wait 10-15 s (one block) and simply retry — it is automatic",
+        "   in most cases.",
+        "3. Avoid sending two writes from the same wallet in the same second.",
+    ]),
+    ("maturity", [
+        "1. These funds were credited very recently (~3 min lock).",
+        "2. Wait 60+ blocks (about 3-5 minutes) and retry.",
+    ]),
+    ("not enough funds", [
+        "1. Check the Dashboard balance panel.",
+        "2. Amount + fee (~0.001 XEL) must fit the spendable balance.",
+        "3. Freshly received funds need ~60 blocks (~3 min) before spending.",
+    ]),
+    ("lowbal", [
+        "1. The wallet balance is fine but the SPENDABLE part is not:",
+        "   XELIS locks freshly credited funds for ~60 blocks (~3 min).",
+        "2. Wait 3-5 minutes and retry.",
+    ]),
+    ("insstake", [
+        "1. Registering as a protocol miner requires 1000 VLT staked",
+        "   (attached to the SAME transaction — the CLI does it for you).",
+        "2. Check your VLT balance on the Dashboard.",
+        "3. If short: Faucet, or buy/mint VLT via Swap.",
+    ]),
+    ("insdep", [
+        "1. The operation needs funds attached to the transaction.",
+        "2. The CLI attaches them automatically — the likely cause is an",
+        "   insufficient or too-fresh balance (wait ~3 min, retry).",
+    ]),
+    ("alreadysub", [
+        "1. You already submitted a price for this aggregation cycle.",
+        "2. One submission per miner per cycle — wait for the next cycle",
+        "   (the keeper triggers one every ~300 blocks / 13 min).",
+    ]),
+    ("toosoon", [
+        "1. Rate limit: this action was done too recently.",
+        "2. Heartbeats: every 900 blocks (~40 min). Faucet: once per day.",
+    ]),
+    ("paused", [
+        "1. The protocol contract is globally paused (guardian action).",
+        "2. Check the Discord announcements, then retry later.",
+    ]),
+    ("rewards_frozen", [
+        "1. Reward emissions are frozen by the emergency admin.",
+        "2. Stake, heartbeats and everything else keep working — only new",
+        "   reward mints are halted. Watch Discord for the unfreeze.",
+    ]),
+    ("baddenom", [
+        "1. The mixer only accepts FIXED amounts: 1, 10 or 100 units.",
+        "2. Pick one of the proposed denominations in the deposit screen.",
+    ]),
+    ("notfound", [
+        "1. The note secret does not match any live note.",
+        "2. Check the secret (64 hex chars, no spaces) and that this note",
+        "   was not already withdrawn (notes are consumed atomically).",
+    ]),
+    ("exists", [
+        "1. This secret was already used for a deposit.",
+        "2. Generate a new secret (the deposit screen makes one for you).",
+    ]),
+]
+
+
+def _error_steps(msg: str):
+    """Return the remediation steps list for a raw error reason, or None."""
+    low = (msg or "").lower()
+    for sig, steps in _ERROR_GUIDES:
+        if sig in low:
+            return steps
     return None
 
 
@@ -613,82 +706,129 @@ def _gen_secret() -> str:
     return secrets.token_bytes(32).hex()
 
 
+# PrivacyMixer v3 fixed denominations (atomic -> display)
+_MIXER_DENOMS = [(100_000_000, "1"), (1_000_000_000, "10"), (10_000_000_000, "100")]
+
+
+def _pick_denomination() -> tuple | None:
+    """Choose one of the 3 fixed mixer denominations. Returns (atomic, label)."""
+    opts = [(f"{lbl} unit(s)", (atomic, lbl)) for atomic, lbl in _MIXER_DENOMS]
+    opts.append(("Back", None))
+    choice = menu("Denomination (all deposits of a class are fungible)", opts)
+    return choice
+
+
 def screen_privacy(b: Backend):
     while True:
         st = b.mixer_stats()
         sub = (f"mixes executed: {st.get('total_mixes', '-')}   "
                f"total pooled: {b.fmt(st.get('total_mixed'))} XEL") if st else "Loading..."
-        choice = menu("Privacy Mixer — private pool (no sender link)", [
-            ("Deposit + create note", "dep"),
+        choice = menu("Privacy Mixer v3 — fixed denominations, no sender link", [
+            ("Deposit + create note (1 / 10 / 100)", "dep"),
             ("Withdraw from pool", "wd"),
             ("Check my note balance", "bal"),
-            ("How it works", "help"),
+            ("How it works (v3)", "help"),
             ("Back", None),
         ], subtitle=sub)
         if choice is None:
             return
         if choice == "dep":
-            asset = "XEL"
-            amt = ask_amount(b, b.xel_asset, "XEL amount to deposit privately:", "0.1")
-            atomic = parse_amount(amt)
-            if atomic is None:
+            # Asset: XEL or VLT
+            asset_choice = menu("Asset to mix", [
+                ("XEL (native)", b.xel_asset),
+                ("VLT (XELIS Vault token)", b.vlt_asset),
+                ("Back", None),
+            ])
+            if asset_choice is None:
                 continue
-            if not _check_balance(b, b.xel_asset, atomic):
+            asset = asset_choice
+            asset_name = "XEL" if asset == b.xel_asset else "VLT"
+            picked = _pick_denomination()
+            if picked is None:
+                continue
+            atomic, lbl = picked
+            if not _check_balance(b, asset, atomic):
                 continue
             secret = _gen_secret()
-            if confirm(f"Deposit {amt} XEL and create a private note?\n"
+            if confirm(f"Deposit {lbl} {asset_name} and create a private note?\n"
                        f"Keep {C.YELLOW}this secret{C.RESET} to withdraw later:\n{C.BRIGHT}{secret}{C.RESET}"):
-                run_tx(b, lambda a=atomic, s=secret: b.mixer_deposit(b.xel_asset, a, s),
+                run_tx(b, lambda a=atomic, s=secret: b.mixer_deposit(asset, a, s),
                        "Private note deposit")
                 info_box("Note secret (SAVE THIS)", [
-                    "To withdraw you must present this secret.",
+                    "To withdraw you must present this secret",
+                    "together with the SAME denomination.",
                     "It can be handed to any address off-chain,",
                     "so other people can withdraw for you.",
                     "",
                     f"{C.YELLOW}{secret}{C.RESET}",
                 ], color=C.MAGENTA)
         elif choice == "wd":
-            dest = text_input("Withdraw TO address (xet:...):").strip()
+            asset_choice = menu("Asset to withdraw", [
+                ("XEL (native)", b.xel_asset),
+                ("VLT (XELIS Vault token)", b.vlt_asset),
+                ("Back", None),
+            ])
+            if asset_choice is None:
+                continue
+            asset = asset_choice
+            asset_name = "XEL" if asset == b.xel_asset else "VLT"
+            dest = text_input("Withdraw TO address (xet:...) — a FRESH address is best:").strip()
             if not dest.startswith("xet:") or len(dest) < 20:
                 info_box("Invalid address", ["Please enter a full xet: address."],
                          color=C.RED)
                 continue
-            amt = ask_amount(b, b.xel_asset, "XEL amount to withdraw:", "0.1")
-            atomic = parse_amount(amt)
-            if atomic is None:
+            picked = _pick_denomination()
+            if picked is None:
                 continue
+            atomic, lbl = picked
             secret = text_input("Your note secret (64 hex):").strip().lower()
             if len(secret) != 64:
                 info_box("Invalid secret", ["Need a 64-char hex secret."], color=C.RED)
                 continue
-            if confirm(f"Withdraw {amt} XEL to {short_addr(dest)}?\n"
+            if confirm(f"Withdraw {lbl} {asset_name} to {short_addr(dest)}?\n"
                        f"Funds come from the shared pool — no sender link."):
                 run_tx(b, lambda d=dest, a=atomic, s=secret:
-                       b.mixer_withdraw(d, b.xel_asset, a, s),
+                       b.mixer_withdraw(d, asset, a, s),
                        "Private note withdraw")
         elif choice == "bal":
+            asset_choice = menu("Note asset", [
+                ("XEL (native)", b.xel_asset),
+                ("VLT (XELIS Vault token)", b.vlt_asset),
+                ("Back", None),
+            ])
+            if asset_choice is None:
+                continue
+            asset = asset_choice
+            asset_name = "XEL" if asset == b.xel_asset else "VLT"
             secret = text_input("Your note secret (64 hex):").strip().lower()
             if len(secret) != 64:
                 info_box("Invalid secret", ["Need a 64-char hex secret."], color=C.RED)
                 continue
-            nb = b.mixer_note_balance(b.xel_asset, secret)
+            nb = b.mixer_note_balance(asset, secret)
             info_box("Note balance",
-                     [f"{b.fmt(nb) if nb is not None else '—'} XEL available",
+                     [f"{b.fmt(nb) if nb is not None else '—'} {asset_name} available",
                       "0 or 'not found' means the note is spent or unknown."],
                      color=C.CYAN)
         elif choice == "help":
-            info_box("How the mixer works (v2)", [
-                "1. Deposit XEL with a random secret → the",
-                "   contract stores a note = blake3(secret).",
-                "2. NO sender or recipient is stored on-chain.",
-                "3. Withdraw by presenting the secret, to ANY",
-                "   recipient, pulling from the shared pool.",
+            info_box("How the mixer works (v3)", [
+                "1. Deposit a FIXED amount (1, 10 or 100 units of",
+                "   XEL or VLT) with a random secret.",
+                "2. The contract stores ONLY a commitment",
+                "   blake3(secret) — no sender, no recipient,",
+                "   no amount, no timestamp. Amounts are also",
+                "   encrypted by XELIS at layer 1.",
+                "3. Withdraw by presenting the secret + the SAME",
+                "   denomination, to ANY recipient address.",
+                "4. The note is consumed atomically (nullifier).",
                 "",
-                "Anonymity = all depositors of the pool + XELIS",
-                "encrypted amounts + off-chain secret handoff.",
+                "Anonymity set = everyone who deposited the same",
+                "asset + denomination. There is no intermediary:",
+                "funds move only between you and the shared pool.",
                 "",
                 f"{C.YELLOW}Keep your secret safe — it is the only way",
                 f"to recover the note.{C.RESET}",
+                f"{C.YELLOW}Use a FRESH recipient address for maximum",
+                f"unlinkability.{C.RESET}",
             ], color=C.MAGENTA)
 
 
@@ -1748,14 +1888,43 @@ def screen_miner_tools(b: Backend):
             mopts.append(("Start built-in miner (auto-configured)", "start"))
         threads = cfg_miner_threads()
         mopts.append((f"Set thread count (currently {threads})", "threads"))
+    # v12.1: confidential earnings view (decrypted locally by the wallet)
+    try:
+        ce = b.miner_confidential_earnings()
+        if ce.get("ciphertext_hex"):
+            if ce.get("amount") is not None:
+                ce_txt = f"{render_ok(b.fmt(ce['amount'], 'VLT'))} (private view)"
+            else:
+                ce_txt = f"{C.DIM}encrypted — visible only to the miner's wallet{C.RESET}"
+            print(f"  {C.DIM}Confidential earnings:{C.RESET} {ce_txt}")
+    except Exception:
+        pass
+    # v12.1: pending accrual info
+    try:
+        ls = b.miner_last_settle()
+        if ls:
+            print(f"  {C.DIM}Pending accrual window:{C.RESET} since topo {ls} "
+                  f"({max(0, b.topo() - ls)} blocks ago)")
+    except Exception:
+        pass
+
     mopts += [
         ("Send heartbeat now", "hb"),
+        ("Claim accrued rewards (v12)", "claim"),
         ("Increase miner stake", "stake"),
         ("Back", None),
     ]
     choice = menu("Miner tools", mopts)
     if choice == "hb":
         run_tx(b, lambda: b.miner_heartbeat(), "Heartbeat")
+    elif choice == "claim":
+        info_box("Claiming rewards", [
+            "Per-block rewards settle automatically on heartbeats,",
+            "valid submissions and stake changes. This claim settles",
+            "them NOW without waiting (chat-service miners, or between",
+            "keeper cycles).",
+        ], color=C.CYAN)
+        run_tx(b, lambda: b.miner_claim_rewards(), "Claim accrued rewards")
     elif choice == "stake":
         amt = ask_amount(b, b.vlt_asset, "VLT amount to add to miner stake:", "100")
         atomic = parse_amount(amt)
@@ -1779,6 +1948,192 @@ def screen_miner_tools(b: Backend):
             cfg_obj.save()
             info_box("Saved", [f"{t} thread(s) — applies at next start."],
                      color=C.GREEN)
+
+
+# ---------------------------------------------------------------------------
+# Doctor — guided diagnostics (v12)
+# ---------------------------------------------------------------------------
+
+def _doc_check(label, ok, steps_if_fail):
+    """Render one check line; returns True if OK."""
+    mark = render_ok("OK ") if ok else render_error("FAIL")
+    print(f"  {mark} {label}")
+    if not ok:
+        for s in steps_if_fail:
+            print(f"       {C.CYAN}{s}{C.RESET}")
+    return ok
+
+
+def screen_doctor(b: Backend, cfg: Config):
+    """Full environment diagnostics with step-by-step fixes.
+
+    Checks, in order: python deps, node connectivity (local then public),
+    wallet RPC (auto-relaunch attempt), asset tracking, contracts bundle,
+    registry resolution, airdrop auto-recording wiring (v12), price feed
+    freshness and protocol health."""
+    clear()
+    print(BANNER)
+    print(f"{C.BOLD}  Doctor — environment diagnostics{C.RESET}")
+    print(f"{C.GRAY}{'─' * 66}{C.RESET}")
+    fixes = []
+
+    # 1. Python dependencies
+    print(f"\n{C.BOLD}[1/8] Python dependencies{C.RESET}")
+    deps_ok = True
+    for mod, pip_name, steps in [
+        ("blake3", "blake3", ["Run: pip install blake3", "(the mixer private notes need it)"]),
+        ("requests", "requests", ["Run: pip install requests"]),
+    ]:
+        try:
+            __import__(mod)
+            print(f"  {render_ok('OK ')} {mod}")
+        except Exception:
+            deps_ok = False
+            fixes.append(f"pip install {pip_name}")
+            _doc_check(mod, False, steps)
+    try:
+        import rich  # noqa: F401
+        print(f"  {render_ok('OK ')} rich (nice UI — optional)")
+    except Exception:
+        print(f"  {render_ok('OPT ')} rich not installed (ANSI fallback used)")
+
+    # 2. Node connectivity
+    print(f"\n{C.BOLD}[2/8] Node connectivity{C.RESET}")
+    topo = 0
+    try:
+        topo = b.topo()
+    except Exception:
+        pass
+    if topo > 0:
+        print(f"  {render_ok('OK ')} daemon reachable — topo {topo}")
+    else:
+        fixes.append("node: check daemon or use the public node")
+        _doc_check("daemon reachable", False, [
+            "1. Check your daemon is running (Settings shows the RPC URL).",
+            "2. No daemon? the CLI falls back to the public node:",
+            "   https://testnet-node.xelis.io — check your internet.",
+            "3. Retry after a few seconds (rate-limits can 403 briefly).",
+        ])
+
+    # 3. Wallet RPC (try auto-relaunch)
+    print(f"\n{C.BOLD}[3/8] Wallet (local RPC){C.RESET}")
+    wallet_ok = bool(b.wallet)
+    if wallet_ok:
+        try:
+            b.wallet.balance()
+            print(f"  {render_ok('OK ')} wallet RPC online")
+        except Exception:
+            wallet_ok = False
+    if not wallet_ok:
+        print(f"  {render_warn('TRY')} auto-relaunching the managed wallet…")
+        try:
+            relaunched = ensure_wallet_alive(cfg)
+        except Exception:
+            relaunched = False
+        if relaunched:
+            print(f"  {render_ok('OK ')} wallet relaunched automatically")
+            b = Backend(cfg.data)
+        else:
+            fixes.append("wallet")
+            _doc_check("wallet RPC", False, [
+                "1. Settings > check wallet binary/path/password.",
+                "2. First run? Use 'Set up wallet / node' in the main menu.",
+                "3. Wallet log: ~/.xelis-vault/logs/wallet.log",
+            ])
+
+    # 4. Asset tracking (VLT/xUSD must be tracked to see balances)
+    print(f"\n{C.BOLD}[4/8] Asset tracking (VLT / xUSD){C.RESET}")
+    if wallet_ok:
+        for asset, name in [(b.vlt_asset, "VLT"), (b.xusd_asset, "xUSD")]:
+            try:
+                b.wallet.balance(asset)
+                print(f"  {render_ok('OK ')} {name} tracked")
+            except Exception:
+                try:
+                    b.wallet.track_asset(asset)
+                    print(f"  {render_ok('FIX')} {name} tracking added automatically")
+                except Exception:
+                    fixes.append(f"track {name}")
+                    _doc_check(f"{name} tracked", False, [
+                        f"Run once: track_asset {asset}",
+                        "Or simply restart the CLI — it auto-tracks.",
+                    ])
+    else:
+        print(f"  {C.DIM}skipped (wallet offline){C.RESET}")
+
+    # 5. Contracts bundle + registry
+    print(f"\n{C.BOLD}[5/8] Contracts & registry{C.RESET}")
+    ok_bundle = bool(b.C("psm")) and bool(b.C("vault_engine"))
+    _doc_check("contract addresses loaded", ok_bundle, [
+        "1. network/testnet.json missing or stale.",
+        "2. Settings > Refresh contract addresses from the registry.",
+    ])
+    try:
+        reg_ok = bool(b.C("miner")) and bool(b.C("airdrop"))
+        _doc_check("registry resolution (miner, airdrop)", reg_ok, [
+            "1. The ContractRegistry may be unreachable.",
+            "2. Retry in a minute; check Discord if it persists.",
+        ])
+    except Exception:
+        pass
+
+    # 6. v12 airdrop auto-recording wiring
+    print(f"\n{C.BOLD}[6/8] Airdrop auto-recording (v12){C.RESET}")
+    try:
+        snap = b.airdrop_snapshot()
+        print(f"  {render_ok('OK ')} tracker online — {snap.get('users', '?')} users, "
+              f"{snap.get('total_points', '?')} points")
+        for ck in ("miner", "staked_oracle", "chat" if b.C("chat" if "chat" in
+                  (b.contracts or {}) else "vault_chat") else "vault_chat"):
+            pass  # resolved below with the right key
+        for key, label in (("miner", "XelisVaultMiner"), ("staked_oracle", "StakedOracle")):
+            v = b.airdrop_recorder_check(key)
+            if v:
+                print(f"  {render_ok('OK ')} {label} authorized to record points")
+            else:
+                fixes.append(f"recorder {label}")
+                _doc_check(f"{label} recorder", False, [
+                    "Run (admin): airdrop set_authorized_recorder on the tracker",
+                    f"with the {label} contract hash — see docs/UPGRADE_v12.md",
+                ])
+    except Exception as e:
+        fixes.append("airdrop tracker read")
+        _doc_check("tracker read", False, [f"Error: {str(e)[:120]}"])
+
+    # 7. Price feed freshness
+    print(f"\n{C.BOLD}[7/8] Price feed{C.RESET}")
+    try:
+        p = b.price()
+        if p and not p[2]:
+            print(f"  {render_ok('OK ')} XEL/USD ${p[0] / 10**DECIMALS:.4f} (fresh)")
+        else:
+            print(f"  {render_warn('WARN')} feed stale or absent")
+            print(f"       {C.CYAN}Providers/keeper may be offline — prices refresh{C.RESET}")
+            print(f"       {C.CYAN}when the next aggregation cycle runs.{C.RESET}")
+    except Exception:
+        print(f"  {render_warn('WARN')} price feed unreachable")
+
+    # 8. Protocol health
+    print(f"\n{C.BOLD}[8/8] Protocol health{C.RESET}")
+    try:
+        ms = b.miner_stats()
+        ts = ms.get("total_staked")
+        print(f"  miners: {ms.get('miners_count', '?')}   staked: {b.fmt(ts) if ts is not None else '?'} VLT")
+        ps = b.psm_reserves()
+        print(f"  PSM reserve: {b.fmt(ps.get('xel_reserve'))} XEL")
+    except Exception:
+        print(f"  {render_warn('WARN')} partial read — node may be busy")
+
+    # Summary
+    print(f"\n{C.GRAY}{'─' * 66}{C.RESET}")
+    if fixes:
+        print(f"{C.YELLOW}  {len(fixes)} issue(s) to fix:{C.RESET}")
+        for f in fixes:
+            print(f"   - {f}")
+    else:
+        print(f"{C.GREEN}  All checks passed — environment healthy.{C.RESET}")
+    print(f"{C.GRAY}  Press any key to go back…{C.RESET}")
+    read_key()
 
 
 def _load_cfg():
@@ -1926,10 +2281,11 @@ def main():
 
         opts = [
             ("Dashboard (live)", lambda: screen_dashboard(b)),
+            ("Doctor — diagnose & fix my setup", lambda: screen_doctor(b, cfg)),
             ("Vault — collateralized xUSD", lambda: screen_vault(b)),
             ("Swap (xUSD / AMM)", lambda: screen_swap(b)),
             ("Savings", lambda: screen_savings(b)),
-            ("Privacy Mixer", lambda: screen_privacy(b)),
+            ("Privacy Mixer v3", lambda: screen_privacy(b)),
             ("Governance", lambda: screen_governance(b)),
             ("Loans (Flash / Peer / Syndicate)", lambda: screen_loans(b)),
             ("Sealed-Bid Auctions", lambda: screen_auctions(b)),

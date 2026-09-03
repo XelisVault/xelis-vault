@@ -127,13 +127,13 @@ CHUNKS = {
     "VaultEngineV3":  {"deposit": 17, "borrow": 18, "repay": 19, "withdraw": 20},
     "VaultSwapV2":    {"create_pool": 16, "add_liquidity": 17, "swap": 18},
     "SavingsRate":    {"deposit": 8, "withdraw": 9, "claim_interest": 10},
-    "PrivacyMixer":   {"deposit": 6, "withdraw": 7},
+    "PrivacyMixer":   {"deposit": 7, "withdraw": 8},   # v3 fixed denominations
     "TreasuryVault":  {"propose": 9, "confirm": 10, "revoke": 11, "execute": 12, "deposit": 16},
     "AssetVault":     {"mint": 5, "transfer_asset": 6, "create_asset": 4,
                         "set_registry": 10},
     "StakedOracle":   {"submit_price": 16, "aggregate_now": 17},
     "XelisVaultMiner": {"register_miner": 15, "enable_service": 16, "increase_stake": 18,
-                        "submit_heartbeat": 21},
+                        "submit_heartbeat": 21, "claim_rewards": 91},
     "GovernanceVault": {"stake": 4, "unstake": 5, "claim_rewards": 6,
                          "get_total_staked": 9, "get_user_staked": 10,
                          "notify_reward_amount": 12, "set_reward_distributor": 13},
@@ -166,7 +166,13 @@ CHUNKS = {
                           "send_direct_message": 113, "get_session": 13,
                           "get_group": 14, "is_active": 16,
                           "get_last_anchor": 17, "get_groups_count": 18},
-    "AirdropTracker":  {"record_mainnet_address": 22},
+    "AirdropTracker":  {"record_mainnet_address": 22,
+                        "record_manual_attribution": 21,
+                        "record_manual_attribution_batch": 54,
+                        "deduct_points": 55, "disqualify_user": 56,
+                        "force_qualify_user": 58, "freeze_points": 23,
+                        "set_authorized_recorder": 68,
+                        "import_user_state": 78, "finalize_migration": 79},
 }
 
 # Airdrop categories (AirdropTracker.slx consts).
@@ -703,8 +709,15 @@ class Backend:
                              val_u64(amount_atomic), val_hash(secret)],
                             max_gas=20_000_000)
 
+    # PrivacyMixer v3 fixed denominations (atomic units, 8-decimals assets)
+    MIXER_DENOMS = [100_000_000, 1_000_000_000, 10_000_000_000]  # 1, 10, 100 units
+
     def mixer_note_balance(self, asset: str, secret: str) -> int | None:
-        """Remaining amount drainable for a secret (blake3(secret)); 0 if absent."""
+        """Remaining value of the note for a secret (v3: fixed denominations).
+
+        v3 notes are boolean nullifier markers keyed by class, so the
+        'balance' is the denomination itself while the note is unspent.
+        Returns 0 once consumed, None on read error."""
         mx = self.C("mixer")
         if not mx or not self.daemon:
             return None
@@ -713,8 +726,11 @@ class Backend:
             commitment = _b3.blake3(bytes.fromhex(secret)).hexdigest()
         except Exception:
             return None
-        v = self.daemon.read_key(mx, f"n_{asset}_" + commitment)
-        return int(v) if isinstance(v, int) else None
+        for cls, denom in ((1, 100_000_000), (2, 1_000_000_000), (3, 10_000_000_000)):
+            v = self.daemon.read_key(mx, f"n_{asset}_{cls}_" + commitment)
+            if v is not None:
+                return denom
+        return 0
 
     # --- Treasury Vault (multisig) --------------------------------------------
 
@@ -796,6 +812,62 @@ class Backend:
             return None
         v = self.daemon.read_key(mn, "ms")
         return int(v) if isinstance(v, int) else None
+
+    def miner_claim_rewards(self) -> OpResult:
+        """v12.1: settle per-block accrued rewards now (no submission needed)."""
+        return self._invoke("XelisVaultMiner", "claim_rewards", [],
+                            max_gas=25_000_000)
+
+    def miner_last_settle(self, addr: str = "") -> int | None:
+        """v12.1: last settle topoheight (pending blocks = topo - last_settle)."""
+        mn = self.C("miner")
+        if not mn or not self.daemon:
+            return None
+        try:
+            return self._storage_read("miner", f"ls_{addr or self.address}")
+        except Exception:
+            return None
+
+    def miner_confidential_earnings(self, addr: str = "") -> dict:
+        """v12.1: confidential earnings view (Ciphertext encrypted for the miner).
+
+        Returns {"ciphertext_hex": ..., "amount": int|None} — amount is
+        decrypted locally by the wallet (decrypt_ciphertext RPC) and is None
+        if this wallet is not the earnings owner."""
+        mn = self.C("miner")
+        out = {"ciphertext_hex": None, "amount": None}
+        if not mn or not self.daemon:
+            return out
+        raw = self.daemon.read_key(mn, f"ect_{addr or self.address}")
+        # ValueCell shapes to handle: opaque Ciphertext (dict with
+        # commitment/handle) or already-flat dict.
+        commitment = handle = None
+        if isinstance(raw, dict):
+            commitment = raw.get("commitment") or raw.get("Commitment")
+            handle = raw.get("handle") or raw.get("Handle")
+        if not commitment or not handle:
+            return out
+        def _h(x):
+            s = x.get("value") if isinstance(x, dict) else x
+            return str(s) if s is not None else None
+        ch, hh = _h(commitment), _h(handle)
+        if ch and hh:
+            out["ciphertext_hex"] = (ch + hh).lower()
+            if self.wallet:
+                try:
+                    out["amount"] = self.wallet.decrypt_ciphertext(out["ciphertext_hex"])
+                except Exception:
+                    pass
+        return out
+
+    def airdrop_recorder_check(self, contract_key: str) -> bool | None:
+        """v12 (doctor): is <contract> authorized to auto-record points?"""
+        at = self.C("airdrop")
+        ch = self.C(contract_key)
+        if not at or not ch:
+            return None
+        v = self._storage_read("airdrop", f"rec_{ch}")
+        return bool(v) if v is not None else False
 
     def miner_enable_service(self, service_id: int) -> OpResult:
         return self._invoke("XelisVaultMiner", "enable_service",

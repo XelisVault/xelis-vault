@@ -1,3 +1,51 @@
+# Changelog
+
+v12.0 — UPGRADE CONTRACTS + AUTO-AIRDROP + REWARD FIX + MIXER V3
+
+## Contracts (11 upgraded, all 51 compile — build/chunkmap_*.txt)
+- AirdropTracker v12: pub fn record_activity_cross (chunk 77, fail-safe)
+  — protocol contracts now auto-record airdrop points on-chain.
+  import_user_state (78) + finalize_migration (79) migrate an existing
+  season WITH days_active + mainnet addresses.
+- XelisVaultMiner v12.1: per-block reward settle (settle_rewards_cross
+  chunk 90, called by the oracle/anchor flows) — fixes the 'miners receive
+  dust' bug (4.86 VLT in 2 weeks -> ~50 VLT/day per 1000 VLT stake).
+  claim_rewards (91), confidential earnings Ciphertext view (ect_<addr>).
+  All mutating pub fns return 0 (VM non-zero = discarded state).
+- StakedOracle v12: settle(90) before distribute(23) in reward_miner;
+  1 MINING point per accepted submission (inline, chunks stable).
+- VaultChat v12: CHAT/RELAYER points inline (9 sites); anchor flow
+  settles rewards first.
+- Governor/GovernanceVault/PSM/VaultSwapV2/SavingsRate/VaultEngineV3 v12:
+  GOV/LIQUIDITY points inline; set_airdrop_tracker entries appended.
+- PrivacyMixer v3 (redesign): Tornado-style fixed denominations (1/10/100),
+  nullifier notes, NO stored amounts/identities, no intermediary.
+  deposit=7, withdraw=8.
+- AnalyticsCollector/CreditScore: fixed pre-existing compile errors
+  (before-use + u32 index) — 51/51 contracts now compile.
+
+## CLI
+- xvault: Doctor screen (8 check families, auto-repair, numbered steps),
+  error->steps guides on every failure, Privacy v3 denominations,
+  claim rewards + confidential earnings display.
+- xvault-miner: Claim accrued rewards action.
+- cli_backend: new chunks, mixer v3 note lookup, decrypt_ciphertext.
+- protocol: WalletClient.decrypt_ciphertext.
+- airdrop_offchain_indexer: live hash loading from network/testnet.json.
+- installers: xvault-relayer now launches relayer_server.py (was the
+  obsolete relayer_daemon.py).
+
+## Repo
+- Removed the stale src/ duplicate (drifted v11.5 copies — the documented
+  cause of user-facing stale-runtime bugs). Legacy scripts archived in
+  scripts/legacy/.
+- deploy/upgrade_v12.py: full phase A-E upgrade + airdrop state migration.
+- docs/UPGRADE_v12.md: precise replacement guide (chunks verified).
+- docs/entry_chunk_ids.json regenerated from real compilation.
+
+
+---
+
 ## [v12R-3 testnet] — 2026-08-24
 
 Canonical-chain redeploy after the 08-22 rollback + fast-sync realignment, with

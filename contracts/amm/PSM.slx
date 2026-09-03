@@ -43,7 +43,8 @@
 //   redeem : xusd.call(5u16, [xusd_amount], {})                      // xUSD.burn_tokens (All chunk 5)
 // ============================================================================
 
-const VERSION: string = "PSM v11.5"
+const VERSION: string = "PSM v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AIRDROP wiring
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -183,6 +184,16 @@ entry mint(xel_amount: u64, min_xusd_out: u64) -> u64 {
     let result: u64 = xusd.call(4u16, [caller, net_xusd, treasury, fee], {})
     require(result == 0, "mintfail")
     s.store(DAILY_MINT_USED_KEY, daily_mint_used + xel_amount)
+    // v12.0: airdrop LIQ points — 10 per XEL minted into xUSD
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 5u8, (xel_amount / 100000000) * 10u64, 400u64], {})
+        }
+    }
     return 0
 }
 
@@ -659,4 +670,17 @@ pub fn redeem_cross(xusd_amount: u64, min_xel_out: u64) -> u64 {
     }
     s.store(DAILY_REDEEM_USED_KEY, daily_redeem_used + xusd_amount)
     return 0
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

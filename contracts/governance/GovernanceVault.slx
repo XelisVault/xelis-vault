@@ -5,7 +5,8 @@
 // FIX #10/#11: added entry wrappers for get_voting_power, get_total_voting_power
 // so Governor/OracleGovernance can call them via Contract::call.
 // ============================================================================
-const VERSION: string = "GovernanceVault v11.3"
+const VERSION: string = "GovernanceVault v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AIRDROP wiring
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -137,6 +138,16 @@ entry stake(amount: u64, lock_days: u64) -> u64 {
     let user_vp: u64 = s.load(USER_VP_PREFIX + caller.to_string()).unwrap_or(0)
     s.store(USER_VP_PREFIX + caller.to_string(), user_vp + vp)
 
+    // v12.0: airdrop GOV 5 pts for staking VLT in governance
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 3u8, 5u64, 502u64], {})
+        }
+    }
     return 0
 }
 
@@ -563,4 +574,17 @@ pub fn get_stake_ids_for_user_paginated(user: Address, offset: u64, limit: u64) 
         i += 1
     }
     return result
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

@@ -1,0 +1,190 @@
+{
+  "data": [
+    {
+      "entry_id": 4,
+      "name": "register_preferences",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "encrypted_push_token",
+          "type": "bytes"
+        },
+        {
+          "name": "encrypted_email_hash",
+          "type": "Hash"
+        },
+        {
+          "name": "encrypted_telegram_id",
+          "type": "bytes"
+        },
+        {
+          "name": "notification_mask",
+          "type": "u8"
+        },
+        {
+          "name": "channel_mask",
+          "type": "u8"
+        },
+        {
+          "name": "min_severity",
+          "type": "u8"
+        },
+        {
+          "name": "quiet_start",
+          "type": "u32"
+        },
+        {
+          "name": "quiet_end",
+          "type": "u32"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "update_contact_info",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "encrypted_push_token",
+          "type": "bytes"
+        },
+        {
+          "name": "encrypted_telegram_id",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "update_notification_prefs",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "notification_mask",
+          "type": "u8"
+        },
+        {
+          "name": "channel_mask",
+          "type": "u8"
+        },
+        {
+          "name": "min_severity",
+          "type": "u8"
+        },
+        {
+          "name": "quiet_start",
+          "type": "u32"
+        },
+        {
+          "name": "quiet_end",
+          "type": "u32"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "unsubscribe",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "emit_notification_event",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "notification_type",
+          "type": "u8"
+        },
+        {
+          "name": "severity",
+          "type": "u8"
+        },
+        {
+          "name": "encrypted_payload",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

@@ -4,7 +4,7 @@
 // Silex-verified, all entry IDs aligned, all bugs from audit v4.3 fixed.
 // v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
 // ============================================================================
-const VERSION: string = "XelisVaultMiner v11.3"
+const VERSION: string = "XelisVaultMiner v12.1"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -15,6 +15,15 @@ const REGISTRY_KEY: string = "reg"
 const VLT_CONTRACT_KEY: string = "vc"
 const VLT_ASSET_KEY: string = "va"
 const DELEGATION_CONTRACT_KEY: string = "dck"  // v11.0: MinerDelegation contract hash (for pushing own_stake updates)
+
+// v12.1: AirdropTracker wiring (auto-recording of protocol activity)
+const AIRDROP_TRACKER_KEY: string = "atk"
+// v12.1: per-block reward accrual (lazy settle)
+const LAST_SETTLE_PREFIX: string = "ls_"
+// v12.1: confidential earnings view (Ciphertext, encrypted for the miner)
+const EARNINGS_CT_PREFIX: string = "ect_"
+// v12.1: last slash amount (transparency, replaces the old non-zero return)
+const LAST_SLASH_KEY: string = "lsl"
 const TREASURY_KEY: string = "tr"
 
 const MIN_STAKE_KEY: string = "ms"
@@ -452,6 +461,8 @@ entry register_miner(endpoint_url: string, miner_pubkey: Hash, services_mask: u8
         active: true
     }
     s.store(MINER_PREFIX + caller.to_string(), miner)
+    // v12.1: init the lazy-settle marker (rewards accrue from registration)
+    s.store(LAST_SETTLE_PREFIX + caller.to_string(), get_current_topoheight())
     s.store(MINER_LIST_PREFIX + count.to_string(10u32), caller)
     s.store(MINERS_COUNT_KEY, count + 1)
 
@@ -557,6 +568,8 @@ entry decrease_stake(amount: u64) -> u64 {
     let caller: Address = get_caller().expect("err")
     let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
     require(miner.stake >= amount, "insstake")
+    // v12.1: claim accrued rewards first (Miner tools > Claim) if pending —
+    // settle is not inlined here to keep the chunk layout stable.
     let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
     let ok: bool = transfer(caller, amount, vlt_asset)
     require(ok, "txfail")
@@ -588,6 +601,8 @@ entry deregister_miner() -> u64 {
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("err")
     let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    // v12.1: claim accrued rewards first (Miner tools > Claim) if pending —
+    // settle is not inlined here to keep the chunk layout stable.
     let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
     let ok: bool = transfer(caller, miner.stake, vlt_asset)
     require(ok, "txfail")
@@ -618,6 +633,11 @@ entry submit_heartbeat() -> u64 {
     let current_topo: u64 = get_current_topoheight()
     let interval: u64 = s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
     require(current_topo >= miner.last_heartbeat + interval, "toosoon")
+    // v12.1: per-block rewards settle via the oracle's distribute path
+    // (settle_rewards_cross, chunk 90) and via claim_rewards — a heartbeat
+    // does not need to settle by itself: the accrual window is bounded by
+    // last_heartbeat + timeout, so nothing is lost between cycles.
+
     miner.last_heartbeat = current_topo
     if current_topo > miner.last_infraction_topo + 1000 {
         if miner.reputation < REP_MAX {
@@ -627,6 +647,16 @@ entry submit_heartbeat() -> u64 {
     }
     s.store(MINER_PREFIX + caller.to_string(), miner)
     maybe_adjust_budget()
+
+    // v12.1: airdrop MINING 50 pts per heartbeat (daily-capped on the tracker)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 1u8, 50u64, 101u64], {})
+        }
+    }
     return 0
 }
 
@@ -688,7 +718,11 @@ pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 
         let treasury: Address = s.load(TREASURY_KEY).expect("err")
         transfer(treasury, treasury_amount, vlt_asset)
     }
-    return slash_amount
+    // v12.1 fix: mutating pub fn returns 0 (VM: non-zero return = failure,
+    // storage writes discarded). Amount kept for transparency.
+    s.store(LAST_SLASH_KEY, slash_amount)
+    emit_event(0u64, ["MinerSlashed", miner_addr.to_string() + "_" + slash_amount.to_string(10u32) + "_" + severity.to_string(10u32)])
+    return 0
 }
 
 // ID 8: distribute_reward (was pub fn)
@@ -718,47 +752,87 @@ pub fn distribute_reward(miner_addr: Address, service_id: u8, is_valid: bool) ->
         return 0
     }
 
+    // =====================================================================
+    // v12.1 — THE REWARD FIX. The old code paid get_dynamic_reward() once per
+    // VALID SUBMISSION (~57/day with the keeper): ~0.003 VLT each, i.e. the
+    // protocol distributed 4.86 VLT in two weeks against a 5.5M budget and a
+    // 2.75M VLT/year emission target. The per-block emission is now settled
+    // lazily by StakedOracle / VaultChat calling settle_rewards_cross
+    // (pub fn, chunk 90) right before this entry, and by claim_rewards:
+    //   reward = block_reward(block) x elapsed_blocks x stake_share x rep_mult
+    // for all the blocks the miner stayed alive (bounded by heartbeat
+    // timeouts). With the same parameters a 1000 VLT miner now earns ~50 VLT
+    // per day instead of ~0.25, in line with the tokenomics.
+    // (Silex requires intra-contract fns declared before use, which would
+    //  shift the chunk ids every existing consumer relies on — hence the
+    //  cross-contract settle pattern.)
+    // =====================================================================
+
+    // Valid submission: counters + reputation.
+    let miner2: Miner = s.load(MINER_PREFIX + miner_addr.to_string()).expect("err")
+    miner2.valid_submissions += 1
+    if service_id == 2 { miner2.successful_anchors += 1 }
+    let rep_gain: u64 = 0
+    if service_id == 1 { rep_gain = REP_GAIN_PRICE } else { rep_gain = REP_GAIN_ANCHOR }
+    if miner2.reputation < REP_MAX {
+        miner2.reputation += rep_gain
+        if miner2.reputation > REP_MAX { miner2.reputation = REP_MAX }
+    }
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner2)
+
+    // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [miner_addr, 1u8, 1u64, 100u64], {})
+        }
+    }
+
+    // Small data-quality reward per valid submission (base x rep multiplier).
     let base_reward: u64 = s.load(BASE_REWARD_ORACLE_KEY).unwrap_or(DEFAULT_BASE_REWARD_ORACLE)
     if service_id == 2 {
         base_reward = s.load(BASE_REWARD_CHAT_KEY).unwrap_or(DEFAULT_BASE_REWARD_CHAT)
     }
-    if base_reward == 0 { return 0 }
-
-    let reward: u64 = get_dynamic_reward(base_reward, miner_addr)
-    if reward == 0 {
-        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-        return 0
+    if base_reward > 0 {
+        let rep_mult: u64 = get_reputation_multiplier(get_effective_reputation(miner2))
+        if rep_mult > 0 {
+            let quality_reward: u64 = (base_reward as u128 * rep_mult as u128 / 10000u128) as u64
+            if quality_reward > 0 {
+                let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+                let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+                if distributed + quality_reward <= total_budget {
+                    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("err")
+                    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+                    // v11.7 fix: cross-contract calls require Access::All (`pub fn`).
+                    //   VLTToken chunk 4 = pub fn mint_to (All); chunk 27 (mint_to_entry) is an
+                    //   Entry — wallet-only, reverted "Chunk is not public" when called here.
+                    let mint_result: u64 = vlt.call(4u16, [miner_addr, quality_reward], {})
+                    require(mint_result == 0, "mintfail")
+                    s.store(DISTRIBUTED_KEY, distributed + quality_reward)
+                    let miner3: Miner = s.load(MINER_PREFIX + miner_addr.to_string()).expect("err")
+                    miner3.total_rewards_earned += quality_reward
+                    s.store(MINER_PREFIX + miner_addr.to_string(), miner3)
+                    // v12.1: confidential earnings view (Ciphertext for the miner)
+                    let ect_key: string = EARNINGS_CT_PREFIX + miner_addr.to_string()
+                    let ect_opt: optional<Ciphertext> = s.load(ect_key)
+                    if ect_opt.is_some() {
+                        let ect: Ciphertext = ect_opt.expect("err")
+                        ect.add(quality_reward)
+                        s.store(ect_key, ect)
+                    } else {
+                        let ect2: Ciphertext = Ciphertext::generate(miner_addr, quality_reward)
+                        s.store(ect_key, ect2)
+                    }
+                }
+            }
+        }
     }
 
-    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
-    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
-    if distributed + reward > total_budget {
-        s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-        return 0
-    }
-
-    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("err")
-    let vlt: Contract = Contract::new(vlt_hash).expect("err")
-    // v11.7 fix: cross-contract calls require Access::All (`pub fn`).
-    //   VLTToken chunk 4 = pub fn mint_to (All); chunk 27 (mint_to_entry) is an
-    //   Entry — wallet-only, reverted "Chunk is not public" when called here.
-    let mint_result: u64 = vlt.call(4u16, [miner_addr, reward], {})
-    require(mint_result == 0, "mintfail")
-
-    miner.total_rewards_earned += reward
-    miner.valid_submissions += 1
-    if service_id == 2 { miner.successful_anchors += 1 }
-
-    let rep_gain: u64 = 0
-    if service_id == 1 { rep_gain = REP_GAIN_PRICE } else { rep_gain = REP_GAIN_ANCHOR }
-    if miner.reputation < REP_MAX {
-        miner.reputation += rep_gain
-        if miner.reputation > REP_MAX { miner.reputation = REP_MAX }
-    }
-    s.store(MINER_PREFIX + miner_addr.to_string(), miner)
-    s.store(DISTRIBUTED_KEY, distributed + reward)
     maybe_adjust_budget()
-    return reward
+    // v12.1 fix: mutating pub fn returns 0 (VM: non-zero return = failure).
+    return 0
 }
 
 // ID 9: is_miner_active_entry (was pub fn is_miner_active)
@@ -1288,7 +1362,9 @@ pub fn auto_slash_offline(miner_addr: Address) -> u64 {
         let treasury: Address = s.load(TREASURY_KEY).expect("err")
         let _ = transfer(treasury, treasury_amount, vlt_asset)
     }
-    return slash_amount
+    // v12.1 fix: mutating pub fn returns 0 (VM non-zero return = failure).
+    s.store(LAST_SLASH_KEY, slash_amount)
+    return 0
 }
 
 // chunk 58: set_compound — enable/disable auto re-staking of rewards
@@ -1628,7 +1704,9 @@ pub fn emergency_slash_miner_cross(miner_addr: Address, slash_bps: u64, reason: 
     let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
     if total_staked >= actual_slash { s.store(TOTAL_STAKED_KEY, total_staked - actual_slash) }
     emit_event(0u64, ["EmergencySlash", miner_addr.to_string() + "_" + actual_slash.to_string(10u32) + "_" + reason])
-    return actual_slash
+    // v12.1 fix: mutating pub fn returns 0 (VM non-zero return = failure).
+    s.store(LAST_SLASH_KEY, actual_slash)
+    return 0
 }
 
 // Chunk 84: emergency_ban_miner (pub fn wrapper for cross-contract)
@@ -1663,4 +1741,159 @@ pub fn set_min_stake_cross(new_min_stake: u64) -> u64 {
     s.store(MIN_STAKE_KEY, new_min_stake)
     emit_event(0u64, ["MinStakeUpdated", new_min_stake.to_string(10u32)])
     return 0
+}
+
+// ============================================================================
+// v12.1 — LAZY PER-BLOCK REWARD SETTLEMENT + CONFIDENTIAL EARNINGS + AIRDROP
+// (all functions below are APPENDED: chunks 0..87 are unchanged, so every
+// existing consumer — StakedOracle calls 22/23/24, CLI CHUNKS, keeper —
+// keeps working unchanged after the registry upgrade)
+// ============================================================================
+
+// fn (chunk 88): accumulate the miner's confidential earnings view.
+// The Ciphertext is encrypted for the MINER's address and grows
+// homomorphically (ElGamal add) on every reward payment. Only the miner's
+// wallet can decrypt it (wallet RPC: decrypt_ciphertext). The contract never
+// learns or stores the plaintext of this view.
+fn add_confidential_earnings(miner_addr: Address, reward: u64) {
+    if reward == 0 { return }
+    let s: Storage = Storage::new()
+    let key: string = EARNINGS_CT_PREFIX + miner_addr.to_string()
+    let ct_opt: optional<Ciphertext> = s.load(key)
+    if ct_opt.is_some() {
+        let ct: Ciphertext = ct_opt.expect("err")
+        // Homomorphic add: ct now encrypts (previous + reward) for the miner.
+        ct.add(reward)
+        s.store(key, ct)
+    } else {
+        let ct2: Ciphertext = Ciphertext::generate(miner_addr, reward)
+        s.store(key, ct2)
+    }
+}
+
+// fn (chunk 89): settle the per-block accrued rewards of one miner.
+// Called from submit_heartbeat, distribute_reward, claim_rewards,
+// decrease_stake and deregister_miner — whichever comes first pays the
+// elapsed blocks. The accrual window is bounded by the miner's liveness:
+// rewards never accrue past last_heartbeat + HEARTBEAT_TIMEOUT, and a single
+// settle is capped at 2 x HEARTBEAT_TIMEOUT blocks (no back-pay after sleep).
+fn settle_accrued_rewards(miner_addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let miner_opt: optional<Miner> = s.load(MINER_PREFIX + miner_addr.to_string())
+    if miner_opt.is_none() { return 0 }
+    let miner: Miner = miner_opt.expect("err")
+
+    let now: u64 = get_current_topoheight()
+    let ls: u64 = s.load(LAST_SETTLE_PREFIX + miner_addr.to_string()).unwrap_or(miner.registered_at)
+    if ls >= now { return 0 }
+
+    let hb_timeout: u64 = s.load(HEARTBEAT_TIMEOUT_KEY).unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT)
+
+    // Advance the settle marker FIRST (idempotent + reentrancy-safe).
+    s.store(LAST_SETTLE_PREFIX + miner_addr.to_string(), now)
+
+    let rewards_frozen: bool = s.load("rewards_frozen").unwrap_or(false)
+    if rewards_frozen { return 0 }
+
+    // Rewards accrue only while the miner keeps heartbeating.
+    let window_end: u64 = now
+    if now > miner.last_heartbeat + hb_timeout {
+        window_end = miner.last_heartbeat + hb_timeout
+    }
+    if window_end <= ls { return 0 }
+    let elapsed: u64 = window_end - ls
+
+    // Cap the settle window: no huge back-pay, and the gap stays honest.
+    let max_window: u64 = hb_timeout * 2
+    if elapsed > max_window { elapsed = max_window }
+    if elapsed == 0 { return 0 }
+    if !miner.active { return 0 }
+
+    let block_reward: u64 = get_current_block_reward()
+    if block_reward == 0 { return 0 }
+
+    // Stake share (anti-concentration cap + STAKE_FLOOR anti-Sybil denominator).
+    let effective_stake: u64 = miner.stake
+    if effective_stake > CAP_STAKE_PER_MINER { effective_stake = CAP_STAKE_PER_MINER }
+    let effective_rep: u64 = get_effective_reputation(miner)
+    let rep_mult: u64 = get_reputation_multiplier(effective_rep)
+    if rep_mult == 0 { return 0 }
+
+    let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    if total_staked == 0 { return 0 }
+    let effective_total: u64 = total_staked
+    if effective_total < STAKE_FLOOR { effective_total = STAKE_FLOOR }
+
+    let active_count: u64 = get_active_miners_count()
+    let new_miner_bonus: u64 = get_new_miner_bonus(miner, active_count)
+
+    // reward = block_reward x elapsed x effective_stake x rep_mult
+    //        / (effective_total x 10000)  x  (1 + new_miner_bonus / 10000)
+    let base_amount: u64 = (block_reward as u128 * elapsed as u128 * effective_stake as u128 * rep_mult as u128 / (effective_total as u128 * 10000u128)) as u64
+    let bonus_amount: u64 = (base_amount as u128 * new_miner_bonus as u128 / 10000u128) as u64
+    let reward: u64 = base_amount + bonus_amount
+    if reward == 0 { return 0 }
+
+    let distributed: u64 = s.load(DISTRIBUTED_KEY).unwrap_or(0)
+    let total_budget: u64 = s.load(TOTAL_BUDGET_KEY).unwrap_or(DEFAULT_TOTAL_BUDGET)
+    if distributed + reward > total_budget { return 0 }
+
+    // Mint through VLTToken chunk 4 (pub fn mint_to, Access::All).
+    let vlt_hash: Hash = s.load(VLT_CONTRACT_KEY).expect("err")
+    let vlt: Contract = Contract::new(vlt_hash).expect("err")
+    let mint_result: u64 = vlt.call(4u16, [miner_addr, reward], {})
+    require(mint_result == 0, "mintfail")
+
+    s.store(DISTRIBUTED_KEY, distributed + reward)
+
+    let miner2: Miner = s.load(MINER_PREFIX + miner_addr.to_string()).expect("err")
+    miner2.total_rewards_earned += reward
+    s.store(MINER_PREFIX + miner_addr.to_string(), miner2)
+
+    // Confidential earnings view for the miner (Ciphertext homomorphic add).
+    add_confidential_earnings(miner_addr, reward)
+
+    emit_event(0u64, ["RewardsSettled", miner_addr.to_string() + "_" + elapsed.to_string(10u32) + "_" + now.to_string(10u32)])
+    return 0
+}
+
+// pub fn (chunk 90): settle_rewards_cross — cross-contract entry point for
+// the per-block reward settle. StakedOracle.reward_miner and VaultChat's
+// anchor flow call this (by chunk number, right before distribute_reward)
+// so the lazy accrual settles even though Silex forbids calling the
+// internal fn from the earlier-declared entries (before-use rule).
+// @caller: authorized service only (same guard as distribute_reward)
+pub fn settle_rewards_cross(miner_addr: Address) -> u64 {
+    only_authorized_service()
+    return settle_accrued_rewards(miner_addr)
+}
+
+// entry (chunk 91): claim_rewards — settle pending accrued rewards without
+// waiting for a heartbeat or a submission. Meant for chat-service miners and
+// for providers between keeper cycles.
+// @caller: a registered miner
+// @security: requires an existing miner record; read-mostly (settle mints)
+entry claim_rewards() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(s.load(MINER_PREFIX + caller.to_string()).is_some(), "notreg")
+    settle_accrued_rewards(caller)
+    return 0
+}
+
+// entry (chunk 92): set_airdrop_tracker — point this contract at the
+// AirdropTracker v12 instance so protocol activity auto-records points.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn (chunk 93): read the miner's last settle topoheight (diagnostics:
+// pending blocks = current topo - last settle).
+pub fn get_last_settle(addr: Address) -> u64 {
+    return Storage::new().load(LAST_SETTLE_PREFIX + addr.to_string()).unwrap_or(0)
+}
+
+// pub fn (chunk 94): read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

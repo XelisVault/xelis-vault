@@ -5,7 +5,7 @@
 // Tous les entry IDs ont été réalignés avec XelisVaultMiner v5.0.
 // v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
 // ============================================================================
-const VERSION: string = "StakedOracle v11.3"
+const VERSION: string = "StakedOracle v12.0"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -14,6 +14,7 @@ const EMERGENCY_KEY: string = "ea"
 const PAUSED_KEY: string = "pz"
 const REGISTRY_KEY: string = "reg"
 const MINER_CONTRACT_KEY: string = "mc"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AirdropTracker wiring
 const DELEGATION_CONTRACT_KEY: string = "dc"  // v11.0: MinerDelegation contract for total stake (own + delegated)
 
 const FEEDS_COUNT_KEY: string = "fc"
@@ -128,6 +129,9 @@ fn check_miner(addr: Address) -> bool {
 
 fn reward_miner(addr: Address, is_valid: bool) {
     let mc: Contract = get_miner_contract()
+    // v12.1: settle the per-block accrued rewards FIRST (pub fn chunk 90),
+    // then pay the data-quality reward (chunk 23).
+    let _ = mc.call(90u16, [addr], {})
     let _ = mc.call(23u16, [addr, 1u8, is_valid], {})
 }
 
@@ -516,6 +520,17 @@ entry submit_price(feed_id: u64, price: u64) -> u64 {
     s.store(entry_key, submission)
     s.store(provided_key, true)
     s.store(count_key, sub_count + 1)
+
+    // v12.0: auto-record 1 MINING airdrop point per accepted price submission.
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 1u8, 1u64, 200u64], {})
+        }
+    }
+
     try_aggregate(feed_id)
     return 0
 }
@@ -988,4 +1003,17 @@ entry force_update_price(feed_id: u64, new_price: u64) -> u64 {
 
     emit_event(0u64, ["ForceUpdatePrice", feed_id.to_string(10u32) + "_" + new_price.to_string(10u32)])
     return 0
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — chunks 0..47 unchanged)
+// ============================================================================
+
+// entry (chunk 49): set_airdrop_tracker — point this oracle at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn (chunk 50): read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }

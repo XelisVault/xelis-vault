@@ -32,7 +32,8 @@
 //   19 : execute_emergency_withdraw
 // ============================================================================
 
-const VERSION: string = "SavingsRate v11.3"
+const VERSION: string = "SavingsRate v12.0"
+const AIRDROP_TRACKER_KEY: string = "atk"  // v12.0: AIRDROP wiring
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -181,6 +182,16 @@ entry deposit(amount: u64) -> u64 {
 
     let total: u64 = s.load(TOTAL_DEPOSITS_KEY).unwrap_or(0)
     s.store(TOTAL_DEPOSITS_KEY, total + amount)
+    // v12.0: airdrop LIQ points — 10 per unit deposited
+        // v12.0: airdrop auto-record (inline — fail-safe by design)
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 5u8, (amount / 100000000) * 10u64, 402u64], {})
+        }
+    }
     release_reentrancy()
     return 0
 }
@@ -527,4 +538,17 @@ pub fn set_timelock_tl(tl: Hash) -> u64 {
     only_admin()
     Storage::new().store(TIMELOCK_KEY, tl)
     return 0
+}
+
+// ============================================================================
+// v12.0 — AIRDROP AUTO-RECORDING (APPENDED — all previous chunks unchanged)
+// ============================================================================
+
+// entry: set_airdrop_tracker — point this contract at the tracker.
+// @caller: admin (or timelock as contract caller)
+entry set_airdrop_tracker(at: Hash) -> u64 { only_admin() Storage::new().store(AIRDROP_TRACKER_KEY, at) return 0 }
+
+// pub fn: read the configured AirdropTracker hash (deploy checks).
+pub fn get_airdrop_tracker() -> Hash {
+    return Storage::new().load(AIRDROP_TRACKER_KEY).unwrap_or(Hash::zero())
 }
