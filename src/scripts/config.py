@@ -23,6 +23,7 @@ class Config:
             "compound": False,
             "contracts": {},
         }
+        self._version = 0
         self.load()
 
     def load(self):
@@ -42,6 +43,7 @@ class Config:
             os.chmod(CONFIG_PATH, 0o600)
         except Exception:
             pass
+        self._version += 1
 
     def get(self, key, default=""):
         return self.data.get(key, default)

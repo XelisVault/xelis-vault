@@ -25,10 +25,12 @@ import json
 import os
 import platform
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 import zlib
@@ -68,11 +70,18 @@ def _detached_kwargs() -> dict:
     is not killed when the controlling terminal closes. On Windows we detach the
     child from the parent console and put it in its own process group so it does
     not receive CTRL_CLOSE_EVENT / CTRL_C_EVENT when the xvault console closes.
+
+    stdin is always explicitly redirected to DEVNULL: with DETACHED_PROCESS on
+    Windows there is no console to inherit stdin from, and letting Popen try to
+    duplicate the parent's (invalid) stdin handle raises
+    `OSError: [WinError 6] The handle is invalid` — this is what previously
+    crashed the miner/wallet/relayer/tunnel right after launch (see miner.log).
     """
+    import subprocess as _sp
     if platform.system() == "Windows":
-        import subprocess as _sp
-        return {"creationflags": _sp.DETACHED_PROCESS | _sp.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
+        return {"creationflags": _sp.DETACHED_PROCESS | _sp.CREATE_NEW_PROCESS_GROUP,
+                "stdin": _sp.DEVNULL}
+    return {"start_new_session": True, "stdin": _sp.DEVNULL}
 
 
 # ---------------------------------------------------------------------------
@@ -296,17 +305,22 @@ def launch_wallet(binary: str, network: str, daemon_url: str, password: str,
 
 
 def wait_for_wallet(url: str, auth, timeout_s: int = 90) -> Optional[str]:
+    """Wait for the wallet RPC to become responsive.
+
+    Uses a 1-second polling interval for fast detection of wallet readiness.
+    Returns the wallet address on success, None on timeout.
+    """
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            addr = rpc_call(url, "get_address", auth=auth)
+            addr = rpc_call(url, "get_address", auth=auth, timeout=2)
             if isinstance(addr, dict):
                 addr = addr.get("address")
             if addr:
                 return addr
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(1)
     return None
 
 
@@ -547,8 +561,14 @@ def ensure_daemon(cfg) -> bool:
 
 def find_miner_binary() -> Optional[str]:
     exe = "xelis_miner.exe" if platform.system() == "Windows" else "xelis_miner"
+    # Also check script directory and current working directory
+    script_dir = Path(__file__).parent.parent.parent / "bin"
+    cwd = Path.cwd() / "bin"
     candidates = [
         BIN_DIR / exe,
+        script_dir / exe,
+        cwd / exe,
+        Path.cwd() / exe,
         Path.home() / ".xelis" / exe,
         Path.home() / "xelis" / exe,
         shutil.which("xelis_miner"),
@@ -635,11 +655,15 @@ def start_miner(cfg) -> tuple[bool, str]:
         return True, f"miner already running (pid {pid})"
 
     binary = cfg.get("miner_binary") or find_miner_binary()
-    if not binary and platform.system() != "Darwin":
+    if not binary:
+        # Try to download on all platforms (including macOS)
         binary = download_miner_binary()
     if not binary:
-        return False, ("xelis_miner not found — install it in ~/.xelis-vault/bin/ "
-                       "or build from source")
+        system = platform.system()
+        exe = "xelis_miner.exe" if system == "Windows" else "xelis_miner"
+        return False, (f"xelis_miner not found — download it from "
+                       f"https://github.com/xelis-project/xelis-blockchain/releases "
+                       f"and place it in {BIN_DIR}/{exe}, or run with --setup")
     cfg.data["miner_binary"] = binary
 
     addr = cfg.get("miner_address")
@@ -662,13 +686,45 @@ def start_miner(cfg) -> tuple[bool, str]:
     return True, f"miner started (pid {proc.pid}, {threads} thread(s), node: {daemon})"
 
 
+def _terminate(pid: int, tree: bool = True) -> None:
+    """Terminate a process, cross-platform.
+
+    - Windows: taskkill /F /T (kills the whole process tree — required for
+      cloudflared, which spawns worker children; a bare os.kill(SIGTERM)
+      does not exist there and would leave orphans).
+    - POSIX: SIGTERM, wait ~2s, then SIGKILL if still alive.
+    """
+    if platform.system() == "Windows":
+        import subprocess as _sp
+        cmd = ["taskkill", "/PID", str(pid), "/F"]
+        if tree:
+            cmd.append("/T")
+        _sp.run(cmd, capture_output=True, timeout=15)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    import time as _t
+    for _ in range(10):
+        _t.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return  # exited
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def stop_miner() -> tuple[bool, str]:
     pid = miner_running()
     if not pid:
         return False, "miner is not running"
     try:
-        os.kill(pid, 15)
-        time.sleep(2)
+        _terminate(pid)
+        time.sleep(1)
         MINER_PID_FILE.unlink(missing_ok=True)
         return True, f"miner stopped (pid {pid})"
     except OSError as e:
@@ -708,13 +764,13 @@ def relayer_running() -> Optional[int]:
         return None
 
 
-def relayer_health(cfg, port: Optional[int] = None) -> bool:
+def relayer_health(cfg, port: Optional[int] = None, timeout: float = 1.0) -> bool:
     port = port or int(cfg.get("relayer_port") or RELAYER_DEFAULT_PORT)
     try:
         import urllib.request
         host = cfg.get("relayer_host") or "127.0.0.1"
         with urllib.request.urlopen(f"http://{host}:{port}/health",
-                                    timeout=4) as resp:
+                                    timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -751,6 +807,8 @@ def start_relayer(cfg) -> tuple[bool, str]:
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file,
                             **_detached_kwargs())
     RELAYER_PID_FILE.write_text(str(proc.pid))
+    print(f"  {C.DIM}relayer starting (pid {proc.pid}) — waiting for the "
+          f"HTTP endpoint on {host}:{port}…{C.RESET}", flush=True)
 
     # health-check: wait up to ~12s for the HTTP endpoint to answer
     for _ in range(12):
@@ -767,8 +825,8 @@ def stop_relayer() -> tuple[bool, str]:
     if not pid:
         return False, "relayer is not running"
     try:
-        os.kill(pid, 15)
-        time.sleep(2)
+        _terminate(pid)
+        time.sleep(1)
         RELAYER_PID_FILE.unlink(missing_ok=True)
         return True, f"relayer stopped (pid {pid})"
     except OSError as e:
@@ -874,40 +932,64 @@ def tunnel_running() -> Optional[int]:
 
 
 def tunnel_url() -> str:
-    """Return the last public URL from the tunnel log (trycloudflare.com)."""
+    """Return the last public URL from the tunnel log (trycloudflare.com).
+
+    Reads only the tail of the log (it grows unboundedly while cloudflared
+    runs), so repeated status checks stay instant no matter how long the
+    tunnel has been up."""
     try:
-        txt = TUNNEL_LOG.read_text(errors="replace")
         import re
-        m = re.search(r"https?://[a-z0-9-]+\.trycloudflare\.com/?", txt)
-        if m:
-            url = m.group(0)
-            return url.rstrip("/")
+        url = ""
+        with open(TUNNEL_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 131_072))   # last 128 KB is plenty
+            txt = f.read().decode("utf-8", "replace")
+        # iterate all matches, keep the LAST one (most recent in the log)
+        for m in re.finditer(r"https?://[a-z0-9-]+\.trycloudflare\.com/?", txt):
+            url = m.group(0).rstrip("/")
+        return url
     except Exception:
-        pass
-    return ""
+        return ""
 
 
-def tunnel_healthy(url: str, timeout: float = 5.0) -> bool:
-    """Quick HTTP HEAD/GET check that the public tunnel URL is reachable."""
+def tunnel_healthy(url: str, timeout: float = 5.0, retries: int = 2) -> bool:
+    """Quick HTTP HEAD/GET check that the public tunnel URL is reachable.
+
+    Uses multiple attempts with short delays to handle transient network
+    issues (common with Cloudflare's edge network propagation)."""
     if not url:
         return False
-    try:
-        r = requests.head(url, timeout=timeout, allow_redirects=True)
-        if r.status_code < 400:
-            return True
-        r = requests.get(url, timeout=timeout, allow_redirects=True, stream=True)
-        r.close()
-        return r.status_code < 400
-    except Exception:
-        return False
+    for attempt in range(retries + 1):
+        try:
+            r = requests.head(url, timeout=timeout, allow_redirects=True)
+            if r.status_code < 400:
+                return True
+            # HEAD might be blocked, try GET
+            r = requests.get(url, timeout=timeout, allow_redirects=True, stream=True)
+            r.close()
+            if r.status_code < 400:
+                return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(1.0)  # brief pause before retry
+    return False
 
 
-def _tunnel_error_snippet(max_lines: int = 20) -> str:
-    """Return the last lines of the tunnel log for diagnostics."""
+def _tunnel_error_snippet(max_bytes: int = 65_536) -> str:
+    """Return the last lines of the tunnel log for diagnostics.
+
+    Reads only the tail (the log grows unboundedly while cloudflared runs),
+    so this stays instant no matter how long the tunnel has been up."""
     try:
-        lines = TUNNEL_LOG.read_text(errors="replace").splitlines()
-        tail = lines[-max_lines:] if lines else []
-        return "\n".join(tail)
+        with open(TUNNEL_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            txt = f.read().decode("utf-8", "replace")
+        lines = txt.splitlines()
+        return "\n".join(lines[-20:]) if lines else "(empty log)"
     except Exception:
         return "(no log)"
 
@@ -940,6 +1022,8 @@ def start_tunnel(cfg) -> tuple[bool, str]:
         return False, f"failed to start cloudflared: {e}"
     TUNNEL_PID_FILE.write_text(str(proc.pid))
     log_file.close()
+    print(f"  {C.DIM}tunnel starting (pid {proc.pid}) — waiting for the "
+          f"public *.trycloudflare.com URL…{C.RESET}", flush=True)
     # poll for the public URL (up to ~25s)
     for _ in range(25):
         time.sleep(1)
@@ -970,8 +1054,8 @@ def stop_tunnel() -> tuple[bool, str]:
     if not pid:
         return False, "tunnel is not running"
     try:
-        os.kill(pid, 15)
-        time.sleep(2)
+        _terminate(pid)
+        time.sleep(1)
         TUNNEL_PID_FILE.unlink(missing_ok=True)
         return True, f"tunnel stopped (pid {pid})"
     except OSError as e:
@@ -991,7 +1075,7 @@ def relayer_tunnel_status(cfg) -> dict:
     }
 
 
-def watchdog_tunnel(cfg, poll_interval: float = 60.0) -> dict:
+def watchdog_tunnel(cfg, poll_interval: float = 60.0, stop_event: Optional[threading.Event] = None) -> dict:
     """Watchdog for tunnel + relayer + on-chain endpoint.
 
     Loop:
@@ -1000,11 +1084,19 @@ def watchdog_tunnel(cfg, poll_interval: float = 60.0) -> dict:
       3. health check public URL
       4. sleep and repeat
 
+    Pass a stop_event (threading.Event) to gracefully stop the watchdog.
     Returns last status dict.
     """
     last_url = ""
     last_status = {"ok": False, "message": "not started"}
+    consecutive_failures = 0
+    max_failures_before_restart = 3
+
     while True:
+        # Check for stop signal
+        if stop_event and stop_event.is_set():
+            last_status["message"] = "watchdog stopped"
+            break
         try:
             status = relayer_tunnel_status(cfg)
             tpid = status.get("tunnel_pid")
@@ -1016,6 +1108,7 @@ def watchdog_tunnel(cfg, poll_interval: float = 60.0) -> dict:
                 tpid = status.get("tunnel_pid")
                 url = status.get("url") or ""
                 last_status = {"ok": ok, "message": msg, "url": url}
+                consecutive_failures = 0
             else:
                 last_status = {"ok": True, "message": f"tunnel alive {url}", "url": url}
             # 2) auto-update on-chain if URL changed
@@ -1031,18 +1124,33 @@ def watchdog_tunnel(cfg, poll_interval: float = 60.0) -> dict:
                     })
                     res = b.chat_update_endpoint(url)
                     last_status["endpoint"] = "updated ✓" if res.ok else f"update failed: {res.reason}"
+                    if res.ok:
+                        last_url = url  # only update last_url on success
                 except Exception as e:
                     last_status["endpoint"] = f"skipped: {e}"
-                last_url = url
             # 3) health check public URL
             if url:
                 healthy = tunnel_healthy(url)
                 last_status["healthy"] = healthy
                 if not healthy:
-                    last_status["message"] += " ⚠ public URL unreachable"
+                    consecutive_failures += 1
+                    last_status["message"] += f" ⚠ public URL unreachable ({consecutive_failures}/{max_failures_before_restart})"
+                    # If too many consecutive failures, restart tunnel
+                    if consecutive_failures >= max_failures_before_restart:
+                        last_status["message"] += " — restarting tunnel…"
+                        stop_tunnel()
+                        time.sleep(2)
+                        consecutive_failures = 0
+                else:
+                    consecutive_failures = 0
         except Exception as e:
             last_status = {"ok": False, "message": f"watchdog error: {e}", "url": last_url}
-        time.sleep(max(5, float(poll_interval)))
+        # Sleep in small increments to respond quickly to stop signal
+        for _ in range(int(max(5, float(poll_interval)))):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
+    return last_status
 
 
 def start_relayer_public(cfg) -> tuple[bool, str]:
@@ -1055,7 +1163,9 @@ def start_relayer_public(cfg) -> tuple[bool, str]:
     url = tunnel_url()
     if ok2:
         if not url:
-            for _ in range(15):
+            # start_tunnel already polls for ~25s; give it a short grace
+            # period with visible feedback instead of a silent 15s block.
+            for _ in range(8):
                 time.sleep(1)
                 url = tunnel_url()
                 if url:

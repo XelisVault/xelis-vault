@@ -38,7 +38,7 @@ WALLET_AUTH = ("wallet", "testpass")
 
 ZERO_HASH = "0" * 64
 
-ADMIN = "xet:YOUR_ADMIN_ADDRESS_HERE"
+ADMIN = "xet:czr9q8k5xlzqdptq7n2vapyjfduldts6tw3e6apl99vknzvmu4zsq8z9j8v"
 
 # Canonical asset hashes (verified on-chain)
 XEL_ASSET = ZERO_HASH                      # native XELIS (8 decimals)
@@ -267,7 +267,7 @@ def _is_transient(method: str, err: dict) -> bool:
 
 
 def _post(url: str, method: str, params: Any, auth: Optional[tuple] = None,
-          timeout: int = 60) -> Any:
+          timeout: int = 8) -> Any:
     payload: dict = {"jsonrpc": "2.0", "method": method, "id": 1}
     if params is not None:
         payload["params"] = params

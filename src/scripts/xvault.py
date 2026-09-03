@@ -19,14 +19,16 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import Config
+from config import Config, CONFIG_PATH
 from tui import (
     C, clear, hide_cursor, show_cursor, read_key, read_key_timeout, kbhit,
-    menu, text_input, confirm, info_box, progress_bar, BANNER,
+    menu, text_input, confirm, info_box, progress_bar, BANNER, _RICH,
     has_rich, render_panel, render_metrics, render_bar, render_badge,
     render_ok, render_warn, render_error, render_status, render_hint,
 )
@@ -34,6 +36,7 @@ from cli_backend import (
     Backend, DECIMALS, OpResult, AIRDROP_CATEGORIES, ZERO_HASH,
 )
 from protocol import SERVICE_ORACLE, SERVICE_CHAT, MIN_STAKE_VLT
+import onboarding
 
 VAULT_DIR = Path.home() / ".xelis-vault"
 
@@ -45,6 +48,10 @@ RELAYER_MAX_FREE_WALLET_SLOTS = 10000
 RELAYER_DEFAULT_FEE_ATOMIC = 1_000_000  # 0.01 XEL/VLT per message
 MINER_HEARTBEAT_WARN_BLOCKS = 1000
 MIN_RELAYER_BOND_VLT = 50
+
+_WALLET_ALIVE_CACHE = {}
+_WALLET_ALIVE_TTL = 15.0  # seconds before re-checking wallet status
+_WALLET_RELAUNCHING: set = set()   # urls currently being relaunched in the background
 
 
 # ---------------------------------------------------------------------------
@@ -213,22 +220,18 @@ def _check_balance(b: Backend, asset: str, atomic: int) -> bool:
     """True if the wallet can spend `atomic` of `asset`; offers max otherwise."""
     asset_name = {ZERO_HASH: "XEL", b.vlt_asset: "VLT", b.xusd_asset: "xUSD"}.get(asset, asset[:16])
     addr = getattr(b, "address", "(unknown)")
+    e = None
     try:
         avail = b.balance(asset)
     except Exception as e:
         avail = None
-    if avail is None and b.wallet:
-        try:
-            avail = b.wallet.balance(asset)
-        except Exception:
-            pass
     if avail is None:
         info_box("Balance check failed", [
             f"{C.RED}Could not read wallet balance.{C.RESET}",
             "",
             f"Wallet: {addr}",
             f"Asset: {asset_name} ({asset[:16]}...)",
-            f"Error: {str(e)[:80]}",
+            f"Error: {str(e)[:80]}" if e else "",
             "",
             f"{C.GRAY}Check that the wallet is running and the RPC is reachable.{C.RESET}",
         ], color=C.RED)
@@ -263,14 +266,37 @@ def coming_soon(name: str, desc: str):
 # ---------------------------------------------------------------------------
 
 def screen_dashboard(b: Backend):
-    """Live professional dashboard — auto-refreshes until a key is pressed.
+    """Live professional dashboard — auto-refreshes in real time until a key
+    is pressed.
 
-    Works on Windows and Unix. Keys are polled BETWEEN every remote RPC call and
-    across the whole wait, so the connection latency (e.g. a remote public node)
-    never makes the screen unresponsive. Any key reliably returns to the menu.
+    A background thread continuously fetches on-chain data via
+    `Backend.dashboard_snapshot()` (itself parallelized + short-TTL cached)
+    and stores the latest snapshot in a lock-protected shared state. The
+    render loop below never makes a network call itself, so it can never
+    freeze waiting on a remote RPC round-trip — key presses are picked up
+    within ~50ms regardless of network conditions.
     """
-    from tui import _RICH  # whether rich rendering path is active
     hide_cursor()
+    state = {"snap": None, "err": None, "refresh_count": 0}
+    lock = threading.Lock()
+    stop = threading.Event()
+    start_time = time.time()
+
+    def _worker():
+        count = 0
+        while not stop.is_set():
+            try:
+                snap = b.dashboard_snapshot()
+                count += 1
+                with lock:
+                    state["snap"], state["err"], state["refresh_count"] = snap, None, count
+            except Exception as e:
+                with lock:
+                    state["err"] = str(e)[:200]
+            stop.wait(1.0)
+
+    t = threading.Thread(target=_worker, daemon=True, name="dashboard-refresh")
+    t.start()
 
     def _pressed():
         # True non-blocking check (works on Windows via msvcrt and on Unix).
@@ -281,88 +307,122 @@ def screen_dashboard(b: Backend):
 
     try:
         while True:
+            with lock:
+                snap, err = state["snap"], state["err"]
+                refresh_n = state["refresh_count"]
+
+            if snap is None:
+                # First frame not ready yet — show a lightweight loading state
+                # instead of a blank/frozen screen while the background
+                # thread completes its first fetch.
+                if _pressed():
+                    return
+                clear()
+                print(render_badge(' XELIS Vault ', 'cyan', filled=True))
+                print()
+                print(f"{C.RED}{err}{C.RESET}" if err else
+                      f"{C.DIM}Connecting to the network…{C.RESET}")
+                if read_key_timeout(0.2) is not None or _pressed():
+                    return
+                continue
+
             if _pressed():
                 return
             clear()
-            topo = b.topo()
-            if _pressed():
-                return
-            price_info = b.price()
-            if _pressed():
-                return
-            bal = b.balances()
-            if _pressed():
-                return
-            ms = b.miner_stats()
-            if _pressed():
-                return
-            psm = b.psm_reserves()
-            if _pressed():
-                return
+            topo = snap["topo"]
+            price_info = snap["price"]
+            bal = snap["balances"]
+            ms = snap["miner_stats"]
+            psm = snap["psm"]
             xel, vlt, xusd = bal.get("XEL"), bal.get("VLT"), bal.get("xUSD")
+            now_str = datetime.now().strftime("%H:%M:%S")
+            uptime_s = int(time.time() - start_time)
+            uptime_str = f"{uptime_s // 3600}h{(uptime_s % 3600) // 60:02d}m"
 
             # ── Header / connection strip ───────────────────────────────
-            net_ok = bool(topo)
-            col = C.GREEN if net_ok else C.RED
-            status = f"{col}● CONNECTED{C.RESET}" if net_ok else f"{C.RED}○ OFFLINE{C.RESET}"
-            hdr = []
-            hdr.append(f"{render_badge(' XELIS Vault ','cyan',filled=True)}  "
-                       f"{render_badge(' TESTNET ','magenta',filled=True)}  {status}")
-            hdr.append("")
-            hdr.append(f"{C.DIM}Topoheight{C.RESET}  {C.BOLD}{topo:,}{C.RESET}"
-                       f"    {C.DIM}Address{C.RESET}  {short_addr(b.address)}")
-            print("\n".join(hdr))
+            net_ok = bool(topo) and err is None
+            conn_badge = render_badge(' ONLINE ', 'green', filled=True) if net_ok \
+                else render_badge(' OFFLINE ', 'red', filled=True)
+            hdr_lines = [
+                f"  {render_badge(' XELIS VAULT ', 'cyan', filled=True)}"
+                f"  {render_badge(' TESTNET ', 'magenta', filled=True)}"
+                f"  {conn_badge}"
+                f"  {C.DIM}{now_str}{C.RESET}"
+                f"  {C.DIM}uptime {uptime_str}{C.RESET}"
+                f"  {C.DIM}refresh #{refresh_n}{C.RESET}",
+                "",
+                f"  {C.DIM}Topoheight{C.RESET}  {C.BOLD}{topo:,}{C.RESET}"
+                f"    {C.DIM}Address{C.RESET}  {C.CYAN}{short_addr(b.address)}{C.RESET}",
+            ]
+            print("\n".join(hdr_lines))
 
             # ── Wallet balances panel ───────────────────────────────────
-            wal_rows = [
-                (f"  {C.BOLD}XEL{C.RESET}",  f"{C.BOLD}{b.fmt(xel)} XEL{C.RESET}"),
-                (f"  {C.BOLD}VLT{C.RESET}",  f"{C.BOLD}{b.fmt(vlt)} VLT{C.RESET}"),
-                (f"  {C.BOLD}xUSD{C.RESET}", f"{C.BOLD}{b.fmt(xusd)} xUSD{C.RESET}"),
-            ]
+            wal_rows = []
+            for sym, val, icon in [("XEL", xel, "◆"), ("VLT", vlt, "◈"), ("xUSD", xusd, "$")]:
+                formatted = b.fmt(val)
+                color = C.GREEN if (val is not None and val > 0) else C.DIM
+                wal_rows.append((f"  {icon} {sym}", f"{color}{C.BOLD}{formatted}{C.RESET}  {C.DIM}{sym}{C.RESET}"))
+
+            # Total USD value estimate
+            if price_info and xel is not None:
+                raw_price = price_info[0] / 10**DECIMALS
+                usd_val = (xel / 10**DECIMALS) * raw_price
+                wal_rows.append((f"  ≈ USD", f"{C.BOLD}${usd_val:,.2f}{C.RESET}  {C.DIM}(XEL only){C.RESET}"))
+
             if price_info:
                 raw, ftopo, stale = price_info
                 age = max(0, topo - ftopo)
-                mark = f"{C.RED}STALE (age {age} blk){C.RESET}" if stale \
-                       else f"{C.GREEN}fresh (age {age} blk){C.RESET}"
-                wal_rows.append(("  XEL/USD", f"{C.BOLD}${raw / 10**DECIMALS:,.4f}{C.RESET}  {mark}"))
+                if stale:
+                    price_badge = f"{C.RED}● STALE ({age} blk){C.RESET}"
+                elif age < 60:
+                    price_badge = f"{C.GREEN}● fresh ({age} blk){C.RESET}"
+                else:
+                    price_badge = f"{C.YELLOW}● aging ({age} blk){C.RESET}"
+                wal_rows.append(("  XEL/USD", f"{C.BOLD}${raw / 10**DECIMALS:,.4f}{C.RESET}  {price_badge}"))
+
             print()
-            body_wal = [" ".join(f"{k:<16}{v}" for k, v in wal_rows[:2]),
-                        " ".join(f"{k:<16}{v}" for k, v in wal_rows[2:4])]
-            print(render_panel("  WALLET  &  PRICE FEED", body_wal,
-                               border_color=C.CYAN))
+            print(render_metrics(wal_rows, title="  WALLET  &  PRICE  FEED",
+                                 border_color=C.CYAN))
 
             # ── Protocol panel ──────────────────────────────────────────
             pro_rows = []
             if psm and psm.get("xel") is not None:
-                pro_rows.append((f"PSM XEL reserve",
-                                 f"{b.fmt(psm.get('xel'))} XEL"))
-                pro_rows.append((f"PSM xUSD reserve",
-                                 f"{b.fmt(psm.get('xusd'))} xUSD"))
+                psm_xel = psm.get("xel", 0)
+                psm_xusd = psm.get("xusd", 0)
+                pro_rows.append(("PSM XEL reserve",
+                                 f"{C.BOLD}{b.fmt(psm_xel)}{C.RESET}  {C.DIM}XEL{C.RESET}"))
+                pro_rows.append(("PSM xUSD reserve",
+                                 f"{C.BOLD}{b.fmt(psm_xusd)}{C.RESET}  {C.DIM}xUSD{C.RESET}"))
             if ms.get("total_staked") is not None:
-                pro_rows.append((f"Miner staked",
-                                 f"{b.fmt(ms['total_staked'])} VLT"))
+                pro_rows.append(("Miner total staked",
+                                 f"{C.BOLD}{b.fmt(ms['total_staked'])}{C.RESET}  {C.DIM}VLT{C.RESET}"))
             if ms.get("budget") is not None and ms.get("distributed") is not None:
                 budget, dist = ms["budget"], ms["distributed"]
-                pct = dist * 100 // budget if budget else 0
-                bar = render_bar(dist / budget if budget else 0, 24)
-                pro_rows.append(("Rewards budget", f"{bar} {dist//10**DECIMALS:g}/{budget//10**DECIMALS:g} VLT ({pct}%)"))
+                pct = dist / budget if budget else 0
+                pct_int = int(pct * 100)
+                bar = render_bar(pct, 20)
+                color = C.GREEN if pct < 0.5 else C.YELLOW if pct < 0.85 else C.RED
+                pro_rows.append(("Rewards distributed",
+                                 f"{bar}  {color}{pct_int}%{C.RESET}  "
+                                 f"{C.DIM}{dist//10**DECIMALS:g}/{budget//10**DECIMALS:g} VLT{C.RESET}"))
+            if ms.get("min_stake") is not None:
+                pro_rows.append(("Min miner stake",
+                                 f"{C.BOLD}{b.fmt(ms['min_stake'])}{C.RESET}  {C.DIM}VLT{C.RESET}"))
             if pro_rows:
                 print()
-                body_pro = [" ".join(f"{k:<18}{v}" for k, v in pro_rows[i:i+2])
-                            for i in range(0, len(pro_rows), 2)]
-                print(render_panel("  PROTOCOL  HEALTH", body_pro,
-                                   border_color=C.MAGENTA))
+                print(render_metrics(pro_rows, title="  PROTOCOL  HEALTH",
+                                     border_color=C.MAGENTA))
 
             # ── Footer ──────────────────────────────────────────────────
             print()
             print(f"{C.DIM}{'─' * 62}{C.RESET}")
-            print(f"{C.DIM}  Refreshing — press {render_badge('q','cyan')} or any key to go back{C.RESET}")
-            # Poll keys across a ~3s refresh window; any key returns immediately.
-            for _ in range(30):
-                if read_key_timeout(0.1) is not None or _pressed():
-                    return
-                time.sleep(0.0)
+            print(f"  {C.DIM}Live auto-refresh (1s) — press any key to go back{C.RESET}")
+            # Data refreshes in the background every ~1s; key presses are
+            # picked up within ~50-200ms regardless (never blocked by RPC).
+            if read_key_timeout(1.0) is not None or _pressed():
+                return
     finally:
+        stop.set()
         show_cursor()
 
 
@@ -449,10 +509,8 @@ def screen_vault(b: Backend):
                 vid_i = int(vid)
             except ValueError:
                 continue
-            debt = b.vault_get(vid_i).get("borrow_amount") if (
-                hasattr(b, "vault_get") and b.vault_get(vid_i)) else 0
-            if not debt:
-                debt = 0
+            vinfo = b.vault_get(vid_i) if hasattr(b, "vault_get") else None
+            debt = (vinfo or {}).get("borrow_amount") or 0
             default = f"{debt / 10**DECIMALS:.6f}".rstrip("0").rstrip(".") if debt else "10"
             amt = text_input(f"xUSD amount to repay (current debt {b.fmt(debt, 'xUSD')}):",
                              default=default)
@@ -492,8 +550,8 @@ def screen_vault(b: Backend):
 
 
 def screen_swap(b: Backend):
-    usd = b.price_usd()
     while True:
+        usd = b.price_usd()
         pools = b.amm_pools()
         psm = b.psm_reserves()
         sub = (f"XEL/USD ${usd:,.4f}   PSM reserves: "
@@ -1382,10 +1440,18 @@ def screen_chat(b: Backend):
                 continue
             ep = text_input("Relayer endpoint (url):").strip() or "http://localhost"
             if confirm(f"Bond {amt} VLT + register as relayer?"):
-                run_tx(b, lambda a=atomic: b.chat_stake_bond(a), "Stake bond")
-                time.sleep(4)
-                run_tx(b, lambda: b.chat_register_relayer(ep, RELAYER_DEFAULT_FEE_ATOMIC, 100),
-                       "Register relayer")
+                res = run_tx(b, lambda a=atomic: b.chat_stake_bond(a), "Stake bond")
+                if res is not None and res.ok:
+                    # Wait for the bond tx to be confirmed on-chain, then
+                    # register. No blind sleep: run_tx already waits for the
+                    # block, so the second tx can follow immediately.
+                    run_tx(b, lambda: b.chat_register_relayer(ep, RELAYER_DEFAULT_FEE_ATOMIC, 100),
+                           "Register relayer")
+                else:
+                    info_box("Bond failed", [
+                        render_error("The bond transaction was not confirmed — "
+                                     "relayer registration skipped."),
+                    ], color=C.RED)
         elif choice == "fee":
             tok = text_input("Token (0=XEL, 1=VLT):").strip() or "0"
             if tok not in ("0", "1"):
@@ -1430,7 +1496,7 @@ def _relayer_server_status(cfg) -> list:
         try:
             import json as _json
             import urllib.request
-            with urllib.request.urlopen(f"http://{st['local_endpoint']}/status", timeout=4) as resp:
+            with urllib.request.urlopen(f"http://{st['local_endpoint']}/status", timeout=2) as resp:
                 s = _json.loads(resp.read())
             lines.append(f"  {C.DIM}topo {s.get('topo')} · anchors {s.get('anchors_submitted')} "
                          f"· outbox {len(s.get('outbox_new', []) or [])}{C.RESET}")
@@ -1603,11 +1669,6 @@ def screen_relayer(b: Backend):
     elif choice == "claim":
         if confirm("Claim accumulated relayer fees to this wallet?"):
             run_tx(b, b.chat_claim_fees, "Claim relayer fees")
-    elif choice == "public":
-        from onboarding import start_relayer_public
-        ok, msg = start_relayer_public(b.cfg if hasattr(b, "cfg") else {})
-        info_box("Expose publicly", [render_ok(msg) if ok else render_error(msg)],
-                 color=C.GREEN if ok else C.RED)
 
 
 # --- Activity screen (transaction export for manual analysis) ----------------
@@ -1754,6 +1815,7 @@ def _clipboard_copy(text: str) -> bool:
 # --- Miner tools screen -----------------------------------------------------
 
 def screen_miner_tools(b: Backend):
+    cfg = _load_cfg()
     while True:
         m = b.my_miner()
         stats = b.miner_stats()
@@ -1947,17 +2009,34 @@ def action_register_miner(b: Backend, cfg: Config):
                    f"endpoint {endpoint}, stake {amt} VLT)?"):
         return
 
-    res = b.miner_register(endpoint, mask, atomic)
-    if res.ok:
+    res = run_tx(b, lambda: b.miner_register(endpoint, mask, atomic),
+                 "Miner registration")
+    if res is None or not res.ok:
+        return
+    # Verify the profile is ACTIVE on-chain (the tx is confirmed, but the
+    # contract applies the registration at the next block — confirm reality).
+    b.invalidate_cache()
+    deadline = time.time() + 60
+    active = False
+    while time.time() < deadline:
+        m = b.my_miner()
+        if m and isinstance(m, list) and len(m) >= 15 and bool(m[14]):
+            active = True
+            break
+        time.sleep(2)
+        b.invalidate_cache()
+    if active:
         info_box("Registered", [
-            render_ok("Miner profile created on-chain ✓"), "",
+            render_ok("Miner profile ACTIVE on-chain ✓"), "",
             f"Tx: {res.tx[:62]}…",
-            "Next: enable services & send a heartbeat from this menu.",
+            "Next: enable services & send a heartbeat from the Miner tools menu.",
         ], color=C.GREEN)
     else:
-        info_box("Registration rejected", [
-            render_error(f"Reason: {res.reason}")
-        ], color=C.RED)
+        info_box("Registered", [
+            render_ok("Transaction confirmed ✓"), "",
+            "Profile still syncing on-chain — it will appear shortly.",
+            f"Tx: {res.tx[:62]}…",
+        ], color=C.GREEN)
 
 
 # ---------------------------------------------------------------------------
@@ -2014,62 +2093,221 @@ def screen_settings(b: Backend, cfg: Config):
 # Main
 # ---------------------------------------------------------------------------
 
-def ensure_wallet_alive(cfg: Config) -> bool:
-    """Auto-relaunch the managed wallet RPC when it is configured but down.
+def _auto_detect_wallet_config(cfg: Config) -> dict:
+    """Auto-detect wallet binary, path, and password when not explicitly configured.
 
-    This is what makes remote-node mode 'zero unavailable': the chain data
-    comes from the public node and the local wallet process is (re)started
-    transparently in the background.
+    Scans known locations and uses coherent defaults so the wallet can be
+    auto-launched even after a minimal setup (e.g. xvault-miner setup that
+    only sets wallet_url). Works on Windows, Linux, and macOS.
+    Returns a dict of detected values.
     """
-    import onboarding
+    detected = {}
+    # ── Binary ──
     binary = cfg.get("wallet_binary")
+    if not binary or not Path(binary).exists():
+        found = onboarding.find_wallet_binary()
+        if found:
+            detected["wallet_binary"] = found
+            binary = found
+    # ── Wallet path ──
+    # Cross-platform: same candidates on all OS (Path handles separators)
     wpath = cfg.get("wallet_path")
+    if not wpath or not Path(wpath).exists():
+        candidates = [
+            VAULT_DIR / "wallets" / "xvault-user",
+            VAULT_DIR / "wallets" / "xvault-testnet",
+            VAULT_DIR / "wallets" / "xvault-mainnet",
+            # Legacy / alternative locations
+            Path.home() / ".xelis" / "wallet" / "testnet",
+            Path.home() / ".xelis" / "wallet",
+        ]
+        for c in candidates:
+            if c.exists() and any(c.iterdir()):
+                detected["wallet_path"] = str(c)
+                wpath = str(c)
+                break
+    # ── Password ──
     password = cfg.get("wallet_password")
-    if not (binary and wpath and password and Path(binary).exists()):
-        return False
-    port = int(cfg.get("wallet_rpc_port") or 18082)
-    url = f"http://127.0.0.1:{port}"
-    try:
-        onboarding.rpc_call(url, "get_address",
-                            auth=(cfg.get("wallet_user", "wallet"),
-                                  cfg.get("wallet_pass", "testpass")), timeout=3)
-        return True  # already up
-    except Exception:
-        pass
+    if not password:
+        # The default password used by start-wallet.bat/.sh and onboarding
+        detected["wallet_password"] = "testpass"
+    # ── Network ──
+    if not cfg.get("wallet_network"):
+        detected["wallet_network"] = "testnet"
+    # ── Seed (for --seed flag, optional) ──
+    # Look for seed backup files to enable auto-launch with the right wallet
+    seed_dir = VAULT_DIR / "seed_backup"
+    if seed_dir.exists():
+        seeds = list(seed_dir.glob("*.seed.txt"))
+        if seeds:
+            try:
+                words = []
+                for line in seeds[0].read_text().splitlines():
+                    parts = line.strip().split(". ", 1)
+                    if len(parts) == 2:
+                        words.append(parts[1])
+                if words:
+                    detected["_wallet_seed"] = " ".join(words)
+            except Exception:
+                pass
+    return detected
+
+
+def _relaunch_wallet_bg(cfg: Config, url: str, cache_key: tuple) -> None:
+    """Background relaunch of the managed wallet RPC (never blocks the UI).
+
+    Called from ensure_wallet_alive when the wallet is configured but down.
+    Runs in a daemon thread: launch the process, wait (up to 60 s) for the
+    JSON-RPC to answer, then update the alive-cache so the main loop notices.
+    """
+    import socket
     try:
         network = cfg.get("wallet_network", "testnet")
         daemon = cfg.get("rpc_url") or onboarding.PUBLIC_NODE
         user = cfg.get("wallet_user", "wallet")
         pwd = cfg.get("wallet_pass", "testpass")
-        onboarding.launch_wallet(binary, network, daemon, password,
-                                 Path(wpath), port, rpc_user=user, rpc_pass=pwd)
-        addr = onboarding.wait_for_wallet(url, (user, pwd), timeout_s=240)
-        if addr:
-            return True
+        binary = cfg.get("wallet_binary")
+        wpath = cfg.get("wallet_path")
+        password = cfg.get("wallet_password")
+        seed = cfg.data.get("_wallet_seed")
+        port = int(cfg.get("wallet_rpc_port") or 18082)
+
+        # Auto-detect missing config
+        if not binary or not wpath or not password:
+            detected = _auto_detect_wallet_config(cfg)
+            binary = binary or detected.get("wallet_binary")
+            wpath = wpath or detected.get("wallet_path")
+            password = password or detected.get("wallet_password")
+            seed = seed or detected.get("_wallet_seed")
+            # Persist detected values so next launch is faster
+            for k, v in detected.items():
+                if not k.startswith("_") and not cfg.get(k):
+                    cfg.data[k] = v
+            cfg.save()
+
+        if not binary or not Path(binary).exists():
+            raise FileNotFoundError("Wallet binary not found — run Setup first")
+        if not wpath:
+            raise FileNotFoundError("Wallet path not found — run Setup first")
+
+        # Check if port is already in use (wallet may be starting by another process)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
         try:
-            print(f"  {C.YELLOW}Auto-relaunched wallet did not answer on {url} "
-                  f"after 240s. See ~/.xelis-vault/logs/wallet.log{C.RESET}")
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                # Port is open — wallet may already be running, just wait for RPC
+                try:
+                    print(f"  {C.DIM}Wallet port {port} already in use, waiting for RPC...{C.RESET}")
+                except Exception:
+                    pass
+                addr = onboarding.wait_for_wallet(url, (user, pwd), timeout_s=30)
+                _WALLET_ALIVE_CACHE[cache_key] = (time.time(), bool(addr))
+                return
+        finally:
+            sock.close()
+
+        try:
+            print(f"  {C.DIM}Auto-launching wallet on port {port}...{C.RESET}")
         except Exception:
             pass
-        return False
+
+        onboarding.launch_wallet(binary, network, daemon, password,
+                                 Path(wpath), port, seed=seed,
+                                 rpc_user=user, rpc_pass=pwd)
+        addr = onboarding.wait_for_wallet(url, (user, pwd), timeout_s=60)
+        _WALLET_ALIVE_CACHE[cache_key] = (time.time(), bool(addr))
+        if addr:
+            try:
+                print(f"  {C.GREEN}Wallet auto-relaunched and ready on {url}{C.RESET}")
+            except Exception:
+                pass
     except Exception as e:
+        _WALLET_ALIVE_CACHE[cache_key] = (time.time(), False)
         try:
             print(f"  {C.RED}Auto-relaunch of wallet failed: {e}{C.RESET}")
         except Exception:
             pass
+    finally:
+        _WALLET_RELAUNCHING.discard(cache_key)
+
+
+def ensure_wallet_alive(cfg: Config) -> bool:
+    """Auto-relaunch the managed wallet RPC when it is configured but down.
+
+    This is what makes remote-node mode 'zero unavailable': the chain data
+    comes from the public node and the local wallet process is (re)started
+    transparently in the background. The relaunch itself runs in a worker
+    thread so the menu never freezes for up to 4 minutes.
+
+    Works even when wallet_binary/wallet_path/wallet_password are not
+    explicitly configured — it auto-detects them from known defaults.
+    """
+    wallet_url = cfg.get("wallet_url")
+    if not wallet_url:
         return False
+    port = int(cfg.get("wallet_rpc_port") or 18082)
+    url = f"http://127.0.0.1:{port}"
+    cache_key = (url, cfg.get("wallet_user", "wallet"))
+    now = time.time()
+    cached = _WALLET_ALIVE_CACHE.get(cache_key)
+    if cached and now - cached[0] < _WALLET_ALIVE_TTL:
+        return cached[1]
+    try:
+        onboarding.rpc_call(url, "get_address",
+                            auth=(cfg.get("wallet_user", "wallet"),
+                                  cfg.get("wallet_pass", "testpass")), timeout=1.5)
+        _WALLET_ALIVE_CACHE[cache_key] = (now, True)
+        return True  # already up
+    except Exception:
+        pass
+    # Wallet is down — check if we CAN relaunch (binary exists or detectable)
+    binary = cfg.get("wallet_binary")
+    if not binary or not Path(binary).exists():
+        detected = _auto_detect_wallet_config(cfg)
+        binary = detected.get("wallet_binary")
+        if not binary:
+            return False  # no binary available, can't relaunch
+    # Relaunch in a background thread, never block the UI.
+    if cache_key in _WALLET_RELAUNCHING:
+        return False  # a relaunch is already in flight
+    _WALLET_RELAUNCHING.add(cache_key)
+    threading.Thread(target=_relaunch_wallet_bg, args=(cfg, url, cache_key),
+                     daemon=True).start()
+    return False
 
 
 def main():
     cfg = Config()
     first_run = not CONFIG_PATH.exists()
+    b = None
+    cfg_version = None
+
+    # Auto-detect and persist wallet config on first launch or if missing
+    if cfg.get("wallet_url"):
+        detected = _auto_detect_wallet_config(cfg)
+        changed = False
+        for k, v in detected.items():
+            if not k.startswith("_") and not cfg.get(k):
+                cfg.data[k] = v
+                changed = True
+        if changed:
+            cfg.save()
+
+    # Pre-flight: trigger wallet auto-relaunch early so it starts in parallel
+    # with the first dashboard render. This makes the wallet appear ready
+    # faster when it was already running or needs a quick relaunch.
+    if cfg.get("wallet_url"):
+        ensure_wallet_alive(cfg)
 
     while True:
-        # transparently bring the managed wallet back before building Backend
-        if not first_run and cfg.get("wallet_binary"):
+        if not first_run and cfg.get("wallet_url"):
             ensure_wallet_alive(cfg)
 
-        b = Backend(cfg.data)
+        current_version = cfg._version
+        if b is None or current_version != cfg_version:
+            b = Backend(cfg.data)
+            cfg_version = current_version
+
         online = b.topo() > 0
         wallet_ok = bool(b.wallet)
         if wallet_ok:
@@ -2078,16 +2316,45 @@ def main():
             except Exception:
                 wallet_ok = False
 
+        # Check if wallet auto-relaunch is in progress
+        wallet_relaunching = False
+        wallet_port_listening = False
+        if not wallet_ok and cfg.get("wallet_url"):
+            port = int(cfg.get("wallet_rpc_port") or 18082)
+            url = f"http://127.0.0.1:{port}"
+            cache_key = (url, cfg.get("wallet_user", "wallet"))
+            wallet_relaunching = cache_key in _WALLET_RELAUNCHING
+            # Check if port is already listening (wallet process starting up)
+            if not wallet_relaunching:
+                import socket as _sock
+                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                _s.settimeout(0.5)
+                try:
+                    if _s.connect_ex(("127.0.0.1", port)) == 0:
+                        wallet_port_listening = True
+                finally:
+                    _s.close()
+
         title_lines = [BANNER]
         clear()
         print(BANNER)
         print(f"{C.GRAY}{'─' * 66}{C.RESET}")
         net = f"{C.GREEN}● daemon online{C.RESET}" if online else \
               f"{C.RED}○ daemon offline{C.RESET}"
-        wal = f"{C.GREEN}● wallet open{C.RESET}" if wallet_ok else \
-              f"{C.YELLOW}○ no wallet{C.RESET}"
+        if wallet_ok:
+            wal = f"{C.GREEN}● wallet ready{C.RESET}"
+        elif wallet_relaunching:
+            wal = f"{C.YELLOW}◌ wallet starting…{C.RESET}"
+        elif wallet_port_listening:
+            wal = f"{C.YELLOW}◌ wallet syncing…{C.RESET}"
+        elif cfg.get("wallet_url"):
+            wal = f"{C.RED}○ wallet unreachable{C.RESET}"
+        else:
+            wal = f"{C.YELLOW}○ no wallet configured{C.RESET}"
         addr = short_addr(cfg.get("miner_address")) if cfg.get("miner_address") else short_addr(b.address)
         print(f"  {net}   {wal}   Address: {addr}")
+        if wallet_relaunching:
+            print(f"  {C.DIM}  ↳ Auto-launching wallet in background…{C.RESET}")
         print()
 
         opts = [

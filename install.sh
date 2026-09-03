@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  XELIS Vault v11.3 — One-Line Installer (Linux & macOS)
+# ============================================================================
+#  Install:   curl -fsSL https://xelisvault.github.io/xelis-vault/install | bash
+#  Uninstall: curl -fsSL https://xelisvault.github.io/xelis-vault/install | bash -s -- --uninstall
+#
+#  Windows users: use install.ps1 or install.bat instead:
+#    PowerShell:  irm https://xelisvault.github.io/xelis-vault/install.ps1 | iex
+#    Or download install.bat and double-click
+# ============================================================================
+set -euo pipefail
+
+if [[ -t 1 ]] && command -v tput &>/dev/null; then
+    BOLD=$(tput bold); DIM=$(tput dim); RESET=$(tput sgr0)
+    RED=$(tput setaf 1); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3)
+    BLUE=$(tput setaf 4); MAGENTA=$(tput setaf 5); CYAN=$(tput setaf 6)
+else
+    BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""
+fi
+
+BANNER="${CYAN}${BOLD}"
+BANNER+="\n ██████  ██      ██   ██ ██ ███████  ██████ ████████ ██  ██████  ███    ██"
+BANNER+="\n██    ██ ██      ██  ██  ██ ██      ██         ██    ██ ██    ██ ████   ██"
+BANNER+="\n██    ██ ██      █████   ██ █████   ██         ██    ██ ██    ██ ██ ██  ██"
+BANNER+="\n██    ██ ██      ██  ██  ██ ██      ██         ██    ██ ██    ██ ██  ██ ██"
+BANNER+="\n ██████  ███████ ██   ██ ██ ███████  ██████    ██    ██  ██████  ██   ████"
+BANNER+="${RESET}\n${DIM}              Privacy-First DeFi on XELIS BlockDAG${RESET}"
+
+info()    { printf "${BLUE}i${RESET}  %s\n" "$*"; }
+success() { printf "${GREEN}v${RESET}  %s\n" "$*"; }
+warn()    { printf "${YELLOW}!${RESET}  %s\n" "$*"; }
+error()   { printf "${RED}x${RESET}  %s\n" "$*" >&2; }
+step()    { printf "\n${MAGENTA}${BOLD}> %s${RESET}\n" "$*"; }
+
+REPO="XelisVault/xelis-vault"
+REPO_URL="https://github.com/${REPO}.git"
+INSTALL_DIR="${HOME}/.xelis-vault"
+BIN_DIR="${HOME}/.local/bin"
+VENV_DIR="${INSTALL_DIR}/venv"
+CONFIG_DIR="${INSTALL_DIR}/config"
+VERSION="7.0"
+
+UNINSTALL=0
+FORCE=0
+INTERACTIVE=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --uninstall) UNINSTALL=1; shift ;;
+        --force|-f) FORCE=1; shift ;;
+        --yes|-y) INTERACTIVE=0; shift ;;
+        --version) echo "xelis-vault ${VERSION}"; exit 0 ;;
+        --help|-h)
+            echo "XELIS Vault Installer v${VERSION} (Linux & macOS)"
+            echo ""
+            echo "Usage: curl -fsSL https://xelisvault.github.io/xelis-vault/install | bash"
+            echo ""
+            echo "Windows: use install.ps1 or install.bat instead"
+            echo "  PowerShell: irm https://xelisvault.github.io/xelis-vault/install.ps1 | iex"
+            echo ""
+            echo "Options:"
+            echo "  --uninstall  Remove XELIS Vault"
+            echo "  --force,-f   Reinstall"
+            echo "  --yes,-y     Skip prompts (CI)"
+            echo "  --version    Print version"
+            exit 0 ;;
+        *) error "Unknown: $1"; exit 1 ;;
+    esac
+done
+
+if [[ $UNINSTALL -eq 1 ]]; then
+    printf "\n${BANNER}\n"
+    step "Uninstalling XELIS Vault"
+    rm -rf "$INSTALL_DIR"
+    rm -f "${BIN_DIR}/xvault" "${BIN_DIR}/xvault-miner"
+    success "Removed"
+    exit 0
+fi
+
+printf "\n${BANNER}\n"
+printf "${DIM}  v${VERSION} Installer (Linux & macOS)${RESET}\n\n"
+
+step "Pre-flight checks"
+command -v python3 >/dev/null || { error "Python 3 required"; exit 1; }
+PY=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+success "Python ${PY}"
+command -v git >/dev/null || { error "git required"; exit 1; }
+success "git available"
+OS=$(uname -s); ARCH=$(uname -m)
+success "Platform: ${OS}/${ARCH}"
+
+step "Installing XELIS Vault"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "${INSTALL_DIR}/logs" "${INSTALL_DIR}/wallet"
+
+if [[ -d "$INSTALL_DIR/src/.git" ]] && [[ $FORCE -eq 0 ]]; then
+    cd "$INSTALL_DIR/src"
+    info "Updating existing installation..."
+    git pull --ff-only
+    success "Repository updated"
+else
+    cd "$INSTALL_DIR"
+    rm -rf src
+    info "Cloning ${REPO}..."
+    git clone --depth 1 "$REPO_URL" src 2>&1 | sed 's/^/    /'
+    success "Repository cloned"
+fi
+
+step "Setting up Python environment"
+if [[ ! -d "$VENV_DIR" ]]; then
+    python3 -m venv "$VENV_DIR"
+    success "Virtualenv created"
+fi
+source "$VENV_DIR/bin/activate"
+pip install --quiet --upgrade pip
+pip install --quiet requests python-dotenv cryptography
+success "Dependencies installed"
+deactivate 2>/dev/null || true
+
+step "Installing launchers"
+mkdir -p "$BIN_DIR"
+
+cat > "${BIN_DIR}/xvault-miner" <<EOF
+#!/usr/bin/env bash
+exec "${VENV_DIR}/bin/python" "${INSTALL_DIR}/src/scripts/xvault-miner.py" "\$@"
+EOF
+chmod +x "${BIN_DIR}/xvault-miner"
+
+cat > "${BIN_DIR}/xvault" <<EOF
+#!/usr/bin/env bash
+exec "${VENV_DIR}/bin/python" "${INSTALL_DIR}/src/scripts/xvault.py" "\$@"
+EOF
+chmod +x "${BIN_DIR}/xvault"
+
+cat > "${BIN_DIR}/xvault-relayer" <<EOF
+#!/usr/bin/env bash
+exec "${VENV_DIR}/bin/python" "${INSTALL_DIR}/src/scripts/relayer_daemon.py" "\$@"
+EOF
+chmod +x "${BIN_DIR}/xvault-relayer"
+
+success "Launchers installed: xvault-miner, xvault, xvault-relayer"
+
+# Auto-add BIN_DIR to PATH (permanent)
+if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
+    warn "${BIN_DIR} not in PATH — adding it permanently"
+    SHELL_NAME=$(basename "$SHELL")
+    case "$SHELL_NAME" in
+        bash)
+            if ! grep -q "${BIN_DIR}" ~/.bashrc 2>/dev/null; then
+                echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> ~/.bashrc
+                success "Added to ~/.bashrc (restart terminal or run: source ~/.bashrc)"
+            fi
+            ;;
+        zsh)
+            if ! grep -q "${BIN_DIR}" ~/.zshrc 2>/dev/null; then
+                echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> ~/.zshrc
+                success "Added to ~/.zshrc (restart terminal or run: source ~/.zshrc)"
+            fi
+            ;;
+        fish)
+            if ! grep -q "${BIN_DIR}" ~/.config/fish/config.fish 2>/dev/null; then
+                echo "set -gx PATH ${BIN_DIR} \$PATH" >> ~/.config/fish/config.fish
+                success "Added to fish config"
+            fi
+            ;;
+        *)
+            info "  Run this command to add to PATH:"
+            info "  export PATH=\"${BIN_DIR}:\$PATH\""
+            ;;
+    esac
+fi
+
+printf "\n${GREEN}${BOLD}================================================================${RESET}\n"
+printf "${GREEN}${BOLD}   XELIS Vault v${VERSION} installed!                             ${RESET}\n"
+printf "${GREEN}${BOLD}================================================================${RESET}\n\n"
+
+printf "${BOLD}For miners:${RESET}\n"
+printf "  ${DIM}\$${RESET} xvault-miner          ${DIM}# Interactive dashboard${RESET}\n\n"
+printf "${BOLD}For community:${RESET}\n"
+printf "  ${DIM}\$${RESET} xvault                ${DIM}# Wallet + all features${RESET}\n"
+printf "  ${DIM}\$${RESET} xvault-relayer         ${DIM}# Run a chat relayer node${RESET}\n\n"
+printf "${DIM}Config: ${CONFIG_DIR}/config.json${RESET}\n"
+printf "${DIM}Source: ${INSTALL_DIR}/src${RESET}\n"
+printf "${DIM}Docs:   https://github.com/${REPO}${RESET}\n\n"
+printf "${MAGENTA}Happy mining!${RESET}\n\n"

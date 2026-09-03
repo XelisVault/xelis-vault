@@ -14,6 +14,8 @@ If all sources fail → fallback to last good price
 Reverts ("alreadysub", nonce races) are tolerated; the loop continues.
 """
 import json
+import os
+import signal
 import statistics
 import sys
 import time
@@ -26,12 +28,16 @@ from protocol import Protocol, val_u64, _with_retries
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "docs" / "deployment_state.json"
 DMAP_PATH = Path(__file__).resolve().parent.parent / "docs" / "entry_chunk_ids.json"
-PRICE_CACHE_PATH = Path("/tmp/oracle_last_good_price.json")
+# Cross-platform cache/log paths (no /tmp/ on Windows)
+_CACHE_DIR = Path(os.environ.get("XELIS_VAULT_DIR",
+                 Path.home() / ".xelis-vault")) / "cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+PRICE_CACHE_PATH = _CACHE_DIR / "oracle_last_good_price.json"
 
 PROVIDERS = [
-    ("http://127.0.0.1:18086/json_rpc", 1),
-    ("http://127.0.0.1:18087/json_rpc", 2),
-    ("http://127.0.0.1:18088/json_rpc", 3),
+    (os.environ.get("PROVIDER1_URL", "http://127.0.0.1:18086/json_rpc"), 1),
+    (os.environ.get("PROVIDER2_URL", "http://127.0.0.1:18087/json_rpc"), 2),
+    (os.environ.get("PROVIDER3_URL", "http://127.0.0.1:18088/json_rpc"), 3),
 ]
 FEED_ID = 0
 FEED_DECIMALS = 8
@@ -53,7 +59,10 @@ MIN_SOURCES = 1               # resilient: 1 live source is enough
 SUBMIT_EVERY = 200            # blocks (~9 min) < hard_stale 500 with margin
 HEARTBEAT_EVERY = 1000        # blocks (~45 min), interval 900 / timeout 4000 (on-chain)
 TX_FEE = 100_000              # 0.001 XEL/tx — burn ≈ 0.4 XEL/day for 3 providers
-LOG = "/tmp/oracle_keeper3.log"
+LOG_DIR = Path(os.environ.get("XELIS_VAULT_DIR",
+              Path.home() / ".xelis-vault")) / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG = str(LOG_DIR / "oracle_keeper3.log")
 
 
 def log(msg: str) -> None:
@@ -109,6 +118,12 @@ def fetch_real_price() -> tuple[int | None, str]:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Oracle keeper — submits prices + heartbeats")
+    parser.add_argument("--wallet-url", help="Single wallet URL to use as provider (fallback)")
+    parser.add_argument("--rpc", help="Daemon RPC URL (unused, kept for compatibility)")
+    args = parser.parse_args()
+
     try:
         state = json.loads(STATE_PATH.read_text())
         dmap = json.loads(DMAP_PATH.read_text())
@@ -126,10 +141,33 @@ def main() -> None:
     chunk_agg = cid("StakedOracle", "aggregate_now")
 
     wallets = []
+    # Try the 3 dedicated provider wallets first
     for url, idx in PROVIDERS:
-        pw = Protocol(wallet_url=url, wallet_auth=("wallet", "testpass"))
-        wallets.append((idx, pw))
-        log(f"provider{idx} ready ({pw.wallet.address()[:20]}…)")
+        try:
+            pw = Protocol(wallet_url=url, wallet_auth=("wallet", "testpass"))
+            addr = pw.wallet.address()
+            wallets.append((idx, pw))
+            log(f"provider{idx} ready ({addr[:20]}…)")
+        except Exception as e:
+            log(f"provider{idx} SKIP ({url}): {str(e)[:60]}")
+
+    # Fallback: use --wallet-url as single provider if no dedicated providers found
+    if not wallets and args.wallet_url:
+        log(f"No dedicated providers found. Using --wallet-url as single provider...")
+        try:
+            pw = Protocol(wallet_url=args.wallet_url, wallet_auth=("wallet", "testpass"))
+            addr = pw.wallet.address()
+            wallets.append((1, pw))
+            log(f"single-provider ready ({addr[:20]}…)")
+        except Exception as e:
+            log(f"single-provider SKIP ({args.wallet_url}): {str(e)[:60]}")
+
+    if not wallets:
+        log("FATAL: no provider wallets available")
+        log("  Options:")
+        log("    1. Start 3 provider wallets on ports 18086/18087/18088")
+        log("    2. Or pass --wallet-url with your main wallet URL")
+        sys.exit(1)
 
     p0 = wallets[0][1]
     last_topo = 0
@@ -138,6 +176,13 @@ def main() -> None:
     if last_good_price:
         log(f"last good price cached: {last_good_price} atomic "
             f"({last_good_price / 10**FEED_DECIMALS:.6f} USD)")
+
+    running = [True]
+    def _stop(sig, frame):
+        log(f"signal {sig} received, shutting down…")
+        running[0] = False
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
     def send(pw: Protocol, contract: str, chunk: int, params: list) -> bool:
         def _b():
@@ -165,7 +210,7 @@ def main() -> None:
                 log(f"  err: {msg}")
             return False
 
-    while True:
+    while running[0]:
         try:
             topo = p0.daemon.topoheight()
         except Exception as e:
@@ -219,7 +264,11 @@ def main() -> None:
                 log(f"submit x{okc} @topo {topo}")
             last_topo = topo
 
-        time.sleep(10)
+        # Sleep in small increments so we respond quickly to shutdown signals
+        for _ in range(10):
+            if not running[0]:
+                break
+            time.sleep(1)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,11 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import re
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,13 +39,19 @@ from tui import (
     render_badge, render_bar, render_ok, render_warn, render_error,
     render_status,
 )
-from cli_backend import Backend, DECIMALS, ZERO_HASH
+from cli_backend import Backend, DECIMALS, ZERO_HASH, load_bundle
 from protocol import MIN_STAKE_VLT
+from onboarding import relayer_tunnel_status
 
 VAULT_DIR = Path.home() / ".xelis-vault"
 LOG_DIR = VAULT_DIR / "logs"
 
 REFRESH_INTERVAL = 5
+
+_FETCH_LIVE_CACHE = {}
+_FETCH_LIVE_TTL = 2.0
+_FETCH_LIVE_MAX = 64
+_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 # Miner struct field order (XelisVaultMiner.slx `Miner`) returned for key
 # `miner_<addr>`:
@@ -85,16 +93,12 @@ def _check_balance(b: Backend, asset: str, atomic: int) -> bool:
     """True if the wallet can spend `atomic` of `asset`; shows error otherwise."""
     asset_name = {ZERO_HASH: "XEL", b.vlt_asset: "VLT", b.xusd_asset: "xUSD"}.get(asset, asset[:16])
     addr = getattr(b, "address", "(unknown)")
+    balance_error = "unknown"
     try:
         avail = b.balance(asset)
     except Exception as e:
         avail = None
         balance_error = str(e)
-    if avail is None and b.wallet:
-        try:
-            avail = b.wallet.balance(asset)
-        except Exception as e2:
-            balance_error = str(e2)
     if avail is None:
         wallet_url = getattr(b, "cfg", {}).get("wallet_url", "(not set)") if hasattr(b, "cfg") else "(not set)"
         wallet_user = getattr(b, "cfg", {}).get("wallet_user", "(not set)") if hasattr(b, "cfg") else "(not set)"
@@ -126,6 +130,62 @@ def _check_balance(b: Backend, asset: str, atomic: int) -> bool:
     return False
 
 
+def confirm_miner_tx(b: Backend, res, action: str, expect_active: bool = False,
+                     max_s: int = 120) -> tuple:
+    """Wait for a miner tx to be MINED, verify it did not revert on-chain,
+    and (optionally) confirm the miner profile is ACTIVE on-chain.
+
+    This is what makes registration/heartbeat/stake/service actions
+    "conforme et réel": the result box only ever says SUCCESS once the
+    network actually accepted and applied the tx — never right after the
+    local broadcast (which can still be rejected a few seconds later).
+    Returns (ok, message).
+    """
+    if not res or not res.ok:
+        return False, (res.reason if res else "no response")
+    print(f"\n{C.DIM}⏳ {action} — broadcast sent, waiting for the block…{C.RESET}", flush=True)
+    t0 = time.time()
+    ok = False
+    # Fast polling: 1s interval for quick block confirmation
+    while time.time() - t0 < max_s:
+        try:
+            r = b.daemon.get_transaction(res.tx)
+            if isinstance(r, dict):
+                topo = (r.get("executed_in_block") or r.get("block_topoheight")
+                        or r.get("topoheight"))
+                if topo or r.get("blocks"):
+                    ok = True
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+    if not ok:
+        return False, "Broadcast sent but no block confirmation after " \
+                      f"{max_s}s — check the explorer later."
+    # On-chain revert check (a mined tx can still be rolled back)
+    revert = ""
+    try:
+        revert = b.verify_onchain(res.tx, timeout=10)
+    except Exception:
+        pass
+    if revert:
+        return False, f"REVERTED on-chain: {revert}"
+    if expect_active:
+        b.invalidate_cache()
+        # Fast polling for ACTIVE status: 1s interval, 60s max
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            m = b.my_miner()
+            if m and isinstance(m, list) and len(m) >= 15 and bool(m[14]):
+                return True, "confirmed & profile ACTIVE on-chain"
+            time.sleep(1)
+            b.invalidate_cache()
+        return True, ("tx confirmed but profile not yet ACTIVE on-chain. "
+                      "This is normal — wait 1-2 minutes and check the dashboard. "
+                      "If still inactive, your stake may be below the minimum.")
+    return True, "confirmed on-chain"
+
+
 def _fallback_rpc_if_needed(cfg) -> str:
     """If the configured daemon RPC is unreachable, switch to the public
     testnet node and persist the new URL so the next launch reuses it.
@@ -133,10 +193,13 @@ def _fallback_rpc_if_needed(cfg) -> str:
     url = cfg.data.get("rpc_url", "")
     if not url:
         return ""
+    endpoint = url.rstrip("/")
+    if endpoint and not endpoint.endswith("/json_rpc"):
+        endpoint += "/json_rpc"
     try:
-        r = requests.post(url, json={"jsonrpc": "2.0", "id": 1,
+        r = requests.post(endpoint, json={"jsonrpc": "2.0", "id": 1,
                                      "method": "get_topoheight", "params": {}},
-                          timeout=3)
+                           timeout=1.5)
         if r.status_code == 200:
             return ""
     except Exception:
@@ -145,7 +208,7 @@ def _fallback_rpc_if_needed(cfg) -> str:
         r2 = requests.post(PUBLIC_TESTNET_RPC,
                            json={"jsonrpc": "2.0", "id": 1,
                                  "method": "get_topoheight", "params": {}},
-                           timeout=5)
+                           timeout=3)
         if r2.status_code == 200:
             cfg.data["rpc_url"] = PUBLIC_TESTNET_RPC
             cfg.save()
@@ -203,6 +266,15 @@ def register_miner_cli(cfg, endpoint: str, services: str, stake_vlt: float):
     if not getattr(b, "address", None):
         print("ERROR: cannot read connected wallet address.")
         return
+    # Check if miner binary is available (warning only, not blocking)
+    from onboarding import find_miner_binary
+    miner_bin = find_miner_binary()
+    if not miner_bin:
+        print("WARNING: xelis_miner binary not found locally.")
+        print("  You can still register on-chain, but you will need to")
+        print("  download the miner binary to start mining locally.")
+        print("  Run with --setup or see documentation for details.")
+        print()
     mask = {"both": 3, "oracle": 1, "chat": 2}.get(services or "both", 3)
     min_atomic = b.miner_stake_min() or MIN_STAKE_VLT
     try:
@@ -217,11 +289,14 @@ def register_miner_cli(cfg, endpoint: str, services: str, stake_vlt: float):
     print(f"  services = {mask} ({services or 'both'})  stake = "
           f"{stake_atomic / 10 ** DECIMALS:g} VLT")
     res = b.miner_register(endpoint, mask, stake_atomic)
-    if res.ok:
-        print("OK: transaction submitted -> " + res.tx[:44] + "...")
-        print("Check the testnet explorer for confirmation.")
+    ok, msg = confirm_miner_tx(b, res, "Miner registration", expect_active=True)
+    if ok:
+        print("OK: miner ACTIVE on-chain -> " + res.tx[:44] + "...")
+        if not miner_bin:
+            print("NOTE: To start mining locally, download xelis_miner and")
+            print("      run 'xvault-miner --miner' or use the Actions menu.")
     else:
-        print("FAILED: " + res.reason)
+        print("FAILED: " + msg)
 
 
 # ---------------------------------------------------------------------------
@@ -259,23 +334,49 @@ def svc_badges(mask):
 # Live data collection (real reads via the backend)
 # ---------------------------------------------------------------------------
 
-def fetch_live(b: Backend) -> dict:
+def fetch_live(cfg, b: Backend) -> dict:
+    now = time.time()
+    cache_key = id(b)
+    cached = _FETCH_LIVE_CACHE.get(cache_key)
+    if cached and now - cached[0] < _FETCH_LIVE_TTL:
+        return cached[1]
+
     live = {"connected": False, "topo": 0, "balances": {},
             "miner": {}, "stats": {}, "feeds": [], "relayer": None,
             "error": "", "diag": {}}
+
+    def _safe(fn, default=None):
+        try:
+            return fn(), None
+        except Exception as e:
+            return default, e
+
     try:
         topo = b.topo()
     except Exception as e:
         live["error"] = f"daemon unreachable: {e}"
         return live
     if not topo:
+        _FETCH_LIVE_CACHE[cache_key] = (now, live)
         return live
     live["connected"] = True
     live["topo"] = topo
-    try:
-        live["balances"] = b.balances() or {}
-    except Exception as e:
+
+    futures = {
+        "balances": _FETCH_EXECUTOR.submit(_safe, b.balances, {}),
+        "miner": _FETCH_EXECUTOR.submit(_safe, b.my_miner),
+        "stats": _FETCH_EXECUTOR.submit(_safe, b.miner_stats, {}),
+        "price": _FETCH_EXECUTOR.submit(_safe, b.price, None),
+        "tunnel": _FETCH_EXECUTOR.submit(_safe, relayer_tunnel_status, None),
+        "relayer": _FETCH_EXECUTOR.submit(_safe, lambda: b.chat_relayer_status(b.address) if b.has_wallet else None, None),
+    }
+    results = {k: f.result() for k, f in futures.items()}
+
+    bal, e = results["balances"]
+    if e:
         live["error"] = f"balances failed: {e}"
+    live["balances"] = bal or {}
+
     try:
         live["diag"] = {
             "address": getattr(b, "address", "(unknown)"),
@@ -287,51 +388,48 @@ def fetch_live(b: Backend) -> dict:
     except Exception:
         pass
 
-    try:
-        m = b.my_miner()
-        if isinstance(m, list) and len(m) >= 15:
-            try:
-                live["miner"] = {
-                    "endpoint": str(m[M_ENDPOINT]),
-                    "stake": int(m[M_STAKE]),
-                    "mask": int(m[M_MASK]),
-                    "registered_at": int(m[M_AT]),
-                    "hb_topo": int(m[M_HB]),
-                    "rewards": int(m[M_REW]),
-                    "slashed": int(m[M_SLASH]),
-                    "reputation": int(m[M_REP]),
-                    "valid_submissions": int(m[M_VSUB]),
-                    "anchors": int(m[M_ANCH]),
-                    "total_submissions": int(m[M_TSUB]),
-                    "active": bool(m[M_ACTIVE]),
-                }
-            except (ValueError, TypeError):
-                pass
-    except Exception as e:
+    m, e = results["miner"]
+    if e:
         live["error"] = f"my_miner failed: {e}"
-
-    try:
-        live["stats"] = b.miner_stats() or {}
-    except Exception as e:
-        live["error"] = f"miner_stats failed: {e}"
-    try:
-        p = b.price()
-        if p:
-            price_raw, feed_topo, stale = p
-            live["feeds"].append({"name": "XEL/USD", "price_raw": price_raw,
-                                  "age": max(0, topo - feed_topo), "stale": stale})
-    except Exception:
-        pass
-    try:
-        from onboarding import relayer_tunnel_status
-        live["tunnel"] = relayer_tunnel_status(cfg)
-    except Exception:
-        live["tunnel"] = None
-    if getattr(b, "has_wallet", False):
+    elif isinstance(m, list) and len(m) >= 15:
         try:
-            live["relayer"] = b.chat_relayer_status(b.address)
-        except Exception:
-            live["relayer"] = None
+            live["miner"] = {
+                "endpoint": str(m[M_ENDPOINT]),
+                "stake": int(m[M_STAKE]),
+                "mask": int(m[M_MASK]),
+                "registered_at": int(m[M_AT]),
+                "hb_topo": int(m[M_HB]),
+                "rewards": int(m[M_REW]),
+                "slashed": int(m[M_SLASH]),
+                "reputation": int(m[M_REP]),
+                "valid_submissions": int(m[M_VSUB]),
+                "anchors": int(m[M_ANCH]),
+                "total_submissions": int(m[M_TSUB]),
+                "active": bool(m[M_ACTIVE]),
+            }
+        except (ValueError, TypeError):
+            pass
+
+    stats, e = results["stats"]
+    if e:
+        live["error"] = f"miner_stats failed: {e}"
+    live["stats"] = stats or {}
+
+    price, _ = results["price"]
+    if price:
+        price_raw, feed_topo, stale = price
+        live["feeds"].append({"name": "XEL/USD", "price_raw": price_raw,
+                              "age": max(0, topo - feed_topo), "stale": stale})
+
+    tunnel, _ = results["tunnel"]
+    live["tunnel"] = tunnel
+
+    relayer, _ = results["relayer"]
+    live["relayer"] = relayer
+
+    if len(_FETCH_LIVE_CACHE) >= _FETCH_LIVE_MAX:
+        _FETCH_LIVE_CACHE.clear()
+    _FETCH_LIVE_CACHE[cache_key] = (now, live)
     return live
 
 
@@ -344,34 +442,23 @@ def render_dashboard(cfg, live, hint=""):
     now = datetime.now().strftime("%H:%M:%S")
     addr = cfg.get("miner_address") or cfg.get("wallet_url") and "(wallet set)" or "(not set)"
 
-    print(f"{C.CYAN}{C.BOLD}  XELIS VAULT {C.RESET}{render_badge('MINER / ORACLE OPERATOR', C.MAGENTA)}")
-    print(f"{C.DIM}  {platform.system()}/{platform.machine()}  {C.GRAY}·{C.RESET}  {render_badge('TESTNET', C.YELLOW)}")
-    print(f"{C.GRAY}{'─' * 60}{C.RESET}")
-
-    conn = render_ok("CONNECTED") if live["connected"] else \
-        render_error("OFFLINE — is the daemon running?")
+    # ── Header ──
+    conn_badge = render_ok("ONLINE") if live["connected"] else render_error("OFFLINE")
     topo = f"{live['topo']:,}" if live["connected"] else "-"
-    print(f"  {C.DIM}{now}{C.RESET}   {C.DIM}Topoheight:{C.RESET} {C.BOLD}{topo}{C.RESET}   {conn}")
-    print(f"  {C.DIM}Operator:{C.RESET} {addr}")
+    print(f"{C.CYAN}{C.BOLD}  XELIS VAULT {C.RESET}{render_badge('MINER / ORACLE OPERATOR', C.MAGENTA)}  "
+          f"{C.DIM}{now}{C.RESET}")
+    print(f"  {C.DIM}Operator:{C.RESET} {C.CYAN}{addr}{C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}Daemon:{C.RESET} {conn_badge}  "
+          f"{C.DIM}Topo:{C.RESET} {C.BOLD}{topo}{C.RESET}")
+
     if live.get("error"):
         print(f"  {C.RED}{C.BOLD}  ! {live['error']}{C.RESET}")
 
-    # Show diagnostic info
-    diag = live.get("diag", {})
-    if diag:
-        print()
-        print(f"  {C.DIM}DIAGNOSTIC:{C.RESET}")
-        print(f"    Wallet address: {diag.get('address', '(unknown)')}")
-        print(f"    Wallet URL: {diag.get('wallet_url', '(not set)')}")
-        print(f"    VLT asset: {diag.get('vlt_asset', '(not loaded)')[:32]}...")
-        print(f"    xUSD asset: {diag.get('xusd_asset', '(not loaded)')[:32]}...")
-        print(f"    Wallet reachable: {diag.get('has_wallet', False)}")
-
-    # ── Miner status ──
+    # ── Miner status panel ──
     m = live.get("miner") or {}
+    stats = live.get("stats") or {}
     if m:
         active = m.get("active", False)
-        status = render_ok("REGISTERED") if active else render_warn("INACTIVE")
+        status = render_ok("ACTIVE") if active else render_warn("INACTIVE")
         rep = m.get("reputation", 3000)
         tier = tier_name(rep)
         tcolor = tier_color(tier)
@@ -379,138 +466,138 @@ def render_dashboard(cfg, live, hint=""):
         hb = m.get("hb_topo", 0)
         if hb and live["connected"]:
             age = max(0, live["topo"] - hb)
-            hb_txt = (render_ok(f"{age} blk ago") if age < 1000
-                      else render_warn(f"{age} blk ago"))
+            if age < 500:
+                hb_txt = render_ok(f"{age} blk")
+            elif age < 1000:
+                hb_txt = f"{C.YELLOW}● {age} blk{C.RESET}"
+            else:
+                hb_txt = render_warn(f"{age} blk — needs refresh")
         else:
             hb_txt = f"{C.DIM}never{C.RESET}"
-        m_lines = [
-            f"  {status}   {render_badge(f'Reputation {rep} · {tier}', tcolor)}",
-            render_metrics([
-                ("Stake", bfmt(m.get("stake"), "VLT")),
-                ("Rewards", f"{C.GREEN}{bfmt(m.get('rewards'), 'VLT')}{C.RESET}"),
-            ], width=54),
-            render_metrics([
-                ("Services", svc_badges(mask)),
-                ("Last heartbeat", hb_txt),
-            ], width=54),
-            f"  {C.DIM}Submissions:{C.RESET} {m.get('valid_submissions', 0)} valid / "
-            f"{m.get('total_submissions', 0)} total   "
-            f"{C.DIM}Anchors:{C.RESET} {m.get('anchors', 0)}   "
-            f"{C.DIM}Slashed:{C.RESET} {C.RED}{bfmt(m.get('slashed'), 'VLT')}{C.RESET}",
-            f"  {C.DIM}Endpoint:{C.RESET} {m.get('endpoint') or '—'}",
-            f"  {C.DIM}Reputation:{C.RESET} {tier_bar(rep)} {rep}/10000",
-        ]
         print()
-        print(render_panel("  MINER  STATUS", m_lines, border_color=C.CYAN, width=58))
+        print(f"  {status}  {render_badge(f'{tier}', tcolor)}  "
+              f"{C.DIM}Rep:{C.RESET} {tier_bar(rep)} {C.BOLD}{rep}{C.RESET}{C.DIM}/10000{C.RESET}")
+        # Show stake with min_stake comparison if inactive
+        stake = m.get('stake', 0)
+        min_stake = stats.get('min_stake') or MIN_STAKE_VLT
+        if not active and stake < min_stake:
+            print(f"  {C.DIM}Stake:{C.RESET}    {C.YELLOW}{bfmt(stake, 'VLT')}{C.RESET} {C.DIM}(min: {bfmt(min_stake, 'VLT')}){C.RESET}  "
+                  f"{C.DIM}Rewards:{C.RESET} {bfmt(m.get('rewards'), 'VLT')}  "
+                  f"{C.DIM}Slashed:{C.RESET} {bfmt(m.get('slashed'), 'VLT')}")
+        else:
+            print(f"  {C.DIM}Stake:{C.RESET}    {bfmt(stake, 'VLT')}  "
+                  f"{C.DIM}Rewards:{C.RESET} {bfmt(m.get('rewards'), 'VLT')}  "
+                  f"{C.DIM}Slashed:{C.RESET} {bfmt(m.get('slashed'), 'VLT')}")
+        # Submissions with success rate
+        vsub = m.get('valid_submissions', 0)
+        tsub = m.get('total_submissions', 0)
+        rate = f"{vsub * 100 // tsub}%" if tsub > 0 else "--"
+        rate_color = C.GREEN if tsub == 0 or vsub / max(tsub, 1) > 0.9 else C.YELLOW
+        print(f"  {C.DIM}Heartbeat:{C.RESET} {hb_txt}  "
+              f"{C.DIM}Submissions:{C.RESET} {C.BOLD}{vsub}{C.RESET}{C.DIM}/{tsub} "
+              f"({rate_color}{rate}{C.RESET})")
+        # Services
+        svcs = []
+        if mask & 1: svcs.append(f"{C.CYAN}Oracle{C.RESET}")
+        if mask & 2: svcs.append(f"{C.MAGENTA}Chat{C.RESET}")
+        svc_txt = " ".join(svcs) if svcs else f"{C.DIM}none{C.RESET}"
+        print(f"  {C.DIM}Services:{C.RESET}  {svc_txt}  "
+              f"{C.DIM}│{C.RESET}  {C.DIM}Endpoint:{C.RESET} {m.get('endpoint') or '—'}")
+        # Inactive hint
+        if not active:
+            print(f"  {C.YELLOW}→ Inactive: use Actions menu to increase stake or send heartbeat{C.RESET}")
     else:
         print()
-        print(render_panel("  MINER  STATUS", [
-            render_warn("Not registered"),
-            f"{C.DIM}This address has no miner profile on-chain yet.",
-            f"{C.DIM}Press {C.BOLD}m{C.RESET}{C.DIM} → Register to start earning VLT.",
-        ], border_color=C.CYAN, width=58))
+        _W = 61  # interior width of the box
+        def _bl(content: str) -> str:
+            """Pad a box line to exactly _W visible chars (ignoring ANSI)."""
+            visible = re.sub(r"\x1b\[[0-9;]*m", "", content)
+            pad = max(0, _W - len(visible))
+            return f"  {C.YELLOW}│{C.RESET}{content}{' ' * pad}{C.YELLOW}│{C.RESET}"
+        _top = f"  {C.YELLOW}┌{'─' * _W}┐{C.RESET}"
+        _bot = f"  {C.YELLOW}└{'─' * _W}┘{C.RESET}"
+        print(_top)
+        print(_bl(f"  {C.BOLD}{C.YELLOW}⚠ NOT REGISTERED{C.RESET}"))
+        print(_bl(""))
+        print(_bl(f"  {C.DIM}Register to start earning VLT rewards:{C.RESET}"))
+        print(_bl(f"    {C.BOLD}1.{C.RESET} Press {C.CYAN}{C.BOLD}m{C.RESET} to open Actions menu"))
+        print(_bl(f"    {C.BOLD}2.{C.RESET} Select {C.CYAN}{C.BOLD}Register as miner (guided){C.RESET}"))
+        print(_bl(f"    {C.BOLD}3.{C.RESET} Follow the prompts (requires 1000 VLT stake)"))
+        print(_bot)
 
-    # ── Wallet balances ──
+    # ── Balances panel ──
     bal = live.get("balances") or {}
-    b_lines = []
-    for sym in ("XEL", "VLT", "xUSD"):
-        v = bal.get(sym)
-        b_lines.append(f"  {C.BOLD}{sym:<5}{C.RESET}  {bfmt(v)}")
-    print()
-    print(render_panel("  WALLET  BALANCE", b_lines, border_color=C.GREEN, width=28))
+    if bal:
+        bal_rows = []
+        for sym, icon in [("XEL", "◆"), ("VLT", "◈"), ("xUSD", "$")]:
+            v = bal.get(sym)
+            color = C.GREEN if (v is not None and v > 0) else C.DIM
+            bal_rows.append(f"  {icon} {C.BOLD}{sym}{C.RESET}  {color}{bfmt(v)}{C.RESET}")
+        print()
+        print(" ".join(bal_rows))
 
-    # ── Protocol stats ──
-    stats = live.get("stats") or {}
-    s_lines = []
-    if stats.get("total_staked") is not None:
-        s_lines.append(f"  Total staked:  {C.BOLD}{bfmt(stats['total_staked'], 'VLT')}{C.RESET}")
-    if stats.get("budget") is not None and stats.get("distributed") is not None:
-        pct = stats["distributed"] * 100 // stats["budget"]
-        s_lines += [
-            f"  Budget spent:  {pct}%",
-            f"                 {render_bar(pct / 100, 24)}",
-        ]
-    if stats.get("min_stake") is not None:
-        s_lines.append(f"  Min stake:     {bfmt(stats['min_stake'], 'VLT')}")
-    if stats.get("budget") is not None:
-        s_lines.append(f"  Reward budget: {C.BOLD}{bfmt(stats['budget'], 'VLT')}{C.RESET}")
-    if not s_lines:
-        s_lines.append(f"  {C.DIM}(miner contract not reachable){C.RESET}")
-    print()
-    print(render_panel("  PROTOCOL  STATS", s_lines, border_color=C.BLUE, width=32))
+    # ── Protocol stats (compact) ──
+    if stats:
+        parts = []
+        if stats.get("total_staked") is not None:
+            parts.append(f"{C.DIM}Staked:{C.RESET} {bfmt(stats['total_staked'], 'VLT')}")
+        if stats.get("budget") and stats.get("distributed") is not None:
+            pct = stats["distributed"] * 100 // stats["budget"]
+            parts.append(f"{C.DIM}Budget:{C.RESET} {pct}% {render_bar(pct / 100, 12)}")
+        if stats.get("min_stake") is not None:
+            parts.append(f"{C.DIM}Min:{C.RESET} {bfmt(stats['min_stake'], 'VLT')}")
+        if parts:
+            print(f"  {'  '.join(parts)}")
 
     # ── Price feeds ──
-    f_lines = []
     feeds = live.get("feeds") or []
     if feeds:
-        for f in feeds[:6]:
+        f_parts = []
+        for f in feeds[:3]:
             c = C.RED if f["stale"] else C.GREEN
-            icon = "●" if f["stale"] else "●"
             price = f["price_raw"] / 10 ** DECIMALS
-            f_lines.append(
-                f"  {c}{icon}{C.RESET} ${price:>9,.4f}  {f['name']:<9}"
-                f"  {C.DIM}age {f['age']} blk{C.RESET}")
-    else:
-        f_lines.append(f"  {C.DIM}(no oracle data yet){C.RESET}")
-    print()
-    print(render_panel("  PRICE  FEEDS", f_lines, border_color=C.YELLOW, width=40))
-
-    # ── Relayer status ──
-    rl = live.get("relayer")
-    if rl:
-        r_lines = []
-        ok = rl.get("active")
-        r_lines.append(f"  {render_status(bool(ok), 'Relayer')}")
-        if rl.get("bond"):
-            r_lines.append(f"  Bond: {C.BOLD}{bfmt(rl['bond'], 'VLT')}{C.RESET}")
-        reg = rl.get("registered")
-        if reg:
-            r_lines.append(f"  Endpoint: {C.CYAN}{reg.get('endpoint', '')}{C.RESET}")
-            r_lines.append(f"  {C.DIM}Free: {reg.get('free_daily_limit', '')} msg/day · "
-                           f"{reg.get('free_wallet_slots', '')} slots{C.RESET}")
-        print()
-        print(render_panel("  RELAYER  (VaultChat)", r_lines, border_color=C.MAGENTA, width=48))
-
-    # ── Tunnel status ──
-    tunnel = live.get("tunnel")
-    if tunnel:
-        t_lines = []
-        t_url = tunnel.get("url") or ""
-        if t_url:
-            t_lines.append(f"  Public URL: {C.CYAN}{t_url}{C.RESET}")
-        else:
-            t_lines.append(f"  {render_warn('No tunnel running')}")
-        tpid = tunnel.get("tunnel_pid")
-        if tpid:
-            t_lines.append(f"  Tunnel PID: {tpid}")
-        rpid = tunnel.get("relayer_pid")
-        if rpid:
-            t_lines.append(f"  Relayer PID: {rpid}")
-        local = tunnel.get("local_endpoint") or ""
-        if local:
-            t_lines.append(f"  Local endpoint: {local}")
-        wd = _watchdog_state.get("last") or {}
-        if wd:
-            ok = wd.get("ok")
-            msg = wd.get("message") or ""
-            endpoint = wd.get("endpoint")
-            healthy = wd.get("healthy")
-            if _watchdog_state.get("enabled"):
-                t_lines.append(f"  Watchdog: {render_ok('ON')} {msg}")
+            if f["stale"]:
+                stale = f" {C.YELLOW}(stale {f['age']}blk){C.RESET}"
+            elif f["age"] < 60:
+                stale = f" {C.GREEN}(fresh){C.RESET}"
             else:
-                t_lines.append(f"  Watchdog: {render_warn('OFF')}")
-            if endpoint:
-                t_lines.append(f"  Endpoint on-chain: {endpoint}")
-            if healthy is not None:
-                t_lines.append(f"  Public health: {render_ok('OK') if healthy else render_warn('UNREACHABLE')}")
-        print()
-        print(render_panel("  PUBLIC  TUNNEL", t_lines, border_color=C.BLUE, width=52))
+                stale = f" {C.DIM}({f['age']}blk){C.RESET}"
+            f_parts.append(f"{c}${price:,.2f}{C.RESET}{stale}")
+        if f_parts:
+            print(f"  {C.DIM}Oracle:{C.RESET} {'  '.join(f_parts)}")
+    else:
+        print(f"  {C.DIM}Oracle: (no data yet){C.RESET}")
 
+    # ── Relayer + tunnel panel ──
+    rl = live.get("relayer")
+    tunnel = live.get("tunnel")
+    if rl or tunnel:
+        print()
+        r_lines = []
+        if rl:
+            ok = rl.get("active")
+            r_lines.append(f"  {C.DIM}Relayer:{C.RESET}  {render_status(bool(ok), '')}  "
+                           f"{C.DIM}Bond:{C.RESET} {bfmt(rl.get('bond'), 'VLT')}")
+        if tunnel:
+            t_url = tunnel.get("url") or ""
+            if t_url:
+                r_lines.append(f"  {C.DIM}Tunnel:{C.RESET}   {C.CYAN}{t_url[:52]}{C.RESET}")
+            else:
+                r_lines.append(f"  {C.DIM}Tunnel:{C.RESET}   {render_warn('OFF')}")
+            wd = _watchdog_state.get("last") or {}
+            if wd and _watchdog_state.get("enabled"):
+                healthy = wd.get("healthy")
+                r_lines.append(f"  {C.DIM}Watchdog:{C.RESET}  {render_ok('OK') if healthy else render_warn('UNREACHABLE')}")
+        if r_lines:
+            print(render_panel("  RELAYER  &  TUNNEL", r_lines,
+                               border_color=C.CYAN, width=60))
+
+    # ── Footer ──
     print()
     print(f"{C.GRAY}{'─' * 60}{C.RESET}")
     if not cfg.get("wallet_url"):
-        print(f"  {render_warn('No wallet connected — run setup (s).')}")
-    print(f"  {C.DIM}q Quit │ r Refresh │ R Reset │ a Auto-refresh │ s Setup │ m Actions │ p Provider guide{C.RESET}")
+        print(f"  {render_warn('No wallet — run setup (s)')}")
+    print(f"  {C.DIM}q Quit  r Refresh  R Reset  a Auto  s Setup  m Actions  p Guide{C.RESET}")
     if hint:
         print(f"  {hint}")
 
@@ -549,7 +636,7 @@ def interactive_setup(cfg):
     wurl = text_input(
         "Wallet RPC URL  (blank = read-only mode)",
         cfg.get("wallet_url"))
-    print(f"{C.DIM}  → Your wallet RPC, e.g. {C.CYAN}http://127.0.0.1:18083/json_rpc{C.RESET}{C.DIM}.\n"
+    print(f"{C.DIM}  → Your wallet RPC, e.g. {C.CYAN}http://127.0.0.1:18082/json_rpc{C.RESET}{C.DIM}.\n"
           f"    Needed only for writes: heartbeat, register, stake.{C.RESET}")
     time.sleep(0.4)
     cfg.data["wallet_url"] = wurl
@@ -602,7 +689,9 @@ def interactive_setup(cfg):
 
 def check_contracts(cfg):
     """Contracts come from the network bundle; only setup state matters."""
-    bundle_ok = bool(Backend(cfg.data).C("miner"))
+    bundle = load_bundle()
+    bundle_ok = bool(bundle.get("contracts", {}).get("miner")
+                     or bundle.get("contracts", {}).get("XelisVaultMiner"))
     has_wallet = bool(cfg.get("wallet_url"))
     if not bundle_ok or not has_wallet:
         clear()
@@ -723,8 +812,15 @@ def launch_keeper(cfg) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logf = open(LOG_DIR / "keeper.log", "ab")
     py = sys.executable or "python3"
+    import platform as _platform
+    if _platform.system() == "Windows":
+        detach_kwargs = {"creationflags": subprocess.DETACHED_PROCESS
+                         | subprocess.CREATE_NEW_PROCESS_GROUP,
+                         "stdin": subprocess.DEVNULL}
+    else:
+        detach_kwargs = {"start_new_session": True, "stdin": subprocess.DEVNULL}
     proc = subprocess.Popen([py, str(script)], stdout=logf, stderr=logf,
-                            start_new_session=True)
+                            **detach_kwargs)
     KEEPER_PID.write_text(str(proc.pid))
     info_box("Keeper launched", [
         render_ok(f"Oracle keeper started (pid {proc.pid})"), "",
@@ -733,13 +829,37 @@ def launch_keeper(cfg) -> None:
     ], color=C.GREEN)
 
 
+def _terminate(pid: int) -> None:
+    """Terminate a process, cross-platform (Windows: taskkill /F /T kills the
+    whole process tree; POSIX: SIGTERM then SIGKILL after a grace period)."""
+    import subprocess as _sp
+    if platform.system() == "Windows":
+        _sp.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True, timeout=15)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    for _ in range(10):
+        time.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def stop_keeper() -> None:
     pid = keeper_running()
     if not pid:
         info_box("Keeper", [render_warn("Keeper is not running.")])
         return
     try:
-        os.kill(pid, 15)
+        _terminate(pid)
         KEEPER_PID.unlink(missing_ok=True)
         info_box("Keeper stopped", [render_ok(f"Stopped pid {pid}.")], color=C.GREEN)
     except OSError as e:
@@ -750,21 +870,54 @@ def stop_keeper() -> None:
 # Actions (real transactions)
 # ---------------------------------------------------------------------------
 
+def _wallet_unreachable_msg(cfg):
+    """Return a helpful message when the wallet RPC is unreachable."""
+    import platform as _plat
+    url = cfg.get("wallet_url") or "(empty)"
+    if _plat.system() == "Windows":
+        wallet_script = f"bin{os.sep}start-wallet.bat"
+        combo_script = f"bin{os.sep}start-wallet-and-keeper.bat"
+    else:
+        wallet_script = f"bin{os.sep}start-wallet.sh"
+        combo_script = f"bin{os.sep}start-wallet-and-keeper.sh"
+    return [
+        render_error("Wallet RPC is configured but unreachable."),
+        "",
+        f"  Current URL: {C.CYAN}{url}{C.RESET}",
+        "",
+        "  Possible fixes:",
+        f"  {C.GREEN}1.{C.RESET} Start the wallet: run {C.BOLD}{wallet_script}{C.RESET}",
+        f"  {C.GREEN}2.{C.RESET} Or use {C.BOLD}{combo_script}{C.RESET}",
+        f"  {C.GREEN}3.{C.RESET} Check the URL in Setup (s) — default port is {C.BOLD}18082{C.RESET}",
+        f"  {C.GREEN}4.{C.RESET} Verify with: {C.DIM}curl http://127.0.0.1:18082/json_rpc{C.RESET}",
+    ]
+
+
 def action_registration_flow(cfg, b):
     """Guided registration with a clean explanation of service choice."""
     if not b.has_wallet:
         info_box("Register miner", [
             render_error("No wallet RPC configured."),
-            "Run Setup (s) and fill 'Wallet RPC URL', e.g. http://127.0.0.1:18083/json_rpc",
+            "Run Setup (s) and fill 'Wallet RPC URL', e.g. http://127.0.0.1:18082/json_rpc",
         ], color=C.RED)
         return
     if not b.ping_wallet():
-        info_box("Register miner", [
-            render_error("Wallet RPC is configured but unreachable."),
-            "Make sure the wallet is running and the URL is correct.",
-            "Current URL: " + (cfg.get("wallet_url") or "(empty)"),
-        ], color=C.RED)
+        info_box("Register miner", _wallet_unreachable_msg(cfg), color=C.RED)
         return
+    # Check if miner binary is available (warning only, not blocking)
+    from onboarding import find_miner_binary
+    miner_bin = find_miner_binary()
+    if not miner_bin:
+        info_box("Miner binary not found", [
+            render_warn("xelis_miner binary not found locally."),
+            "",
+            "You can still register on-chain, but you will need to",
+            "download the miner binary to start mining locally.",
+            "",
+            f"Download from: {C.CYAN}https://github.com/xelis-project/xelis-blockchain/releases{C.RESET}",
+            f"Or run with: {C.CYAN}--setup{C.RESET}",
+        ], color=C.YELLOW)
+        print()
     m = b.my_miner()
     if m and isinstance(m, list) and len(m) >= 15:
         if bool(m[M_ACTIVE]):
@@ -773,11 +926,28 @@ def action_registration_flow(cfg, b):
                 "Use 'Increase stake' or 'Enable service' instead.",
             ], color=C.GREEN)
         else:
-            info_box("Already registered (inactive)", [
+            # Show diagnostic info to help the user understand why inactive
+            stake = int(m[M_STAKE]) if m[M_STAKE] else 0
+            rep = int(m[M_REP]) if m[M_REP] else 0
+            slashed = int(m[M_SLASH]) if m[M_SLASH] else 0
+            min_stake = b.miner_stake_min() or MIN_STAKE_VLT
+            lines = [
                 render_warn("This address has a miner profile, but it is inactive."),
-                "To reactivate: use 'Increase miner stake' to reach the minimum stake.",
-                "If you want to start fresh: deregister from xvault first.",
-            ], color=C.YELLOW)
+                "",
+                f"  Current stake: {C.BOLD}{stake / 10**DECIMALS:g} VLT{C.RESET}",
+                f"  Minimum required: {C.BOLD}{min_stake / 10**DECIMALS:g} VLT{C.RESET}",
+            ]
+            if stake < min_stake:
+                lines.append(f"  {C.YELLOW}→ Stake is below minimum — use 'Increase miner stake' to reactivate{C.RESET}")
+            elif slashed > 0:
+                lines.append(f"  {C.YELLOW}→ Slashed: {slashed / 10**DECIMALS:g} VLT — reputation may be too low{C.RESET}")
+            elif rep < 1000:
+                lines.append(f"  {C.YELLOW}→ Reputation too low ({rep}) — send heartbeats to rebuild{C.RESET}")
+            else:
+                lines.append(f"  {C.YELLOW}→ Use 'Increase miner stake' or send a heartbeat to reactivate{C.RESET}")
+            lines.append("")
+            lines.append("If you want to start fresh: deregister from xvault first.")
+            info_box("Already registered (inactive)", lines, color=C.YELLOW)
         return
 
     endpoint = cfg.get("miner_endpoint")
@@ -809,37 +979,93 @@ def action_registration_flow(cfg, b):
         return
     if not _check_balance(b, b.vlt_asset, stake_atomic):
         return
+    # Check XEL balance for transaction fees (need at least 0.1 XEL)
+    try:
+        xel_bal = b.balance(b.xel_asset)
+        if xel_bal is not None and xel_bal < 10_000_000:  # 0.1 XEL in atomic
+            info_box("Insufficient XEL", [
+                render_error("Not enough XEL for transaction fees."),
+                "",
+                f"  Available: {b.fmt(xel_bal)} XEL",
+                f"  Required: at least 0.1 XEL for gas + fees",
+                "",
+                f"  {C.DIM}Transaction fees are paid in XEL, not VLT.{C.RESET}",
+            ], color=C.RED)
+            return
+    except Exception:
+        pass  # Continue anyway, let the tx fail if no XEL
 
     # Show full diagnostic before registration
     try:
         xel_bal = b.balance(b.xel_asset)
         vlt_bal = b.balance(b.vlt_asset)
         xusd_bal = b.balance(b.xusd_asset)
+        svc_names = []
+        if mask & SERVICE_ORACLE: svc_names.append(f"{C.CYAN}Oracle{C.RESET}")
+        if mask & SERVICE_CHAT: svc_names.append(f"{C.MAGENTA}Chat{C.RESET}")
+        svc_txt = " + ".join(svc_names) if svc_names else "none"
         diag = [
             f"Wallet address: {b.address}",
             f"XEL balance: {b.fmt(xel_bal) if xel_bal is not None else 'unavailable'}",
             f"VLT balance: {b.fmt(vlt_bal) if vlt_bal is not None else 'unavailable'}",
             f"xUSD balance: {b.fmt(xusd_bal) if xusd_bal is not None else 'unavailable'}",
-            f"Requested stake: {amt} VLT ({stake_atomic} atomic)",
+            "",
+            f"Services: {svc_txt}",
+            f"Endpoint: {C.CYAN}{endpoint}{C.RESET}",
+            f"Stake: {C.BOLD}{amt} VLT{C.RESET} ({stake_atomic} atomic)",
         ]
         info_box("Pre-registration check", diag, color=C.CYAN)
     except Exception:
         pass
 
-    print(f"{C.DIM}  Registering with: endpoints={endpoint}  services_mask={mask}  "
+    svc_names = []
+    if mask & SERVICE_ORACLE: svc_names.append("Oracle")
+    if mask & SERVICE_CHAT: svc_names.append("Chat")
+    svc_txt = " + ".join(svc_names) if svc_names else "none"
+    print(f"{C.DIM}  Registering with: services={svc_txt}  endpoint={endpoint}  "
           f"stake={amt} VLT{C.RESET}\n")
-    if not confirm(f"Register this address as a miner (services mask {mask}, "
-                   f"endpoint {endpoint})?"):
+    if not confirm(f"Register this address as a miner (services: {svc_txt}, "
+                   f"endpoint: {endpoint})?"):
         return
+    # Immediate feedback after confirmation
+    print(f"\n{C.CYAN}{C.BOLD}  Sending registration transaction...{C.RESET}", flush=True)
+    print(f"  {C.DIM}This may take 10-30 seconds depending on network congestion.{C.RESET}\n", flush=True)
     res = b.miner_register(endpoint, mask, stake_atomic)
-    if res.ok:
-        info_box("Registered", [
-            render_ok("Miner profile created ✓"), "",
-            f"Tx: {res.tx[:44]}…",
-            "Next: enable services & send a heartbeat from the Actions menu.",
-        ], color=C.GREEN)
+    if not res or not res.ok:
+        info_box("Registration failed", [
+            render_error("Transaction could not be sent."),
+            "",
+            f"  Reason: {res.reason if res else 'no response'}",
+            "",
+            f"  {C.DIM}Check your wallet balance and network connection.{C.RESET}",
+        ], color=C.RED)
+        return
+    ok, msg = confirm_miner_tx(b, res, "Miner registration", expect_active=True)
+    if ok:
+        if "ACTIVE" in msg:
+            lines = [
+                render_ok("Miner profile ACTIVE on-chain ✓"), "",
+                f"Tx: {res.tx[:44]}…",
+                "Next: enable services & send a heartbeat from the Actions menu.",
+            ]
+            if not miner_bin:
+                lines.extend([
+                    "",
+                    f"{C.YELLOW}NOTE: To start mining locally, download xelis_miner from:{C.RESET}",
+                    f"{C.CYAN}https://github.com/xelis-project/xelis-blockchain/releases{C.RESET}",
+                ])
+            info_box("Registered", lines, color=C.GREEN)
+        else:
+            info_box("Registration pending", [
+                render_warn("Transaction confirmed, but profile not yet ACTIVE."),
+                "",
+                f"  {C.DIM}{msg}{C.RESET}",
+                "",
+                f"Tx: {res.tx[:44]}…",
+                "Wait 1-2 minutes and check the dashboard.",
+            ], color=C.YELLOW)
     else:
-        info_box("Registration rejected", [render_error(f"Reason: {res.reason}")],
+        info_box("Registration rejected", [render_error(f"Reason: {msg}")],
                  color=C.RED)
 
 
@@ -847,15 +1073,11 @@ def action_heartbeat(cfg, b):
     if not b.has_wallet:
         info_box("Heartbeat failed", [
             render_error("No wallet RPC configured."),
-            "Run Setup (s) and fill 'Wallet RPC URL', e.g. http://127.0.0.1:18083/json_rpc",
+            "Run Setup (s) and fill 'Wallet RPC URL', e.g. http://127.0.0.1:18082/json_rpc",
         ], color=C.RED)
         return
     if not b.ping_wallet():
-        info_box("Heartbeat failed", [
-            render_error("Wallet RPC is configured but unreachable."),
-            "Make sure the wallet is running and the URL is correct.",
-            "Current URL: " + (cfg.get("wallet_url") or "(empty)"),
-        ], color=C.RED)
+        info_box("Heartbeat failed", _wallet_unreachable_msg(cfg), color=C.RED)
         return
     m = b.my_miner()
     if not m or not isinstance(m, list) or len(m) < 15:
@@ -868,20 +1090,30 @@ def action_heartbeat(cfg, b):
         ], color=C.RED)
         return
     if not bool(m[M_ACTIVE]):
-        info_box("Heartbeat", [
+        stake = int(m[M_STAKE]) if m[M_STAKE] else 0
+        min_stake = b.miner_stake_min() or MIN_STAKE_VLT
+        lines = [
             render_warn("Miner profile is inactive on-chain."),
             "The contract rejects heartbeats from inactive miners.",
-            "If your stake fell below the minimum, use 'Increase miner stake' to reactivate.",
-        ], color=C.YELLOW)
+            "",
+            f"  Current stake: {C.BOLD}{stake / 10**DECIMALS:g} VLT{C.RESET}",
+            f"  Minimum required: {C.BOLD}{min_stake / 10**DECIMALS:g} VLT{C.RESET}",
+        ]
+        if stake < min_stake:
+            lines.append(f"  {C.YELLOW}→ Use 'Increase miner stake' to reactivate{C.RESET}")
+        else:
+            lines.append(f"  {C.YELLOW}→ Stake is sufficient — reputation may be too low{C.RESET}")
+        info_box("Heartbeat", lines, color=C.YELLOW)
         return
     res = b.miner_heartbeat()
-    if res.ok:
+    ok, msg = confirm_miner_tx(b, res, "Heartbeat")
+    if ok:
         info_box("Heartbeat sent", [
-            render_ok("Transaction broadcast ✓"), "",
+            render_ok("Heartbeat confirmed on-chain ✓"), "",
             f"Tx: {res.tx[:40]}…",
         ], color=C.GREEN)
     else:
-        info_box("Heartbeat rejected", [render_error(f"Reason: {res.reason}")],
+        info_box("Heartbeat rejected", [render_error(f"Reason: {msg}")],
                  color=C.RED)
 
 
@@ -893,11 +1125,7 @@ def action_increase_stake(cfg, b):
         ], color=C.RED)
         return
     if not b.ping_wallet():
-        info_box("Increase stake", [
-            render_error("Wallet RPC is configured but unreachable."),
-            "Make sure the wallet is running and the URL is correct.",
-            "Current URL: " + (cfg.get("wallet_url") or "(empty)"),
-        ], color=C.RED)
+        info_box("Increase stake", _wallet_unreachable_msg(cfg), color=C.RED)
         return
     m = b.my_miner()
     if not m or not isinstance(m, list) or len(m) < 15:
@@ -910,9 +1138,15 @@ def action_increase_stake(cfg, b):
         ], color=C.RED)
         return
     if not bool(m[M_ACTIVE]):
+        stake = int(m[M_STAKE]) if m[M_STAKE] else 0
+        min_stake = b.miner_stake_min() or MIN_STAKE_VLT
         info_box("Increase stake", [
             render_warn("Miner profile is inactive on-chain."),
             "Increasing stake can reactivate it if stake was below the minimum.",
+            "",
+            f"  Current stake: {C.BOLD}{stake / 10**DECIMALS:g} VLT{C.RESET}",
+            f"  Minimum required: {C.BOLD}{min_stake / 10**DECIMALS:g} VLT{C.RESET}",
+            f"  Amount needed: {C.BOLD}{max(0, min_stake - stake) / 10**DECIMALS:g} VLT{C.RESET}",
         ], color=C.YELLOW)
     amt = text_input("VLT amount to add to miner stake:", default="100")
     try:
@@ -929,11 +1163,13 @@ def action_increase_stake(cfg, b):
         return
     if confirm(f"Stake {amt} VLT more?"):
         res = b.miner_increase_stake(atomic)
-        if res.ok:
-            info_box("Stake increased", [render_ok("Done ✓"), f"Tx: {res.tx[:40]}…"],
+        ok, msg = confirm_miner_tx(b, res, "Stake increase", expect_active=True)
+        if ok:
+            info_box("Stake increased", [render_ok(f"Stake confirmed on-chain ✓"),
+                                         f"Tx: {res.tx[:40]}…"],
                      color=C.GREEN)
         else:
-            info_box("Failed", [render_error(f"Reason: {res.reason}")], color=C.RED)
+            info_box("Failed", [render_error(f"Reason: {msg}")], color=C.RED)
 
 
 def action_enable_service(cfg, b):
@@ -944,11 +1180,7 @@ def action_enable_service(cfg, b):
         ], color=C.RED)
         return
     if not b.ping_wallet():
-        info_box("Enable service", [
-            render_error("Wallet RPC is configured but unreachable."),
-            "Make sure the wallet is running and the URL is correct.",
-            "Current URL: " + (cfg.get("wallet_url") or "(empty)"),
-        ], color=C.RED)
+        info_box("Enable service", _wallet_unreachable_msg(cfg), color=C.RED)
         return
     m = b.my_miner()
     if not m or not isinstance(m, list) or len(m) < 15:
@@ -960,10 +1192,20 @@ def action_enable_service(cfg, b):
         ], color=C.RED)
         return
     if not bool(m[M_ACTIVE]):
-        info_box("Enable service", [
+        stake = int(m[M_STAKE]) if m[M_STAKE] else 0
+        min_stake = b.miner_stake_min() or MIN_STAKE_VLT
+        lines = [
             render_warn("Miner profile is inactive on-chain."),
-            "Reactivate it first by increasing your stake (Increase miner stake).",
-        ], color=C.YELLOW)
+            "Reactivate it first before enabling services.",
+            "",
+            f"  Current stake: {C.BOLD}{stake / 10**DECIMALS:g} VLT{C.RESET}",
+            f"  Minimum required: {C.BOLD}{min_stake / 10**DECIMALS:g} VLT{C.RESET}",
+        ]
+        if stake < min_stake:
+            lines.append(f"  {C.YELLOW}→ Use 'Increase miner stake' to reactivate{C.RESET}")
+        else:
+            lines.append(f"  {C.YELLOW}→ Stake is sufficient — send a heartbeat to reactivate{C.RESET}")
+        info_box("Enable service", lines, color=C.YELLOW)
         return
     svc = menu("Enable a service", [
         ("Oracle (submit prices, earn VLT)", SERVICE_ORACLE),
@@ -975,11 +1217,134 @@ def action_enable_service(cfg, b):
     label = "Oracle" if svc == SERVICE_ORACLE else "Chat relay"
     if confirm(f"Enable {label} service?"):
         res = b.miner_enable_service(svc)
-        if res.ok:
-            info_box("Service enabled", [render_ok(f"{label} on ✓"), f"Tx: {res.tx[:40]}…"],
+        ok, msg = confirm_miner_tx(b, res, f"Enable {label}")
+        if ok:
+            info_box("Service enabled", [render_ok(f"{label} on ✓"),
+                                         f"Tx: {res.tx[:40]}…"],
                      color=C.GREEN)
         else:
-            info_box("Failed", [render_error(f"Reason: {res.reason}")], color=C.RED)
+            info_box("Failed", [render_error(f"Reason: {msg}")], color=C.RED)
+
+
+def action_update_endpoint(cfg, b):
+    """Update the miner's endpoint on-chain by deregistering and re-registering.
+
+    WARNING: This will lose the miner's reputation and history. The stake is
+    refunded, then must be re-deposited. Only use this when absolutely necessary
+    (e.g. tunnel URL changed).
+    """
+    if not b.has_wallet:
+        info_box("Update endpoint", [
+            render_error("No wallet RPC configured."),
+            "Run Setup (s) and fill 'Wallet RPC URL'.",
+        ], color=C.RED)
+        return
+    if not b.ping_wallet():
+        info_box("Update endpoint", _wallet_unreachable_msg(cfg), color=C.RED)
+        return
+    m = b.my_miner()
+    if not m or not isinstance(m, list) or len(m) < 15:
+        info_box("Update endpoint", [
+            render_error("No miner profile found on-chain for this wallet."),
+            "You must register first before updating the endpoint.",
+        ], color=C.RED)
+        return
+
+    # Get current endpoint and stake
+    current_endpoint = str(m[M_ENDPOINT]) if m[M_ENDPOINT] else "(unknown)"
+    stake = int(m[M_STAKE]) if m[M_STAKE] else 0
+    mask = int(m[M_MASK]) if m[M_MASK] else 0
+
+    # Show current state
+    info_box("Current endpoint", [
+        f"  Endpoint: {C.CYAN}{current_endpoint}{C.RESET}",
+        f"  Stake: {C.BOLD}{stake / 10**DECIMALS:g} VLT{C.RESET}",
+        f"  Services mask: {mask}",
+    ], color=C.CYAN)
+
+    # Warn about consequences
+    warn_lines = [
+        render_warn("WARNING: This operation will:"),
+        "",
+        f"  {C.RED}• Deregister your miner (lose reputation & history){C.RESET}",
+        f"  {C.YELLOW}• Refund your stake ({stake / 10**DECIMALS:g} VLT){C.RESET}",
+        f"  {C.YELLOW}• Require re-registration with new endpoint{C.RESET}",
+        f"  {C.YELLOW}• Require re-deposit of stake{C.RESET}",
+        "",
+        "This is ONLY necessary if your endpoint URL has changed",
+        "(e.g. trycloudflare.com tunnel restarted with new URL).",
+    ]
+    info_box("Update endpoint — consequences", warn_lines, color=C.YELLOW)
+
+    if not confirm("Proceed with endpoint update? This cannot be undone."):
+        return
+
+    # Step 1: Deregister
+    print(f"\n{C.CYAN}{C.BOLD}  Step 1/2: Deregistering miner...{C.RESET}", flush=True)
+    res = b.miner_deregister()
+    ok, msg = confirm_miner_tx(b, res, "Miner deregistration")
+    if not ok:
+        info_box("Deregistration failed", [render_error(f"Reason: {msg}")], color=C.RED)
+        return
+    print(f"  {C.GREEN}✓ Miner deregistered. Stake refunded.{C.RESET}", flush=True)
+
+    # Step 2: Re-register with new endpoint
+    print(f"\n{C.CYAN}{C.BOLD}  Step 2/2: Re-registering with new endpoint...{C.RESET}", flush=True)
+    show_cursor()
+    new_endpoint = text_input("New endpoint URL:", default=current_endpoint)
+    hide_cursor()
+    if not new_endpoint or new_endpoint == current_endpoint:
+        info_box("Cancelled", [render_warn("Endpoint unchanged. No re-registration needed.")],
+                 color=C.YELLOW)
+        return
+
+    # Check XEL for fees
+    try:
+        xel_bal = b.balance(b.xel_asset)
+        if xel_bal is not None and xel_bal < 10_000_000:
+            info_box("Insufficient XEL", [
+                render_error("Not enough XEL for transaction fees."),
+                f"  Available: {b.fmt(xel_bal)} XEL",
+                f"  Required: at least 0.1 XEL",
+            ], color=C.RED)
+            return
+    except Exception:
+        pass
+
+    # Check VLT balance for re-stake
+    if not _check_balance(b, b.vlt_asset, stake):
+        return
+
+    if not confirm(f"Re-register with endpoint: {new_endpoint}?"):
+        return
+
+    print(f"\n{C.CYAN}{C.BOLD}  Sending re-registration transaction...{C.RESET}", flush=True)
+    res = b.miner_register(new_endpoint, mask, stake)
+    if not res or not res.ok:
+        info_box("Re-registration failed", [
+            render_error("Transaction could not be sent."),
+            f"  Reason: {res.reason if res else 'no response'}",
+        ], color=C.RED)
+        return
+
+    ok, msg = confirm_miner_tx(b, res, "Miner re-registration", expect_active=True)
+    if ok:
+        if "ACTIVE" in msg:
+            info_box("Endpoint updated", [
+                render_ok("Miner re-registered with new endpoint ✓"),
+                "",
+                f"  New endpoint: {C.CYAN}{new_endpoint}{C.RESET}",
+                f"  Tx: {res.tx[:44]}…",
+            ], color=C.GREEN)
+        else:
+            info_box("Endpoint update pending", [
+                render_warn("Transaction confirmed, but profile not yet ACTIVE."),
+                "",
+                f"  New endpoint: {C.CYAN}{new_endpoint}{C.RESET}",
+                f"  {C.DIM}{msg}{C.RESET}",
+            ], color=C.YELLOW)
+    else:
+        info_box("Re-registration failed", [render_error(f"Reason: {msg}")], color=C.RED)
 
 
 def action_menu(cfg, b):
@@ -987,6 +1352,7 @@ def action_menu(cfg, b):
     running = miner_running()
     opts = [
         ("Register as miner (guided)", "reg"),
+        ("Update endpoint (deregister + re-register)", "update_ep"),
         ("Send heartbeat now", "hb"),
         ("Increase miner stake", "stake"),
         ("Enable a service", "svc"),
@@ -1004,6 +1370,8 @@ def action_menu(cfg, b):
     choice = menu("Miner actions", opts)
     if choice == "reg":
         action_registration_flow(cfg, b)
+    elif choice == "update_ep":
+        action_update_endpoint(cfg, b)
     elif choice == "hb":
         action_heartbeat(cfg, b)
     elif choice == "stake":
@@ -1322,6 +1690,8 @@ def main():
     parser.add_argument("--miner", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--setup", action="store_true")
+    parser.add_argument("--run-keeper", action="store_true",
+                        help="Run the oracle keeper in foreground (for batch/shell scripts)")
     parser.add_argument("--set-address", help=argparse.SUPPRESS)
     parser.add_argument("--start-mining", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--import-seed", help=argparse.SUPPRESS)
@@ -1372,8 +1742,9 @@ def main():
         ok, msg = start_miner(cfg)
         print(("OK: " if ok else "ERREUR: ") + msg)
         if ok:
-            print("Journal du mineur : %s\\.xelis-vault\\logs\\miner.log"
-                  % os.path.expanduser("~"))
+            from pathlib import Path
+            log_path = Path.home() / ".xelis-vault" / "logs" / "miner.log"
+            print(f"Journal du mineur : {log_path}")
         time.sleep(2)
         return
 
@@ -1381,11 +1752,38 @@ def main():
         interactive_setup(cfg)
         return
 
+    # Non-interactive: run the oracle keeper in foreground.
+    # The batch/shell scripts background this process themselves.
+    if args.run_keeper:
+        keeper_script = Path(__file__).parent / "oracle_keeper3.py"
+        if not keeper_script.exists():
+            print(f"ERROR: oracle_keeper3.py not found at {keeper_script}")
+            return
+        print(f"Starting oracle keeper (foreground mode)...")
+        print(f"  Keeper script: {keeper_script}")
+        print(f"  Press Ctrl+C to stop.")
+        print()
+        try:
+            # Run in foreground so the batch/shell script can manage the process
+            import subprocess
+            py = sys.executable or "python3"
+            cmd = [py, str(keeper_script)]
+            # Pass wallet-url if configured, so keeper can use it as fallback
+            wallet_url = cfg.get("wallet_url")
+            if wallet_url:
+                cmd += ["--wallet-url", wallet_url]
+            proc = subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\nKeeper stopped.")
+        return
+
+    print(f"{C.DIM}  Loading dashboard...{C.RESET}", flush=True)
     hint = _fallback_rpc_if_needed(cfg)
     mode = check_contracts(cfg)
 
     auto_refresh = True
     running = [True]
+    b = Backend(cfg.data)
 
     def on_signal(sig, frame):
         running[0] = False
@@ -1398,8 +1796,7 @@ def main():
     hide_cursor()
     try:
         while running[0]:
-            b = Backend(cfg.data)
-            live = fetch_live(b) if mode != "demo" or b.topo() else \
+            live = fetch_live(cfg, b) if mode != "demo" or b.topo() else \
                 {"connected": False, "topo": 0, "balances": {}, "miner": {},
                  "stats": {}, "feeds": [], "relayer": None}
             render_dashboard(cfg, live, hint)
@@ -1413,11 +1810,13 @@ def main():
             elif key == "s":
                 show_cursor()
                 interactive_setup(cfg)
+                b = Backend(cfg.data)
                 hide_cursor()
             elif key == "R":
                 show_cursor()
                 if confirm("Reset configuration to defaults? This will clear all settings."):
                     cfg.reset()
+                    b = Backend(cfg.data)
                     info_box("Reset", [render_ok("Configuration reset to defaults.")], color=C.GREEN)
                 hide_cursor()
             elif key == "r":

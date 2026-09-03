@@ -1,2 +1,3 @@
 @echo off
-"C:\Users\Ael\.xelis-vault\venv\Scripts\python.exe" "C:\Users\Ael\.xelis-vault\src\scripts\xvault-miner.py" %*
+"venv\Scripts\python.exe" "src\scripts\xvault-miner.py" %*
+

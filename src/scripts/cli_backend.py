@@ -23,6 +23,7 @@ import json
 import secrets
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from protocol import (
     WalletClient, DaemonClient, RPCError,
     val_u64, val_u128, val_u8, val_u16, val_str, val_hash, val_addr, val_bytes,
-    parse_cell,
+    val_bool, parse_cell,
 )
 
 ZERO_HASH = "0" * 64
@@ -41,22 +42,46 @@ MIN_AUCTION_DURATION_BLOCKS = 1440
 # Network bundle loading (contracts + assets)
 # ---------------------------------------------------------------------------
 
+_BUNDLE_CACHE = None
+_BUNDLE_MTIME = None
+_BUNDLE_PATH = None
+_REGISTRY_CACHE = {}
+_REGISTRY_TTL = 300
+_REGISTRY_MAX = 128
+
 def _bundle_candidates() -> list:
+    global _BUNDLE_PATH
     here = Path(__file__).parent
-    return [
+    candidates = [
         here.parent / "network" / "testnet.json",      # installed layout
         here.parent.parent / "network" / "testnet.json",
         here / "network_testnet.json",
     ]
+    _BUNDLE_PATH = candidates[0]
+    return candidates
 
 
 def load_bundle() -> dict:
+    global _BUNDLE_CACHE, _BUNDLE_MTIME, _BUNDLE_PATH
+    # Ensure _BUNDLE_PATH is set (call _bundle_candidates if needed)
+    if _BUNDLE_PATH is None:
+        _bundle_candidates()
+    try:
+        mtime = _BUNDLE_PATH.stat().st_mtime if _BUNDLE_PATH else None
+    except Exception:
+        mtime = None
+    if mtime and mtime == _BUNDLE_MTIME and _BUNDLE_CACHE is not None:
+        return _BUNDLE_CACHE
     for c in _bundle_candidates():
         if c.exists():
             try:
-                return json.loads(c.read_text())
+                _BUNDLE_CACHE = json.loads(c.read_text())
+                _BUNDLE_MTIME = c.stat().st_mtime
+                return _BUNDLE_CACHE
             except Exception:
                 pass
+    _BUNDLE_CACHE = {}
+    _BUNDLE_MTIME = mtime
     return {}
 
 
@@ -231,8 +256,8 @@ class Backend:
         self.xel_asset = ZERO_HASH
         self.feed_id = int(bundle.get("oracle_feed_id", 0))
 
-        daemon_url = cfg.get("rpc_url") or "http://127.0.0.1:18081"
-        wallet_url = cfg.get("wallet_url") or ""
+        daemon_url = (cfg.get("rpc_url") or "http://127.0.0.1:18081").rstrip("/")
+        wallet_url = (cfg.get("wallet_url") or "").rstrip("/")
         if daemon_url and not daemon_url.endswith("/json_rpc"):
             daemon_url += "/json_rpc"
         if wallet_url and not wallet_url.endswith("/json_rpc"):
@@ -240,8 +265,29 @@ class Backend:
         self.daemon = DaemonClient(daemon_url)
         auth = (cfg.get("wallet_user") or "wallet", cfg.get("wallet_pass") or "testpass")
         self.wallet = WalletClient(wallet_url, auth) if wallet_url else None
+        # Short-TTL read cache + shared worker pool: avoids re-fetching the
+        # same on-chain state on every screen redraw (dashboard, menus...)
+        # and lets independent reads (e.g. a vault scan) run concurrently
+        # instead of one blocking HTTP round-trip after another.
+        self._cache: dict = {}
+        self._pool = ThreadPoolExecutor(max_workers=16)
         self._resolve_via_registry()
         self._ensure_tracked_assets()
+
+    def _cached(self, key: str, ttl: float, fn):
+        """Return fn()'s result, cached for `ttl` seconds under `key`."""
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        val = fn()
+        self._cache[key] = (now, val)
+        return val
+
+    def invalidate_cache(self):
+        """Drop every cached read — called right after a successful tx so the
+        UI reflects the new on-chain state immediately instead of stale data."""
+        self._cache.clear()
 
     def _resolve_via_registry(self):
         """ContractRegistry cur_<Name> overrides static tables (authoritative)."""
@@ -249,6 +295,13 @@ class Backend:
                or self.contracts.get("ContractRegistry")
                or self.contracts.get("contract_registry"))
         if not reg:
+            return
+        daemon_url = getattr(self, "daemon", None)
+        url = getattr(daemon_url, "url", "") if daemon_url else ""
+        cache_key = (url, reg)
+        cached = _REGISTRY_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < _REGISTRY_TTL:
+            self.contracts.update(cached[1])
             return
         resolved = {}
         for key, name in _REGISTRY_NAMES.items():
@@ -260,15 +313,20 @@ class Backend:
                 resolved[key] = h                # snake_case alias
                 resolved[name] = h               # canonical CamelCase key
         self.contracts.update(resolved)
+        if len(_REGISTRY_CACHE) >= _REGISTRY_MAX:
+            _REGISTRY_CACHE.clear()
+        _REGISTRY_CACHE[cache_key] = (time.time(), resolved)
 
     def _ensure_tracked_assets(self):
         """Make sure the wallet knows about VLT and xUSD before balance checks."""
+        self._tracked_assets = {ZERO_HASH}
         if not self.wallet:
             return
         try:
             for asset in (self.vlt_asset, self.xusd_asset):
                 if asset and asset != ZERO_HASH:
                     self.wallet.track_asset(asset)
+                    self._tracked_assets.add(asset)
         except Exception:
             pass
 
@@ -301,34 +359,72 @@ class Backend:
         return self.contracts.get(key, "")
 
     def topo(self) -> int:
-        try:
-            return self.daemon.topoheight()
-        except Exception:
-            return 0
+        def _fetch():
+            try:
+                return self.daemon.topoheight()
+            except Exception:
+                return 0
+        return self._cached("topo", 2.0, _fetch)
 
     def balance(self, asset: str = ZERO_HASH) -> Optional[int]:
-        if not self.wallet:
-            return None
-        try:
-            if asset and asset != ZERO_HASH:
-                try:
-                    self.wallet.track_asset(asset)
-                except Exception:
-                    pass
-            return self.wallet.balance(asset)
-        except Exception as e:
+        """Cached wallet balance (short TTL, invalidated after every write).
+
+        Uncached, this used to block for seconds whenever the wallet RPC is
+        down (each call re-entered the full retry cycle of _post); every
+        dashboard redraw and menu loop paid that price. Now a dead wallet is
+        only probed once per TTL window.
+        """
+        def _fetch():
+            if not self.wallet:
+                return None
             try:
+                if asset and asset not in self._tracked_assets:
+                    try:
+                        self.wallet.track_asset(asset)
+                        self._tracked_assets.add(asset)
+                    except Exception:
+                        pass
                 return self.wallet.balance(asset)
             except Exception:
+                # _post() already retries transient failures internally; a
+                # second full retry cycle here would only double the wait for
+                # nothing (e.g. ~17s instead of ~8s when the wallet is simply
+                # not running).
                 return None
+        return self._cached(f"balance:{asset}", 2.0, _fetch)
 
     def balances(self) -> dict:
-        out = {}
-        for name, asset in (("XEL", self.xel_asset), ("VLT", self.vlt_asset),
-                            ("xUSD", self.xusd_asset)):
-            b = self.balance(asset)
-            out[name] = b
-        return out
+        """XEL/VLT/xUSD balances, fetched concurrently (was 3 sequential
+        round-trips — now the wall-clock cost of the single slowest one)."""
+        names = (("XEL", self.xel_asset), ("VLT", self.vlt_asset),
+                 ("xUSD", self.xusd_asset))
+        results = self._pool.map(lambda na: self.balance(na[1]), names)
+        return {name: bal for (name, _), bal in zip(names, results)}
+
+    def dashboard_snapshot(self) -> dict:
+        """Every metric the live dashboard needs, fetched concurrently.
+
+        Each of these already has its own short-TTL cache, so calling this
+        every ~150ms from a background refresh thread costs nothing extra
+        between TTL windows — and the *first* uncached call still only costs
+        one round-trip's worth of latency instead of the sum of five,
+        because everything below runs in parallel on its own executor
+        (never nested inside `self._pool`, to avoid any risk of the pool
+        waiting on itself).
+        """
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            f_topo = ex.submit(self.topo)
+            f_price = ex.submit(self.price)
+            f_bal = ex.submit(self.balances)
+            f_ms = ex.submit(self.miner_stats)
+            f_psm = ex.submit(self.psm_reserves)
+            return {
+                "topo": f_topo.result(),
+                "price": f_price.result(),
+                "balances": f_bal.result(),
+                "miner_stats": f_ms.result(),
+                "psm": f_psm.result(),
+            }
 
     def fmt(self, amount: Optional[int], suffix: str = "") -> str:
         if amount is None:
@@ -339,17 +435,19 @@ class Backend:
 
     def price(self):
         """(price_raw, feed_topo, stale) from StakedOracle storage."""
-        so = self.C("staked_oracle")
-        if not so:
+        def _fetch():
+            so = self.C("staked_oracle")
+            if not so:
+                return None
+            fg = self.daemon.read_key(so, f"fg_{self.feed_id}")
+            if isinstance(fg, list) and len(fg) >= 2:
+                price, feed_topo = int(fg[0]), int(fg[1])
+                hsb = self.daemon.read_key(so, "hsb")
+                hard_stale = int(hsb) if isinstance(hsb, int) else 500
+                stale = (self.topo() - feed_topo) > hard_stale
+                return price, feed_topo, stale
             return None
-        fg = self.daemon.read_key(so, f"fg_{self.feed_id}")
-        if isinstance(fg, list) and len(fg) >= 2:
-            price, feed_topo = int(fg[0]), int(fg[1])
-            hsb = self.daemon.read_key(so, "hsb")
-            hard_stale = int(hsb) if isinstance(hsb, int) else 500
-            stale = (self.topo() - feed_topo) > hard_stale
-            return price, feed_topo, stale
-        return None
+        return self._cached("price", 2.0, _fetch)
 
     def price_usd(self) -> Optional[float]:
         p = self.price()
@@ -358,89 +456,103 @@ class Backend:
     # -- protocol stats -----------------------------------------------------
 
     def miner_stats(self) -> dict:
-        mn = self.C("miner")
-        out = {}
-        if not mn:
+        def _fetch():
+            mn = self.C("miner")
+            out = {}
+            if not mn:
+                return out
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                ts, tb, dist, ms = ex.map(lambda k: self.daemon.read_key(mn, k),
+                                          ("ts", "tb", "dist", "ms"))
+            if isinstance(ts, int): out["total_staked"] = ts
+            if isinstance(tb, int): out["budget"] = tb
+            if isinstance(dist, int): out["distributed"] = dist
+            if isinstance(ms, int): out["min_stake"] = ms
             return out
-        ts = self.daemon.read_key(mn, "ts")
-        tb = self.daemon.read_key(mn, "tb")
-        dist = self.daemon.read_key(mn, "dist")
-        ms = self.daemon.read_key(mn, "ms")
-        if isinstance(ts, int): out["total_staked"] = ts
-        if isinstance(tb, int): out["budget"] = tb
-        if isinstance(dist, int): out["distributed"] = dist
-        if isinstance(ms, int): out["min_stake"] = ms
-        return out
+        return self._cached("miner_stats", 3.0, _fetch)
 
     def my_miner(self) -> Optional[list]:
-        mn = self.C("miner")
-        addr = None
-        if self.wallet:
-            try:
-                addr = self.wallet.address()
-            except Exception:
-                pass
-        if not addr:
-            addr = self.address
-        if not mn or not addr:
-            return None
-        m = self.daemon.read_key(mn, f"miner_{addr}")
-        return m if isinstance(m, list) else None
+        def _fetch():
+            mn = self.C("miner")
+            addr = None
+            if self.wallet:
+                try:
+                    addr = self.wallet.address()
+                except Exception:
+                    pass
+            if not addr:
+                addr = self.address
+            if not mn or not addr:
+                return None
+            m = self.daemon.read_key(mn, f"miner_{addr}")
+            return m if isinstance(m, list) else None
+        return self._cached("my_miner", 3.0, _fetch)
 
     def psm_reserves(self) -> dict:
-        psm = self.C("psm")
-        out = {}
-        if not psm:
+        def _fetch():
+            psm = self.C("psm")
+            out = {}
+            if not psm:
+                return out
+            try:
+                out["xel"] = self.daemon.get_contract_balance(psm, self.xel_asset)
+            except Exception:
+                pass
+            try:
+                out["xusd"] = self.daemon.get_contract_balance(psm, self.xusd_asset)
+            except Exception:
+                pass
             return out
-        try:
-            out["xel"] = self.daemon.get_contract_balance(psm, self.xel_asset)
-        except Exception:
-            pass
-        try:
-            out["xusd"] = self.daemon.get_contract_balance(psm, self.xusd_asset)
-        except Exception:
-            pass
-        return out
+        return self._cached("psm_reserves", 3.0, _fetch)
 
     def amm_pools(self) -> list:
-        vs = self.C("vault_swap")
-        if not vs:
-            return []
-        count = self.daemon.read_key(vs, "pc")
-        pools = []
-        n = int(count) if isinstance(count, int) else 0
-        pairs = [(self.xel_asset, self.xusd_asset), (self.xel_asset, self.vlt_asset),
-                 (self.vlt_asset, self.xusd_asset)]
-        for a, b in pairs:
-            lo, hi = (a, b) if a < b else (b, a)
-            pool = self.daemon.read_key(vs, f"p_{lo}_{hi}")
-            if isinstance(pool, list) and len(pool) >= 6:
-                pools.append({"a": str(pool[0]), "b": str(pool[1]),
-                              "reserve_a": int(pool[2]), "reserve_b": int(pool[3])})
-        return pools
+        def _fetch():
+            vs = self.C("vault_swap")
+            if not vs:
+                return []
+            pairs = [(self.xel_asset, self.xusd_asset), (self.xel_asset, self.vlt_asset),
+                     (self.vlt_asset, self.xusd_asset)]
+            keys = []
+            for a, b in pairs:
+                lo, hi = (a, b) if a < b else (b, a)
+                keys.append(f"p_{lo}_{hi}")
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                raw_pools = list(ex.map(lambda k: self.daemon.read_key(vs, k), keys))
+            pools = []
+            for pool in raw_pools:
+                if isinstance(pool, list) and len(pool) >= 6:
+                    pools.append({"a": str(pool[0]), "b": str(pool[1]),
+                                  "reserve_a": int(pool[2]), "reserve_b": int(pool[3])})
+            return pools
+        return self._cached("amm_pools", 3.0, _fetch)
 
     def my_vaults(self) -> list:
         ve = self.C("vault_engine")
         addr = self.address
         if not ve or not addr:
             return []
-        n = self.daemon.read_key(ve, "n")
-        total = int(n) if isinstance(n, int) else 0
-        vaults = []
-        for i in range(1, min(total, 200) + 1):
-            snap = self.daemon.read_key(ve, f"v{i}")
-            if isinstance(snap, list) and len(snap) >= 10:
-                owner = str(snap[0])
-                if owner == addr:
-                    vaults.append({
+
+        def _fetch():
+            n = self.daemon.read_key(ve, "n")
+            total = int(n) if isinstance(n, int) else 0
+            ids = range(1, min(total, 200) + 1)
+
+            def _read(i):
+                snap = self.daemon.read_key(ve, f"v{i}")
+                if isinstance(snap, list) and len(snap) >= 10 and str(snap[0]) == addr:
+                    return {
                         "id": i,
                         "collateral_asset": str(snap[1]),
                         "collateral": int(snap[2]),
                         "borrow_amount": int(snap[4]),
                         "last_update_topo": int(snap[6]),
                         "liquidated": bool(snap[7]),
-                    })
-        return vaults
+                    }
+                return None
+            # Was a fully sequential O(n) scan (one blocking HTTP round-trip
+            # per vault, up to 200) — now fanned out across the shared pool.
+            return [v for v in self._pool.map(_read, ids) if v is not None]
+        return self._cached(f"my_vaults:{addr}", 4.0, _fetch)
 
     def health_factor(self, v: dict) -> Optional[float]:
         """Approximate HF: collateral value / debt value (xUSD ≈ $1)."""
@@ -456,50 +568,56 @@ class Backend:
     MIN_CR = 2.0  # 200% minimum collateral ratio
 
     def savings_stats(self) -> dict:
-        sr = self.C("savings_rate")
-        out = {}
-        if not sr:
+        def _fetch():
+            sr = self.C("savings_rate")
+            out = {}
+            if not sr:
+                return out
+            td = self.daemon.read_key(sr, "td")
+            ab = self.daemon.read_key(sr, "ab")
+            if isinstance(td, int):
+                out["total_deposits"] = td
+            if isinstance(ab, int):
+                out["apy_bps"] = ab
+            try:
+                out["contract_xusd"] = self.daemon.get_contract_balance(sr, self.xusd_asset)
+            except Exception:
+                pass
             return out
-        td = self.daemon.read_key(sr, "td")
-        ab = self.daemon.read_key(sr, "ab")
-        if isinstance(td, int):
-            out["total_deposits"] = td
-        if isinstance(ab, int):
-            out["apy_bps"] = ab
-        try:
-            out["contract_xusd"] = self.daemon.get_contract_balance(sr, self.xusd_asset)
-        except Exception:
-            pass
-        return out
+        return self._cached("savings_stats", 3.0, _fetch)
 
     def mixer_stats(self) -> dict:
-        mx = self.C("mixer")
-        out = {}
-        if not mx:
+        def _fetch():
+            mx = self.C("mixer")
+            out = {}
+            if not mx:
+                return out
+            tmc, tm = self._pool.map(
+                lambda k: self.daemon.read_key(mx, k),
+                ("tmc", f"tm_{self.xel_asset}"))
+            if isinstance(tmc, int): out["total_mixes"] = tmc
+            if isinstance(tm, int): out["total_mixed"] = tm
             return out
-        tmc = self.daemon.read_key(mx, "tmc")
-        tm = self.daemon.read_key(mx, f"tm_{self.xel_asset}")
-        if isinstance(tmc, int): out["total_mixes"] = tmc
-        if isinstance(tm, int): out["total_mixed"] = tm
-        return out
+        return self._cached("mixer_stats", 3.0, _fetch)
 
     def treasury_info(self) -> dict:
-        tv = self.C("treasury_vault")
-        out = {}
-        if not tv:
+        def _fetch():
+            tv = self.C("treasury_vault")
+            out = {}
+            if not tv:
+                return out
+            sc, q, pc = self._pool.map(
+                lambda k: self.daemon.read_key(tv, k), ("sc", "q", "pc"))
+            if isinstance(sc, int): out["signers"] = sc
+            if isinstance(q, int): out["quorum"] = q
+            if isinstance(pc, int): out["proposals"] = pc
+            try:
+                out["xel"] = self.daemon.get_contract_balance(tv, self.xel_asset)
+                out["xusd"] = self.daemon.get_contract_balance(tv, self.xusd_asset)
+            except Exception:
+                pass
             return out
-        sc = self.daemon.read_key(tv, "sc")
-        q = self.daemon.read_key(tv, "q")
-        pc = self.daemon.read_key(tv, "pc")
-        if isinstance(sc, int): out["signers"] = sc
-        if isinstance(q, int): out["quorum"] = q
-        if isinstance(pc, int): out["proposals"] = pc
-        try:
-            out["xel"] = self.daemon.get_contract_balance(tv, self.xel_asset)
-            out["xusd"] = self.daemon.get_contract_balance(tv, self.xusd_asset)
-        except Exception:
-            pass
-        return out
+        return self._cached("treasury_info", 3.0, _fetch)
 
     def rwa_asset_info(self) -> dict:
         av = self.C("asset_vault")
@@ -521,25 +639,26 @@ class Backend:
     # -- faucet --------------------------------------------------------------
 
     def faucet_info(self) -> dict:
-        fa = self.C("faucet")
-        out = {}
-        if not fa:
+        def _fetch():
+            fa = self.C("faucet")
+            out = {}
+            if not fa:
+                return out
+            xa, va, cd = self._pool.map(
+                lambda k: self.daemon.read_key(fa, k), ("xa", "va2", "cd"))
+            if isinstance(xa, int): out["xel_per_claim"] = xa
+            if isinstance(va, int): out["vlt_per_claim"] = va
+            if isinstance(cd, int): out["cooldown"] = cd
+            try:
+                out["xel_pool"] = self.daemon.get_contract_balance(fa, self.xel_asset)
+                out["vlt_pool"] = self.daemon.get_contract_balance(fa, self.vlt_asset)
+            except Exception:
+                pass
+            last = self.daemon.read_key(fa, f"ulc_{self.address}") if self.address else None
+            if isinstance(last, int):
+                out["my_last_claim_topo"] = last
             return out
-        xa = self.daemon.read_key(fa, "xa")
-        va = self.daemon.read_key(fa, "va2")
-        cd = self.daemon.read_key(fa, "cd")
-        if isinstance(xa, int): out["xel_per_claim"] = xa
-        if isinstance(va, int): out["vlt_per_claim"] = va
-        if isinstance(cd, int): out["cooldown"] = cd
-        try:
-            out["xel_pool"] = self.daemon.get_contract_balance(fa, self.xel_asset)
-            out["vlt_pool"] = self.daemon.get_contract_balance(fa, self.vlt_asset)
-        except Exception:
-            pass
-        last = self.daemon.read_key(fa, f"ulc_{self.address}") if self.address else None
-        if isinstance(last, int):
-            out["my_last_claim_topo"] = last
-        return out
+        return self._cached("faucet_info", 3.0, _fetch)
 
     # =========================================================================
     # Transaction ops — only flows verified end-to-end on-chain
@@ -565,6 +684,10 @@ class Backend:
             return OpResult(False, reason=msg[:200])
         except Exception as e:
             return OpResult(False, reason=str(e)[:200])
+        # A write just landed: drop every cached read so the next screen
+        # redraw shows the real, post-tx on-chain state instead of a stale
+        # cached balance/vault/pool snapshot.
+        self.invalidate_cache()
         return OpResult(True, tx=tx, contract=contract_key, entry=fn)
 
     # --- PSM ---------------------------------------------------------------
@@ -651,8 +774,13 @@ class Backend:
 
     def verify_onchain(self, tx: str, timeout: float = 12.0) -> str:
         """Return '' if the tx committed cleanly, else the on-chain revert reason.
-        Polls the contract logs (written async after mining) for an exit_error."""
+        Polls the contract logs (written async after mining) for an exit_error.
+
+        Uses adaptive polling: starts fast (1s) and backs off to 2.5s as the
+        wait grows — most confirmations arrive within the first few seconds,
+        so we want to catch them quickly without hammering the daemon."""
         deadline = time.time() + timeout
+        poll_interval = 1.0
         while time.time() < deadline:
             try:
                 logs = self.daemon.get_contract_logs(tx)
@@ -671,7 +799,8 @@ class Backend:
                     if entry.get("exit_error"):
                         return str(entry["exit_error"])
                 return ""  # clean exit (no error logged)
-            time.sleep(1.5)
+            time.sleep(poll_interval)
+            poll_interval = min(2.5, poll_interval * 1.5)
         return ""  # could not observe — treat as success (builds already confirmed)
 
     # --- AMM -----------------------------------------------------------------
@@ -843,6 +972,11 @@ class Backend:
         return self._invoke("XelisVaultMiner", "enable_service",
                             [val_u8(service_id)], max_gas=15_000_000)
 
+    def miner_deregister(self) -> OpResult:
+        """Fully deregister the miner: refunds stake and removes the miner record."""
+        return self._invoke("XelisVaultMiner", "deregister_miner",
+                            [], max_gas=15_000_000)
+
     # --- Faucet -------------------------------------------------------------------
 
     def faucet_distribute(self, addresses: list) -> OpResult:
@@ -880,16 +1014,22 @@ class Backend:
                             [], max_gas=20_000_000)
 
     def gov_total_staked(self) -> int | None:
-        v = self._storage_read("GovernanceVault", "ts")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("GovernanceVault", "ts")
+            return int(v) if v is not None else None
+        return self._cached("gov_total_staked", 3.0, _fetch)
 
     def gov_user_staked(self) -> int | None:
-        v = self._storage_read("GovernanceVault", "us_" + self._my_addr())
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("GovernanceVault", "us_" + self._my_addr())
+            return int(v) if v is not None else None
+        return self._cached("gov_user_staked", 3.0, _fetch)
 
     def gov_stakes_count(self) -> int | None:
-        v = self._storage_read("GovernanceVault", "sc")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("GovernanceVault", "sc")
+            return int(v) if v is not None else None
+        return self._cached("gov_stakes_count", 3.0, _fetch)
 
     # --- Governor (on-chain governance) --------------------------------------
 
@@ -910,42 +1050,50 @@ class Backend:
                             [val_u64(proposal_id)], max_gas=30_000_000)
 
     def gov_count(self) -> int | None:
-        v = self._storage_read("Governor", "pc")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("Governor", "pc")
+            return int(v) if v is not None else None
+        return self._cached("gov_count", 3.0, _fetch)
 
     def gov_proposal_list(self, limit: int = 20) -> list:
-        """Return proposals as parsed dicts (Proposal struct read from storage)."""
-        gov = self.C("Governor")
-        if not gov or not self.daemon:
-            return []
-        count = self.gov_count() or 0
-        out = []
-        for i in range(min(count, limit)):
-            try:
-                p = self.daemon.read_key(gov, f"p_{i}")
-            except Exception:
-                continue
-            if not isinstance(p, list):
-                continue
-            def _g(idx, cast=int):
+        """Return proposals as parsed dicts (Proposal struct read from storage).
+
+        Reads are fanned out across the shared pool — was a fully sequential
+        one-RPC-per-proposal scan (up to 20 round-trips on the menu loop)."""
+        def _fetch():
+            gov = self.C("Governor")
+            if not gov or not self.daemon:
+                return []
+            count = self.gov_count() or 0
+            ids = range(min(count, limit))
+            def _read(i):
                 try:
-                    return cast(p[idx])
-                except (IndexError, ValueError):
+                    p = self.daemon.read_key(gov, f"p_{i}")
+                except Exception:
                     return None
-            out.append({
-                "id": _g(0),
-                "proposer": _g(1, str),
-                "target": (_g(2, str) or "")[:16],
-                "entry_id": _g(3),
-                "description": str(_g(5) or "")[:40],
-                "start_topo": _g(6),
-                "end_topo": _g(7),
-                "yes": _g(8), "no": _g(9), "abstain": _g(10),
-                "queued": bool(_g(11)), "cancelled": bool(_g(12)),
-                "executed": bool(_g(13)),
-            })
-        out.sort(key=lambda x: (x["id"] or 0))
-        return out
+                if not isinstance(p, list):
+                    return None
+                def _g(idx, cast=int):
+                    try:
+                        return cast(p[idx])
+                    except (IndexError, ValueError):
+                        return None
+                return {
+                    "id": _g(0),
+                    "proposer": _g(1, str),
+                    "target": (_g(2, str) or "")[:16],
+                    "entry_id": _g(3),
+                    "description": str(_g(5) or "")[:40],
+                    "start_topo": _g(6),
+                    "end_topo": _g(7),
+                    "yes": _g(8), "no": _g(9), "abstain": _g(10),
+                    "queued": bool(_g(11)), "cancelled": bool(_g(12)),
+                    "executed": bool(_g(13)),
+                }
+            out = [p for p in self._pool.map(_read, ids) if p]
+            out.sort(key=lambda x: (x["id"] or 0))
+            return out
+        return self._cached("gov_proposal_list", 4.0, _fetch)
 
     def gov_voting_period(self) -> int | None:
         v = self._storage_read("Governor", "vp")
@@ -972,22 +1120,28 @@ class Backend:
                             [val_hash(cb_hash)], max_gas=10_000_000)
 
     def flashloan_liquidity(self, asset: str) -> int | None:
-        fl = self.C("FlashLoan")
-        if not fl:
-            return None
-        try:
-            return int(self.daemon.get_contract_balance(fl, asset) or 0)
-        except Exception:
-            return None
+        def _fetch():
+            fl = self.C("FlashLoan")
+            if not fl:
+                return None
+            try:
+                return int(self.daemon.get_contract_balance(fl, asset) or 0)
+            except Exception:
+                return None
+        return self._cached(f"flashloan_liq:{asset}", 3.0, _fetch)
 
     def flashloan_earned(self) -> int | None:
-        v = self._storage_read("FlashLoan", "te")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("FlashLoan", "te")
+            return int(v) if v is not None else None
+        return self._cached("flashloan_earned", 3.0, _fetch)
 
     def flashloan_fee_bps(self) -> int | None:
         """FlashLoan fee in basis points (storage key `fb`)."""
-        v = self._storage_read("FlashLoan", "fb")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("FlashLoan", "fb")
+            return int(v) if v is not None else None
+        return self._cached("flashloan_fee_bps", 3.0, _fetch)
 
     # --- FlashCallback -------------------------------------------------------
 
@@ -1023,7 +1177,184 @@ class Backend:
             return OpResult(False, reason=msg[:200])
         except Exception as e:
             return OpResult(False, reason=str(e)[:200])
+        self.invalidate_cache()
         return OpResult(True, tx=tx)
+
+    # =====================================================================
+    # Compatibility adapters for contract_ops.py / admin_panel.py
+    # =====================================================================
+    # These files call submit_transaction / invoke_contract_fn with raw
+    # contract hashes and plain Python params.  The adapters bridge the
+    # gap to the typed _invoke / _invoke_raw primitives above.
+
+    @staticmethod
+    def _auto_val(v):
+        """Auto-encode a raw Python value into ValueCell format."""
+        if isinstance(v, dict):
+            return v                          # already a ValueCell
+        if isinstance(v, bool):
+            return val_bool(v)
+        if isinstance(v, int):
+            return val_u64(v)
+        if isinstance(v, str):
+            if len(v) == 64 and all(c in '0123456789abcdefABCDEF' for c in v):
+                return val_hash(v)
+            if v.startswith("xet:"):
+                return val_addr(v)
+            return val_str(v)
+        if isinstance(v, list):
+            return [Backend._auto_val(x) for x in v]
+        return val_str(str(v))
+
+    def _resolve_contract(self, contract_or_key: str) -> str:
+        """Resolve a contract hash from a key name or raw hash."""
+        h = self.C(contract_or_key)
+        if h:
+            return h
+        # Maybe it's already a raw 64-char hash
+        if (isinstance(contract_or_key, str)
+                and len(contract_or_key) == 64
+                and all(c in '0123456789abcdefABCDEF' for c in contract_or_key)):
+            return contract_or_key
+        return ""
+
+    def submit_transaction(self, contract_or_key: str, entry_id: int,
+                           params: list = None, fee: int = 500_000,
+                           max_gas: int = 10_000_000) -> str:
+        """Submit a write transaction.  Returns tx hash or empty string.
+
+        Adapter used by contract_ops.py and admin_panel.py which pass raw
+        contract hashes + entry IDs + plain Python params.
+        """
+        contract = self._resolve_contract(contract_or_key)
+        if not contract:
+            return ""
+        if not self.wallet:
+            return ""
+        encoded = [self._auto_val(p) for p in (params or [])]
+        try:
+            return self.wallet.invoke(contract, entry_id, encoded,
+                                      max_gas=max_gas, fee=fee)
+        except RPCError as e:
+            return ""
+        except Exception:
+            return ""
+
+    def invoke_contract_fn(self, contract_or_key: str, fn_name: str,
+                           params: list = None):
+        """Read-only contract call via storage-key dispatch.
+
+        Maps well-known pub fn names to their on-chain storage keys and
+        reads them via daemon.read_key.  Returns the parsed value (scalar,
+        list, or tuple) or None when the key was never written.
+        """
+        contract = self._resolve_contract(contract_or_key)
+        if not contract:
+            return None
+        params = params or []
+        rd = self.daemon.read_key
+
+        # --- GuardianMultisig -------------------------------------------
+        if fn_name == "is_signer" and params:
+            return rd(contract, f"g_{params[0]}") or False
+
+        # --- MinerDelegation -------------------------------------------
+        if fn_name == "get_total_delegated":
+            return rd(contract, "td") or 0
+        if fn_name == "get_miner_count":
+            return rd(contract, "mc") or 0
+        if fn_name == "get_delegator_info" and params:
+            return rd(contract, f"del_{params[0]}")
+        if fn_name == "get_delegator_pending" and params:
+            return rd(contract, f"dpr_{params[0]}") or 0
+        if fn_name == "get_miner_profile" and params:
+            return rd(contract, f"mp_{params[0]}")
+        if fn_name == "get_miner_pending" and params:
+            return rd(contract, f"mpr_{params[0]}") or 0
+        if fn_name == "get_miner" and params:
+            return rd(contract, f"miner_{params[0]}")
+
+        # --- FeeDistributor --------------------------------------------
+        if fn_name == "get_founder_balance":
+            return rd(contract, "fp") or 0
+        if fn_name == "get_treasury_balance":
+            return rd(contract, "tp") or 0
+
+        # --- FaucetContract --------------------------------------------
+        if fn_name == "get_faucet_info":
+            xa = rd(contract, "xa") or 0
+            va = rd(contract, "va2") or 0
+            cd = rd(contract, "cd") or 0
+            xlc = rd(contract, "xlc") or 0
+            vlc = rd(contract, "vlc") or 0
+            pz = rd(contract, "pz") or 0
+            return [xa, va, cd, xlc, vlc, pz]
+
+        # --- FounderVesting --------------------------------------------
+        if fn_name == "get_vesting_info":
+            fa = rd(contract, "fa") or ""
+            ta = rd(contract, "ta") or 0
+            cl = rd(contract, "cl") or 0
+            st = rd(contract, "st") or 0
+            cb = rd(contract, "cb") or 0
+            vb = rd(contract, "vb") or 0
+            pz = rd(contract, "pz") or 0
+            return [fa, ta, cl, st, cb, vb, 0, pz]
+        if fn_name == "get_claimable_amount":
+            ta = rd(contract, "ta") or 0
+            cl = rd(contract, "cl") or 0
+            st = rd(contract, "st") or 0
+            cb = rd(contract, "cb") or 0
+            vb = rd(contract, "vb") or 0
+            topo = self.topo()
+            if topo < st + cb or vb == 0:
+                return 0
+            vested = ta * min(topo - st, vb) // vb
+            return max(0, vested - cl)
+
+        # --- RevenueShareDelegation ------------------------------------
+        if fn_name == "get_founder_pending":
+            return rd(contract, "fp") or 0
+        if fn_name == "get_contributor_count":
+            return rd(contract, "shc") or 0
+        if fn_name == "get_share_info" and params:
+            return rd(contract, f"sh_{params[0]}")
+
+        # --- AirdropTracker -------------------------------------------
+        if fn_name == "get_protocol_stats":
+            uc = rd(contract, "uc") or 0
+            tp = rd(contract, "tp") or 0
+            fz = rd(contract, "fz") or 0
+            fn_v = rd(contract, "fn") or 0
+            return [uc, tp, 0, 0, bool(fz), bool(fn_v)]
+        if fn_name == "get_admin_log_count":
+            return rd(contract, "alc") or 0
+        if fn_name == "get_admin_log_entry" and params:
+            return rd(contract, f"alog_{params[0]}")
+
+        # --- EmergencyShutdown ----------------------------------------
+        if fn_name == "get_state":
+            return rd(contract, "st")
+
+        # --- Generic fallback: try fn_name as a raw storage key --------
+        try:
+            return rd(contract, fn_name)
+        except Exception:
+            return None
+
+    def invoke_contract(self, contract_or_key: str, entry_id: int):
+        """Read-only alias used by contract_ops (e.g. VAULT_TOTAL_VAULTS)."""
+        # Most entry_ids used as "read" in contract_ops map to storage keys.
+        # Try reading the integer entry_id as a string key first.
+        contract = self._resolve_contract(contract_or_key)
+        if not contract:
+            return None
+        return self.daemon.read_key(contract, str(entry_id))
+
+    def get_xel_price(self) -> Optional[int]:
+        """Return XEL/USD price in atomic (1e8) or None."""
+        p = self.price()
+        return p[0] if p else None
 
     # --- PeerLoan ------------------------------------------------------------
 
@@ -1059,8 +1390,10 @@ class Backend:
                             max_gas=25_000_000)
 
     def pl_count(self) -> int | None:
-        v = self._storage_read("PeerLoan", "oc")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("PeerLoan", "oc")
+            return int(v) if v is not None else None
+        return self._cached("pl_count", 3.0, _fetch)
 
     # --- SyndicatePool -------------------------------------------------------
 
@@ -1100,8 +1433,10 @@ class Backend:
                             [val_u64(pool_id)], max_gas=20_000_000)
 
     def sp_count(self) -> int | None:
-        v = self._storage_read("SyndicatePool", "pc")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("SyndicatePool", "pc")
+            return int(v) if v is not None else None
+        return self._cached("sp_count", 3.0, _fetch)
 
     # --- SealedBidAuction ----------------------------------------------------
 
@@ -1146,8 +1481,10 @@ class Backend:
                             [val_u64(auction_id)], max_gas=15_000_000)
 
     def au_count(self) -> int | None:
-        v = self._storage_read("SealedBidAuction", "ac")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("SealedBidAuction", "ac")
+            return int(v) if v is not None else None
+        return self._cached("au_count", 3.0, _fetch)
 
     # --- Timelock ------------------------------------------------------------
 
@@ -1233,8 +1570,10 @@ class Backend:
                             [], max_gas=20_000_000)
 
     def chat_groups_count(self) -> int | None:
-        v = self._storage_read("VaultChat", "gc")
-        return int(v) if v is not None else None
+        def _fetch():
+            v = self._storage_read("VaultChat", "gc")
+            return int(v) if v is not None else None
+        return self._cached("chat_groups_count", 3.0, _fetch)
 
     def chat_inbox(self, addr: str = "") -> list:
         """Read my on-chain direct (+relayed) inbox from storage.
@@ -1242,33 +1581,35 @@ class Backend:
         addr = addr or self.address
         if not addr:
             return []
-        chat = self.C("VaultChat")
-        if not chat:
-            return []
-        out = []
-        dc = self.daemon.read_key(chat, f"dmsgc_{addr}")
-        n_dm = int(dc) if isinstance(dc, int) else 0
-        for i in range(min(n_dm, 50)):
-            raw = self.daemon.read_key(chat, f"dmsg_{addr}_{i}")
-            if not raw:
-                continue
-            parts = str(raw).split("|")
-            out.append({"kind": "direct", "blob": parts[0],
-                        "sender": parts[1] if len(parts) > 1 else "",
-                        "ts": parts[2] if len(parts) > 2 else "",
-                        "slot": i})
-        mc = self.daemon.read_key(chat, f"msgc_{addr}")
-        n_m = int(mc) if isinstance(mc, int) else 0
-        for i in range(min(n_m, 50)):
-            raw = self.daemon.read_key(chat, f"msg_{addr}_{i}")
-            if not raw:
-                continue
-            parts = str(raw).split("|")
-            out.append({"kind": "relayed", "blob": parts[0],
-                        "sender": parts[1] if len(parts) > 1 else "",
-                        "ts": parts[2] if len(parts) > 2 else "",
-                        "slot": i})
-        return out
+        def _fetch():
+            chat = self.C("VaultChat")
+            if not chat:
+                return []
+            out = []
+            dc = self.daemon.read_key(chat, f"dmsgc_{addr}")
+            n_dm = int(dc) if isinstance(dc, int) else 0
+            dms = [raw for raw in self._pool.map(
+                lambda i: self.daemon.read_key(chat, f"dmsg_{addr}_{i}"),
+                range(min(n_dm, 50))) if raw]
+            for i, raw in enumerate(dms):
+                parts = str(raw).split("|")
+                out.append({"kind": "direct", "blob": parts[0],
+                            "sender": parts[1] if len(parts) > 1 else "",
+                            "ts": parts[2] if len(parts) > 2 else "",
+                            "slot": i})
+            mc = self.daemon.read_key(chat, f"msgc_{addr}")
+            n_m = int(mc) if isinstance(mc, int) else 0
+            msgs = [raw for raw in self._pool.map(
+                lambda i: self.daemon.read_key(chat, f"msg_{addr}_{i}"),
+                range(min(n_m, 50))) if raw]
+            for i, raw in enumerate(msgs):
+                parts = str(raw).split("|")
+                out.append({"kind": "relayed", "blob": parts[0],
+                            "sender": parts[1] if len(parts) > 1 else "",
+                            "ts": parts[2] if len(parts) > 2 else "",
+                            "slot": i})
+            return out
+        return self._cached(f"chat_inbox:{addr}", 3.0, _fetch)
 
     @staticmethod
     def chat_decode(msg: str) -> str:
@@ -1377,17 +1718,30 @@ class Backend:
 
     def airdrop_leaderboard(self, limit: int = 15) -> list:
         """Top-N users pre-finalize. Reads the user list + points from storage
-        and sorts locally (the chain's O(n^2) rank getter is avoided)."""
+        and sorts locally (the chain's O(n^2) rank getter is avoided).
+
+        Wave-parallel reads: all user-list slots in parallel, then all
+        UserPoints structs in parallel (was fully sequential — up to 800
+        round-trips on the menu loop)."""
         count = self._air_int("uc")
+        if count <= 0:
+            return []
+        # Wave 1: resolve all addresses in parallel
+        addr_list = [a for a in self._pool.map(
+            lambda i: self._air_read(_AIR_LIST_PREFIX + str(i)),
+            range(min(count, 400)))
+            if a and isinstance(a, str)]
+        if not addr_list:
+            return []
+        # Wave 2: read all UserPoints in parallel
+        user_data = list(self._pool.map(
+            lambda addr: self._air_read(_AIR_USER_PREFIX + addr),
+            addr_list))
         rows = []
-        for i in range(min(count, 400)):
-            addr_raw = self._air_read(_AIR_LIST_PREFIX + str(i))
-            if not isinstance(addr_raw, str):
-                continue
-            up = self._air_read(_AIR_USER_PREFIX + addr_raw)
+        for addr, up in zip(addr_list, user_data):
             if isinstance(up, list) and len(up) >= 9:
                 rows.append({
-                    "addr": addr_raw, "points": int(up[7]),
+                    "addr": addr, "points": int(up[7]),
                     "qualified": bool(up[12]) if len(up) > 12 else False,
                     "mainnet": str(up[11]),
                     "with_bonus": int(up[8]),
@@ -1396,21 +1750,31 @@ class Backend:
         return rows[:limit]
 
     def airdrop_rank(self, addr: str = "", limit_up: int = 400) -> tuple:
-        """Return (rank, total_users) for an address (1-based; 0 if unknown)."""
+        """Return (rank, total_users) for an address (1-based; 0 if unknown).
+
+        Parallel reads: all user points are fetched concurrently instead of
+        one-by-one (was O(n) sequential RPCs)."""
         addr = addr or self.address
         up = self.airdrop_user_points(addr)
         if not up:
             return 0, self._air_int("uc")
         my_points = up["total_raw"]
         count = self._air_int("uc")
-        higher = 0
-        for i in range(min(count, limit_up)):
-            addr2 = self._air_read(_AIR_LIST_PREFIX + str(i))
-            if not isinstance(addr2, str) or addr2 == addr:
-                continue
-            o = self._air_read(_AIR_USER_PREFIX + addr2)
-            if isinstance(o, list) and len(o) >= 8 and int(o[7]) > my_points:
-                higher += 1
+        if count <= 0:
+            return 1, 0
+        # Wave 1: resolve all addresses in parallel
+        addr_list = [a for a in self._pool.map(
+            lambda i: self._air_read(_AIR_LIST_PREFIX + str(i)),
+            range(min(count, limit_up)))
+            if a and isinstance(a, str) and a != addr]
+        if not addr_list:
+            return 1, count
+        # Wave 2: read all UserPoints in parallel, count those with higher score
+        user_data = list(self._pool.map(
+            lambda a: self._air_read(_AIR_USER_PREFIX + a),
+            addr_list))
+        higher = sum(1 for o in user_data
+                     if isinstance(o, list) and len(o) >= 8 and int(o[7]) > my_points)
         return higher + 1, count
 
     # --- VaultChat relayer --------------------
@@ -1418,76 +1782,88 @@ class Backend:
     def chat_relayer_status(self, addr: str = "") -> dict:
         """Read a relayer's on-chain profile from VaultChat storage."""
         addr = addr or self.address
-        vc = self.C("VaultChat")
-        if not vc or not self.daemon:
-            return {}
-        def r(key):
-            try:
-                return self.daemon.read_key(vc, key)
-            except Exception:
-                return None
-        active = r("relayer_" + addr)
-        bond = r("rbond_" + addr)
-        fee = r("rfee_" + addr)
-        token = r("rtok_" + addr)
-        reg = r("rlreg_" + addr)
-        out = {
-            "active": (active is True) or (isinstance(active, list) and bool(active)),
-            "bond": int(bond) if isinstance(bond, int) else (int(bond[0]) if isinstance(bond, list) and bond else 0),
-            "fee": int(fee) if isinstance(fee, int) else (int(fee[0]) if isinstance(fee, list) and fee else 1000000),
-            "token": int(token) if isinstance(token, int) else (int(token[0]) if isinstance(token, list) and token else 0),
-            "registered": None,
-        }
-        # rlreg_<addr> is "endpoint|free_daily_limit|free_wallet_slots" (string)
-        if isinstance(reg, str) and "|" in reg:
-            parts = reg.split("|")
-            out["registered"] = {
-                "endpoint": parts[0],
-                "free_daily_limit": parts[1] if len(parts) > 1 else "",
-                "free_wallet_slots": parts[2] if len(parts) > 2 else "",
+        def _fetch():
+            vc = self.C("VaultChat")
+            if not vc or not self.daemon:
+                return {}
+            def r(key):
+                try:
+                    return self.daemon.read_key(vc, key)
+                except Exception:
+                    return None
+            active = r("relayer_" + addr)
+            bond = r("rbond_" + addr)
+            fee = r("rfee_" + addr)
+            token = r("rtok_" + addr)
+            reg = r("rlreg_" + addr)
+            out = {
+                "active": (active is True) or (isinstance(active, list) and bool(active)),
+                "bond": int(bond) if isinstance(bond, int) else (int(bond[0]) if isinstance(bond, list) and bond else 0),
+                "fee": int(fee) if isinstance(fee, int) else (int(fee[0]) if isinstance(fee, list) and fee else 1000000),
+                "token": int(token) if isinstance(token, int) else (int(token[0]) if isinstance(token, list) and token else 0),
+                "registered": None,
             }
-        return out
+            # rlreg_<addr> is "endpoint|free_daily_limit|free_wallet_slots" (string)
+            if isinstance(reg, str) and "|" in reg:
+                parts = reg.split("|")
+                out["registered"] = {
+                    "endpoint": parts[0],
+                    "free_daily_limit": parts[1] if len(parts) > 1 else "",
+                    "free_wallet_slots": parts[2] if len(parts) > 2 else "",
+                }
+            return out
+        return self._cached(f"chat_relayer_status:{addr}", 3.0, _fetch)
 
     def chat_relayers_list(self) -> list:
         """Enumerate all registered relayers on-chain.
 
         The contract keeps a registry: rlregc = count, rlreg_idx_<i> = the
         relayer's address, rlreg_<addr> = "endpoint|free_daily_limit|free_wallet_slots".
-        Returns a list of dicts, newest first.
+        Returns a list of dicts, newest first. Cached (short TTL) so the
+        Relayer screen never re-scans the registry on every redraw.
         """
         vc = self.C("VaultChat")
         if not vc or not self.daemon:
             return []
-        def r(key):
-            try:
-                return self.daemon.read_key(vc, key)
-            except Exception:
-                return None
-        count = int(r("rlregc")) if isinstance(r("rlregc"), int) else 0
-        out = []
-        for i in range(count):
-            addr = r(f"rlreg_idx_{i}")
-            if not addr or not isinstance(addr, str):
-                continue
-            reg = r("rlreg_" + addr)
-            details = {"addr": addr, "endpoint": "", "free_daily_limit": 0,
-                       "free_wallet_slots": 0,
-                       "bond": 0, "fee": 0, "token": 0}
-            if isinstance(reg, str) and "|" in reg:
-                p = reg.split("|")
-                details["endpoint"] = p[0]
-                details["free_daily_limit"] = int(p[1]) if p[1].isdigit() else p[1]
-                details["free_wallet_slots"] = int(p[2]) if len(p) > 2 and p[2].isdigit() else (p[2] if len(p) > 2 else 0)
-            bnd = r("rbond_" + addr)
-            fee = r("rfee_" + addr)
-            tok = r("rtok_" + addr)
-            details["bond"] = int(bnd) if isinstance(bnd, int) else (int(bnd[0]) if isinstance(bnd, list) and bnd else 0)
-            details["fee"] = int(fee) if isinstance(fee, int) else (int(fee[0]) if isinstance(fee, list) and fee else 0)
-            details["token"] = int(tok) if isinstance(tok, int) else (int(tok[0]) if isinstance(tok, list) and tok else 0)
-            out.append(details)
-        # newest first (registry is append-only, last index = newest)
-        out.reverse()
-        return out
+        def _fetch():
+            def r(key):
+                try:
+                    return self.daemon.read_key(vc, key)
+                except Exception:
+                    return None
+            cnt = r("rlregc")
+            count = int(cnt) if isinstance(cnt, int) else 0
+            if count <= 0:
+                return []
+            # Wave 1: resolve every registry slot in parallel (was sequential).
+            addrs = [a for a in self._pool.map(
+                lambda i: r(f"rlreg_idx_{i}"), range(count))
+                if a and isinstance(a, str)]
+            if not addrs:
+                return []
+            # Wave 2: 4 reads per relayer, all in parallel (was 5N sequential RPCs).
+            keys = [k for a in addrs
+                    for k in (f"rlreg_{a}", f"rbond_{a}", f"rfee_{a}", f"rtok_{a}")]
+            vals = list(self._pool.map(r, keys))
+            out = []
+            for i, a in enumerate(addrs):
+                reg, bnd, fee, tok = vals[i * 4:(i + 1) * 4]
+                details = {"addr": a, "endpoint": "", "free_daily_limit": 0,
+                           "free_wallet_slots": 0,
+                           "bond": 0, "fee": 0, "token": 0}
+                if isinstance(reg, str) and "|" in reg:
+                    p = reg.split("|")
+                    details["endpoint"] = p[0]
+                    details["free_daily_limit"] = int(p[1]) if p[1].isdigit() else p[1]
+                    details["free_wallet_slots"] = int(p[2]) if len(p) > 2 and p[2].isdigit() else (p[2] if len(p) > 2 else 0)
+                details["bond"] = int(bnd) if isinstance(bnd, int) else (int(bnd[0]) if isinstance(bnd, list) and bnd else 0)
+                details["fee"] = int(fee) if isinstance(fee, int) else (int(fee[0]) if isinstance(fee, list) and fee else 0)
+                details["token"] = int(tok) if isinstance(tok, int) else (int(tok[0]) if isinstance(tok, list) and tok else 0)
+                out.append(details)
+            # newest first (registry is append-only, last index = newest)
+            out.reverse()
+            return out
+        return self._cached("chat_relayers_list", 3.0, _fetch)
 
     def _air_read_relay(self, vc: str, key: str):
         try:
@@ -1526,39 +1902,43 @@ class Backend:
 
     def delegation_get_profile(self, miner_addr: str) -> dict | None:
         """Get miner's delegation profile: (name, description, commission_bps)."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon:
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon:
+                return None
+            try:
+                raw = self.daemon.read_key(md, f"mp_{miner_addr}")
+                if isinstance(raw, list) and len(raw) >= 3:
+                    return {
+                        "name": str(raw[0]),
+                        "description": str(raw[1]),
+                        "commission_bps": int(raw[2]),
+                    }
+            except Exception:
+                pass
             return None
-        try:
-            raw = self.daemon.read_key(md, f"mp_{miner_addr}")
-            if isinstance(raw, list) and len(raw) >= 3:
-                return {
-                    "name": str(raw[0]),
-                    "description": str(raw[1]),
-                    "commission_bps": int(raw[2]),
-                }
-        except Exception:
-            pass
-        return None
+        return self._cached(f"del_profile:{miner_addr}", 4.0, _fetch)
 
     def delegation_my_delegation(self) -> dict | None:
         """Get my current delegation info."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon or not self.address:
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon or not self.address:
+                return None
+            try:
+                raw = self.daemon.read_key(md, f"del_{self.address}")
+                if isinstance(raw, list) and len(raw) >= 5:
+                    return {
+                        "miner": str(raw[0]),
+                        "amount": int(raw[1]),
+                        "index": int(raw[2]),
+                        "delegated_at": int(raw[3]),
+                        "auto_compound": bool(raw[4]) if len(raw) > 4 else False,
+                    }
+            except Exception:
+                pass
             return None
-        try:
-            raw = self.daemon.read_key(md, f"del_{self.address}")
-            if isinstance(raw, list) and len(raw) >= 5:
-                return {
-                    "miner": str(raw[0]),
-                    "amount": int(raw[1]),
-                    "index": int(raw[2]),
-                    "delegated_at": int(raw[3]),
-                    "auto_compound": bool(raw[4]) if len(raw) > 4 else False,
-                }
-        except Exception:
-            pass
-        return None
+        return self._cached("del_my", 4.0, _fetch)
 
     def delegation_miner_stake(self, miner_addr: str) -> int:
         """Get total stake of a miner (own + delegated)."""
@@ -1592,64 +1972,70 @@ class Backend:
 
     def delegation_total_delegated(self) -> int:
         """Total delegated VLT across all miners."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon:
-            return 0
-        try:
-            raw = self.daemon.read_key(md, "td")
-            return int(raw) if isinstance(raw, int) else 0
-        except Exception:
-            return 0
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon:
+                return 0
+            try:
+                raw = self.daemon.read_key(md, "td")
+                return int(raw) if isinstance(raw, int) else 0
+            except Exception:
+                return 0
+        return self._cached("del_total", 4.0, _fetch)
 
     def delegation_miner_count(self) -> int:
         """Number of registered miners."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon:
-            return 0
-        try:
-            raw = self.daemon.read_key(md, "mc")
-            return int(raw) if isinstance(raw, int) else 0
-        except Exception:
-            return 0
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon:
+                return 0
+            try:
+                raw = self.daemon.read_key(md, "mc")
+                return int(raw) if isinstance(raw, int) else 0
+            except Exception:
+                return 0
+        return self._cached("del_mc", 4.0, _fetch)
 
     def delegation_miner_pending(self, miner_addr: str) -> int:
         """Pending rewards for a miner."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon:
-            return 0
-        try:
-            raw = self.daemon.read_key(md, f"mpr_{miner_addr}")
-            return int(raw) if isinstance(raw, int) else 0
-        except Exception:
-            return 0
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon:
+                return 0
+            try:
+                raw = self.daemon.read_key(md, f"mpr_{miner_addr}")
+                return int(raw) if isinstance(raw, int) else 0
+            except Exception:
+                return 0
+        return self._cached(f"del_mpr:{miner_addr}", 4.0, _fetch)
 
     def delegation_delegator_pending(self, delegator_addr: str) -> int:
         """Pending rewards for a delegator (computed from index + extra)."""
-        md = self.C("MinerDelegation")
-        if not md or not self.daemon or not delegator_addr:
-            return 0
-        try:
-            del_raw = self.daemon.read_key(md, f"del_{delegator_addr}")
-            if not isinstance(del_raw, list) or len(del_raw) < 5:
+        def _fetch():
+            md = self.C("MinerDelegation")
+            if not md or not self.daemon or not delegator_addr:
                 return 0
-            miner_addr = str(del_raw[0])
-            amount = int(del_raw[1])
-            index_snapshot = int(del_raw[2])
-            profile_raw = self.daemon.read_key(md, f"mp_{miner_addr}")
-            if not isinstance(profile_raw, list) or len(profile_raw) < 8:
+            try:
+                del_raw = self.daemon.read_key(md, f"del_{delegator_addr}")
+                if not isinstance(del_raw, list) or len(del_raw) < 5:
+                    return 0
+                miner_addr = str(del_raw[0])
+                amount = int(del_raw[1])
+                index_snapshot = int(del_raw[2])
+                profile_raw = self.daemon.read_key(md, f"mp_{miner_addr}")
+                if not isinstance(profile_raw, list) or len(profile_raw) < 8:
+                    return 0
+                reward_index = int(profile_raw[7])
+                index_diff = reward_index - index_snapshot
+                if index_diff <= 0:
+                    return 0
+                pending = (amount * index_diff) // 10**18
+                extra_raw = self.daemon.read_key(md, f"dpr_{delegator_addr}")
+                extra = int(extra_raw) if isinstance(extra_raw, int) else 0
+                return pending + extra
+            except Exception:
                 return 0
-            reward_index = int(profile_raw[7])
-            index_diff = reward_index - index_snapshot
-            if index_diff <= 0:
-                return 0
-            pending = (amount * index_diff) // 10**18
-            extra_raw = self.daemon.read_key(md, f"dpr_{delegator_addr}")
-            extra = int(extra_raw) if isinstance(extra_raw, int) else 0
-            return pending + extra
-        except Exception:
-            return 0
-
-    # --- Generic int reader --------------------------------------------------
+        return self._cached(f"del_pending:{delegator_addr}", 4.0, _fetch)
 
     def _storage_read(self, contract_key: str, key_str: str):
         """Read a string-keyed storage cell from a contract."""

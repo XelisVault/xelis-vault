@@ -1,0 +1,13 @@
+{
+  "rpc_url": "https://testnet-node.xelis.io",
+  "wallet_url": "http://127.0.0.1:18082",
+  "wallet_user": "wallet",
+  "wallet_pass": "your_wallet_password_here",
+  "miner_address": "",
+  "miner_endpoint": "",
+  "services": "oracle",
+  "compound": false,
+  "contracts": {},
+  "miner_binary": "",
+  "miner_threads": "4"
+}

@@ -14,7 +14,7 @@
 //   8. Auto-compound opt-in pour délégateurs
 // ============================================================================
 
-const VERSION: string = "MinerDelegation v11.3"
+const VERSION: string = "MinerDelegation v11.5"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"

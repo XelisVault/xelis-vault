@@ -5,7 +5,7 @@
 // Tous les entry IDs ont été réalignés avec XelisVaultMiner v5.0.
 // v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
 // ============================================================================
-const VERSION: string = "StakedOracle v11.3"
+const VERSION: string = "StakedOracle v11.5"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"

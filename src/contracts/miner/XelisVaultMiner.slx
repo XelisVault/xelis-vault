@@ -4,7 +4,7 @@
 // Silex-verified, all entry IDs aligned, all bugs from audit v4.3 fixed.
 // v5.1: documentation-only minor bump (rich doc comments on every entry & pub fn).
 // ============================================================================
-const VERSION: string = "XelisVaultMiner v11.3"
+const VERSION: string = "XelisVaultMiner v11.5"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -471,16 +471,18 @@ entry register_miner(endpoint_url: string, miner_pubkey: Hash, services_mask: u8
 
 // ID 1: enable_service
 // Enable an additional service bit on an already-registered miner account.
-// @caller: the miner themselves (must already be registered)
+// @caller: the miner themselves (must already be registered and active)
 // @params: service_id - service slot to enable (1..=8, 1=oracle, 2=chat)
 // @returns: 0 on success
-// @security: when_not_paused, requires existing miner record, rejects re-enabling an already-active service
+// @security: when_not_paused, requires existing active miner record, rejects re-enabling an already-active service
 entry enable_service(service_id: u8) -> u64 {
     when_not_paused()
     require(service_id >= 1 && service_id <= 8, "badservice")
     let s: Storage = Storage::new()
     let caller: Address = get_caller().expect("err")
     let miner: Miner = s.load(MINER_PREFIX + caller.to_string()).expect("err")
+    // v11.5: Require miner to be active before enabling services
+    require(miner.active, "inactive")
     let bit: u8 = 1 << (service_id - 1)
     require(miner.services_mask & bit == 0, "alreadyon")
     miner.services_mask = miner.services_mask | bit
@@ -601,6 +603,9 @@ entry deregister_miner() -> u64 {
         let c: u64 = s.load(SERVICE_MINERS_PREFIX + "2").unwrap_or(0)
         if c > 0 { s.store(SERVICE_MINERS_PREFIX + "2", c - 1) }
     }
+    // v11.5: Decrement miners count to keep accurate total
+    let count: u64 = s.load(MINERS_COUNT_KEY).unwrap_or(0)
+    if count > 0 { s.store(MINERS_COUNT_KEY, count - 1) }
     s.delete(MINER_PREFIX + caller.to_string())
     return 0
 }
@@ -619,7 +624,8 @@ entry submit_heartbeat() -> u64 {
     let interval: u64 = s.load(HEARTBEAT_INTERVAL_KEY).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
     require(current_topo >= miner.last_heartbeat + interval, "toosoon")
     miner.last_heartbeat = current_topo
-    if current_topo > miner.last_infraction_topo + 1000 {
+    // v11.5: Avoid overflow in last_infraction_topo + 1000 check
+    if current_topo > miner.last_infraction_topo && current_topo - miner.last_infraction_topo > 1000 {
         if miner.reputation < REP_MAX {
             miner.reputation += REP_GAIN_HEARTBEAT
             if miner.reputation > REP_MAX { miner.reputation = REP_MAX }
@@ -660,8 +666,8 @@ pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 
     else { slash_bps = 5000; rep_loss = REP_LOSS_MALICIOUS }
 
     let slash_amount: u64 = (miner.stake as u128 * slash_bps as u128 / 10000u128) as u64
+    let actual_slash: u64 = 0
     if slash_amount > 0 {
-        let actual_slash: u64 = 0
         if slash_amount > miner.stake { actual_slash = miner.stake } else { actual_slash = slash_amount }
         miner.stake -= actual_slash
         miner.total_slashed += actual_slash
@@ -674,12 +680,14 @@ pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 
     if miner.reputation < REP_CRITICAL { miner.active = false }
     s.store(MINER_PREFIX + miner_addr.to_string(), miner)
 
+    // v11.5: Use actual_slash (not slash_amount) to keep TOTAL_STAKED_KEY accurate
     let total_staked: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
-    if total_staked >= slash_amount { s.store(TOTAL_STAKED_KEY, total_staked - slash_amount) }
+    if total_staked >= actual_slash { s.store(TOTAL_STAKED_KEY, total_staked - actual_slash) }
 
-    let burn_amount: u64 = slash_amount / 2
-    let reporter_reward: u64 = slash_amount / 10
-    let treasury_amount: u64 = slash_amount - burn_amount - reporter_reward
+    // v11.5: Distribute actual_slash (not slash_amount) to burn/reporter/treasury
+    let burn_amount: u64 = actual_slash / 2
+    let reporter_reward: u64 = actual_slash / 10
+    let treasury_amount: u64 = actual_slash - burn_amount - reporter_reward
 
     let vlt_asset: Hash = s.load(VLT_ASSET_KEY).expect("err")
     if burn_amount > 0 { let _ = burn(burn_amount, vlt_asset) }
@@ -688,7 +696,7 @@ pub fn slash_miner(miner_addr: Address, severity: u8, reporter: Address) -> u64 
         let treasury: Address = s.load(TREASURY_KEY).expect("err")
         transfer(treasury, treasury_amount, vlt_asset)
     }
-    return slash_amount
+    return actual_slash
 }
 
 // ID 8: distribute_reward (was pub fn)

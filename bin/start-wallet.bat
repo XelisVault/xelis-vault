@@ -1,24 +1,45 @@
 @echo off
-setlocal
+REM Xelis Vault - Start Wallet (Windows)
+REM Usage: start-wallet.bat [password]
 
-set "WALLET_BIN=%USERPROFILE%\.xelis-vault\bin\xelis_wallet.exe"
-set "WALLET_DIR=%USERPROFILE%\.xelis-vault\wallets\xvault-user"
+setlocal enabledelayedexpansion
 
-echo ========================================================================
-echo   XELIS Vault - Wallet (testnet)
-echo ========================================================================
+REM Find Python
+set "PYTHON="
+if exist "venv\Scripts\python.exe" (
+    set "PYTHON=venv\Scripts\python.exe"
+) else (
+    where python >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PYTHON=python"
+    ) else (
+        echo ERROR: Python not found. Please install Python or create venv.
+        pause
+        exit /b 1
+    )
+)
+
+REM Default password
+set "PASS=%~1"
+if "!PASS!"=="" set "PASS=testpass"
+
+REM Wallet port
+set "PORT=18082"
+
 echo.
-echo Lancement du wallet...
+echo ========================================
+echo   XELIS WALLET
+echo ========================================
+echo.
+echo   RPC: http://127.0.0.1:%PORT%/json_rpc
+echo   User: wallet
+echo   Pass: !PASS!
+echo.
+echo   Starting wallet...
+echo   Press Ctrl+C to stop
 echo.
 
-start "XELIS Vault - Wallet" cmd /c ""%WALLET_BIN%" --network testnet --wallet-path "%WALLET_DIR%" --daemon-address https://testnet-node.xelis.io"
+REM Start wallet
+"%PYTHON%" src\scripts\onboarding.py wallet --password "!PASS!" --port %PORT%
 
-timeout /t 3 /nobreak >nul
-
-echo.
-echo Wallet lance. Verifiez la fenetre du wallet pour l'adresse et les soldes.
-echo.
 pause
-
-endlocal
-
