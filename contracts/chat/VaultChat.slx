@@ -353,17 +353,10 @@ entry anchor_messages(merkle_root: Hash, message_count: u64, sender_count: u64, 
     let total: u64 = s.load(TOTAL_MESSAGES_KEY).unwrap_or(0)
     s.store(TOTAL_MESSAGES_KEY, total + message_count)
 
-    // v12.0: airdrop RELAYER 10 pts per stored anchor
-    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
-    if ad_t.is_some() {
-        let ad_h: Hash = ad_t.expect("err")
-        if ad_h != Hash::zero() {
-            let ad_c: Contract = Contract::new(ad_h).expect("err")
-            let _ = ad_c.call(77u16, [caller, 2u8, 10u64, 301u64], {})
-        }
-    }
-
     // === ANTI-ABUS LAYER 3: Reward only if quality thresholds met ===
+    // v12.1: the airdrop RELAYER points are awarded HERE AT THE EARLIEST —
+    // after the quality gate — so that spam anchors (fewer than 5 messages
+    // or fewer than 2 senders) can no longer farm airdrop points.
     let qualifies_for_reward: bool = message_count >= ANCHOR_MIN_MESSAGES && sender_count >= ANCHOR_MIN_SENDERS
 
     if !qualifies_for_reward {
@@ -376,6 +369,19 @@ entry anchor_messages(merkle_root: Hash, message_count: u64, sender_count: u64, 
     if daily_reward >= ANCHOR_DAILY_REWARD_CAP {
         // Already hit daily cap, no more reward today
         return 0
+    }
+
+    // v12.1: airdrop RELAYER 10 pts per QUALITY anchor (moved AFTER the
+    // quality gate — was previously awarded before validation, letting
+    // spammers farm up to 500 pts/day). record_activity_cross is fail-safe:
+    // a paused/unconfigured tracker silently no-ops and never reverts here.
+    let ad_t: optional<Hash> = s.load(AIRDROP_TRACKER_KEY)
+    if ad_t.is_some() {
+        let ad_h: Hash = ad_t.expect("err")
+        if ad_h != Hash::zero() {
+            let ad_c: Contract = Contract::new(ad_h).expect("err")
+            let _ = ad_c.call(77u16, [caller, 2u8, 10u64, 301u64], {})
+        }
     }
 
     // === ANTI-ABUS LAYER 5: Diminishing returns ===
@@ -394,16 +400,16 @@ entry anchor_messages(merkle_root: Hash, message_count: u64, sender_count: u64, 
         diminishing_mult = 2000
     }
 
-    // Reward the relayer via XelisVaultMiner v5.0 entry 18 (distribute_reward)
-    // with service_id=2 (chat). Skipped if miner contract not configured.
-    // The XelisVaultMiner applies reputation multiplier on its side.
+    // Reward the relayer via XelisVaultMiner (chat service). Skipped if the
+    // miner contract is not configured. The XelisVaultMiner applies the
+    // reputation multiplier on its side.
+    // (v12.1 comment fix: entry 18 was the v5 layout — the current chunks
+    //  are 90 = settle_rewards_cross(Address) and 23 = distribute_reward.)
     let miner_hash_opt: optional<Hash> = s.load(MINER_CONTRACT_KEY)
     if miner_hash_opt.is_some() {
         let miner_hash: Hash = miner_hash_opt.expect("err")
         if miner_hash != Hash::zero() {
             let miner: Contract = Contract::new(miner_hash).expect("err")
-            // Pass diminishing multiplier to miner (it will apply on top of reputation)
-            // Entry 18 = distribute_reward(addr, service_id, is_valid)
             // The diminishing factor is tracked here, reward is adjusted in XelisVaultMiner
             let _ = miner.call(90u16, [caller], {})
             let _ = miner.call(23u16, [caller, CHAT_SERVICE_ID as u8, true], {})

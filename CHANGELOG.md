@@ -1,5 +1,70 @@
 # Changelog
 
+v12.1 — COMMUNITY REVIEW FIXES (migration safety + CLI anchor + docs)
+
+## upgrade flow (deploy/upgrade_v12.py — rewritten)
+- FIX: SyntaxError (`BYTECODE_DIR` used before its `global` declaration)
+  — the script did not even import.
+- BREAKING (safer) phase order: A deploy -> C config -> D migrate -> B
+  registry cutover -> U unpause (LAST on-chain step) -> E repo files.
+  Migration now completes BEFORE the registry cutover; `--phase all`
+  runs exactly this order.
+- AirdropTracker v12.1 starts PAUSED (constructor stores pz=true). The
+  script verifies it and pauses non-paused bytecode as a safety net.
+- Migration import bypasses the manual attribution cap safely (absolute
+  sanity bound 1e12) — users above the 50k manual cap migrate without
+  failure.
+- import_user_state signature extended: last_active_day + qualified are
+  preserved (previously reset to today/false); users with unreadable
+  structs are imported with safe defaults instead of being skipped.
+- NEW on-chain migration cursor: set_mig_cursor (chunk 81) /
+  get_mig_cursor (82, key "mig") — crash-safe resume straight from the
+  chain (cursor updated every 20 imports; re-imports are idempotent).
+- finalize_migration (chunk 79) now uses an ON-CHAIN batch cursor + a
+  completion flag ("migd"): paginated finalize can never double-count a
+  batch and re-running after completion is a strict no-op (previously it
+  would ZERO the published totals).
+- Phase D snapshots the old tracker (uc/tp/ct_1..7) and FAILS CLOSED if
+  anything changed during the migration (no cutover until re-run).
+- Phase U reads the on-chain "pz" key before unpausing: a crash after a
+  successful on-chain unpause never unpauses twice.
+- Phase B upgrades BOTH registry names of the swap: "VaultSwap" AND the
+  "VaultSwapV2" alias (both exist on-chain since v12R; previously only
+  "VaultSwap" was upgraded — and the artifact mapping never matched the
+  deployed key, so the swap was never upgraded at all).
+- bytecode dir now defaults to the repo build/ (compiled artifacts are
+  committed); --bytecode-dir still available.
+
+## contracts
+- AirdropTracker v12.1: see above (paused start, cap bypass, extended
+  import signature, mig cursor, fail-safe finalize). Chunks 81/82
+  appended; all existing chunks keep position/kind (append-only verified).
+- VaultChat v12.1: anchor_messages now awards the RELAYER airdrop points
+  AFTER the quality gate (>=5 messages, >=2 senders, daily cap) —
+  previously spammers could farm up to 500 pts/day. Chunk count unchanged
+  (137), only chunk 11 body changes.
+- Bytecode rebuild: canonical compiler (xelis-vm v1.3.0) rebuilds are
+  byte-for-byte identical to the committed build/ artifacts.
+
+## CLI
+- FIX: chat_anchor(root, count, senders, msg_type) — anchor_messages
+  (VaultChat chunk 11) takes FOUR on-chain params; the previous 3-arg
+  call reverted on every anchor tx. The TUI asks for the unique sender
+  count; relayer_server.py is fixed by the same signature change (its
+  third argument was silently interpreted as msg_type).
+
+## docs/tests/tooling
+- scripts/compile_all.py: NEW — compiles the 51 contracts into build/
+  (.hex + .abi.json + chunk maps) and regenerates docs/entry_chunk_ids.json,
+  with a mechanical append-only check. Referenced by README/build docs
+  (was previously mentioned but missing).
+- docs/UPGRADE_v12.md: rewritten for the v12.1 flow (critical phase order,
+  crash-resume, fail-closed, unpause-last); stale StakedOracle
+  set_airdrop_tracker chunk fixed 49 -> 60 (lines 16/84; Annexe B was
+  already correct).
+- tests/test_upgrade_v12_resume.py: NEW — 9 crash-resume/cutover tests
+  with a fully mocked protocol (all PASS).
+
 v12.0 — UPGRADE CONTRACTS + AUTO-AIRDROP + REWARD FIX + MIXER V3
 
 ## Contracts (11 upgraded, all 51 compile — build/chunkmap_*.txt)

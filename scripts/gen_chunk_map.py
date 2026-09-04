@@ -7,6 +7,7 @@ l'ordre de déclaration source (1:1 avec l'ordre des chunks compilés), les kind
 et params du stderr du compile tool.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -14,7 +15,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CONTRACTS = REPO / "contracts"
-TOOL = "/Users/adrien/opencode/xelis-compile-tool/target/release/xelis_compile_tool"
+TOOL = os.environ.get("XELIS_COMPILE_TOOL",
+                      "/home/z/xelis-compile-tool/target/release/xelis_compile_tool")
 OUT = REPO / "docs" / "entry_chunk_ids.json"
 HEXDIR = Path("/tmp")
 

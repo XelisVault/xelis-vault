@@ -1226,9 +1226,19 @@ class Backend:
                             [val_u64(group_id), val_bytes(msg_hex), val_u64(ttl)],
                             max_gas=20_000_000)
 
-    def chat_anchor(self, root: str, count: int, msg_type: int = 0) -> OpResult:
+    def chat_anchor(self, root: str, count: int, senders: int = 1,
+                    msg_type: int = 0) -> OpResult:
+        """Anchor a batch of chat messages (VaultChat chunk 11).
+
+        v12.1 fix: anchor_messages takes FOUR on-chain params
+        (merkle_root, message_count, sender_count, msg_type) — the previous
+        3-arg call (root, count, msg_type) mismatched the compiled entry and
+        every anchor tx reverted. `senders` must be >= 2 for the anchor to
+        earn the relayer reward (quality gate, ANTI-ABUS LAYER 3).
+        """
         return self._invoke("VaultChat", "anchor_messages",
-                            [val_hash(root), val_u64(count), val_u8(msg_type)],
+                            [val_hash(root), val_u64(count),
+                             val_u64(senders), val_u8(msg_type)],
                             max_gas=20_000_000)
 
     def chat_stake_bond(self, vlt_atomic: int) -> OpResult:

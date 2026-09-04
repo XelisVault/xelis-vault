@@ -72,7 +72,7 @@
 //   31 : get_version
 // ============================================================================
 
-const VERSION: string = "AirdropTracker v11.3"
+const VERSION: string = "AirdropTracker v12.1"
 
 const ADMIN_KEY: string = "a"
 const TIMELOCK_KEY: string = "tl"
@@ -130,6 +130,26 @@ const FORCE_QUALIFIED_PREFIX: string = "fqual_"        // user → bool (manuall
 const ADMIN_LOG_PREFIX: string = "alog_"               // index → AdminLogEntry
 const ADMIN_LOG_COUNT_KEY: string = "alc"
 const ADMIN_LOG_MAX: u64 = 1000                        // keep last 1000 admin actions
+
+// v12.1: on-chain migration cursor for crash-safe resume of import_user_state
+// batches (upgrade_v12.py phase D reads "mig" on-chain and continues from it;
+// re-imports are idempotent overwrites, so a crash between the import and the
+// cursor update re-does at most one small batch).
+const MIG_CURSOR_KEY: string = "mig"
+
+// v12.1: finalize_migration internal cursor + completion flag. The batch
+// cursor makes paginated finalize calls atomic and crash-safe ON-CHAIN (the
+// script cannot know where a crash stopped it); the completion flag makes
+// re-running finalize after completion a safe no-op instead of zeroing the
+// published totals.
+const MIG_FINALIZE_CURSOR_KEY: string = "migf"
+const MIGRATION_FINALIZED_KEY: string = "migd"
+
+// v12.1: absolute sanity bound for migrated totals (1e12 points). The manual
+// attribution cap (MANUAL_CAP_KEY) does NOT apply to the migration import —
+// imported points are a verified on-chain state migration, not manual
+// attributions, and users above the manual cap must migrate without failure.
+const MIGRATION_ABS_MAX: u64 = 1000000000000
 
 // Categories
 const CAT_MINING: u8 = 1
@@ -208,7 +228,12 @@ hook constructor() -> u64 {
     let caller: Address = get_caller().expect("err")
     s.store(ADMIN_KEY, caller)
     s.store(GUARDIAN_KEY, caller)
-    s.store(PAUSED_KEY, false)
+    // v12.1: the tracker starts PAUSED. The upgrade flow deploys it paused,
+    // migrates the previous tracker's users (import_user_state works while
+    // paused), cuts the registry over, and unpauses LAST (chunk 74).
+    // record_activity_cross no-ops silently while paused, so protocol
+    // contracts keep working during the migration window.
+    s.store(PAUSED_KEY, true)
     s.store(FROZEN_KEY, false)
     s.store(FINALIZED_KEY, false)
     s.store(USER_COUNT_KEY, 0u64)
@@ -1441,21 +1466,31 @@ pub fn record_activity_cross(user: Address, category: u8, points: u64, action_id
     return 0
 }
 
-// CHUNK 78: entry import_user_state — one-shot admin migration entry.
+// CHUNK 78: entry import_user_state — admin migration entry (v12.1).
 // Used when upgrading the tracker contract (a new contract hash means a
 // fresh, empty storage). The migration script reads the previous tracker
-// instance via RPC and re-imports each user here — INCLUDING days_active
-// and the registered mainnet address, which record_manual_attribution
-// cannot restore (it always recomputes days from the current topo).
+// instance via RPC and re-imports each user here — INCLUDING days_active,
+// last_active_day, the qualified flag and the registered mainnet address,
+// which record_manual_attribution cannot restore (it always recomputes
+// days from the current topo).
+//
+// v12.1 changes:
+//   - callable while PAUSED: the new tracker starts paused and is migrated
+//     BEFORE the registry cutover; unpause (chunk 74) is the final step.
+//   - imported totals are NOT capped by MANUAL_CAP_KEY: this is a verified
+//     on-chain state migration, not a manual attribution — users above the
+//     default manual cap (50,000 pts) must migrate without failure. An
+//     absolute sanity bound (MIGRATION_ABS_MAX) still protects the totals.
+//   - preserves last_active_day and the qualified flag of the old state.
+//
 // @caller: admin only
-// @security: only_admin; caps imported points per user at MANUAL_CAP_KEY;
-//            logs to the admin audit trail; idempotent (re-import overwrites).
-entry import_user_state(user: Address, mining: u64, relayer: u64, governance: u64, chat: u64, liquidity: u64, bounty: u64, community: u64, days: u64, mainnet_addr: Address) -> u64 {
-    when_not_paused()
+// @security: only_admin; idempotent (re-import overwrites — used for the
+//            crash-safe resume driven by the on-chain mig cursor, chunk 81);
+//            logs to the admin audit trail.
+entry import_user_state(user: Address, mining: u64, relayer: u64, governance: u64, chat: u64, liquidity: u64, bounty: u64, community: u64, days: u64, last_active_day: u64, qualified: bool, mainnet_addr: Address) -> u64 {
     when_not_frozen()
     only_admin()
     let s: Storage = Storage::new()
-    let cap: u64 = s.load(MANUAL_CAP_KEY).unwrap_or(DEFAULT_MANUAL_CAP)
 
     // Get or create the user record.
     let up: UserPoints = get_or_init_user(user)
@@ -1467,13 +1502,13 @@ entry import_user_state(user: Address, mining: u64, relayer: u64, governance: u6
     up.bounty = bounty
     up.community = community
     let total: u64 = mining + relayer + governance + chat + liquidity + bounty + community
-    require(total <= cap, "toomuch")
+    require(total <= MIGRATION_ABS_MAX, "toomuch")
     up.total_raw = total
     up.total_with_bonus = 0
     up.days_active = days
-    up.last_active_day = get_day(get_current_topoheight())
+    up.last_active_day = last_active_day
     up.mainnet_address = mainnet_addr
-    up.qualified = false
+    up.qualified = qualified
     up.registered = true
     s.store(USER_PREFIX + user.to_string(), up)
 
@@ -1493,16 +1528,31 @@ entry import_user_state(user: Address, mining: u64, relayer: u64, governance: u6
 
 // CHUNK 79: entry finalize_migration — recompute ALL global totals (user
 // count, total points, per-category totals) from the imported user records.
-// MUST be called once, after the last import_user_state, before resuming
-// auto-recording. Paginated like finalize_distribution for gas safety.
+// MUST be called repeatedly (one batch of up to 200 users per call) after the
+// last import_user_state, before resuming auto-recording.
+//
+// v12.1: the batch start index is an ON-CHAIN cursor (MIG_FINALIZE_CURSOR_KEY),
+// not a parameter — each call is atomic (accumulate + advance the cursor in
+// the same execution), so a crash at ANY point resumes exactly where it
+// stopped and can never double-count a batch. A completion flag
+// (MIGRATION_FINALIZED_KEY) makes later calls a strict no-op: re-running
+// finalize after completion must NOT zero the published totals.
 // @caller: admin only
-// @security: only_admin; process at most 200 users per call; repeated calls
-//            continue from the stored cursor; idempotent per page.
-entry finalize_migration(start_index: u64, count: u64) -> u64 {
+// @security: only_admin; process at most 200 users per call; safe to re-run.
+entry finalize_migration(count: u64) -> u64 {
     only_admin()
     require(count > 0 && count <= 200, "badbatch")
     let s: Storage = Storage::new()
+
+    // Already finalized? Strict no-op (fail-safe against zeroing totals).
+    let already_done: bool = s.load(MIGRATION_FINALIZED_KEY).unwrap_or(false)
+    if already_done {
+        emit_event(0u64, ["MigrationAlreadyFinalized", "noop"])
+        return 0
+    }
+
     let user_count: u64 = s.load(USER_COUNT_KEY).unwrap_or(0)
+    let start_index: u64 = s.load(MIG_FINALIZE_CURSOR_KEY).unwrap_or(0)
     require(start_index <= user_count, "oob")
 
     // Accumulators (persisted across paginated calls).
@@ -1561,8 +1611,12 @@ entry finalize_migration(start_index: u64, count: u64) -> u64 {
         s.delete("mig_c5")
         s.delete("mig_c6")
         s.delete("mig_c7")
+        s.delete(MIG_FINALIZE_CURSOR_KEY)
+        s.store(MIGRATION_FINALIZED_KEY, true)
         emit_event(0u64, ["MigrationFinalized", user_count.to_string(10u32) + "_" + tp.to_string(10u32)])
     } else {
+        // Advance the on-chain cursor atomically with this batch.
+        s.store(MIG_FINALIZE_CURSOR_KEY, end)
         emit_event(0u64, ["MigrationBatch", end.to_string(10u32) + "/" + user_count.to_string(10u32)])
     }
     return 0
@@ -1572,4 +1626,26 @@ entry finalize_migration(start_index: u64, count: u64) -> u64 {
 // authorized recorder? (for deploy verification / CLI diagnostics)
 pub fn get_record_authority(contract_hash: Hash) -> bool {
     return Storage::new().load(RECORDER_PREFIX + contract_hash.to_hex()).unwrap_or(false)
+}
+
+// CHUNK 81: entry set_mig_cursor — v12.1: on-chain, crash-safe migration
+// cursor. upgrade_v12.py phase D updates this after every batch of
+// import_user_state calls; on resume the script reads "mig" on-chain and
+// continues from there. Re-imports are idempotent overwrites, so a crash
+// between an import and the cursor update re-does at most one small batch.
+// @caller: admin only
+// @security: only_admin; logged to the admin audit trail.
+entry set_mig_cursor(cursor: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(MIG_CURSOR_KEY, cursor)
+    log_admin_action(6u8, get_caller().expect("err"), 0u8, cursor, 0u64, "v12 migration cursor")
+    emit_event(0u64, ["MigCursor", cursor.to_string(10u32)])
+    return 0
+}
+
+// CHUNK 82: pub fn get_mig_cursor — v12.1: read-only: current migration
+// cursor (0 = no migration in progress / not started).
+pub fn get_mig_cursor() -> u64 {
+    return Storage::new().load(MIG_CURSOR_KEY).unwrap_or(0)
 }

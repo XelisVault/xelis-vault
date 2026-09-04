@@ -482,6 +482,14 @@
           "type": "u64"
         },
         {
+          "name": "last_active_day",
+          "type": "u64"
+        },
+        {
+          "name": "qualified",
+          "type": "bool"
+        },
+        {
           "name": "mainnet_addr",
           "type": "Address"
         }
@@ -494,11 +502,19 @@
       "outputs": "u64",
       "params": [
         {
-          "name": "start_index",
-          "type": "u64"
-        },
-        {
           "name": "count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 81,
+      "name": "set_mig_cursor",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "cursor",
           "type": "u64"
         }
       ],

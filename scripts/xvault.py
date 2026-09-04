@@ -1469,8 +1469,10 @@ def screen_chat(b: Backend):
                 info_box("Invalid", ["Need 64-char hex root."], color=C.RED)
                 continue
             count = text_input("Message count:").strip() or "1"
-            if confirm(f"Anchor {count} messages?"):
-                run_tx(b, lambda r=root, c=int(count): b.chat_anchor(r, c),
+            senders = text_input("Unique senders (min 2 for reward):").strip() or "1"
+            if confirm(f"Anchor {count} messages from {senders} senders?"):
+                run_tx(b, lambda r=root, c=int(count), s=int(senders):
+                       b.chat_anchor(r, c, s),
                        "Anchor messages")
         elif choice == "relayer":
             amt = ask_amount(b, b.vlt_asset, "VLT bond (min 50):", "50")

@@ -90,3 +90,27 @@ binaire officiel/création seed locale validée contre le binaire/import),
 daemon auto-detect, contrats chargés depuis `network/testnet.json`.
 Schéma mnémonique Xelis implémenté (1626 mots, 24+checksum=copie du mot
 crc32%24, scalaire curve25519 canonique).
+
+---
+
+## Correctifs v12.1 (community review) — 2026-09-05
+
+Aucune transaction de déploiement : les correctifs ci-dessous sont **dans le
+repo** (contrats recompilés, script d'upgrade réécrit) et se déploieront via
+`deploy/upgrade_v12.py --phase all` (ordre : A → C → D → B → U → E, voir
+`docs/UPGRADE_v12.md`).
+
+| Correctif | Fichiers | Impact déploiement |
+|---|---|---|
+| Script d'upgrade SyntaxError + ordre des phases + crash-resume on-chain + fail-closed + unpause idempotent + alias VaultSwap/VaultSwapV2 | `deploy/upgrade_v12.py` | ré-exécuter A→E à la prochaine upgrade |
+| AirdropTracker démarre en pause, import sans cap manuel, `last_active_day`/`qualified` préservés, curseur `mig` (chunks **81/82**), finalize à curseur interne + flag `migd` | `contracts/airdrop/AirdropTracker.slx` → `build/deploy_AirdropTracker.hex` | **recompiler/redéployer** le tracker ; chunks append-only vérifiés |
+| VaultChat : points RELAYER attribués après la porte qualité (≥5 msgs, ≥2 senders) | `contracts/chat/VaultChat.slx` → `build/deploy_VaultChat.hex` | **recompiler/redéployer** VaultChat (chunk 11 uniquement) |
+| CLI anchor 4 args (`sender_count` manquant → revert systématique) | `scripts/cli_backend.py`, `scripts/xvault.py` | mise à jour CLI locale |
+| Doc chunk obsolète StakedOracle.set_airdrop_tracker 49→60 ; guide réécrit | `docs/UPGRADE_v12.md` | — |
+| Compilation reproductible + vérification append-only | `scripts/compile_all.py`, `build/README.md`, `scripts/gen_chunk_map.py` | — |
+| Tests crash-resume 9/9 | `tests/test_upgrade_v12_resume.py` | — |
+
+Validation : rebuild byte-for-byte PASS (compilateur canonique xelis-vm
+v1.3.0), layout append-only vérifié mécaniquement, `python3 -m py_compile`
+PASS, tests migration/cutover crash-resume **9/9 PASS**, `git diff --check`
+PASS.

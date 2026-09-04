@@ -1410,3 +1410,39 @@ y est indexé par chunk→{name} (pas {fn→chunk}) → passer les chunk ids en 
 3. Relancer keeper + indexer ; arrêter l'injecteur manuel.
 4. Doctor : tout vert, puis E2E (submit prix → point MINING on-chain ;
    settle → dist qui grimpe réellement).
+
+## v12.1 — correctifs de la review communautaire (2026-09-05)
+
+10 signalements d'un reviewer externe contre main 365575e : TOUS vérifiés
+contre le code (reproduits) et corrigés. Détail complet : docs/UPGRADE_v12.md
+§0bis, CHANGELOG v12.1.
+
+INVARIANTS NOUVEAUX (à respecter pour toute évolution future) :
+- upgrade flow : ordre A → C → D (migration) → B (cutover) → U (unpause,
+  DERNIÈRE étape on-chain) → E. Le tracker v12.1 DÉMARRE EN PAUSE
+  (constructeur pz=true) ; import_user_state est appelable en pause ;
+  record_activity_cross no-op silencieux en pause (jamais de revert).
+- migration airdrop : reprise par curseur ON-CHAIN (clé "mig", chunks 81/82,
+  set_mig_cursor tous les 20 imports) ; re-imports idempotents ;
+  finalize_migration (chunk 79) = curseur interne "migf" + flag "migd"
+  (re-run = no-op strict, JAMAIS de double comptage ni de remise à zéro des
+  totaux) ; phase D fail-closed (snapshot uc/tp/ct_1..7 avant/après).
+- import_user_state : 12 params (user, 7 compteurs, days, last_active_day,
+  qualified, mainnet_addr) — préserver TOUS les champs lors de toute
+  modification ; PAS de cap manuel sur l'import (borne absolue 10^12).
+- registre : le swap vit sous DEUX noms (cur_VaultSwap + cur_VaultSwapV2,
+  alias v12R) — TOUTE upgrade du swap doit mettre à jour les DEUX.
+- VaultChat.anchor_messages (chunk 11) : 4 params on-chain
+  (merkle_root, message_count, sender_count, msg_type) ; les points RELAYER
+  ne sont attribués qu'APRÈS la porte qualité (≥5 msgs, ≥2 senders, cap
+  journalier 100 VLT, diminishing returns) — même règle pour tout futur
+  point de récompense.
+- compilation : scripts/compile_all.py (XELIS_COMPILE_TOOL ou chemin par
+  défaut) — byte-for-byte canonique (xelis-vm v1.3.0 + build_environment
+  MockStorageProvider, deterministic) ; append-only vérifié mécaniquement
+  (position+kind+name) à chaque recompile ; extension de signature
+  autorisée seulement si tous les callers sont mis à jour dans le même
+  commit (v12.1 : import_user_state, finalize_migration).
+- tests : tests/test_upgrade_v12_resume.py (protocole mocké, 9 tests) —
+  lancer après TOUTE modification de deploy/upgrade_v12.py ou des chunks
+  78/79/81/82 du tracker.
