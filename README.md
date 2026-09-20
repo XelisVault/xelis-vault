@@ -48,7 +48,7 @@ sdk/xvault/        Python CLI + SDK
 scripts/           CI tooling (linter, chunk-id verifier, structure check)
 tests/             reference tests — Python crypto ↔ contract byte-parity
 docs/              MIXER / SECURITY / ARCHITECTURE
-legacy/            v12 archive (51 contracts) — READ ONLY, do not deploy
+legacy/            v12 archive (51 contracts) — testnet era, kept intact (see legacy/README.md)
 ```
 
 ## CI

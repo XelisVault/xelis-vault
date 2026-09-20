@@ -1,12 +1,18 @@
-# LEGACY ARCHIVE — v12 contracts (DO NOT DEPLOY)
+# LEGACY ARCHIVE — v12 contracts (testnet era)
 
 This directory archives the complete v12 codebase: 51 Silex contracts plus
 their build artifacts, scripts, deployment tooling and documentation.
+**Nothing was deleted in the v13 reorganization** — every file of the v12
+tree is preserved here, with full git history.
 
-## Status: NOT DEPLOYABLE
+## Status: testnet-only, no new deployments
 
-A full audit (September 2026) found the v12 stack unsafe, including but not
-limited to:
+- **Already-deployed testnet instances are unaffected.** Contracts live
+  on-chain: this archive only changes where the source sits on GitHub.
+  Keep using them as a sandbox — that is exactly what testnet is for.
+- **Do not deploy new instances of v12 code, and never on mainnet.**
+  A full audit (September 2026) found the v12 stack unsafe, including but
+  not limited to:
 
 - transfers paid from shared contract balances without collecting the
   user's deposit (trivial drains in chat/miner/lending/auction stacks)
