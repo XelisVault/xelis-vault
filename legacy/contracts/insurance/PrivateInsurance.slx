@@ -1,0 +1,451 @@
+// ============================================================================
+// PrivateInsurance.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Replicates v4.2 logic with sequential entry IDs starting at 0.
+// FIX #14: Two-step emergency_withdraw at IDs 15/16 with 17280-block delay.
+//   Note: v4.2 had no emergency owner; v5.0 introduces EMERGENCY_KEY (init in
+//   constructor) + set_emergency entry to support the two-step pattern.
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : create_policy
+//   1  : buy_policy
+//   2  : claim
+//   3  : approve_claim
+//   4  : cancel_policy
+//   5  : expire_policy
+//   6  : get_policy_entry
+//   7  : get_policies_count_entry
+//   8  : set_registry
+//   9  : set_timelock
+//   10 : set_emergency
+//   11 : pause
+//   12 : unpause
+//   13 : transfer_admin
+//   14 : get_version
+//   15 : request_emergency_withdraw
+//   16 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "PrivateInsurance v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const POLICIES_COUNT_KEY: string = "pc"
+const POLICY_PREFIX: string = "p_"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+
+// v11.4: Reentrancy guard
+const RG_STATUS_KEY: string = "rg"
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+
+fn non_reentrant() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+struct Policy {
+    id: u64,
+    insurer: Address,
+    insured: optional<Address>,
+    asset: Hash,
+    coverage_amount: u64,
+    premium: u64,
+    duration_blocks: u64,
+    trigger_hash: Hash,
+    created_at: u64,
+    activated_at: u64,
+    expires_at: u64,
+    status: u8
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(POLICIES_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn policy_key(policy_id: u64) -> string {
+    return POLICY_PREFIX + policy_id.to_string(10u32)
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: create_policy
+// create policy.
+// @caller: user / authorized caller
+// @params: asset - Hash
+// @params: coverage_amount - u64
+// @params: premium - u64
+// @params: duration_blocks - u64
+// @params: trigger_hash - Hash
+// @returns: u
+// @security: when_not_paused
+entry create_policy(
+    asset: Hash,
+    coverage_amount: u64,
+    premium: u64,
+    duration_blocks: u64,
+    trigger_hash: Hash
+) -> u64 {
+    when_not_paused()
+    require(coverage_amount > 0, "nocoverage")
+    require(premium > 0, "nopremium")
+    require(duration_blocks >= 1440, "baddur")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
+    require(dep >= coverage_amount, "insdep")
+    if dep > coverage_amount {
+        let _ = transfer(caller, dep - coverage_amount, asset)
+    }
+
+    let id: u64 = s.load(POLICIES_COUNT_KEY).unwrap_or(0)
+    let policy: Policy = Policy {
+        id: id,
+        insurer: caller,
+        insured: null,
+        asset: asset,
+        coverage_amount: coverage_amount,
+        premium: premium,
+        duration_blocks: duration_blocks,
+        trigger_hash: trigger_hash,
+        created_at: get_current_topoheight(),
+        activated_at: 0,
+        expires_at: 0,
+        status: 0
+    }
+    s.store(policy_key(id), policy)
+    s.store(POLICIES_COUNT_KEY, id + 1)
+    return 0
+}
+
+// ID 1: buy_policy
+// buy policy.
+// @caller: any user
+// @params: policy_id - u64
+// @returns: u
+// @security: when_not_paused
+entry buy_policy(policy_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: Policy = s.load(policy_key(policy_id)).expect("err")
+    require(policy.status == 0, "notopen")
+    require(policy.insurer != caller, "selfbuy")
+
+    let dep: u64 = get_deposit_for_asset(policy.asset).expect("err")
+    require(dep >= policy.premium, "insdep")
+    if dep > policy.premium {
+        let _ = transfer(caller, dep - policy.premium, policy.asset)
+    }
+
+    let _ = transfer(policy.insurer, policy.premium, policy.asset)
+
+    policy.insured = caller
+    policy.activated_at = get_current_topoheight()
+    policy.expires_at = policy.activated_at + policy.duration_blocks
+    policy.status = 1
+    s.store(policy_key(policy_id), policy)
+    return 0
+}
+
+// ID 2: claim
+// claim.
+// @caller: any user
+// @params: policy_id - u64
+// @params: evidence_hash - Hash
+// @returns: u
+// @security: when_not_paused
+entry claim(policy_id: u64, evidence_hash: Hash) -> u64 {
+    when_not_paused()
+    non_reentrant()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: Policy = s.load(policy_key(policy_id)).expect("err")
+    require(policy.status == 1, "notactive")
+    require(policy.insured.expect("err") == caller, "notinsured")
+    require(policy.trigger_hash == evidence_hash, "trigmatch")
+
+    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    policy.status = 2
+    s.store(policy_key(policy_id), policy)
+    return 0
+}
+
+// ID 3: approve_claim
+// approve claim.
+// @caller: any user
+// @params: policy_id - u64
+// @returns: u
+// @security: standard access control
+entry approve_claim(policy_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: Policy = s.load(policy_key(policy_id)).expect("err")
+    require(policy.status == 1, "notactive")
+    require(policy.insurer == caller, "notinsurer")
+    require(policy.insured.is_some(), "noinsured")
+
+    let _ = transfer(policy.insured.expect("err"), policy.coverage_amount, policy.asset)
+    policy.status = 2
+    s.store(policy_key(policy_id), policy)
+    return 0
+}
+
+// ID 4: cancel_policy
+// cancel policy.
+// @caller: any user
+// @params: policy_id - u64
+// @returns: u
+// @security: when_not_paused
+entry cancel_policy(policy_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let policy: Policy = s.load(policy_key(policy_id)).expect("err")
+    require(policy.status == 0, "notopen")
+    require(policy.insurer == caller, "notinsurer")
+
+    let _ = transfer(caller, policy.coverage_amount, policy.asset)
+    policy.status = 4
+    s.store(policy_key(policy_id), policy)
+    return 0
+}
+
+// ID 5: expire_policy
+// expire policy.
+// @caller: user / authorized caller
+// @params: policy_id - u64
+// @returns: u
+// @security: standard access control
+entry expire_policy(policy_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let policy: Policy = s.load(policy_key(policy_id)).expect("err")
+    require(policy.status == 1, "notactive")
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > policy.expires_at, "notexpired")
+
+    let _ = transfer(policy.insurer, policy.coverage_amount, policy.asset)
+    policy.status = 3
+    s.store(policy_key(policy_id), policy)
+    return 0
+}
+
+// ID 6: get_policy_entry
+// get policy entry.
+// @caller: user / authorized caller
+// @params: policy_id - u64
+// @returns: tuple: (
+// @security: standard access control
+entry get_policy_entry(policy_id: u64) -> (Address, optional<Address>, Hash, u64, u64, u64, u64, u8) {
+    let p: Policy = Storage::new().load(policy_key(policy_id)).expect("err")
+    return (
+        p.insurer, p.insured, p.asset, p.coverage_amount, p.premium,
+        p.duration_blocks, p.expires_at, p.status
+    )
+}
+
+// ID 7: get_policies_count_entry
+// get policies count entry.
+// @caller: user / authorized caller
+// @returns: u
+// @security: only_admin
+entry get_policies_count_entry() -> u64 {
+    return Storage::new().load(POLICIES_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 8: set_registry
+// set registry.
+// @caller: admin (or timelock)
+// @params: reg - Hash
+// @returns: u
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 9: set_timelock
+// set timelock.
+// @caller: admin (or timelock)
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 10: set_emergency
+// set emergency.
+// @caller: admin (or timelock)
+// @params: e - Address
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 11: pause
+// pause.
+// @caller: admin (or timelock)
+// @params: reason - string
+// @returns: u
+// @security: only_admin
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 12: unpause
+// unpause.
+// @caller: admin (or timelock)
+// @returns: u
+// @security: only_admin
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 13: transfer_admin
+// transfer admin.
+// @caller: admin (or timelock)
+// @params: new_admin - Address
+// @returns: u
+// @security: only_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 14: get_version
+// get version.
+// @caller: user / authorized caller
+// @returns: s
+// @security: only_emergency, 2-step withdraw (24h delay)
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 15: request_emergency_withdraw
+// request emergency withdraw.
+// @caller: any user
+// @returns: u
+// @security: only_emergency, 2-step withdraw (24h delay)
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 16: execute_emergency_withdraw
+// execute emergency withdraw.
+// @caller: any user
+// @params: asset - Hash
+// @returns: u
+// @security: 2-step withdraw (24h delay)
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+// get policy.
+// @caller: anyone (read-only)
+// @params: policy_id - u64
+// @returns: tuple: (
+// @security: standard access control
+pub fn get_policy(policy_id: u64) -> (Address, optional<Address>, Hash, u64, u64, u64, u64, u8) {
+    let p: Policy = Storage::new().load(policy_key(policy_id)).expect("err")
+    return (
+        p.insurer, p.insured, p.asset, p.coverage_amount, p.premium,
+        p.duration_blocks, p.expires_at, p.status
+    )
+}
+
+// get policies count.
+// @caller: anyone (read-only)
+// @returns: u
+// @security: only_admin
+pub fn get_policies_count() -> u64 {
+    return Storage::new().load(POLICIES_COUNT_KEY).unwrap_or(0)
+}
+
+// set timelock tl.
+// @caller: anyone (read-only)
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}

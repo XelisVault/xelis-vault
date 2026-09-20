@@ -1,0 +1,449 @@
+{
+  "data": [
+    {
+      "entry_id": 16,
+      "name": "create_pool",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_a",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_b",
+          "type": "Hash"
+        },
+        {
+          "name": "is_psm",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "add_liquidity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_a",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_b",
+          "type": "Hash"
+        },
+        {
+          "name": "amount_a",
+          "type": "u64"
+        },
+        {
+          "name": "amount_b",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "swap",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_in",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_out",
+          "type": "Hash"
+        },
+        {
+          "name": "amount_in",
+          "type": "u64"
+        },
+        {
+          "name": "min_amount_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "psm_mint",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xel_amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_xusd_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "psm_redeem",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xusd_amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_xel_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "get_pool_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_a",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_b",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_amount_out_view_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_in",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_out",
+          "type": "Hash"
+        },
+        {
+          "name": "amount_in",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "get_twap_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_a",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_b",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "get_volatility_bps_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_a",
+          "type": "Hash"
+        },
+        {
+          "name": "asset_b",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "get_pools_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "get_pool_by_index_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "index",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "get_fees_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "set_base_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "set_treasury_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "set_max_volatility_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "v",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "set_max_swap_pct_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "p",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 34,
+      "name": "set_psm_mint_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 35,
+      "name": "set_psm_redeem_fee_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "f",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 36,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 37,
+      "name": "set_oracle",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "oracle",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "set_xusd_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xa",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 39,
+      "name": "set_xusd_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 40,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "t",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 41,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 44,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 56,
+      "name": "set_psm_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "psm",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 58,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

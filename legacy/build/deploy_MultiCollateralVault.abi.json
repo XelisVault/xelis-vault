@@ -1,0 +1,194 @@
+{
+  "data": [
+    {
+      "entry_id": 4,
+      "name": "create_multi_vault",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "add_collateral",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "remove_collateral",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "current_total_collateral_value",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "borrow_multi",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "borrow_amount",
+          "type": "u64"
+        },
+        {
+          "name": "total_collateral_value",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "repay_multi",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "repay_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "liquidate_multi",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "current_total_collateral_value",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_asset_ltv",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset_name",
+          "type": "string"
+        },
+        {
+          "name": "ltv_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

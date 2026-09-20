@@ -1,0 +1,211 @@
+{
+  "data": [
+    {
+      "entry_id": 2,
+      "name": "create_asset",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "transfer_tokens",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "to",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "get_asset_info",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "set_vault_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_psm",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_savings",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "set_minter",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "set_burner",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_asset_hash_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "get_asset_info_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "get_balance_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

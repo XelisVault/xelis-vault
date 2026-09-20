@@ -1,0 +1,650 @@
+// ============================================================================
+// SealedBidAuction.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Sealed-bid (commit-reveal) auction preserved from v4.2.
+//
+// N-02 FIX (carried over from v4.2):
+//   - reveal() tracks the running maximum bid + bidder (stored in "maxbid_*"
+//     and "maxbidder_*" keys) and records every bidder in a flat bidder list.
+//   - settle() reads the tracked max bid (rather than trusting declare_winner)
+//     and stores the winner deterministically.
+//   - declare_winner is DEPRECATED: restricted to the seller AND must match the
+//     tracked max bid/bidder. This prevents permissionless winner manipulation.
+//   - refund_bid() lets every losing bidder reclaim their funds after settle.
+//
+// Two-step emergency_withdraw (IDs 19/20, "ert" key, 17280-block delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : create_auction
+//   1  : commit
+//   2  : reveal
+//   3  : settle
+//   4  : declare_winner        (deprecated, seller-only, must match tracked max)
+//   5  : refund_bid            (N-02 fix: losing bidder refund)
+//   6  : claim_asset
+//   7  : claim_proceeds
+//   8  : get_auction_entry
+//   9  : get_auctions_count_entry
+//   10 : pause
+//   11 : unpause
+//   12 : set_registry
+//   13 : set_treasury
+//   14 : set_timelock
+//   15 : set_guardian
+//   16 : set_emergency
+//   17 : transfer_admin
+//   18 : get_version
+//   19 : request_emergency_withdraw
+//   20 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "SealedBidAuction v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const TREASURY_KEY: string = "tr"
+
+const AUCTIONS_COUNT_KEY: string = "ac"
+const AUCTION_PREFIX: string = "a_"
+const COMMIT_PREFIX: string = "c_"
+const REVEAL_PREFIX: string = "r_"
+
+const MAXBID_PREFIX: string = "maxbid_"
+const MAXBIDDER_PREFIX: string = "maxbidder_"
+const BIDDERS_COUNT_PREFIX: string = "bidders_"
+const BIDDER_LIST_PREFIX: string = "bidder_"
+const REFUNDED_PREFIX: string = "refunded_"
+
+const PROTOCOL_FEE_BPS: u64 = 100
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+struct Auction {
+    id: u64,
+    seller: Address,
+    asset: Hash,
+    amount: u64,
+    bid_asset: Hash,
+    min_bid: u64,
+    commit_end: u64,
+    reveal_end: u64,
+    winning_bidder: optional<Address>,
+    winning_bid: u64,
+    settled: bool,
+    claimed_asset: bool,
+    claimed_proceeds: bool,
+    created_at: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(AUCTIONS_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn auction_key(id: u64) -> string {
+    return AUCTION_PREFIX + id.to_string(10u32)
+}
+
+fn commit_key(auction_id: u64, addr: Address) -> string {
+    return COMMIT_PREFIX + auction_id.to_string(10u32) + "_" + addr.to_string()
+}
+
+fn reveal_key(auction_id: u64, addr: Address) -> string {
+    return REVEAL_PREFIX + auction_id.to_string(10u32) + "_" + addr.to_string()
+}
+
+fn maxbid_key(auction_id: u64) -> string {
+    return MAXBID_PREFIX + auction_id.to_string(10u32)
+}
+
+fn maxbidder_key(auction_id: u64) -> string {
+    return MAXBIDDER_PREFIX + auction_id.to_string(10u32)
+}
+
+fn bidders_count_key(auction_id: u64) -> string {
+    return BIDDERS_COUNT_PREFIX + auction_id.to_string(10u32)
+}
+
+fn bidder_list_key(auction_id: u64, index: u64) -> string {
+    return BIDDER_LIST_PREFIX + auction_id.to_string(10u32) + "_" + index.to_string(10u32)
+}
+
+fn refunded_key(auction_id: u64, addr: Address) -> string {
+    return REFUNDED_PREFIX + auction_id.to_string(10u32) + "_" + addr.to_string()
+}
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: create_auction
+// Create a new sealed-bid (commit-reveal) auction: seller deposits the asset, sets min bid and durations.
+// @caller: any user (the seller)
+// @params: asset - Hash of the asset being auctioned
+// @params: amount - quantity of asset to auction (must be > 0)
+// @params: bid_asset - Hash of the asset bids are denominated in
+// @params: min_bid - minimum acceptable bid amount
+// @params: commit_duration - length of commit phase in blocks (1440..=43200)
+// @params: reveal_duration - length of reveal phase in blocks (1440..=43200)
+// @returns: new auction id
+// @security: when_not_paused, requires pre-deposit of asset, duration bounds enforced, refunds leftover deposit to seller
+// create auction.
+entry create_auction(
+    asset: Hash,
+    amount: u64,
+    bid_asset: Hash,
+    min_bid: u64,
+    commit_duration: u64,
+    reveal_duration: u64
+) -> u64 {
+    when_not_paused()
+    require(amount > 0, "amtgt0")
+    require(min_bid > 0, "nomin")
+    require(commit_duration >= 1440 && commit_duration <= 43200, "badcdur")
+    require(reveal_duration >= 1440 && reveal_duration <= 43200, "badrdur")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
+
+    let current_topo: u64 = get_current_topoheight()
+    let id: u64 = s.load(AUCTIONS_COUNT_KEY).unwrap_or(0)
+    let auction: Auction = Auction {
+        id: id,
+        seller: caller,
+        asset: asset,
+        amount: amount,
+        bid_asset: bid_asset,
+        min_bid: min_bid,
+        commit_end: current_topo + commit_duration,
+        reveal_end: current_topo + commit_duration + reveal_duration,
+        winning_bidder: null,
+        winning_bid: 0,
+        settled: false,
+        claimed_asset: false,
+        claimed_proceeds: false,
+        created_at: current_topo
+    }
+    s.store(auction_key(id), auction)
+    s.store(AUCTIONS_COUNT_KEY, id + 1)
+    return 0
+}
+
+// ID 1: commit
+// Submit a sealed bid hash for an auction during the commit phase (one commit per bidder).
+// @caller: any bidder
+// @params: auction_id - target auction id
+// @params: bid_hash - hash of (bid_amount || nonce || bidder_address)
+// @returns: 0 on success
+// @security: when_not_paused, must be within commit window, one commit per bidder enforced
+// commit.
+entry commit(auction_id: u64, bid_hash: Hash) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo <= auction.commit_end, "commitend")
+
+    let key: string = commit_key(auction_id, caller)
+    let existing: optional<Hash> = s.load(key)
+    require(existing.is_none(), "alreadycommitted")
+
+    s.store(key, bid_hash)
+    return 0
+}
+
+// ID 2: reveal
+// Reveal a previously committed bid; verifies the hash and deposits the bid amount, tracking the running max.
+// @caller: bidder who previously committed
+// @params: auction_id - target auction id
+// @params: bid_amount - revealed bid amount (must be >= min_bid)
+// @params: nonce - nonce used in the original commit hash
+// @returns: 0 on success
+// @security: when_not_paused, must be within reveal window, hash must match commit, requires pre-deposit of bid_asset; updates running max bid/bidder (N-02 fix)
+// reveal.
+entry reveal(auction_id: u64, bid_amount: u64, nonce: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > auction.commit_end, "notreveal")
+    require(current_topo <= auction.reveal_end, "revealend")
+    require(bid_amount >= auction.min_bid, "lowbid")
+
+    let ck: string = commit_key(auction_id, caller)
+    let committed_hash: Hash = s.load(ck).expect("nocommit")
+
+    let reveal_data: string = bid_amount.to_string(10u32) + "_" + nonce.to_string(10u32) + "_" + caller.to_string()
+    let computed_hash: Hash = Hash::blake3(reveal_data.to_bytes())
+    require(computed_hash == committed_hash, "hashmismatch")
+
+    let dep: u64 = get_deposit_for_asset(auction.bid_asset).expect("err")
+    require(dep >= bid_amount, "insdep")
+    if dep > bid_amount {
+        let _ = transfer(caller, dep - bid_amount, auction.bid_asset)
+    }
+
+    s.store(reveal_key(auction_id, caller), bid_amount)
+
+    // N-02 FIX: track running maximum bid
+    let current_max: u64 = s.load(maxbid_key(auction_id)).unwrap_or(0)
+    if bid_amount > current_max {
+        s.store(maxbid_key(auction_id), bid_amount)
+        s.store(maxbidder_key(auction_id), caller)
+    }
+    let bidders: u64 = s.load(bidders_count_key(auction_id)).unwrap_or(0)
+    s.store(bidders_count_key(auction_id), bidders + 1)
+    s.store(bidder_list_key(auction_id, bidders), caller)
+
+    return 0
+}
+
+// ID 3: settle — reads the tracked max bid (N-02 fix)
+// Settle the auction after the reveal phase ends, recording the tracked max bidder as the winner.
+// @caller: anyone
+// @params: auction_id - target auction id
+// @returns: 0 on success
+// @security: when_not_paused, requires reveal phase ended, requires at least one reveal, idempotency check (settled flag), reads tracked max (not user-supplied)
+// settle.
+entry settle(auction_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+    require(!auction.settled, "alreadysettled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > auction.reveal_end, "notended")
+
+    let max_bid: u64 = s.load(maxbid_key(auction_id)).unwrap_or(0)
+    require(max_bid > 0, "noreveals")
+
+    let winner: Address = s.load(maxbidder_key(auction_id)).expect("nowinner")
+
+    auction.winning_bidder = winner
+    auction.winning_bid = max_bid
+    auction.settled = true
+    s.store(auction_key(auction_id), auction)
+    return 0
+}
+
+// ID 4: declare_winner — DEPRECATED (seller-only, must match tracked max)
+// Deprecated alternative settler; restricted to the seller and the supplied winner/bid must match the tracked max (N-02 fix).
+// @caller: auction seller only
+// @params: auction_id - target auction id
+// @params: winner - address that must match the tracked max bidder
+// @params: winning_bid - amount that must match the tracked max bid
+// @returns: 0 on success
+// @security: when_not_paused, only seller, post-reveal-window, requires exact match with tracked max (no permissionless winner manipulation)
+// declare winner.
+entry declare_winner(auction_id: u64, winner: Address, winning_bid: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+    require(!auction.settled, "alreadysettled")
+
+    let current_topo: u64 = get_current_topoheight()
+    require(current_topo > auction.reveal_end, "notended")
+
+    let caller: Address = get_caller().expect("err")
+    require(auction.seller == caller, "notseller")
+
+    let tracked_max: u64 = s.load(maxbid_key(auction_id)).unwrap_or(0)
+    let tracked_winner: Address = s.load(maxbidder_key(auction_id)).expect("nowinner")
+
+    require(winner == tracked_winner, "notmaxbidder")
+    require(winning_bid == tracked_max, "notmaxbid")
+
+    auction.winning_bidder = winner
+    auction.winning_bid = winning_bid
+    auction.settled = true
+    s.store(auction_key(auction_id), auction)
+    return 0
+}
+
+// ID 5: refund_bid — N-02 fix: losing bidder refund
+// Refund a losing bidder's deposited bid amount after the auction has settled.
+// @caller: losing bidder
+// @params: auction_id - target auction id
+// @returns: 0 on success
+// @security: requires auction settled, winner cannot refund, one-shot per bidder (refunded flag), requires prior reveal
+// refund bid.
+entry refund_bid(auction_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+    require(auction.settled, "notsettled")
+
+    if auction.winning_bidder.is_some() {
+        require(auction.winning_bidder.expect("err") != caller, "iswinner")
+    }
+
+    let rk: string = refunded_key(auction_id, caller)
+    let already: bool = s.load(rk).unwrap_or(false)
+    require(!already, "alreadyrefunded")
+
+    let bid_amount: u64 = s.load(reveal_key(auction_id, caller)).unwrap_or(0)
+    require(bid_amount > 0, "nobid")
+
+    let _ = transfer(caller, bid_amount, auction.bid_asset)
+    s.store(rk, true)
+    return 0
+}
+
+// ID 6: claim_asset
+// Winning bidder claims the auctioned asset after settlement.
+// @caller: winning bidder only
+// @params: auction_id - target auction id
+// @returns: 0 on success
+// @security: when_not_paused, requires settled, requires caller is winner, one-shot (claimed_asset flag)
+// claim asset.
+entry claim_asset(auction_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+    require(auction.settled, "notsettled")
+    require(auction.winning_bidder.is_some(), "nowinner")
+    require(auction.winning_bidder.expect("err") == caller, "notwinner")
+    require(!auction.claimed_asset, "alreadyclaimed")
+
+    let _ = transfer(caller, auction.amount, auction.asset)
+    auction.claimed_asset = true
+    s.store(auction_key(auction_id), auction)
+    return 0
+}
+
+// ID 7: claim_proceeds
+// Seller claims the winning bid proceeds (minus protocol fee) after settlement.
+// @caller: auction seller only
+// @params: auction_id - target auction id
+// @returns: 0 on success
+// @security: when_not_paused, requires settled, only seller, one-shot (claimed_proceeds flag), protocol fee routed to treasury
+// claim proceeds.
+entry claim_proceeds(auction_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let auction: Auction = s.load(auction_key(auction_id)).expect("anf")
+    require(auction.settled, "notsettled")
+    require(auction.seller == caller, "notseller")
+    require(!auction.claimed_proceeds, "alreadyclaimed")
+
+    let fee: u64 = (auction.winning_bid as u128 * PROTOCOL_FEE_BPS as u128 / 10000u128) as u64
+    let proceeds: u64 = auction.winning_bid - fee
+
+    let _ = transfer(caller, proceeds, auction.bid_asset)
+
+    if fee > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("trnoset")
+        let _ = transfer(treasury, fee, auction.bid_asset)
+    }
+
+    auction.claimed_proceeds = true
+    s.store(auction_key(auction_id), auction)
+    return 0
+}
+
+// ID 8: get_auction_entry
+// Return the public state of an auction.
+// @caller: anyone
+// @params: auction_id - target auction id
+// @returns: tuple (seller, asset, amount, bid_asset, min_bid, commit_end, reveal_end, winning_bidder, winning_bid, settled)
+// @security: read-only view, no access control
+// get auction entry.
+entry get_auction_entry(auction_id: u64) -> (Address, Hash, u64, Hash, u64, u64, u64, optional<Address>, u64, bool) {
+    let a: Auction = Storage::new().load(auction_key(auction_id)).expect("anf")
+    return (
+        a.seller, a.asset, a.amount, a.bid_asset, a.min_bid,
+        a.commit_end, a.reveal_end, a.winning_bidder, a.winning_bid, a.settled
+    )
+}
+
+// ID 9: get_auctions_count_entry
+// Return the total number of auctions created.
+// @caller: anyone
+// @returns: count of auctions
+// @security: read-only view, no access control
+// get auctions count entry.
+entry get_auctions_count_entry() -> u64 {
+    return Storage::new().load(AUCTIONS_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 10: pause
+// Pause all auction-creating / bidding / settling operations.
+// @caller: guardian or admin
+// @params: reason - human-readable pause reason
+// @returns: 0 on success
+// @security: only_guardian_or_admin, sets PAUSED_KEY to true
+// pause.
+entry pause(reason: string) -> u64 {
+    only_guardian_or_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 11: unpause
+// Resume auction operations after a pause.
+// @caller: admin or timelock
+// @returns: 0 on success
+// @security: only_admin (stricter than pause)
+// unpause.
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 12: set_registry
+// Update the ContractRegistry hash (reserved).
+// @caller: admin or timelock
+// @params: reg - new registry contract Hash
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set registry.
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 13: set_treasury
+// Update the treasury address that receives protocol fees from auction proceeds.
+// @caller: admin or timelock
+// @params: t - new treasury Address
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set treasury.
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+// ID 14: set_timelock
+// Set the timelock contract hash allowed to invoke admin-gated entries.
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, sets the alternate admin path
+// set timelock.
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 15: set_guardian
+// Update the guardian address that may pause the contract.
+// @caller: admin or timelock
+// @params: g - new guardian Address
+// @returns: 0 on success
+// @security: only_admin, privileged configuration
+// set guardian.
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// ID 16: set_emergency
+// Hand off the emergency role to a new address (requires current emergency role to call).
+// @caller: emergency role
+// @params: e - new emergency Address
+// @returns: 0 on success
+// @security: only_emergency, two-party handoff
+// set emergency.
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 17: transfer_admin
+// Transfer the admin role to a new address (single-step; verify before calling).
+// @caller: admin or timelock
+// @params: new_admin - address that will become the new admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer — ensure new_admin is correct before committing
+// transfer admin.
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 18: get_version
+// Return the contract version string.
+// @caller: anyone
+// @returns: semantic version string (e.g. "SealedBidAuction v5.0")
+// @security: read-only view, no access control
+// get version.
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 19: request_emergency_withdraw
+// First step of the 2-step emergency withdraw: record current topoheight as request timestamp.
+// @caller: emergency role
+// @returns: 0 on success
+// @security: only_emergency, starts 17280-block (~24h) timelock before execution
+// request emergency withdraw.
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 20: execute_emergency_withdraw
+// Second step of the 2-step emergency withdraw: sweep the entire balance of an asset to the emergency role.
+// @caller: emergency role
+// @params: asset - which asset Hash to withdraw fully
+// @returns: 0 on success
+// @security: only_emergency, requires prior request_emergency_withdraw, enforced 17280-block delay, single-use (deletes request key)
+// execute emergency withdraw.
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+// Return the public state of an auction.
+// @caller: anyone
+// @params: auction_id - target auction id
+// @returns: tuple (seller, asset, amount, bid_asset, min_bid, commit_end, reveal_end, winning_bidder, winning_bid, settled)
+// @security: read-only view, no access control
+// get auction.
+pub fn get_auction(auction_id: u64) -> (Address, Hash, u64, Hash, u64, u64, u64, optional<Address>, u64, bool) {
+    let a: Auction = Storage::new().load(auction_key(auction_id)).expect("anf")
+    return (
+        a.seller, a.asset, a.amount, a.bid_asset, a.min_bid,
+        a.commit_end, a.reveal_end, a.winning_bidder, a.winning_bid, a.settled
+    )
+}
+
+// Return the total number of auctions created.
+// @caller: anyone
+// @returns: count of auctions
+// @security: read-only view, no access control
+// get auctions count.
+pub fn get_auctions_count() -> u64 {
+    return Storage::new().load(AUCTIONS_COUNT_KEY).unwrap_or(0)
+}
+
+// Set the timelock contract hash (alternate admin path via contract-caller check).
+// @caller: admin or timelock
+// @params: tl - new timelock contract Hash
+// @returns: 0 on success
+// @security: only_admin, mirrors the entry version for read-only callers
+// set timelock tl.
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}

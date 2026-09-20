@@ -1,0 +1,364 @@
+// ============================================================================
+// NotificationCenter.slx — XELIS Vault v10.2 (Brainstorming Feature #2)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Système de notifications on-chain pour alertes automatiques.
+//
+// RÔLE : Les utilisateurs enregistrent leurs préférences (push token chiffré,
+//        email hash, telegram chat_id chiffré) UNE fois. Les bots off-chain
+//        surveillent les events on-chain et envoient les notifications.
+//
+// PRIVACY : Aucune donnée PII n'est stockée en clair. Les identifiants sont
+//           hachés (email) ou chiffrés (telegram, push token). Seul l'utilisateur
+//           peut décoder son payload via sa clé privée.
+//
+// NOTIFICATIONS POSSIBLES :
+//   - Health factor < 150% (vault à risque)
+//   - Vault liquidable (health < 100%)
+//   - Prix XEL a bougé de >10% en 5 min
+//   - Proposition de governance exécutée
+//   - Récompenses VLT reçues
+//   - Message VaultChat en attente
+//   - Liquidation exécutée sur votre vault
+//   - Prêt P2P arrivé à échéance
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : register_preferences
+//   1  : update_contact_info
+//   2  : update_notification_prefs
+//   3  : unsubscribe
+//   4  : get_preferences (pub fn)
+//   5  : get_subscriber_count (pub fn)
+//   6  : emit_notification_event (relayer/guardian only)
+//   7  : set_registry
+//   8  : set_timelock
+//   9  : set_guardian
+//   10 : pause
+//   11 : unpause
+//   12 : transfer_admin
+//   13 : get_version
+// ============================================================================
+
+const VERSION: string = "NotificationCenter v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const SUBSCRIBER_PREFIX: string = "sub_"
+const SUBSCRIBER_COUNT_KEY: string = "sc"
+
+// Notification type bitmask
+const NT_VAULT_HEALTH: u8 = 1
+const NT_LIQUIDATION: u8 = 2
+const NT_PRICE_ALERT: u8 = 4
+const NT_GOVERNANCE: u8 = 8
+const NT_REWARDS: u8 = 16
+const NT_CHAT: u8 = 32
+const NT_P2P_LOAN: u8 = 64
+const NT_ALL: u8 = 127
+
+// Delivery channel bitmask
+const CH_PUSH: u8 = 1
+const CH_EMAIL: u8 = 2
+const CH_TELEGRAM: u8 = 4
+const CH_ALL: u8 = 7
+
+struct NotificationPreferences {
+    // Encrypted contact info (only user can decrypt)
+    encrypted_push_token: bytes,        // E2E encrypted push token
+    encrypted_email_hash: Hash,         // SHA-256 of email (for dedup)
+    encrypted_telegram_id: bytes,       // E2E encrypted Telegram chat_id
+    // Bitmask of which notification types user wants
+    notification_mask: u8,
+    // Bitmask of which channels to use
+    channel_mask: u8,
+    // Minimum severity threshold (1=low, 2=medium, 3=high, 4=critical)
+    min_severity: u8,
+    // Quiet hours (in UTC seconds since midnight, 0-86399)
+    quiet_start: u32,
+    quiet_end: u32,
+    active: bool,
+    registered_at: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(SUBSCRIBER_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Register notification preferences (one-time setup)
+// User provides encrypted contact info + desired notification types
+entry register_preferences(
+    encrypted_push_token: bytes,
+    encrypted_email_hash: Hash,
+    encrypted_telegram_id: bytes,
+    notification_mask: u8,
+    channel_mask: u8,
+    min_severity: u8,
+    quiet_start: u32,
+    quiet_end: u32
+) -> u64 {
+    when_not_paused()
+    require(notification_mask > 0, "nonotif")
+    require(channel_mask > 0, "nochan")
+    require(min_severity >= 1 && min_severity <= 4, "badsev")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let key: string = SUBSCRIBER_PREFIX + caller.to_string()
+
+    let existing: optional<NotificationPreferences> = s.load(key)
+    let is_new: bool = existing.is_none()
+
+    let prefs: NotificationPreferences = NotificationPreferences {
+        encrypted_push_token: encrypted_push_token,
+        encrypted_email_hash: encrypted_email_hash,
+        encrypted_telegram_id: encrypted_telegram_id,
+        notification_mask: notification_mask,
+        channel_mask: channel_mask,
+        min_severity: min_severity,
+        quiet_start: quiet_start,
+        quiet_end: quiet_end,
+        active: true,
+        registered_at: get_current_topoheight()
+    }
+    s.store(key, prefs)
+
+    if is_new {
+        let count: u64 = s.load(SUBSCRIBER_COUNT_KEY).unwrap_or(0)
+        s.store(SUBSCRIBER_COUNT_KEY, count + 1)
+    }
+
+    // Emit event for notification bots to pick up
+    emit_event(0u64, ["NotificationRegistered", caller.to_string()])
+    return 0
+}
+
+// Entry 1: Update encrypted contact blobs (push token + telegram id)
+// Two fields at once is cheaper than two separate transactions
+entry update_contact_info(encrypted_push_token: bytes, encrypted_telegram_id: bytes) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let key: string = SUBSCRIBER_PREFIX + caller.to_string()
+
+    let prefs_opt: optional<NotificationPreferences> = s.load(key)
+    require(prefs_opt.is_some(), "notreg")
+    let prefs: NotificationPreferences = prefs_opt.expect("err")
+    prefs.encrypted_push_token = encrypted_push_token
+    prefs.encrypted_telegram_id = encrypted_telegram_id
+    s.store(key, prefs)
+    return 0
+}
+
+// Entry 2: Update notification preferences (masks + severity + quiet hours)
+entry update_notification_prefs(
+    notification_mask: u8,
+    channel_mask: u8,
+    min_severity: u8,
+    quiet_start: u32,
+    quiet_end: u32
+) -> u64 {
+    when_not_paused()
+    require(notification_mask > 0, "nonotif")
+    require(channel_mask > 0, "nochan")
+    require(min_severity >= 1 && min_severity <= 4, "badsev")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let key: string = SUBSCRIBER_PREFIX + caller.to_string()
+
+    let prefs_opt: optional<NotificationPreferences> = s.load(key)
+    require(prefs_opt.is_some(), "notreg")
+    let prefs: NotificationPreferences = prefs_opt.expect("err")
+    prefs.notification_mask = notification_mask
+    prefs.channel_mask = channel_mask
+    prefs.min_severity = min_severity
+    prefs.quiet_start = quiet_start
+    prefs.quiet_end = quiet_end
+    s.store(key, prefs)
+    return 0
+}
+
+// Entry 3: Unsubscribe (mark inactive, keep history for analytics)
+entry unsubscribe() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let key: string = SUBSCRIBER_PREFIX + caller.to_string()
+
+    let prefs_opt: optional<NotificationPreferences> = s.load(key)
+    require(prefs_opt.is_some(), "notreg")
+    let prefs: NotificationPreferences = prefs_opt.expect("err")
+    prefs.active = false
+    s.store(key, prefs)
+
+    let count: u64 = s.load(SUBSCRIBER_COUNT_KEY).unwrap_or(0)
+    if count > 0 {
+        s.store(SUBSCRIBER_COUNT_KEY, count - 1)
+    }
+    return 0
+}
+
+// Pub fn 4: Get preferences for a user (notification bots read this)
+// Privacy: returns encrypted blobs only — bots cannot decrypt without user's key
+pub fn get_preferences(user: Address) -> (bytes, Hash, bytes, u8, u8, u8, u32, u32, bool, u64) {
+    let s: Storage = Storage::new()
+    let prefs: NotificationPreferences = s.load(SUBSCRIBER_PREFIX + user.to_string()).expect("notreg")
+    return (
+        prefs.encrypted_push_token,
+        prefs.encrypted_email_hash,
+        prefs.encrypted_telegram_id,
+        prefs.notification_mask,
+        prefs.channel_mask,
+        prefs.min_severity,
+        prefs.quiet_start,
+        prefs.quiet_end,
+        prefs.active,
+        prefs.registered_at
+    )
+}
+
+// Pub fn 5: Get total active subscriber count
+pub fn get_subscriber_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(SUBSCRIBER_COUNT_KEY).unwrap_or(0)
+}
+
+// Entry 6: Emit a notification event (called by relayers/guardians/contracts)
+// Bots watch the event stream and route notifications to the right users
+entry emit_notification_event(
+    recipient: Address,
+    notification_type: u8,
+    severity: u8,
+    encrypted_payload: bytes
+) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Verify caller is authorized (admin, guardian, or a registered protocol contract)
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+    let is_authorized: bool = caller == admin || caller == guardian
+
+    // Also allow any registered contract in the registry to emit
+    if !is_authorized {
+        let reg_opt: optional<Hash> = s.load(REGISTRY_KEY)
+        if reg_opt.is_some() {
+            // In production, would call registry.is_registered(caller)
+            // For now, trust the contract caller chain
+            let cc_opt: optional<Hash> = get_contract_caller()
+            is_authorized = cc_opt.is_some()
+        }
+    }
+    require(is_authorized, "notauth")
+
+    // Check if recipient wants this notification type
+    let prefs_opt: optional<NotificationPreferences> = s.load(SUBSCRIBER_PREFIX + recipient.to_string())
+    if prefs_opt.is_some() {
+        let prefs: NotificationPreferences = prefs_opt.expect("err")
+        if prefs.active && (prefs.notification_mask & notification_type) != 0 && severity >= prefs.min_severity {
+            // Emit event — bots pick this up and deliver via preferred channel
+            let event_data: string = recipient.to_string() + "_" + notification_type.to_string(10u32) + "_" + severity.to_string(10u32)
+            emit_event(0u64, ["Notify", event_data])
+        }
+    }
+    return 0
+}
+
+// Entry 7: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 8: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 9: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 10: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 11: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 12: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 13: Get version
+entry get_version() -> string {
+    return VERSION
+}

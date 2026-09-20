@@ -1,0 +1,319 @@
+// ============================================================================
+// FlashLoan.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #5: flash_loan() rewritten cleanly with proper balance check.
+// FIX #14: Two-step emergency_withdraw.
+// ============================================================================
+const VERSION: string = "FlashLoan v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const TREASURY_KEY: string = "tr"
+const REGISTRY_KEY: string = "reg"
+
+const FEE_BPS_KEY: string = "fb"
+const TOTAL_EARNED_KEY: string = "te"
+const RG_STATUS_KEY: string = "rg"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+const DEFAULT_FEE_BPS: u64 = 9
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+const VERIFIED_CALLBACK_PREFIX: string = "vcb_"
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(FEE_BPS_KEY, DEFAULT_FEE_BPS)
+    s.store(TOTAL_EARNED_KEY, 0u64)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn non_reentrant() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+// ============================================================================
+// ENTRIES (sequential IDs starting at 0)
+// ============================================================================
+
+// ID 0: flash_loan — FIX #5: clean structure, proper balance check
+// flash loan.
+// @caller: user / authorized caller
+// @params: asset - Hash
+// @params: amount - u64
+// @params: callback_contract - Hash
+// @params: callback_data - bytes
+// @returns: u
+// @security: non_reentrant
+entry flash_loan(
+    asset: Hash,
+    amount: u64,
+    callback_contract: Hash,
+    callback_data: bytes
+) -> u64 {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+    non_reentrant()
+    require(amount > 0, "amtgt0")
+
+    // v10.5: Verify callback contract is whitelisted (audit fix)
+    let cb_verified: bool = s.load(VERIFIED_CALLBACK_PREFIX + callback_contract.to_hex()).unwrap_or(false)
+    require(cb_verified, "cbnotverified")
+
+    let balance_before: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(balance_before >= amount, "insliquidity")
+
+    let fee_bps: u64 = s.load(FEE_BPS_KEY).unwrap_or(DEFAULT_FEE_BPS)
+    let fee: u64 = (amount as u128 * fee_bps as u128 / 10000u128) as u64
+    let total_to_repay: u64 = amount + fee
+    require(total_to_repay >= amount, "ovf")
+
+    // F-02 fix (CRITICAL): Send the principal to the callback contract (NOT to the originating caller EOA).
+    //   The callback contract is the one that operates on the principal during the loan.
+    let caller: Address = get_caller().expect("err")
+    let cb: Contract = Contract::new(callback_contract).expect("err")
+    require(transfer_contract(callback_contract, amount, asset), "xferfail")
+    // v11.7 fix: invoke on_flash_loan at its real chunk ID (2) as a cross-contract
+    //   call. Cross-contract requires Access::All (`pub fn`) — the v11.5 `entry`
+    //   version of on_flash_loan reverted with "Chunk is not public".
+    //   (Historical note: the pre-v11.5 bug was a stale chunk id hitting
+    //   set_flash_loan; the F-02 fix swapped visibility instead of fixing the id.)
+    let result: u64 = cb.call(2u16, [asset, amount, fee, caller, callback_data], {})
+    require(result == 0, "cbfail")
+
+    // After callback, balance must be >= balance_before + fee
+    let balance_after: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    require(balance_after >= balance_before + fee, "notrepaid")
+
+    // Send fee to treasury
+    if fee > 0 {
+        let treasury: Address = s.load(TREASURY_KEY).expect("err")
+        let _ = transfer(treasury, fee, asset)
+        let total_earned: u64 = s.load(TOTAL_EARNED_KEY).unwrap_or(0)
+        s.store(TOTAL_EARNED_KEY, total_earned + fee)
+    }
+
+    release_reentrancy()
+    return 0
+}
+
+// ID 1: get_fee_bps_entry
+// get fee bps entry.
+// @caller: user / authorized caller
+// @returns: u
+// @security: standard access control
+entry get_fee_bps_entry() -> u64 {
+    return Storage::new().load(FEE_BPS_KEY).unwrap_or(DEFAULT_FEE_BPS)
+}
+
+// ID 2: get_total_earned_entry
+// get total earned entry.
+// @caller: user / authorized caller
+// @returns: u
+// @security: standard access control
+entry get_total_earned_entry() -> u64 {
+    return Storage::new().load(TOTAL_EARNED_KEY).unwrap_or(0)
+}
+
+// ID 3: get_available_liquidity_entry
+// get available liquidity entry.
+// @caller: user / authorized caller
+// @params: asset - Hash
+// @returns: u
+// @security: only_admin
+entry get_available_liquidity_entry(asset: Hash) -> u64 {
+    return get_balance_for_asset(asset).unwrap_or(0)
+}
+
+// ID 4: set_fee_bps
+// set fee bps.
+// @caller: admin (or timelock)
+// @params: bps - u64
+// @returns: u
+// @security: only_admin, only_guardian_or_admin
+entry set_fee_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 1 && bps <= 100, "badval")
+    Storage::new().store(FEE_BPS_KEY, bps)
+    return 0
+}
+
+// ID 5: pause
+// pause.
+// @caller: guardian or admin
+// @params: reason - string
+// @returns: u
+// @security: only_admin, only_guardian_or_admin
+entry pause(reason: string) -> u64 { only_guardian_or_admin() Storage::new().store(PAUSED_KEY, true) return 0 }
+
+// ID 6: unpause
+// unpause.
+// @caller: guardian or admin
+// @returns: u
+// @security: only_admin
+entry unpause() -> u64 { only_admin() Storage::new().store(PAUSED_KEY, false) return 0 }
+
+// ID 7: set_treasury
+// set treasury.
+// @caller: guardian or admin
+// @params: t - Address
+// @returns: u
+// @security: only_admin
+entry set_treasury(t: Address) -> u64 { only_admin() Storage::new().store(TREASURY_KEY, t) return 0 }
+
+// ID 8: set_registry
+// set registry.
+// @caller: guardian or admin
+// @params: reg - Hash
+// @returns: u
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// ID 9: set_timelock
+// set timelock.
+// @caller: guardian or admin
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ID 10: set_guardian
+// set guardian.
+// @caller: guardian or admin
+// @params: g - Address
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_guardian(g: Address) -> u64 { only_admin() Storage::new().store(GUARDIAN_KEY, g) return 0 }
+
+// ID 11: set_emergency
+// set emergency.
+// @caller: admin (or timelock)
+// @params: e - Address
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_emergency(e: Address) -> u64 { only_emergency() Storage::new().store(EMERGENCY_KEY, e) return 0 }
+
+// ID 12: transfer_admin
+// transfer admin.
+// @caller: admin (or timelock)
+// @params: new_admin - Address
+// @returns: u
+// @security: only_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// ID 13: get_version
+// get version.
+// @caller: user / authorized caller
+// @returns: s
+// @security: 2-step withdraw (24h delay)
+entry get_version() -> string { return VERSION }
+
+// ID 14: request_emergency_withdraw
+// request emergency withdraw.
+// @caller: any user
+// @returns: u
+// @security: 2-step withdraw (24h delay)
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 15: execute_emergency_withdraw
+// execute emergency withdraw.
+// @caller: any user
+// @params: asset - Hash
+// @returns: u
+// @security: 2-step withdraw (24h delay)
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// pub fn (read-only)
+// set timelock tl.
+// @caller: anyone (read-only)
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// ============================================================================
+// v6.0: Callback verification
+// ============================================================================
+
+
+entry verify_callback(callback_contract: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(VERIFIED_CALLBACK_PREFIX + callback_contract.to_hex(), true)
+    return 0
+}
+
+entry revoke_callback(callback_contract: Hash) -> u64 {
+    only_admin()
+    Storage::new().delete(VERIFIED_CALLBACK_PREFIX + callback_contract.to_hex())
+    return 0
+}
+
+pub fn is_callback_verified(callback_contract: Hash) -> bool {
+    return Storage::new().load(VERIFIED_CALLBACK_PREFIX + callback_contract.to_hex()).unwrap_or(false)
+}

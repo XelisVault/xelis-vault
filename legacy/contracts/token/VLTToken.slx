@@ -1,0 +1,375 @@
+// ============================================================================
+// VLTToken.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Entry IDs:
+//   0: mint_to (private fn called via entry wrapper for batch)
+//   1: burn_own
+//   2: mint_batch
+//   3: set_minter
+//   4: set_burner
+//   ...
+// ============================================================================
+const VERSION: string = "VLTToken v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const REGISTRY_KEY: string = "reg"
+const ASSET_HASH_KEY: string = "ah"
+const MAX_SUPPLY_KEY: string = "ms"
+const TOTAL_BURNED_KEY: string = "tb"
+const MINTER_PREFIX: string = "mi_"
+const BURNER_PREFIX: string = "bu_"
+
+const MAX_SUPPLY: u64 = 1000000000000000
+const DECIMALS: u8 = 8
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn require_minter() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let cc_opt: optional<Hash> = get_contract_caller()
+    if cc_opt.is_some() {
+        let cc: Hash = cc_opt.expect("err")
+        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_minter, "notminter")
+        return
+    }
+    require(false, "notminter")
+}
+
+fn require_burner() {
+    let s: Storage = Storage::new()
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notburner")
+    let cc: Hash = cc_opt.expect("err")
+    let is_burner: bool = s.load(BURNER_PREFIX + cc.to_hex()).unwrap_or(false)
+    require(is_burner, "notburner")
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(MAX_SUPPLY_KEY, MAX_SUPPLY)
+    s.store(TOTAL_BURNED_KEY, 0u64)
+    return 0
+}
+
+// Mint VLT to a recipient (callable by authorized minter, e.g., XelisVaultMiner).
+// @caller: authorized minter contract or admin
+// @params: to - recipient address
+// @params: amount - VLT atomic units to mint
+// @returns: 0 on success
+// @security: require_minter (admin or whitelisted contract); enforces MAX_SUPPLY cap
+// ID 0: mint_to (callable by authorized minter, e.g., XelisVaultMiner)
+pub fn mint_to(to: Address, amount: u64) -> u64 {
+    require_minter()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    let current_supply: u64 = asset.get_supply()
+    let max_supply: u64 = s.load(MAX_SUPPLY_KEY).unwrap_or(MAX_SUPPLY)
+    require(current_supply + amount <= max_supply, "supmax")
+    let ok: bool = asset.mint(amount)
+    require(ok, "mintfail")
+    let ok2: bool = transfer(to, amount, hash)
+    require(ok2, "txfail")
+    return 0
+}
+
+// Burn VLT from the caller's own balance (self-service burn).
+// @caller: any VLT holder
+// @params: amount - VLT atomic units to burn
+// @returns: 0 on success
+// @security: requires balance >= amount; updates TOTAL_BURNED_KEY counter
+// ID 1: burn_own
+entry burn_own(amount: u64) -> u64 {
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+    require(bal >= amount, "insbal")
+    let ok: bool = burn(amount, hash)
+    require(ok, "burnfail")
+    let total_burned: u64 = s.load(TOTAL_BURNED_KEY).unwrap_or(0)
+    s.store(TOTAL_BURNED_KEY, total_burned + amount)
+    return 0
+}
+
+// Mint VLT to up to 32 recipients in one call (batch version of mint_to).
+// @caller: authorized minter contract or admin
+// @params: recipients - array of recipient addresses (1..=32)
+// @params: amounts - array of VLT amounts, parallel to recipients
+// @returns: 0 on success
+// @security: require_minter; arrays must have equal length; each mint enforces MAX_SUPPLY cap
+// ID 2: mint_batch
+entry mint_batch(recipients: Address[], amounts: u64[]) -> u64 {
+    require_minter()
+    let n: u64 = recipients.len() as u64
+    require(n == amounts.len() as u64, "lenmismatch")
+    require(n > 0 && n <= 32, "badcount")
+    let i: u64 = 0
+    while i < n {
+        // Call own mint_to via internal entry — but we are already in an entry,
+        // so we replicate the logic to avoid re-entry issues
+        let to: Address = recipients[i as u32]
+        let amount: u64 = amounts[i as u32]
+        require(amount > 0, "amtgt0")
+        let s: Storage = Storage::new()
+        let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+        let asset: Asset = Asset::get_by_hash(hash).expect("err")
+        let current_supply: u64 = asset.get_supply()
+        let max_supply: u64 = s.load(MAX_SUPPLY_KEY).unwrap_or(MAX_SUPPLY)
+        require(current_supply + amount <= max_supply, "supmax")
+        let ok: bool = asset.mint(amount)
+        require(ok, "mintfail")
+        let ok2: bool = transfer(to, amount, hash)
+        require(ok2, "txfail")
+        i += 1
+    }
+    return 0
+}
+
+// Whitelist (or remove) a minter contract that may call mint_to / mint_batch.
+// @caller: admin (or timelock via contract call)
+// @params: contract_hash - minter contract hash to whitelist
+// @params: enabled - true to allow, false to revoke
+// @returns: 0 on success
+// @security: only_admin
+// ID 3: set_minter
+entry set_minter(contract_hash: Hash, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store(MINTER_PREFIX + contract_hash.to_hex(), enabled)
+    return 0
+}
+
+// Whitelist (or remove) a burner contract that may call burn_from.
+// @caller: admin (or timelock via contract call)
+// @params: contract_hash - burner contract hash to whitelist
+// @params: enabled - true to allow, false to revoke
+// @returns: 0 on success
+// @security: only_admin
+// ID 4: set_burner
+entry set_burner(contract_hash: Hash, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store(BURNER_PREFIX + contract_hash.to_hex(), enabled)
+    return 0
+}
+
+// Create the VLT asset (one-time initialization, fails if already created).
+// @caller: admin (or timelock via contract call)
+// @returns: 0 on success
+// @security: only_admin; one-shot (existing asset hash check); creates asset with MAX_SUPPLY and MaxSupplyMode::None
+// ID 5: create_asset
+entry create_asset() -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let existing: optional<Hash> = s.load(ASSET_HASH_KEY)
+    require(existing.is_none(), "exists")
+    let asset: Asset = Asset::create(
+        MAX_SUPPLY, "XELIS Vault", "VLT", DECIMALS, MaxSupplyMode::Mintable { max_supply: MAX_SUPPLY }
+    ).expect("err")
+    let hash: Hash = asset.get_hash()
+    s.store(ASSET_HASH_KEY, hash)
+    return 0
+}
+
+// Set the ContractRegistry hash for cross-contract name resolution.
+// @caller: admin (or timelock via contract call)
+// @params: reg - ContractRegistry hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 6: set_registry
+entry set_registry(reg: Hash) -> u64 { only_admin() Storage::new().store(REGISTRY_KEY, reg) return 0 }
+
+// Set the timelock contract hash (allowed to call admin entries via contract call).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ID 7: set_timelock
+entry set_timelock(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+// Transfer admin role to a new address (single-step).
+// @caller: admin (or timelock via contract call)
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ID 8: transfer_admin
+entry transfer_admin(new_admin: Address) -> u64 { only_admin() Storage::new().store(ADMIN_KEY, new_admin) return 0 }
+
+// Set the emergency admin address (only the current emergency admin can change it).
+// @caller: emergency admin only
+// @params: e - new emergency admin address
+// @returns: 0 on success
+// @security: only current emergency admin (self-managed role)
+// ID 9: set_emergency
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let current: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == current, "notemg")
+    s.store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("VLTToken v5.0")
+// @security: read-only, no access restrictions
+// ID 10: get_version
+entry get_version() -> string { return VERSION }
+
+// Returns the VLT asset hash (panics if asset not yet created).
+// @caller: anyone
+// @returns: VLT asset hash
+// @security: read-only, no access restrictions, panics if unset
+// ID 11: get_asset_hash_entry
+entry get_asset_hash_entry() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// Returns the configured max supply for VLT.
+// @caller: anyone
+// @returns: max supply in atomic units
+// @security: read-only, no access restrictions
+// ID 12: get_max_supply_entry
+entry get_max_supply_entry() -> u64 {
+    return Storage::new().load(MAX_SUPPLY_KEY).unwrap_or(MAX_SUPPLY)
+}
+
+// Returns the total VLT burned via burn_own / burn_from since deployment.
+// @caller: anyone
+// @returns: cumulative burned amount
+// @security: read-only, no access restrictions
+// ID 13: get_total_burned_entry
+entry get_total_burned_entry() -> u64 {
+    return Storage::new().load(TOTAL_BURNED_KEY).unwrap_or(0)
+}
+
+// Returns the circulating supply (current supply minus total burned).
+// @caller: anyone
+// @returns: circulating supply in atomic units
+// @security: read-only, no access restrictions, panics if asset not yet created
+// ID 14: get_circulating_supply_entry
+entry get_circulating_supply_entry() -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    let supply: u64 = asset.get_supply()
+    let burned: u64 = s.load(TOTAL_BURNED_KEY).unwrap_or(0)
+    return supply - burned
+}
+
+// ============================================================================
+// FIX #14: Two-step emergency withdraw
+// ============================================================================
+
+// Step 1 of 2-step emergency withdrawal: record the request topoheight (starts delay window).
+// @caller: emergency admin only
+// @returns: 0 on success
+// @security: only emergency admin, stores request topo for delay verification
+// ID 15: request_emergency_withdraw
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// Step 2 of 2-step emergency withdrawal: drain all of `asset` after EMERGENCY_DELAY_BLOCKS elapsed.
+// @caller: emergency admin only
+// @params: asset - hash of asset to withdraw (Hash::zero() for XEL)
+// @returns: 0 on success
+// @security: only emergency admin, requires prior request + EMERGENCY_DELAY_BLOCKS delay (2-step protection, FIX #14)
+// ID 16: execute_emergency_withdraw
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 { transfer(caller, bal, asset) }
+    return 0
+}
+
+// Returns the VLT asset hash (read-only view, panics if asset not yet created).
+// @caller: anyone
+// @returns: VLT asset hash
+// @security: read-only, no access restrictions, panics if unset
+// pub fn (read-only)
+pub fn get_asset_hash() -> Hash { return Storage::new().load(ASSET_HASH_KEY).expect("err") }
+// Returns the configured max supply for VLT (read-only view).
+// @caller: anyone
+// @returns: max supply in atomic units
+// @security: read-only, no access restrictions
+pub fn get_max_supply() -> u64 { return Storage::new().load(MAX_SUPPLY_KEY).unwrap_or(MAX_SUPPLY) }
+// Returns the total VLT burned since deployment (read-only view).
+// @caller: anyone
+// @returns: cumulative burned amount
+// @security: read-only, no access restrictions
+pub fn get_total_burned() -> u64 { return Storage::new().load(TOTAL_BURNED_KEY).unwrap_or(0) }
+// Returns the circulating supply (current supply minus total burned, read-only view).
+// @caller: anyone
+// @returns: circulating supply in atomic units
+// @security: read-only, no access restrictions, panics if asset not yet created
+pub fn get_circulating_supply() -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    let supply: u64 = asset.get_supply()
+    let burned: u64 = s.load(TOTAL_BURNED_KEY).unwrap_or(0)
+    return supply - burned
+}
+// Burn VLT from the contract's own balance on behalf of a whitelisted burner contract.
+// @caller: authorized burner contract (via contract call)
+// @params: amount - VLT atomic units to burn
+// @returns: 0 on success
+// @security: require_burner (whitelisted contract only); requires contract balance >= amount; updates TOTAL_BURNED_KEY
+pub fn burn_from(amount: u64) -> u64 {
+    require_burner()
+    require(amount > 0, "amtgt0")
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+    require(bal >= amount, "insbal")
+    let ok: bool = burn(amount, hash)
+    require(ok, "burnfail")
+    let total_burned: u64 = s.load(TOTAL_BURNED_KEY).unwrap_or(0)
+    s.store(TOTAL_BURNED_KEY, total_burned + amount)
+    return 0
+}
+// Legacy read-only invoke setter for the timelock hash (kept for ABI compatibility).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin — note: pub fn in Silex is read-only; prefer entry set_timelock (ID 7) for state mutation
+pub fn set_timelock_tl(tl: Hash) -> u64 { only_admin() Storage::new().store(TIMELOCK_KEY, tl) return 0 }
+
+entry mint_to_entry(to: Address, amount: u64) -> u64 { return mint_to(to, amount) }

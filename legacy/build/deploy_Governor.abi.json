@@ -1,0 +1,180 @@
+{
+  "data": [
+    {
+      "entry_id": 3,
+      "name": "propose",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "target",
+          "type": "Hash"
+        },
+        {
+          "name": "entry_id",
+          "type": "u16"
+        },
+        {
+          "name": "params",
+          "type": "bytes"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 4,
+      "name": "vote",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        },
+        {
+          "name": "support",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "queue",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "cancel",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "get_proposal_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "set_governance_vault",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "gv",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_voting_period",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_quorum_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_approval_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_proposal_threshold",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "threshold",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

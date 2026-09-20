@@ -1,0 +1,150 @@
+{
+  "data": [
+    {
+      "entry_id": 4,
+      "name": "register_liquidator",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "endpoint_url",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "stake_for_priority",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "unstake",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "record_liquidation",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "liq_addr",
+          "type": "Address"
+        },
+        {
+          "name": "blocks_to_act",
+          "type": "u64"
+        },
+        {
+          "name": "reward_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "report_inactive",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "liq_addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "claim_rewards",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

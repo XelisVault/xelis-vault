@@ -1,0 +1,397 @@
+// ============================================================================
+// VaultTemplates.slx — XELIS Vault v10.2 (Brainstorming Feature #3)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Templates pré-configurés pour stratégies courantes (one-click vaults).
+//
+// RÔLE : Un user sélectionne un template, signe UNE transaction, et le contrat
+//        exécute plusieurs actions en batch (deposit + borrow + swap + deposit).
+//
+// TEMPLATES DISPONIBLES :
+//   1. Safe Vault      : Deposit XEL, borrow 50% LTV xUSD, hold
+//   2. Leverage Loop   : Deposit XEL → borrow xUSD → swap to XEL → deposit → repeat 3x
+//   3. Yield Farmer    : Deposit XEL → borrow xUSD → deposit in SavingsRate → earn yield spread
+//   4. PSM Arbitrageur : Hold xUSD, monitor peg deviation, auto-arbitrage
+//   5. Liquidity Provider : Deposit XEL → borrow xUSD → provide LP on VaultSwap
+//
+// AVANTAGES :
+//   - UX simplifiée (1 tx au lieu de 5-10)
+//   - Strategies expertes accessibles aux débutants
+//   - Coût gas réduit (batch)
+//   - Réutilisable et composables
+//
+// SÉCURITÉ :
+//   - Chaque template a des limites strictes (max leverage, max borrow)
+//   - Slippage protection (min_out parameters)
+//   - Emergency exit function
+//
+// Entry IDs:
+//   0  : execute_safe_vault
+//   1  : execute_leverage_loop
+//   2  : execute_yield_farmer
+//   3  : execute_psm_arbitrage
+//   4  : execute_lp_strategy
+//   5  : emergency_exit
+//   6  : get_template_info (pub fn)
+//   7  : set_vault_engine
+//   8  : set_psm
+//   9  : set_vault_swap
+//   10 : set_savings_rate
+//   11 : set_registry
+//   12 : set_timelock
+//   13 : set_guardian
+//   14 : pause
+//   15 : unpause
+//   16 : transfer_admin
+//   17 : get_version
+// ============================================================================
+
+const VERSION: string = "VaultTemplates v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const VAULT_ENGINE_KEY: string = "ve"
+const PSM_KEY: string = "psm"
+const VAULT_SWAP_KEY: string = "vs"
+const SAVINGS_RATE_KEY: string = "sr"
+
+const EXECUTION_PREFIX: string = "exec_"
+const EXECUTION_COUNT_KEY: string = "ec"
+
+// Template constants
+const SAFE_VAULT_LTV_BPS: u64 = 5000          // 50% LTV
+const LEVERAGE_LOOP_MAX_ITER: u8 = 3            // max 3 iterations
+const LEVERAGE_LOOP_TARGET_LTV_BPS: u64 = 6000 // 60% target LTV per iter
+const YIELD_FARMER_BORROW_BPS: u64 = 7000      // 70% LTV
+const PSM_ARBITRAGE_THRESHOLD_BPS: u64 = 100   // 1% deviation
+const LP_STRATEGY_BORROW_BPS: u64 = 6000       // 60% LTV
+const SLIPPAGE_BPS: u64 = 100                   // 1% max slippage
+
+struct TemplateExecution {
+    template_id: u8,
+    user: Address,
+    initial_collateral: u64,
+    final_collateral: u64,
+    borrowed_amount: u64,
+    executed_at: u64,
+    success: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(EXECUTION_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn record_execution(template_id: u8, user: Address, initial: u64, final_col: u64, borrowed: u64, success: bool) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(EXECUTION_COUNT_KEY).unwrap_or(0)
+    let exec: TemplateExecution = TemplateExecution {
+        template_id: template_id,
+        user: user,
+        initial_collateral: initial,
+        final_collateral: final_col,
+        borrowed_amount: borrowed,
+        executed_at: get_current_topoheight(),
+        success: success
+    }
+    s.store(EXECUTION_PREFIX + count.to_string(10u32), exec)
+    s.store(EXECUTION_COUNT_KEY, count + 1)
+}
+
+// Entry 0: Execute Safe Vault template
+// Deposit XEL, borrow 50% LTV in xUSD, hold
+entry execute_safe_vault(collateral_amount: u64, min_borrow_out: u64) -> u64 {
+    when_not_paused()
+    require(collateral_amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Calculate borrow amount (50% LTV)
+    let borrow_amount: u64 = (collateral_amount * SAFE_VAULT_LTV_BPS) / 10000
+    require(borrow_amount >= min_borrow_out, "slippage")
+
+    // In production:
+    // 1. Transfer XEL from caller to this contract
+    // 2. Call vault_engine.deposit(collateral_amount)
+    // 3. Call vault_engine.borrow(vault_id, borrow_amount)
+    // 4. Transfer xUSD to caller
+
+    record_execution(1u8, caller, collateral_amount, collateral_amount, borrow_amount, true)
+    emit_event(0u64, ["SafeVaultExecuted", caller.to_string()])
+    return 0
+}
+
+// Entry 1: Execute Leverage Loop template
+// Deposit XEL → borrow xUSD → swap to XEL → deposit → repeat (max 3 iterations)
+entry execute_leverage_loop(initial_collateral: u64, min_final_collateral: u64) -> u64 {
+    when_not_paused()
+    require(initial_collateral > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let current_collateral: u64 = initial_collateral
+    let total_borrowed: u64 = 0
+    let i: u8 = 0
+
+    while i < LEVERAGE_LOOP_MAX_ITER {
+        // Borrow 60% LTV
+        let borrow_amount: u64 = (current_collateral * LEVERAGE_LOOP_TARGET_LTV_BPS) / 10000
+        if borrow_amount == 0 { break }
+
+        // In production:
+        // 1. Call vault_engine.deposit(current_collateral) if i > 0
+        // 2. Call vault_engine.borrow(vault_id, borrow_amount)
+        // 3. Call vault_swap.swap(xUSD -> XEL, min_out=borrow*0.99)
+        // 4. current_collateral = swap_output
+
+        total_borrowed += borrow_amount
+        // Simplified: assume swap is 1:1 for demo
+        current_collateral += borrow_amount
+        i += 1
+    }
+
+    require(current_collateral >= min_final_collateral, "slippage")
+    record_execution(2u8, caller, initial_collateral, current_collateral, total_borrowed, true)
+    emit_event(0u64, ["LeverageLoopExecuted", caller.to_string()])
+    return 0
+}
+
+// Entry 2: Execute Yield Farmer template
+// Deposit XEL → borrow xUSD (70% LTV) → deposit in SavingsRate
+entry execute_yield_farmer(collateral_amount: u64, min_borrow_out: u64) -> u64 {
+    when_not_paused()
+    require(collateral_amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let borrow_amount: u64 = (collateral_amount * YIELD_FARMER_BORROW_BPS) / 10000
+    require(borrow_amount >= min_borrow_out, "slippage")
+
+    // In production:
+    // 1. vault_engine.deposit(collateral_amount)
+    // 2. vault_engine.borrow(vault_id, borrow_amount)
+    // 3. savings_rate.deposit(borrow_amount)
+    // 4. Return savings_position_id
+
+    record_execution(3u8, caller, collateral_amount, collateral_amount, borrow_amount, true)
+    emit_event(0u64, ["YieldFarmerExecuted", caller.to_string()])
+    return 0
+}
+
+// Entry 3: Execute PSM Arbitrage template
+// Monitor peg deviation, swap if profitable
+// Caller provides current xUSD price (in cents, 100 = $1)
+entry execute_psm_arbitrage(amount: u64, current_xusd_price_cents: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Check if peg deviation is profitable
+    let is_premium: bool = current_xusd_price_cents > 100
+    let deviation: u64 = is_premium ? current_xusd_price_cents - 100 : 100 - current_xusd_price_cents
+    require(deviation >= PSM_ARBITRAGE_THRESHOLD_BPS / 10, "notprofitable")
+
+    // In production:
+    // If premium (xUSD > $1): mint xUSD from PSM ($1), sell on VaultSwap (premium)
+    // If discount (xUSD < $1): buy xUSD on VaultSwap (discount), redeem at PSM ($1)
+    let profit_estimate: u64 = (amount * deviation) / 10000
+
+    record_execution(4u8, caller, amount, amount, profit_estimate, true)
+    emit_event(0u64, ["PSMArbitrageExecuted", caller.to_string()])
+    return 0
+}
+
+// Entry 4: Execute LP Strategy template
+// Deposit XEL → borrow xUSD (60% LTV) → provide LP on VaultSwap
+entry execute_lp_strategy(collateral_amount: u64, min_borrow_out: u64) -> u64 {
+    when_not_paused()
+    require(collateral_amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let borrow_amount: u64 = (collateral_amount * LP_STRATEGY_BORROW_BPS) / 10000
+    require(borrow_amount >= min_borrow_out, "slippage")
+
+    // In production:
+    // 1. vault_engine.deposit(collateral_amount)
+    // 2. vault_engine.borrow(vault_id, borrow_amount)
+    // 3. vault_swap.add_liquidity(XEL, collateral_amount/2, xUSD, borrow_amount)
+
+    record_execution(5u8, caller, collateral_amount, collateral_amount, borrow_amount, true)
+    emit_event(0u64, ["LPStrategyExecuted", caller.to_string()])
+    return 0
+}
+
+// Entry 5: Emergency exit (close all positions from a template execution)
+entry emergency_exit(execution_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let exec: TemplateExecution = s.load(EXECUTION_PREFIX + execution_id.to_string(10u32)).expect("notfound")
+    require(exec.user == caller, "notowner")
+
+    // In production:
+    // 1. Withdraw from SavingsRate / VaultSwap LP
+    // 2. Repay vault borrow
+    // 3. Withdraw collateral
+    // 4. Transfer everything to caller
+
+    emit_event(0u64, ["EmergencyExit", execution_id.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 6: Get info about a template (name + description + risk level)
+pub fn get_template_info(template_id: u8) -> (string, string, u8) {
+    if template_id == 1 {
+        return ("Safe Vault", "Deposit XEL, borrow 50% LTV xUSD, hold position", 1u8)
+    }
+    if template_id == 2 {
+        return ("Leverage Loop", "Deposit XEL, borrow + swap to XEL, repeat 3x for leveraged exposure", 4u8)
+    }
+    if template_id == 3 {
+        return ("Yield Farmer", "Deposit XEL, borrow xUSD, deposit in SavingsRate for yield spread", 2u8)
+    }
+    if template_id == 4 {
+        return ("PSM Arbitrageur", "Monitor xUSD peg deviation, auto-arbitrage between PSM and VaultSwap", 3u8)
+    }
+    if template_id == 5 {
+        return ("Liquidity Provider", "Deposit XEL, borrow xUSD, provide LP on VaultSwap for trading fees", 3u8)
+    }
+    return ("Unknown", "", 0u8)
+}
+
+// Entry 7: Set vault engine
+entry set_vault_engine(ve: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VAULT_ENGINE_KEY, ve)
+    return 0
+}
+
+// Entry 8: Set PSM
+entry set_psm(psm: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(PSM_KEY, psm)
+    return 0
+}
+
+// Entry 9: Set vault swap
+entry set_vault_swap(vs: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VAULT_SWAP_KEY, vs)
+    return 0
+}
+
+// Entry 10: Set savings rate
+entry set_savings_rate(sr: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(SAVINGS_RATE_KEY, sr)
+    return 0
+}
+
+// Entry 11: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 12: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 13: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 14: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 15: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 16: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 17: Get version
+entry get_version() -> string {
+    return VERSION
+}

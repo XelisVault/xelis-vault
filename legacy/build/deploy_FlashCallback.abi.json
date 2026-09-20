@@ -1,0 +1,61 @@
+{
+  "data": [
+    {
+      "entry_id": 3,
+      "name": "claim_profit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 4,
+      "name": "set_flash_loan",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "fl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

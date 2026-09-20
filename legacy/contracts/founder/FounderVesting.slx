@@ -1,0 +1,311 @@
+// ============================================================================
+// FounderVesting.slx — XELIS Vault v10.3
+// ----------------------------------------------------------------------------
+// Vesting contract for the protocol founder/team.
+//
+// RÔLE : Distribue 500,000 VLT sur 4 ans avec 1 an de cliff.
+//        Transparent, on-chain, governance-controlled.
+//
+// MÉCANIQUE :
+//   - 500,000 VLT pré-alloués au founder
+//   - 1 an de cliff (rien pendant 1 an)
+//   - Après le cliff : vesting linéaire sur 3 ans (années 2-4)
+//   - 166,667 VLT/an débloqués après le cliff
+//   - Le founder peut claim à tout moment après le cliff
+//
+// SÉCURITÉ :
+//   - Seul le founder peut claim
+//   - L'admin (governance) peut changer le founder (en cas de transfert)
+//   - Le founder ne peut pas être changé sans timelock
+//   - Montant total fixed, pas d'inflation possible
+//
+// TRANSPARENCE :
+//   - Tout est visible on-chain
+//   - get_vesting_info() retourne tous les détails
+//   - get_claimable_amount() retourne le montant claimable maintenant
+//
+// Entry IDs:
+//   0  : claim_founder_tokens
+//   1  : get_vesting_info (pub fn)
+//   2  : get_claimable_amount (pub fn)
+//   3  : get_claimed_amount (pub fn)
+//   4  : set_founder (admin/governance only)
+//   5  : set_vlt_contract
+//   6  : set_vlt_asset
+//   7  : set_registry
+//   8  : set_timelock
+//   9  : set_guardian
+//   10 : pause
+//   11 : unpause
+//   12 : transfer_admin
+//   13 : get_version
+// ============================================================================
+
+const VERSION: string = "FounderVesting v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const FOUNDER_KEY: string = "fa"
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+
+const TOTAL_AMOUNT_KEY: string = "ta"
+const CLAIMED_KEY: string = "cl"
+const START_TOPO_KEY: string = "st"
+const CLIFF_BLOCKS_KEY: string = "cb"
+const VESTING_BLOCKS_KEY: string = "vb"
+
+// 1 year = ~6,307,200 blocks at 5s/block
+const DEFAULT_CLIFF_BLOCKS: u64 = 6307200       // 1 year
+const DEFAULT_VESTING_BLOCKS: u64 = 18921600    // 3 years (after cliff)
+const DEFAULT_TOTAL_AMOUNT: u64 = 50000000000000 // 500,000 VLT (8 decimals)
+
+
+// v10.6: Reentrancy guard
+const RG_STATUS_KEY: string = "rg"
+const RG_NOT_ENTERED: u64 = 1
+const RG_ENTERED: u64 = 2
+
+fn non_reentrant_fv() {
+    let s: Storage = Storage::new()
+    let status: u64 = s.load(RG_STATUS_KEY).unwrap_or(RG_NOT_ENTERED)
+    require(status != RG_ENTERED, "reentrant")
+    s.store(RG_STATUS_KEY, RG_ENTERED)
+}
+
+fn release_reentrancy_fv() {
+    Storage::new().store(RG_STATUS_KEY, RG_NOT_ENTERED)
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(FOUNDER_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_AMOUNT_KEY, DEFAULT_TOTAL_AMOUNT)
+    s.store(CLAIMED_KEY, 0u64)
+    s.store(START_TOPO_KEY, get_current_topoheight())
+    s.store(CLIFF_BLOCKS_KEY, DEFAULT_CLIFF_BLOCKS)
+    s.store(VESTING_BLOCKS_KEY, DEFAULT_VESTING_BLOCKS)
+    s.store(RG_STATUS_KEY, RG_NOT_ENTERED)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Claim vested tokens (founder only)
+// After cliff, linear vesting over 3 years
+// F-14 fix (MEDIUM): the previous version updated CLAIMED_KEY before the
+//   cross-contract VLT transfer and discarded the transfer's return value
+//   (`let _ = vlt.call(...)`). If the VLT call returned a non-zero (failure)
+//   status without the runtime reverting, claimed accounting would advance
+//   while tokens never actually left the vesting contract — permanently
+//   under-paying the founder with no way to re-claim.
+//   Now we:
+//     1) perform the transfer FIRST (capture result),
+//     2) require(result == 0, "xferfail") before updating CLAIMED_KEY,
+//     3) use the native transfer() instead of an invalid vlt.call(4u16, ...)
+//        — VLTToken chunk 4 is create_asset (no args), not transfer_to.
+//        The vesting contract holds its own VLT balance and transfers it
+//        directly to the founder EOA via the native asset transfer.
+entry claim_founder_tokens() -> u64 {
+    when_not_paused()
+    non_reentrant_fv()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let founder: Address = s.load(FOUNDER_KEY).expect("err")
+    require(caller == founder, "notfounder")
+
+    let current_topo: u64 = get_current_topoheight()
+    let start_topo: u64 = s.load(START_TOPO_KEY).expect("err")
+    let cliff_blocks: u64 = s.load(CLIFF_BLOCKS_KEY).expect("err")
+    let vesting_blocks: u64 = s.load(VESTING_BLOCKS_KEY).expect("err")
+    let total: u64 = s.load(TOTAL_AMOUNT_KEY).expect("err")
+    let claimed: u64 = s.load(CLAIMED_KEY).unwrap_or(0)
+
+    // Check cliff passed
+    let cliff_end: u64 = start_topo + cliff_blocks
+    require(current_topo >= cliff_end, "cliffnotpassed")
+
+    // Calculate vested amount
+    let elapsed_after_cliff: u64 = current_topo - cliff_end
+    let vested: u64 = elapsed_after_cliff >= vesting_blocks ? total : (total * elapsed_after_cliff) / vesting_blocks
+
+    let claimable: u64 = vested - claimed
+    require(claimable > 0, "nothing")
+
+    // F-14 fix: perform the transfer FIRST and verify it succeeded.
+    // Use native transfer() — VLT is held by this contract as a regular asset
+    // balance, so we move it directly to the founder EOA. No VLTToken entry
+    // call is needed (and chunk 4 is create_asset, not transfer_to).
+    let vlt_asset_opt: optional<Hash> = s.load(VLT_ASSET_KEY)
+    let asset: Hash = Hash::zero()  // default to XEL if VLT_ASSET_KEY not set
+    if vlt_asset_opt.is_some() {
+        asset = vlt_asset_opt.expect("err")
+    }
+    let ok: bool = transfer(founder, claimable, asset)
+    require(ok, "xferfail")
+
+    // F-14 fix: only update CLAIMED_KEY AFTER the transfer succeeds.
+    s.store(CLAIMED_KEY, claimed + claimable)
+
+    emit_event(0u64, ["FounderTokensClaimed", claimable.to_string(10u32)])
+    release_reentrancy_fv()
+    return 0
+}
+
+// Pub fn 1: Get full vesting info
+pub fn get_vesting_info() -> (Address, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    let paused_flag: u64 = 0u64
+    if paused { paused_flag = 1u64 }
+    return (
+        s.load(FOUNDER_KEY).expect("err"),
+        s.load(TOTAL_AMOUNT_KEY).expect("err"),
+        s.load(CLAIMED_KEY).unwrap_or(0),
+        s.load(START_TOPO_KEY).expect("err"),
+        s.load(CLIFF_BLOCKS_KEY).expect("err"),
+        s.load(VESTING_BLOCKS_KEY).expect("err"),
+        get_current_topoheight(),
+        paused_flag
+    )
+}
+
+// Pub fn 2: Get amount claimable right now
+pub fn get_claimable_amount() -> u64 {
+    let s: Storage = Storage::new()
+    let current_topo: u64 = get_current_topoheight()
+    let start_topo: u64 = s.load(START_TOPO_KEY).expect("err")
+    let cliff_blocks: u64 = s.load(CLIFF_BLOCKS_KEY).expect("err")
+    let vesting_blocks: u64 = s.load(VESTING_BLOCKS_KEY).expect("err")
+    let total: u64 = s.load(TOTAL_AMOUNT_KEY).expect("err")
+    let claimed: u64 = s.load(CLAIMED_KEY).unwrap_or(0)
+
+    let cliff_end: u64 = start_topo + cliff_blocks
+    if current_topo < cliff_end { return 0 }
+
+    let elapsed: u64 = current_topo - cliff_end
+    let vested: u64 = elapsed >= vesting_blocks ? total : (total * elapsed) / vesting_blocks
+
+    if vested > claimed {
+        return vested - claimed
+    }
+    return 0
+}
+
+// Pub fn 3: Get total claimed so far
+pub fn get_claimed_amount() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(CLAIMED_KEY).unwrap_or(0)
+}
+
+// Entry 4: Set founder address (admin/governance only, with timelock)
+// Used if founder wants to transfer vesting to another address
+entry set_founder(new_founder: Address) -> u64 {
+    only_admin()
+    require(new_founder != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), "badaddr")
+    let s: Storage = Storage::new()
+    s.store(FOUNDER_KEY, new_founder)
+    emit_event(0u64, ["FounderChanged", new_founder.to_string()])
+    return 0
+}
+
+// Entry 5: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 6: Set VLT asset
+entry set_vlt_asset(va: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_ASSET_KEY, va)
+    return 0
+}
+
+// Entry 7: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 8: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 9: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 10: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 11: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 12: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 13: Get version
+entry get_version() -> string {
+    return VERSION
+}

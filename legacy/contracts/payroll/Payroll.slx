@@ -1,0 +1,444 @@
+// ============================================================================
+// Payroll.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Recurring per-block payroll, preserved from v4.2.
+//
+// v5.0 changes:
+//   - pub fn (get_pending, get_employees_count) wrapped as *_entry entries so
+//     other contracts can read payroll state via Contract::call.
+//   - Added EMERGENCY_KEY + set_emergency entry.
+//   - Added two-step emergency_withdraw (IDs 15/16, "ert" key, 17280-block
+//     delay).
+//
+// Entry IDs (sequential, starting at 0):
+//   0  : add_employee
+//   1  : update_employee
+//   2  : remove_employee
+//   3  : claim
+//   4  : set_treasury
+//   5  : set_registry
+//   6  : set_timelock
+//   7  : set_emergency
+//   8  : pause
+//   9  : unpause
+//   10 : transfer_admin
+//   11 : deposit_funds
+//   12 : get_pending_entry
+//   13 : get_employees_count_entry
+//   14 : get_version
+//   15 : request_emergency_withdraw
+//   16 : execute_emergency_withdraw
+// ============================================================================
+
+const VERSION: string = "Payroll v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const TREASURY_KEY: string = "tr"
+
+const EMPLOYEES_COUNT_KEY: string = "ec"
+const EMPLOYEE_PREFIX: string = "e_"
+const LAST_CLAIM_PREFIX: string = "lc_"
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+struct Employee {
+    addr: Address,
+    asset: Hash,
+    rate_per_block: u64,
+    start_topo: u64,
+    end_topo: u64,
+    active: bool,
+    total_paid: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(EMPLOYEES_COUNT_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_emergency() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+}
+
+fn when_not_paused() {
+    let paused: bool = Storage::new().load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+// ID 0: add_employee
+// add employee.
+// @caller: user / authorized caller
+// @params: addr - Address
+// @params: asset - Hash
+// @params: rate_per_block - u64
+// @params: start_topo - u64
+// @params: end_topo - u64
+// @returns: u
+// @security: when_not_paused, only_admin
+entry add_employee(
+    addr: Address,
+    asset: Hash,
+    rate_per_block: u64,
+    start_topo: u64,
+    end_topo: u64
+) -> u64 {
+    when_not_paused()
+    only_admin()
+    require(rate_per_block > 0, "badrate")
+    require(end_topo > start_topo, "baddates")
+
+    let s: Storage = Storage::new()
+    let existing: optional<Employee> = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    require(existing.is_none(), "exists")
+
+    let employee: Employee = Employee {
+        addr: addr,
+        asset: asset,
+        rate_per_block: rate_per_block,
+        start_topo: start_topo,
+        end_topo: end_topo,
+        active: true,
+        total_paid: 0
+    }
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    let count: u64 = s.load(EMPLOYEES_COUNT_KEY).unwrap_or(0)
+    s.store(EMPLOYEES_COUNT_KEY, count + 1)
+    return 0
+}
+
+// ID 1: update_employee
+// update employee.
+// @caller: user / authorized caller
+// @params: addr - Address
+// @params: rate_per_block - u64
+// @params: end_topo - u64
+// @returns: u
+// @security: when_not_paused, only_admin
+entry update_employee(addr: Address, rate_per_block: u64, end_topo: u64) -> u64 {
+    when_not_paused()
+    only_admin()
+    let s: Storage = Storage::new()
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("err")
+    require(employee.active, "inactive")
+    require(rate_per_block > 0, "badrate")
+    require(end_topo > employee.start_topo, "baddate")
+
+    employee.rate_per_block = rate_per_block
+    employee.end_topo = end_topo
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    return 0
+}
+
+// ID 2: remove_employee
+// remove employee.
+// @caller: user / authorized caller
+// @params: addr - Address
+// @returns: u
+// @security: when_not_paused, only_admin
+entry remove_employee(addr: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + addr.to_string()).expect("err")
+    employee.active = false
+    employee.end_topo = get_current_topoheight()
+    s.store(EMPLOYEE_PREFIX + addr.to_string(), employee)
+    return 0
+}
+
+// ID 3: claim
+// claim.
+// @caller: any user
+// @returns: u
+// @security: when_not_paused
+entry claim() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let employee: Employee = s.load(EMPLOYEE_PREFIX + caller.to_string()).expect("err")
+    require(employee.active, "inactive")
+
+    let current_topo: u64 = get_current_topoheight()
+    let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + caller.to_string()).unwrap_or(employee.start_topo)
+
+    let start: u64 = 0
+    if last_claim > employee.start_topo {
+        start = last_claim
+    } else {
+        start = employee.start_topo
+    }
+    let end: u64 = 0
+    if current_topo < employee.end_topo {
+        end = current_topo
+    } else {
+        end = employee.end_topo
+    }
+    require(end > start, "nothing")
+
+    let blocks_elapsed: u64 = end - start
+    let amount_due: u64 = (blocks_elapsed as u128 * employee.rate_per_block as u128) as u64
+
+    let bal: u64 = get_balance_for_asset(employee.asset).unwrap_or(0)
+    let actual: u64 = 0
+    if amount_due > bal {
+        actual = bal
+    } else {
+        actual = amount_due
+    }
+    require(actual > 0, "nofunds")
+
+    let _ = transfer(caller, actual, employee.asset)
+
+    s.store(LAST_CLAIM_PREFIX + caller.to_string(), end)
+    employee.total_paid += actual
+    s.store(EMPLOYEE_PREFIX + caller.to_string(), employee)
+    return 0
+}
+
+// ID 4: set_treasury
+// set treasury.
+// @caller: admin (or timelock)
+// @params: t - Address
+// @returns: u
+// @security: only_admin
+entry set_treasury(t: Address) -> u64 {
+    only_admin()
+    Storage::new().store(TREASURY_KEY, t)
+    return 0
+}
+
+// ID 5: set_registry
+// set registry.
+// @caller: admin (or timelock)
+// @params: reg - Hash
+// @returns: u
+// @security: only_admin
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// ID 6: set_timelock
+// set timelock.
+// @caller: admin (or timelock)
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ID 7: set_emergency
+// set emergency.
+// @caller: admin (or timelock)
+// @params: e - Address
+// @returns: u
+// @security: only_admin, only_emergency
+entry set_emergency(e: Address) -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ID 8: pause
+// pause.
+// @caller: admin (or timelock)
+// @params: reason - string
+// @returns: u
+// @security: only_admin
+entry pause(reason: string) -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, true)
+    return 0
+}
+
+// ID 9: unpause
+// unpause.
+// @caller: admin (or timelock)
+// @returns: u
+// @security: only_admin
+entry unpause() -> u64 {
+    only_admin()
+    Storage::new().store(PAUSED_KEY, false)
+    return 0
+}
+
+// ID 10: transfer_admin
+// transfer admin.
+// @caller: admin (or timelock)
+// @params: new_admin - Address
+// @returns: u
+// @security: only_admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ID 11: deposit_funds
+// deposit funds.
+// @caller: any user
+// @params: asset - Hash
+// @params: amount - u64
+// @returns: u
+// @security: standard access control
+entry deposit_funds(asset: Hash, amount: u64) -> u64 {
+    require(amount > 0, "amtgt0")
+    let caller: Address = get_caller().expect("err")
+    let dep: u64 = get_deposit_for_asset(asset).expect("err")
+    require(dep >= amount, "insdep")
+    if dep > amount {
+        let _ = transfer(caller, dep - amount, asset)
+    }
+    return 0
+}
+
+// ID 12: get_pending_entry
+// get pending entry.
+// @caller: user / authorized caller
+// @params: addr - Address
+// @returns: u
+// @security: standard access control
+fn get_pending_entry_impl(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let employee_opt: optional<Employee> = s.load(EMPLOYEE_PREFIX + addr.to_string())
+    if employee_opt.is_none() { return 0 }
+    let employee: Employee = employee_opt.expect("err")
+    if !employee.active { return 0 }
+    let current_topo: u64 = get_current_topoheight()
+    let last_claim: u64 = s.load(LAST_CLAIM_PREFIX + addr.to_string()).unwrap_or(employee.start_topo)
+    let start: u64 = 0
+    if last_claim > employee.start_topo {
+        start = last_claim
+    } else {
+        start = employee.start_topo
+    }
+    let end: u64 = 0
+    if current_topo < employee.end_topo {
+        end = current_topo
+    } else {
+        end = employee.end_topo
+    }
+    if end <= start { return 0 }
+    let blocks_elapsed: u64 = end - start
+    return (blocks_elapsed as u128 * employee.rate_per_block as u128) as u64
+}
+
+entry get_pending_entry(addr: Address) -> u64 {
+    return get_pending_entry_impl(addr)
+}
+
+// ID 13: get_employees_count_entry
+// get employees count entry.
+// @caller: user / authorized caller
+// @returns: u
+// @security: standard access control
+entry get_employees_count_entry() -> u64 {
+    return Storage::new().load(EMPLOYEES_COUNT_KEY).unwrap_or(0)
+}
+
+// ID 14: get_version
+// get version.
+// @caller: user / authorized caller
+// @returns: s
+// @security: only_emergency, 2-step withdraw (24h delay)
+entry get_version() -> string {
+    return VERSION
+}
+
+// ID 15: request_emergency_withdraw
+// request emergency withdraw.
+// @caller: any user
+// @returns: u
+// @security: only_emergency, 2-step withdraw (24h delay)
+entry request_emergency_withdraw() -> u64 {
+    only_emergency()
+    Storage::new().store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// ID 16: execute_emergency_withdraw
+// execute emergency withdraw.
+// @caller: any user
+// @params: asset - Hash
+// @returns: u
+// @security: 2-step withdraw (24h delay)
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// ============================================================================
+// pub fn (read-only) — not counted for entry IDs
+// ============================================================================
+
+// get pending.
+// @caller: anyone (read-only)
+// @params: addr - Address
+// @returns: u
+// @security: only_admin
+pub fn get_pending(addr: Address) -> u64 {
+    return get_pending_entry_impl(addr)
+}
+
+// get employees count.
+// @caller: anyone (read-only)
+// @returns: u
+// @security: only_admin
+pub fn get_employees_count() -> u64 {
+    return Storage::new().load(EMPLOYEES_COUNT_KEY).unwrap_or(0)
+}
+
+// set timelock tl.
+// @caller: anyone (read-only)
+// @params: tl - Hash
+// @returns: u
+// @security: only_admin
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}

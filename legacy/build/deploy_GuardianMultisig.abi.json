@@ -1,0 +1,179 @@
+{
+  "data": [
+    {
+      "entry_id": 3,
+      "name": "propose_emergency_action",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "target",
+          "type": "Hash"
+        },
+        {
+          "name": "action",
+          "type": "u8"
+        },
+        {
+          "name": "params",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 4,
+      "name": "confirm",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "execute",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "add_guardian_via_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "guardian",
+          "type": "Address"
+        },
+        {
+          "name": "params",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "remove_guardian_via_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "guardian",
+          "type": "Address"
+        },
+        {
+          "name": "params",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "set_quorum_via_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_quorum",
+          "type": "u64"
+        },
+        {
+          "name": "params",
+          "type": "bytes"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "get_proposal_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "get_guardians_info_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "is_guardian_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

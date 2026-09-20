@@ -1,0 +1,531 @@
+// ============================================================================
+// RevenueShareDelegation.slx — XELIS Vault v10.4.3
+// ----------------------------------------------------------------------------
+// Permet au founder de partager une partie de ses revenus protocolaires avec
+// un contributeur valuable, pour une durée déterminée.
+//
+// RÔLE :
+//   - Le founder reçoit 10% des fees du protocole (via FeeDistributor)
+//   - Au lieu de recevoir directement, FeeDistributor pointe vers CE contrat
+//   - Le founder configure des "parts" : X% pour contributeur A pendant N blocks
+//   - Quand FeeDistributor envoie les revenus, ce contrat les répartit automatiquement
+//   - Après la durée, la part revient à 100% au founder
+//
+// EXEMPLE :
+//   - Founder veut partager 30% de ses revenus avec "Alice" pendant 6 mois
+//   - Founder appelle : set_share(alice_addr, 3000, 3110400)
+//   - Pendant 6 mois : Alice reçoit 30%, Founder reçoit 70%
+//   - Après 6 mois : Founder reçoit 100% à nouveau
+//
+// FONCTIONNALITÉS :
+//   - Multiple contributeurs (max 10 simultanés)
+//   - Durée configurable par contributeur (en blocks)
+//   - Pourcentage configurable (max 50% par contributeur)
+//   - Révocation anticipée possible
+//   - Tracking des montants distribués
+//   - Claim manuel (les revenus s'accumulent, le claim les transfère)
+//
+// SÉCURITÉ :
+//   - Seul le founder peut configurer les parts
+//   - Le founder ne peut pas se retirer plus que sa part
+//   - Les contributeurs ne peuvent claim que leur part accumulée
+//   - Tout est transparent et auditable on-chain
+//
+// Entry IDs:
+//   0  : set_share (founder only)
+//   1  : revoke_share (founder only)
+//   2  : update_share_percentage (founder only)
+//   3  : extend_share_duration (founder only)
+//   4  : claim_founder_revenue (founder only)
+//   5  : claim_contributor_revenue (contributor only)
+//   6  : receive_fee (called by FeeDistributor)
+//   7  : get_share_info (pub fn)
+//   8  : get_founder_pending (pub fn)
+//   9  : get_contributor_pending (pub fn)
+//   10 : get_contributor_count (pub fn)
+//   11 : get_total_distributed (pub fn)
+//   12 : get_share_at_index (pub fn)
+//   13 : is_share_active (pub fn)
+//   14 : set_vlt_contract
+//   15 : set_xel_asset
+//   16 : set_registry
+//   17 : set_timelock
+//   18 : set_guardian
+//   19 : pause
+//   20 : unpause
+//   21 : transfer_admin
+//   22 : get_version
+// ============================================================================
+
+const VERSION: string = "RevenueShareDelegation v11.3"
+
+const ADMIN_KEY: string = "a"
+const FOUNDER_KEY: string = "fa"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+const XEL_ASSET_KEY: string = "xa"
+
+const SHARE_PREFIX: string = "sh_"            // contributor → ShareInfo
+const SHARE_LIST_PREFIX: string = "shl_"      // index → contributor address
+const SHARE_COUNT_KEY: string = "shc"
+const FOUNDER_PENDING_KEY: string = "fp"       // founder's accumulated revenue
+const TOTAL_DISTRIBUTED_KEY: string = "td"     // all-time total distributed
+const TOTAL_RECEIVED_KEY: string = "tr"        // all-time total received from FeeDistributor
+// F-04 fix (HIGH): stored hash of the canonical FeeDistributor contract.
+const FEE_DISTRIBUTOR_KEY: string = "fdh"
+
+const MAX_CONTRIBUTORS: u64 = 10
+const MAX_SHARE_BPS: u64 = 5000                // max 50% per contributor
+const BLOCKS_PER_DAY: u64 = 17280
+
+struct ShareInfo {
+    contributor: Address,
+    percentage_bps: u64,           // e.g. 3000 = 30%
+    start_topo: u64,
+    end_topo: u64,                 // start + duration
+    total_received: u64,           // all-time received by this contributor
+    pending: u64,                  // claimable now
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(FOUNDER_KEY, caller)  // founder = deployer initially
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(SHARE_COUNT_KEY, 0u64)
+    s.store(FOUNDER_PENDING_KEY, 0u64)
+    s.store(TOTAL_DISTRIBUTED_KEY, 0u64)
+    s.store(TOTAL_RECEIVED_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_founder() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let founder: Address = s.load(FOUNDER_KEY).expect("err")
+    require(caller == founder, "notfounder")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Only the registered FeeDistributor contract can call receive_fee.
+// F-04 fix (HIGH): the previous version accepted ANY contract caller
+//   (only checked get_contract_caller().is_some()), allowing a throwaway
+//   contract to inject arbitrary asset/amount pairs into the revenue-share
+//   accounting. Now we store FEE_DISTRIBUTOR_KEY and compare explicitly.
+fn only_fee_distributor() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    // F-04 fix: require that the contract caller is the registered FeeDistributor hash.
+    let fd_opt: optional<Hash> = s.load(FEE_DISTRIBUTOR_KEY)
+    require(fd_opt.is_some(), "nofd")
+    let fd: Hash = fd_opt.expect("err")
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notauth")
+    let cc: Hash = cc_opt.expect("err")
+    require(cc == fd, "notfd")
+}
+
+// Calculate the effective percentage for a contributor at current topoheight
+// Returns 0 if share is expired or inactive
+fn get_effective_percentage(contributor: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let share_opt: optional<ShareInfo> = s.load(SHARE_PREFIX + contributor.to_string())
+    if share_opt.is_none() { return 0 }
+    let share: ShareInfo = share_opt.expect("err")
+    if !share.active { return 0 }
+    let current: u64 = get_current_topoheight()
+    if current < share.start_topo { return 0 }
+    if current >= share.end_topo { return 0 }
+    return share.percentage_bps
+}
+
+// Calculate total active shares percentage (must be <= 10000 bps = 100%)
+fn get_total_active_percentage() -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(SHARE_COUNT_KEY).unwrap_or(0)
+    let total: u64 = 0
+    let i: u64 = 0
+    while i < count {
+        let addr_opt: optional<Address> = s.load(SHARE_LIST_PREFIX + i.to_string(10u32))
+        if addr_opt.is_some() {
+            let addr: Address = addr_opt.expect("err")
+            let pct: u64 = get_effective_percentage(addr)
+            total += pct
+        }
+        i += 1
+    }
+    return total
+}
+
+// Entry 0: Set a revenue share for a contributor
+// percentage_bps: 3000 = 30% (max 5000 = 50%)
+// duration_blocks: how long the share lasts (e.g. 3110400 = 6 months)
+entry set_share(contributor: Address, percentage_bps: u64, duration_blocks: u64) -> u64 {
+    when_not_paused()
+    only_founder()
+    require(contributor != Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), "badaddr")
+    require(contributor != get_caller().expect("err"), "selfshare")
+    require(percentage_bps > 0 && percentage_bps <= MAX_SHARE_BPS, "badpct")
+    require(duration_blocks >= BLOCKS_PER_DAY, "tooshort")  // min 1 day
+    require(duration_blocks <= 63072000, "toolong")         // max 10 years
+
+    let s: Storage = Storage::new()
+
+    // Check if contributor already has a share
+    let existing_opt: optional<ShareInfo> = s.load(SHARE_PREFIX + contributor.to_string())
+    let is_new: bool = existing_opt.is_none()
+
+    // Check max contributors
+    if is_new {
+        let count: u64 = s.load(SHARE_COUNT_KEY).unwrap_or(0)
+        require(count < MAX_CONTRIBUTORS, "maxcontrib")
+    }
+
+    // Check total doesn't exceed 100%
+    let current_total: u64 = get_total_active_percentage()
+    let existing_pct: u64 = 0
+    if !is_new {
+        existing_pct = get_effective_percentage(contributor)
+    }
+    let new_total: u64 = current_total - existing_pct + percentage_bps
+    require(new_total <= 10000, "exceeds100")
+
+    // Create/update the share
+    let share: ShareInfo = ShareInfo {
+        contributor: contributor,
+        percentage_bps: percentage_bps,
+        start_topo: get_current_topoheight(),
+        end_topo: get_current_topoheight() + duration_blocks,
+        total_received: 0,
+        pending: 0,
+        active: true
+    }
+    s.store(SHARE_PREFIX + contributor.to_string(), share)
+
+    // Add to list if new
+    if is_new {
+        let count: u64 = s.load(SHARE_COUNT_KEY).unwrap_or(0)
+        s.store(SHARE_LIST_PREFIX + count.to_string(10u32), contributor)
+        s.store(SHARE_COUNT_KEY, count + 1)
+    }
+
+    emit_event(0u64, ["ShareSet", contributor.to_string() + "_" + percentage_bps.to_string(10u32)])
+    return 0
+}
+
+// Entry 1: Revoke a share immediately (founder only)
+entry revoke_share(contributor: Address) -> u64 {
+    when_not_paused()
+    only_founder()
+    let s: Storage = Storage::new()
+    let share_opt: optional<ShareInfo> = s.load(SHARE_PREFIX + contributor.to_string())
+    require(share_opt.is_some(), "noshare")
+    let share: ShareInfo = share_opt.expect("err")
+    share.active = false
+    share.end_topo = get_current_topoheight()  // end now
+    s.store(SHARE_PREFIX + contributor.to_string(), share)
+    emit_event(0u64, ["ShareRevoked", contributor.to_string()])
+    return 0
+}
+
+// Entry 2: Update percentage for an existing share (founder only)
+entry update_share_percentage(contributor: Address, new_percentage_bps: u64) -> u64 {
+    when_not_paused()
+    only_founder()
+    require(new_percentage_bps > 0 && new_percentage_bps <= MAX_SHARE_BPS, "badpct")
+    let s: Storage = Storage::new()
+    let share: ShareInfo = s.load(SHARE_PREFIX + contributor.to_string()).expect("noshare")
+    require(share.active, "inactive")
+
+    // Check total doesn't exceed 100%
+    let current_total: u64 = get_total_active_percentage()
+    let existing_pct: u64 = get_effective_percentage(contributor)
+    let new_total: u64 = current_total - existing_pct + new_percentage_bps
+    require(new_total <= 10000, "exceeds100")
+
+    share.percentage_bps = new_percentage_bps
+    s.store(SHARE_PREFIX + contributor.to_string(), share)
+    emit_event(0u64, ["ShareUpdated", contributor.to_string() + "_" + new_percentage_bps.to_string(10u32)])
+    return 0
+}
+
+// Entry 3: Extend the duration of an existing share (founder only)
+entry extend_share_duration(contributor: Address, additional_blocks: u64) -> u64 {
+    when_not_paused()
+    only_founder()
+    require(additional_blocks > 0, "zero")
+    let s: Storage = Storage::new()
+    let share: ShareInfo = s.load(SHARE_PREFIX + contributor.to_string()).expect("noshare")
+    require(share.active, "inactive")
+    share.end_topo = share.end_topo + additional_blocks
+    s.store(SHARE_PREFIX + contributor.to_string(), share)
+    emit_event(0u64, ["ShareExtended", contributor.to_string() + "_" + additional_blocks.to_string(10u32)])
+    return 0
+}
+
+// Entry 4: Founder claims their accumulated revenue
+entry claim_founder_revenue() -> u64 {
+    when_not_paused()
+    only_founder()
+    let s: Storage = Storage::new()
+    let pending: u64 = s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+    require(pending > 0, "nothing")
+
+    s.store(FOUNDER_PENDING_KEY, 0u64)
+
+    let total_distributed: u64 = s.load(TOTAL_DISTRIBUTED_KEY).unwrap_or(0)
+    s.store(TOTAL_DISTRIBUTED_KEY, total_distributed + pending)
+
+    // In production: transfer `pending` amount of XEL/VLT to founder
+    emit_event(0u64, ["FounderRevenueClaimed", pending.to_string(10u32)])
+    return 0
+}
+
+// Entry 5: Contributor claims their accumulated revenue share
+entry claim_contributor_revenue() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let share: ShareInfo = s.load(SHARE_PREFIX + caller.to_string()).expect("noshare")
+    require(share.pending > 0, "nothing")
+
+    let amount: u64 = share.pending
+    share.pending = 0
+    share.total_received += amount
+    s.store(SHARE_PREFIX + caller.to_string(), share)
+
+    let total_distributed: u64 = s.load(TOTAL_DISTRIBUTED_KEY).unwrap_or(0)
+    s.store(TOTAL_DISTRIBUTED_KEY, total_distributed + amount)
+
+    // In production: transfer `amount` to caller
+    emit_event(0u64, ["ContributorRevenueClaimed", caller.to_string() + "_" + amount.to_string(10u32)])
+    return 0
+}
+
+// Entry 6: Receive fee from FeeDistributor
+// This contract is set as the "founder" in FeeDistributor
+// When FeeDistributor sends the founder share, it calls this entry
+// asset: Hash of the asset (XEL = Hash::zero(), or token hash)
+// amount: total amount sent
+entry receive_fee(asset: Hash, amount: u64) -> u64 {
+    when_not_paused()
+    only_fee_distributor()
+    require(amount > 0, "zero")
+
+    let s: Storage = Storage::new()
+
+    // Update total received
+    let total_received: u64 = s.load(TOTAL_RECEIVED_KEY).unwrap_or(0)
+    s.store(TOTAL_RECEIVED_KEY, total_received + amount)
+
+    // Distribute to active contributors based on their percentages
+    let count: u64 = s.load(SHARE_COUNT_KEY).unwrap_or(0)
+    let total_distributed_to_contributors: u64 = 0
+    let i: u64 = 0
+
+    while i < count {
+        let addr_opt: optional<Address> = s.load(SHARE_LIST_PREFIX + i.to_string(10u32))
+        if addr_opt.is_some() {
+            let addr: Address = addr_opt.expect("err")
+            let pct: u64 = get_effective_percentage(addr)
+            if pct > 0 {
+                let share_amount: u64 = (amount * pct) / 10000
+                let share: ShareInfo = s.load(SHARE_PREFIX + addr.to_string()).expect("err")
+                share.pending += share_amount
+                s.store(SHARE_PREFIX + addr.to_string(), share)
+                total_distributed_to_contributors += share_amount
+            }
+        }
+        i += 1
+    }
+
+    // Remainder goes to founder
+    let founder_amount: u64 = amount - total_distributed_to_contributors
+    let fp: u64 = s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+    s.store(FOUNDER_PENDING_KEY, fp + founder_amount)
+
+    return 0
+}
+
+// Pub fn 7: Get share info for a contributor
+// Returns (percentage_bps, start_topo, end_topo, total_received, pending, active)
+pub fn get_share_info(contributor: Address) -> (u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let share: ShareInfo = s.load(SHARE_PREFIX + contributor.to_string()).expect("noshare")
+    return (
+        share.percentage_bps,
+        share.start_topo,
+        share.end_topo,
+        share.total_received,
+        share.pending,
+        share.active
+    )
+}
+
+// Pub fn 8: Get founder's pending (unclaimed) revenue
+pub fn get_founder_pending() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(FOUNDER_PENDING_KEY).unwrap_or(0)
+}
+
+// Pub fn 9: Get contributor's pending (unclaimed) revenue
+pub fn get_contributor_pending(contributor: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let share_opt: optional<ShareInfo> = s.load(SHARE_PREFIX + contributor.to_string())
+    if share_opt.is_none() { return 0 }
+    let share: ShareInfo = share_opt.expect("err")
+    return share.pending
+}
+
+// Pub fn 10: Get number of contributors (active + inactive)
+pub fn get_contributor_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(SHARE_COUNT_KEY).unwrap_or(0)
+}
+
+// Pub fn 11: Get total distributed (all-time, to founder + contributors)
+pub fn get_total_distributed() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_DISTRIBUTED_KEY).unwrap_or(0)
+}
+
+// Pub fn 12: Get contributor address at index (for iteration)
+pub fn get_share_at_index(index: u64) -> Address {
+    let s: Storage = Storage::new()
+    return s.load(SHARE_LIST_PREFIX + index.to_string(10u32)).expect("oob")
+}
+
+// Pub fn 13: Check if a share is currently active (not expired)
+pub fn is_share_active(contributor: Address) -> bool {
+    let s: Storage = Storage::new()
+    let share_opt: optional<ShareInfo> = s.load(SHARE_PREFIX + contributor.to_string())
+    if share_opt.is_none() { return false }
+    let share: ShareInfo = share_opt.expect("err")
+    if !share.active { return false }
+    let current: u64 = get_current_topoheight()
+    if current < share.start_topo { return false }
+    if current >= share.end_topo { return false }
+    return true
+}
+
+// Entry 14: Set VLT contract
+entry set_vlt_contract(vc: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VLT_CONTRACT_KEY, vc)
+    return 0
+}
+
+// Entry 15: Set XEL asset
+entry set_xel_asset(xa: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(XEL_ASSET_KEY, xa)
+    return 0
+}
+
+// Entry 16: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 17: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 18: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 19: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 20: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 21: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 22: Get version
+entry get_version() -> string {
+    return VERSION
+}
+
+// Entry 23 (after recompile): Set FeeDistributor contract hash (admin only) — F-04 fix.
+// Configures the canonical FeeDistributor whose receive_fee calls are accepted.
+entry set_fee_distributor(fdh: Hash) -> u64 {
+    only_admin()
+    require(fdh != Hash::zero(), "badhash")
+    let s: Storage = Storage::new()
+    s.store(FEE_DISTRIBUTOR_KEY, fdh)
+    emit_event(0u64, ["FeeDistributorSet", fdh.to_hex()])
+    return 0
+}
+
+// Pub fn: Get the configured FeeDistributor hash (Hash::zero() if not set).
+pub fn get_fee_distributor() -> Hash {
+    let s: Storage = Storage::new()
+    let fd_opt: optional<Hash> = s.load(FEE_DISTRIBUTOR_KEY)
+    if fd_opt.is_none() { return Hash::zero() }
+    return fd_opt.expect("err")
+}

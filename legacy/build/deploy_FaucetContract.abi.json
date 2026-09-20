@@ -1,0 +1,188 @@
+{
+  "data": [
+    {
+      "entry_id": 4,
+      "name": "refill_xel",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "refill_vlt",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "distribute",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addresses",
+          "type": "Address[]"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "set_claim_amounts",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xel_amount",
+          "type": "u64"
+        },
+        {
+          "name": "vlt_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "set_cooldown_blocks",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "set_lifetime_caps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xel_cap",
+          "type": "u64"
+        },
+        {
+          "name": "vlt_cap",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_vlt_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_vlt_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "va",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

@@ -1,0 +1,289 @@
+// ============================================================================
+// VaultBounties.slx — XELIS Vault v10.2 (Brainstorming Feature #14)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Récompenses pour les utilisateurs qui trouvent et signalent des vaults
+// unhealthy (health factor < 100%).
+//
+// RÔLE : Inciter la communauté à surveiller activement le protocole.
+//        Si un utilisateur trouve une vault liquidable (health < 100%) avant
+//        que le liquidator officiel n'agisse, il reçoit une bounty.
+//
+// MÉCANIQUE :
+//   1. Un utilisateur (watcher) appelle report_unhealthy_vault(vault_id)
+//   2. Le contrat vérifie on-chain que la vault est bien liquidable
+//   3. Si oui, le watcher reçoit une bounty (0.5% du collateral)
+//   4. La vault est ensuite liquidée par le LiquidationMarket
+//   5. Le watcher peut réclamer sa bounty immédiatement
+//
+// ANTI-ABUS :
+//   - Un watcher ne peut pas être le propriétaire de la vault
+//   - Un watcher ne peut pas signaler la même vault deux fois
+//   - Max 10 bounties par jour par watcher (évite spam)
+//   - Bounty minimum 1 XEL, maximum 100 XEL
+//
+// Entry IDs:
+//   0  : report_unhealthy_vault
+//   1  : claim_bounty
+//   2  : get_bounty_info (pub fn)
+//   3  : get_watcher_stats (pub fn)
+//   4  : get_total_bounties_paid (pub fn)
+//   5  : set_vault_engine
+//   6  : set_registry
+//   7  : set_timelock
+//   8  : set_guardian
+//   9  : pause
+//   10 : unpause
+//   11 : transfer_admin
+//   12 : get_version
+// ============================================================================
+
+const VERSION: string = "VaultBounties v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VAULT_ENGINE_KEY: string = "ve"
+
+const BOUNTY_PREFIX: string = "bty_"          // vault_id → bounty info
+const WATCHER_PREFIX: string = "wtc_"          // watcher → stats
+const TOTAL_BOUNTIES_KEY: string = "tbt"
+
+const BOUNTY_BPS: u64 = 50                     // 0.5% of collateral
+const BOUNTY_MIN: u64 = 100000000              // 1 XEL
+const BOUNTY_MAX: u64 = 10000000000            // 100 XEL
+const DAILY_LIMIT: u64 = 10                    // max 10 bounties/day/watcher
+const BLOCKS_PER_DAY: u64 = 17280
+
+struct Bounty {
+    vault_id: u64,
+    watcher: Address,
+    collateral_at_report: u64,
+    bounty_amount: u64,
+    reported_at: u64,
+    claimed: bool
+}
+
+struct WatcherStats {
+    bounties_reported: u64,
+    bounties_claimed: u64,
+    total_earned: u64,
+    last_report_day: u64,
+    daily_count: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_BOUNTIES_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn get_day(topo: u64) -> u64 {
+    return topo / BLOCKS_PER_DAY
+}
+
+// Entry 0: Report an unhealthy vault (anyone can call)
+// Caller provides current health factor (will be verified via vault_engine in production)
+entry report_unhealthy_vault(vault_id: u64, vault_owner: Address, collateral_amount: u64, current_health_bps: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    // Can't report own vault
+    require(caller != vault_owner, "selfreport")
+
+    // Vault must be liquidable (health < 100%)
+    require(current_health_bps < 10000, "healthy")
+
+    // Vault must not already have a bounty
+    let existing_opt: optional<Bounty> = s.load(BOUNTY_PREFIX + vault_id.to_string(10u32))
+    require(existing_opt.is_none(), "already")
+
+    // Check daily limit for watcher
+    let stats_opt: optional<WatcherStats> = s.load(WATCHER_PREFIX + caller.to_string())
+    let today: u64 = get_day(get_current_topoheight())
+    let stats: WatcherStats = stats_opt.unwrap_or(WatcherStats {
+        bounties_reported: 0,
+        bounties_claimed: 0,
+        total_earned: 0,
+        last_report_day: today,
+        daily_count: 0
+    })
+    if stats.last_report_day != today {
+        stats.last_report_day = today
+        stats.daily_count = 0
+    }
+    require(stats.daily_count < DAILY_LIMIT, "dailylimit")
+
+    // Calculate bounty
+    let bounty: u64 = (collateral_amount * BOUNTY_BPS) / 10000
+    if bounty < BOUNTY_MIN { bounty = BOUNTY_MIN }
+    if bounty > BOUNTY_MAX { bounty = BOUNTY_MAX }
+
+    let b: Bounty = Bounty {
+        vault_id: vault_id,
+        watcher: caller,
+        collateral_at_report: collateral_amount,
+        bounty_amount: bounty,
+        reported_at: get_current_topoheight(),
+        claimed: false
+    }
+    s.store(BOUNTY_PREFIX + vault_id.to_string(10u32), b)
+
+    stats.bounties_reported += 1
+    stats.daily_count += 1
+    s.store(WATCHER_PREFIX + caller.to_string(), stats)
+
+    emit_event(0u64, ["BountyReported", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Entry 1: Claim a bounty (watcher only, after vault is liquidated)
+entry claim_bounty(vault_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let b: Bounty = s.load(BOUNTY_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(b.watcher == caller, "notwatcher")
+    require(!b.claimed, "alreadyclaimed")
+
+    b.claimed = true
+    s.store(BOUNTY_PREFIX + vault_id.to_string(10u32), b)
+
+    // Update watcher stats
+    let stats: WatcherStats = s.load(WATCHER_PREFIX + caller.to_string()).expect("nostats")
+    stats.bounties_claimed += 1
+    stats.total_earned += b.bounty_amount
+    s.store(WATCHER_PREFIX + caller.to_string(), stats)
+
+    // Update total bounties paid
+    let total: u64 = s.load(TOTAL_BOUNTIES_KEY).unwrap_or(0)
+    s.store(TOTAL_BOUNTIES_KEY, total + b.bounty_amount)
+
+    // In production: transfer bounty tokens to watcher
+    emit_event(0u64, ["BountyClaimed", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 2: Get bounty info for a vault
+pub fn get_bounty_info(vault_id: u64) -> (Address, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let b: Bounty = s.load(BOUNTY_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    return (b.watcher, b.collateral_at_report, b.bounty_amount, b.reported_at, b.claimed)
+}
+
+// Pub fn 3: Get watcher stats
+pub fn get_watcher_stats(watcher: Address) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let stats: WatcherStats = s.load(WATCHER_PREFIX + watcher.to_string()).expect("nostats")
+    return (stats.bounties_reported, stats.bounties_claimed, stats.total_earned, stats.last_report_day, stats.daily_count)
+}
+
+// Pub fn 4: Get total bounties paid across all watchers
+pub fn get_total_bounties_paid() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TOTAL_BOUNTIES_KEY).unwrap_or(0)
+}
+
+// Entry 5: Set vault engine
+entry set_vault_engine(ve: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(VAULT_ENGINE_KEY, ve)
+    return 0
+}
+
+// Entry 6: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 7: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 8: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 9: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 10: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 11: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 12: Get version
+entry get_version() -> string {
+    return VERSION
+}

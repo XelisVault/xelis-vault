@@ -1,0 +1,317 @@
+{
+  "data": [
+    {
+      "entry_id": 3,
+      "name": "propose_add_feed",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        },
+        {
+          "name": "min_price",
+          "type": "u64"
+        },
+        {
+          "name": "max_price",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 4,
+      "name": "propose_update_feed",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "min_price",
+          "type": "u64"
+        },
+        {
+          "name": "max_price",
+          "type": "u64"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "propose_remove_feed",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "propose_set_param",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "param_key",
+          "type": "u8"
+        },
+        {
+          "name": "param_value",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "propose_set_reward",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reward_amount",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "propose_emergency_cb",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "propose_reset_feed",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "vote",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        },
+        {
+          "name": "support",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "execute_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "cancel_proposal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_voting_period",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_quorum_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_approval_bps",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "set_execution_delay",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "set_oracle",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "oracle",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "set_governance_vault",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "gv",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "set_miner_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "mc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

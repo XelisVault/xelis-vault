@@ -1,0 +1,396 @@
+// ============================================================================
+// xUSD.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// Entry IDs 0-17 match the deployed VaultEngine's expectations:
+//   3 = mint_tokens, 4 = mint_split, 5 = burn_tokens, 17 = mint_to_contract
+// New features (minter/burner whitelist, two-step emergency, etc.) at 18+.
+// Cross-contract functions use `pub fn` (required by Contract::call()).
+// ============================================================================
+
+const VERSION: string = "xUSD v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const EMERGENCY_KEY: string = "ea"
+const REGISTRY_KEY: string = "reg"
+
+const ASSET_HASH_KEY: string = "ah"
+const MINTER_PREFIX: string = "mi_"
+const BURNER_PREFIX: string = "bu_"
+
+const DECIMALS: u8 = 8
+const MAX_SUPPLY: u64 = 0
+
+const EMERGENCY_REQUEST_TOPO_KEY: string = "ert"
+const EMERGENCY_DELAY_BLOCKS: u64 = 17280
+
+// ============================================================================
+// CHUNK 0 — Constructor
+// ============================================================================
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(EMERGENCY_KEY, caller)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 1 — only_admin guard
+// ============================================================================
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+// ============================================================================
+// CHUNK 2 — create_asset (requires 1 XEL deposit, one-shot)
+// ============================================================================
+entry create_asset() -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    let existing: optional<Hash> = s.load(ASSET_HASH_KEY)
+    require(existing.is_none(), "exists")
+
+    let asset: Asset = Asset::create(
+        MAX_SUPPLY,
+        "XELIS USD",
+        "XUSD",
+        DECIMALS,
+        MaxSupplyMode::None
+    ).expect("err")
+    let hash: Hash = asset.get_hash()
+    s.store(ASSET_HASH_KEY, hash)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 3 — mint_tokens (cross-contract, VaultEngine calls at entry 3)
+// ============================================================================
+pub fn mint_tokens(to: Address, amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller != admin {
+        let cc: Hash = get_contract_caller().expect("nocaller")
+        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_minter, "notminter")
+    }
+    require(amount > 0, "amtgt0")
+
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+
+    let ok: bool = asset.mint(amount)
+    require(ok, "mintfail")
+    let ok2: bool = transfer(to, amount, hash)
+    require(ok2, "txfail")
+    return 0
+}
+
+// ============================================================================
+// CHUNK 4 — mint_split (cross-contract, VaultEngine calls at entry 4)
+// ============================================================================
+pub fn mint_split(to: Address, amount: u64, treasury: Address, fee: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller != admin {
+        let cc: Hash = get_contract_caller().expect("nocaller")
+        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_minter, "notminter")
+    }
+    let total: u64 = amount + fee
+    require(total > 0, "amtgt0")
+    require(total >= amount, "ovf")
+
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+
+    let ok: bool = asset.mint(total)
+    require(ok, "mintfail")
+
+    if amount > 0 {
+        let ok1: bool = transfer(to, amount, hash)
+        require(ok1, "txfail1")
+    }
+    if fee > 0 {
+        let ok2: bool = transfer(treasury, fee, hash)
+        require(ok2, "txfail2")
+    }
+    return 0
+}
+
+// ============================================================================
+// CHUNK 5 — burn_tokens (cross-contract, VaultEngine calls at entry 5)
+// ============================================================================
+pub fn burn_tokens(amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let cc: Hash = get_contract_caller().expect("nocaller")
+    let is_burner: bool = s.load(BURNER_PREFIX + cc.to_hex()).unwrap_or(false)
+    require(is_burner, "notburner")
+    require(amount > 0, "amtgt0")
+
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+    require(bal >= amount, "lowbal")
+
+    let ok: bool = burn(amount, hash)
+    require(ok, "burnfail")
+    return 0
+}
+
+// ============================================================================
+// CHUNK 6 — transfer_tokens (from deposits)
+// ============================================================================
+entry transfer_tokens(to: Address, amount: u64) -> u64 {
+    require(amount > 0, "amtgt0")
+    let caller: Address = get_caller().expect("err")
+    require(to != caller, "selfxfer")
+
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+
+    let dep: optional<u64> = get_deposit_for_asset(hash)
+    require(dep.is_some() && dep.expect("err") >= amount, "nodep")
+
+    let ok: bool = transfer(to, amount, hash)
+    require(ok, "txfail")
+
+    if dep.expect("err") > amount {
+        let ok_r: bool = transfer(caller, dep.expect("err") - amount, hash)
+        require(ok_r, "rfail")
+    }
+    return 0
+}
+
+// ============================================================================
+// CHUNK 7 — get_asset_hash (cross-contract)
+// ============================================================================
+pub fn get_asset_hash() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// ============================================================================
+// CHUNK 8 — get_asset_info
+// ============================================================================
+entry get_asset_info() -> (string, string, u64, u8) {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
+}
+
+// ============================================================================
+// CHUNK 9 — set_vault_contract (backward compat, authorizes as minter+burner)
+// ============================================================================
+entry set_vault_contract(contract_hash: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(MINTER_PREFIX + contract_hash.to_hex(), true)
+    s.store(BURNER_PREFIX + contract_hash.to_hex(), true)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 10 — set_timelock
+// ============================================================================
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 11 — set_timelock_tl (cross-contract)
+// ============================================================================
+pub fn set_timelock_tl(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 12 — transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 13 — set_psm (authorize PSM contract as minter)
+// ============================================================================
+entry set_psm(hash: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(MINTER_PREFIX + hash.to_hex(), true)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 14 — set_emergency
+// ============================================================================
+entry set_emergency(e: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let cur: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == cur, "notemg")
+    Storage::new().store(EMERGENCY_KEY, e)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 15 — emergency_withdraw (single-step, legacy compat)
+// ============================================================================
+entry emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let bal: u64 = get_balance_for_asset(Hash::zero()).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, Hash::zero())
+    }
+    return 0
+}
+
+// ============================================================================
+// CHUNK 16 — set_savings (authorize SavingsRate as minter+burner)
+// ============================================================================
+entry set_savings(hash: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(MINTER_PREFIX + hash.to_hex(), true)
+    s.store(BURNER_PREFIX + hash.to_hex(), true)
+    return 0
+}
+
+// ============================================================================
+// CHUNK 17 — mint_to_contract (cross-contract, VaultEngine calls for insurance)
+// ============================================================================
+pub fn mint_to_contract(target: Hash, amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller != admin {
+        let cc: Hash = get_contract_caller().expect("nocaller")
+        let is_minter: bool = s.load(MINTER_PREFIX + cc.to_hex()).unwrap_or(false)
+        require(is_minter, "notminter")
+    }
+    require(amount > 0, "amtgt0")
+
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+
+    let ok: bool = asset.mint(amount)
+    require(ok, "mintfail")
+    let ok2: bool = transfer_contract(target, amount, hash)
+    require(ok2, "txfail")
+    return 0
+}
+
+// ============================================================================
+// CHUNKS 18+ — New features (set_minter, set_burner, registry, two-step EWD, etc.)
+// ============================================================================
+
+// CHUNK 18: set_minter — whitelist a contract to call mint_tokens/mint_split/mint_to_contract
+entry set_minter(contract_hash: Hash, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store(MINTER_PREFIX + contract_hash.to_hex(), enabled)
+    return 0
+}
+
+// CHUNK 19: set_burner — whitelist a contract to call burn_tokens
+entry set_burner(contract_hash: Hash, enabled: bool) -> u64 {
+    only_admin()
+    Storage::new().store(BURNER_PREFIX + contract_hash.to_hex(), enabled)
+    return 0
+}
+
+// CHUNK 20: set_registry — set ContractRegistry hash
+entry set_registry(reg: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(REGISTRY_KEY, reg)
+    return 0
+}
+
+// CHUNK 21: get_version
+entry get_version() -> string {
+    return VERSION
+}
+
+// CHUNK 22: get_asset_hash_entry (callable via wallet RPC)
+entry get_asset_hash_entry() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// CHUNK 23: get_asset_info_entry
+entry get_asset_info_entry() -> (string, string, u64, u8) {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
+}
+
+// CHUNK 24: get_balance_entry
+entry get_balance_entry(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    return get_balance_for_asset(hash).unwrap_or(0)
+}
+
+// CHUNK 25: request_emergency_withdraw (step 1 of two-step)
+entry request_emergency_withdraw() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    s.store(EMERGENCY_REQUEST_TOPO_KEY, get_current_topoheight())
+    return 0
+}
+
+// CHUNK 26: execute_emergency_withdraw (step 2 of two-step, after EMERGENCY_DELAY_BLOCKS)
+entry execute_emergency_withdraw(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let e: Address = s.load(EMERGENCY_KEY).expect("err")
+    require(caller == e, "notemg")
+    let req_topo: u64 = s.load(EMERGENCY_REQUEST_TOPO_KEY).unwrap_or(0)
+    require(req_topo > 0, "norequest")
+    let now_topo: u64 = get_current_topoheight()
+    require(now_topo >= req_topo + EMERGENCY_DELAY_BLOCKS, "toosoon")
+    s.delete(EMERGENCY_REQUEST_TOPO_KEY)
+    let bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    if bal > 0 {
+        let _ = transfer(caller, bal, asset)
+    }
+    return 0
+}
+
+// CHUNK 27: pub fn get_asset_hash (cross-contract duplicate of chunk 7)
+pub fn get_asset_hash_pub() -> Hash {
+    return Storage::new().load(ASSET_HASH_KEY).expect("err")
+}
+
+// CHUNK 28: pub fn get_asset_info_pub
+pub fn get_asset_info_pub() -> (string, string, u64, u8) {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    let asset: Asset = Asset::get_by_hash(hash).expect("err")
+    return (asset.get_name(), asset.get_ticker(), asset.get_supply(), DECIMALS)
+}
+
+// CHUNK 29: pub fn get_balance_pub
+pub fn get_balance_pub(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let hash: Hash = s.load(ASSET_HASH_KEY).expect("err")
+    return get_balance_for_asset(hash).unwrap_or(0)
+}

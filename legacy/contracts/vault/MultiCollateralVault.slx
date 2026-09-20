@@ -1,0 +1,358 @@
+// ============================================================================
+// MultiCollateralVault.slx — XELIS Vault v10.2 (Brainstorming Feature #6)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Vault multi-collateral : accepte plusieurs types de collateral simultanément.
+//
+// RÔLE : Une vault qui accepte XEL + VLT + RWA Gold + xUSD dans la même vault.
+//        Le health factor est calculé sur la valeur totale diversifiée.
+//
+// AVANTAGES :
+//   - Diversification du risque (si XEL chute, le gold peut compenser)
+//   - Réduction du risque de liquidation
+//   - LTV plus avantageux (meilleur mix = meilleur LTV)
+//   - UX simplifiée (1 vault au lieu de N vaults par asset)
+//
+// MÉCANIQUE :
+//   1. User create_multi_vault() — initialise une vault vide
+//   2. User add_collateral(asset, amount) — peut appeler plusieurs fois avec différents assets
+//   3. User borrow_multi(amount) — borrow xUSD contre le total collateral
+//   4. Health factor = sum(collateral_i * price_i * LTV_i) / borrow_value
+//   5. Liquidation : tous les collaterals sont liquidés proportionnellement
+//
+// LTV PAR ASSET :
+//   - XEL : 75% (highly liquid)
+//   - VLT : 60% (protocol token, more volatile)
+//   - xUSD : 90% (stablecoin)
+//   - RWA Gold : 70% (real-world asset, less liquid)
+//   - RWA RealEstate : 50% (illiquid)
+//
+// PRIVACY :
+//   - Les montants par asset peuvent être chiffrés (Ciphertext option)
+//   - Le total est public (pour health factor transparency)
+//
+// Entry IDs:
+//   0  : create_multi_vault
+//   1  : add_collateral
+//   2  : remove_collateral
+//   3  : borrow_multi
+//   4  : repay_multi
+//   5  : liquidate_multi
+//   6  : get_multi_vault (pub fn)
+//   7  : get_health_factor (pub fn)
+//   8  : get_collateral_breakdown (pub fn)
+//   9  : get_supported_assets (pub fn)
+//   10 : set_asset_ltv
+//   11 : set_registry
+//   12 : set_timelock
+//   13 : set_guardian
+//   14 : pause
+//   15 : unpause
+//   16 : transfer_admin
+//   17 : get_version
+// ============================================================================
+
+const VERSION: string = "MultiCollateralVault v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const COUNTER_KEY: string = "n"
+const VAULT_PREFIX: string = "mv_"
+const COLLATERAL_PREFIX: string = "mc_"        // vault_id + asset → amount
+const ASSET_LTV_PREFIX: string = "ltv_"        // asset → LTV in bps
+const SUPPORTED_ASSETS_KEY: string = "sa"
+const MAX_ASSETS_PER_VAULT: u8 = 10
+const LIQUIDATION_PENALTY_BPS: u64 = 1000      // 10%
+const MIN_HEALTH_BPS: u64 = 10000              // 100% = liquidable
+
+struct MultiVault {
+    id: u64,
+    owner: Address,
+    asset_count: u8,
+    total_borrow: u64,
+    created_at: u64,
+    last_update_topo: u64,
+    liquidated: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(COUNTER_KEY, 1u64)
+    s.store(SUPPORTED_ASSETS_KEY, 0u8)
+
+    // Default LTVs
+    s.store(ASSET_LTV_PREFIX + "xel", 7500u64)        // 75%
+    s.store(ASSET_LTV_PREFIX + "vlt", 6000u64)        // 60%
+    s.store(ASSET_LTV_PREFIX + "xusd", 9000u64)       // 90%
+    s.store(ASSET_LTV_PREFIX + "gold", 7000u64)       // 70%
+    s.store(ASSET_LTV_PREFIX + "realestate", 5000u64) // 50%
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Create a new multi-collateral vault (empty initially)
+entry create_multi_vault() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let id: u64 = s.load(COUNTER_KEY).expect("err")
+
+    let vault: MultiVault = MultiVault {
+        id: id,
+        owner: caller,
+        asset_count: 0,
+        total_borrow: 0,
+        created_at: get_current_topoheight(),
+        last_update_topo: get_current_topoheight(),
+        liquidated: false
+    }
+    s.store(VAULT_PREFIX + id.to_string(10u32), vault)
+    s.store(COUNTER_KEY, id + 1)
+    return 0
+}
+
+// Entry 1: Add collateral of a specific asset
+// In production: caller must transfer `amount` of `asset` to this contract first
+entry add_collateral(vault_id: u64, asset: Hash, amount: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liquidated")
+    require(vault.asset_count < MAX_ASSETS_PER_VAULT, "maxassets")
+
+    let key: string = COLLATERAL_PREFIX + vault_id.to_string(10u32) + "_" + asset.to_hex()
+    let existing: u64 = s.load(key).unwrap_or(0)
+    if existing == 0 {
+        vault.asset_count += 1
+    }
+    s.store(key, existing + amount)
+    vault.last_update_topo = get_current_topoheight()
+    s.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+
+    return 0
+}
+
+// Entry 2: Remove collateral (only if health factor remains > 150%)
+// Caller must provide current total collateral value (in XEL atomic)
+entry remove_collateral(vault_id: u64, asset: Hash, amount: u64, current_total_collateral_value: u64) -> u64 {
+    when_not_paused()
+    require(amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liquidated")
+
+    let key: string = COLLATERAL_PREFIX + vault_id.to_string(10u32) + "_" + asset.to_hex()
+    let existing: u64 = s.load(key).expect("nocol")
+    require(existing >= amount, "insufficient")
+
+    // In production: verify health factor after removal is > 150%
+    // For now, accept caller-provided value (must be signed by keeper)
+
+    s.store(key, existing - amount)
+    if existing - amount == 0 {
+        vault.asset_count -= 1
+    }
+    vault.last_update_topo = get_current_topoheight()
+    s.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+
+    // In production: transfer `amount` of `asset` back to caller
+    return 0
+}
+
+// Entry 3: Borrow xUSD against total collateral
+// Caller provides total collateral value (for health check)
+entry borrow_multi(vault_id: u64, borrow_amount: u64, total_collateral_value: u64) -> u64 {
+    when_not_paused()
+    require(borrow_amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liquidated")
+
+    // Health check: borrow must not push health below 150%
+    let new_borrow: u64 = vault.total_borrow + borrow_amount
+    // Health = collateral_value * 10000 / borrow_value (assuming borrow is in xUSD = $1)
+    // For 150% min: collateral_value * 10000 >= new_borrow * 15000
+    require(total_collateral_value * 10000 >= new_borrow * 15000, "unhealthy")
+
+    vault.total_borrow = new_borrow
+    vault.last_update_topo = get_current_topoheight()
+    s.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+
+    // In production: mint xUSD to caller
+    return 0
+}
+
+// Entry 4: Repay borrow
+entry repay_multi(vault_id: u64, repay_amount: u64) -> u64 {
+    when_not_paused()
+    require(repay_amount > 0, "zero")
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(vault.owner == get_caller().expect("err"), "notowner")
+    require(!vault.liquidated, "liquidated")
+    require(vault.total_borrow >= repay_amount, "toomuch")
+
+    // In production: burn xUSD from caller
+    vault.total_borrow -= repay_amount
+    vault.last_update_topo = get_current_topoheight()
+    s.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+    return 0
+}
+
+// Entry 5: Liquidate a multi-collateral vault (anyone can call if health < 100%)
+// All collaterals are seized proportionally
+entry liquidate_multi(vault_id: u64, current_total_collateral_value: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    require(!vault.liquidated, "already")
+
+    // Verify health is below 100%
+    require(current_total_collateral_value * 10000 < vault.total_borrow * 10000, "healthy")
+
+    vault.liquidated = true
+    vault.last_update_topo = get_current_topoheight()
+    s.store(VAULT_PREFIX + vault_id.to_string(10u32), vault)
+
+    // In production: seize all collaterals, repay borrow, give penalty to liquidator
+    let penalty: u64 = (vault.total_borrow * LIQUIDATION_PENALTY_BPS) / 10000
+    emit_event(0u64, ["MultiVaultLiquidated", vault_id.to_string(10u32)])
+    return 0
+}
+
+// Pub fn 6: Get multi-vault info
+pub fn get_multi_vault(vault_id: u64) -> (Address, u8, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    return (vault.owner, vault.asset_count, vault.total_borrow, vault.created_at, vault.last_update_topo, vault.liquidated)
+}
+
+// Pub fn 7: Get current health factor (caller provides collateral value)
+pub fn get_health_factor(vault_id: u64, current_collateral_value: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let vault: MultiVault = s.load(VAULT_PREFIX + vault_id.to_string(10u32)).expect("notfound")
+    if vault.total_borrow == 0 { return 0 }  // infinite health, return 0 as sentinel
+    return (current_collateral_value * 10000) / vault.total_borrow
+}
+
+// Pub fn 8: Get collateral amount for a specific asset in a vault
+pub fn get_collateral_breakdown(vault_id: u64, asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let key: string = COLLATERAL_PREFIX + vault_id.to_string(10u32) + "_" + asset.to_hex()
+    return s.load(key).unwrap_or(0)
+}
+
+// Pub fn 9: Get LTV for an asset
+pub fn get_supported_assets(asset_name: string) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(ASSET_LTV_PREFIX + asset_name).unwrap_or(0)
+}
+
+// Entry 10: Set LTV for an asset (admin only)
+entry set_asset_ltv(asset_name: string, ltv_bps: u64) -> u64 {
+    only_admin()
+    require(ltv_bps <= 10000, "badltv")
+    let s: Storage = Storage::new()
+    s.store(ASSET_LTV_PREFIX + asset_name, ltv_bps)
+    return 0
+}
+
+// Entry 11: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 12: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 13: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 14: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 15: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 16: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 17: Get version
+entry get_version() -> string {
+    return VERSION
+}

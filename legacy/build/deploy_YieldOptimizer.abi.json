@@ -1,0 +1,193 @@
+{
+  "data": [
+    {
+      "entry_id": 4,
+      "name": "opt_in",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "strategy",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "opt_out",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "set_strategy",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_strategy",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "execute_strategy",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "savings_apr_bps",
+          "type": "u64"
+        },
+        {
+          "name": "lending_apr_bps",
+          "type": "u64"
+        },
+        {
+          "name": "gov_apr_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "reinvest_rewards",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "user",
+          "type": "Address"
+        },
+        {
+          "name": "rewards_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "claim_rewards",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_savings_rate",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "sr",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_lending_market",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "lm",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_gov_vault",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "gv",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

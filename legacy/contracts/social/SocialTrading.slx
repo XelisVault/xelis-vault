@@ -1,0 +1,302 @@
+// ============================================================================
+// SocialTrading.slx — XELIS Vault v10.2 (Brainstorming Feature #9)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Social trading / copy trading pour vaults XELIS.
+//
+// RÔLE : Un utilisateur "leader" rend sa vault publique (volontairement).
+//        Les followers peuvent auto-répliquer ses actions (deposit, borrow,
+//        swap). Le suivi est proportionnel.
+//
+// MÉCANIQUE :
+//   1. Leader calls make_vault_public(vault_id) — opt-in
+//   2. Follower calls follow_leader(leader_addr, ratio_bps)
+//      - ratio_bps = % des actions du leader à répliquer (ex: 5000 = 50%)
+//   3. Quand le leader fait deposit/borrow/repay/withdraw, un event est émis
+//   4. Les bots des followers écoutent ces events et exécutent les mêmes actions
+//   5. Le follower peut stop_follow à tout moment (liquid democracy)
+//
+// AVANTAGES :
+//   - Les nouveaux utilisateurs peuvent copier les stratégies des experts
+//   - Le leader gagne en reputation + petits kickbacks (optionnel)
+//   - Pas de smart contract risk supplémentaire (le follower signe chaque tx)
+//
+// PRIVACY :
+//   - Le leader rend SEULEMENT la vault sélectionnée publique (pas toutes)
+//   - Les followers voient les actions (deposit/borrow) mais pas l'historique complet
+//   - Le leader peut cacher sa vault à tout moment
+//
+// LIMITES :
+//   - Max 100 followers par leader
+//   - Max 10 leaders par follower (diversification)
+//   - Ratio minimum 10% (1000 bps), maximum 100% (10000 bps)
+//
+// Entry IDs:
+//   0  : make_vault_public
+//   1  : make_vault_private
+//   2  : follow_leader
+//   3  : stop_follow
+//   4  : emit_leader_action (called by VaultEngine)
+//   5  : get_public_vault (pub fn)
+//   6  : get_followers_count (pub fn)
+//   7  : get_following_count (pub fn)
+//   8  : get_leader_reputation (pub fn)
+//   9  : set_registry
+//   10 : set_timelock
+//   11 : set_guardian
+//   12 : pause
+//   13 : unpause
+//   14 : transfer_admin
+//   15 : get_version
+// ============================================================================
+
+const VERSION: string = "SocialTrading v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const PUBLIC_VAULT_PREFIX: string = "pv_"          // leader → vault_id (public)
+const FOLLOW_PREFIX: string = "fol_"                // follower → leader
+const FOLLOWER_COUNT_PREFIX: string = "fc_"         // leader → count
+const FOLLOWING_COUNT_PREFIX: string = "fg_"        // follower → count
+const LEADER_REP_PREFIX: string = "lr_"             // leader → reputation
+
+const MAX_FOLLOWERS: u64 = 100
+const MAX_FOLLOWING: u64 = 10
+const MIN_RATIO_BPS: u64 = 1000     // 10%
+const MAX_RATIO_BPS: u64 = 10000    // 100%
+
+// Action types emitted to followers
+const ACT_DEPOSIT: u8 = 1
+const ACT_BORROW: u8 = 2
+const ACT_REPAY: u8 = 3
+const ACT_WITHDRAW: u8 = 4
+const ACT_SWAP: u8 = 5
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Make a vault public (leader opt-in)
+entry make_vault_public(vault_id: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    // In production: verify caller owns vault_id via VaultEngine
+
+    let existing: optional<u64> = s.load(PUBLIC_VAULT_PREFIX + caller.to_string())
+    require(existing.is_none(), "alreadypublic")
+    s.store(PUBLIC_VAULT_PREFIX + caller.to_string(), vault_id)
+    emit_event(0u64, ["VaultMadePublic", caller.to_string()])
+    return 0
+}
+
+// Entry 1: Make vault private (hide from followers)
+entry make_vault_private() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.delete(PUBLIC_VAULT_PREFIX + caller.to_string())
+    emit_event(0u64, ["VaultMadePrivate", caller.to_string()])
+    return 0
+}
+
+// Entry 2: Follow a leader with a specified ratio
+entry follow_leader(leader: Address, ratio_bps: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(leader != caller, "selffollow")
+    require(ratio_bps >= MIN_RATIO_BPS && ratio_bps <= MAX_RATIO_BPS, "badratio")
+
+    // Leader must have a public vault
+    let public_vault_opt: optional<u64> = s.load(PUBLIC_VAULT_PREFIX + leader.to_string())
+    require(public_vault_opt.is_some(), "notpublic")
+
+    // Check leader hasn't exceeded max followers
+    let follower_count: u64 = s.load(FOLLOWER_COUNT_PREFIX + leader.to_string()).unwrap_or(0)
+    require(follower_count < MAX_FOLLOWERS, "maxfollowers")
+
+    // Check follower hasn't exceeded max following
+    let following_count: u64 = s.load(FOLLOWING_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+    require(following_count < MAX_FOLLOWING, "maxfollowing")
+
+    // Store follow relationship
+    s.store(FOLLOW_PREFIX + caller.to_string(), leader)
+    s.store(FOLLOW_PREFIX + caller.to_string() + "_r", ratio_bps)
+    s.store(FOLLOWER_COUNT_PREFIX + leader.to_string(), follower_count + 1)
+    s.store(FOLLOWING_COUNT_PREFIX + caller.to_string(), following_count + 1)
+
+    emit_event(0u64, ["FollowStarted", caller.to_string() + "_" + leader.to_string()])
+    return 0
+}
+
+// Entry 3: Stop following a leader
+entry stop_follow(leader: Address) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let existing: optional<Address> = s.load(FOLLOW_PREFIX + caller.to_string())
+    require(existing.is_some(), "notfollowing")
+    let cur: Address = existing.expect("err")
+    require(cur == leader, "wrongleader")
+
+    s.delete(FOLLOW_PREFIX + caller.to_string())
+    s.delete(FOLLOW_PREFIX + caller.to_string() + "_r")
+
+    let fc: u64 = s.load(FOLLOWER_COUNT_PREFIX + leader.to_string()).unwrap_or(0)
+    if fc > 0 { s.store(FOLLOWER_COUNT_PREFIX + leader.to_string(), fc - 1) }
+
+    let fgc: u64 = s.load(FOLLOWING_COUNT_PREFIX + caller.to_string()).unwrap_or(0)
+    if fgc > 0 { s.store(FOLLOWING_COUNT_PREFIX + caller.to_string(), fgc - 1) }
+
+    return 0
+}
+
+// Entry 4: Emit a leader action (called by VaultEngine when leader does something)
+// Followers' bots listen to these events and replicate the action
+entry emit_leader_action(leader: Address, action_type: u8, amount: u64, asset: Hash) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    // Verify leader has a public vault
+    let public_opt: optional<u64> = s.load(PUBLIC_VAULT_PREFIX + leader.to_string())
+    require(public_opt.is_some(), "notpublic")
+
+    // Verify caller is authorized (VaultEngine contract or admin)
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(caller == admin || cc_opt.is_some(), "notauth")
+
+    // Update leader reputation (+1 per emitted action, capped)
+    let rep: u64 = s.load(LEADER_REP_PREFIX + leader.to_string()).unwrap_or(0)
+    if rep < 10000 {
+        s.store(LEADER_REP_PREFIX + leader.to_string(), rep + 1)
+    }
+
+    // Emit event with all info followers need
+    let event_data: string = leader.to_string() + "_" + action_type.to_string(10u32) + "_" + amount.to_string(10u32)
+    emit_event(0u64, ["LeaderAction", event_data])
+    return 0
+}
+
+// Pub fn 5: Get public vault ID for a leader (0 if not public)
+pub fn get_public_vault(leader: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(PUBLIC_VAULT_PREFIX + leader.to_string()).unwrap_or(0)
+}
+
+// Pub fn 6: Get number of followers for a leader
+pub fn get_followers_count(leader: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(FOLLOWER_COUNT_PREFIX + leader.to_string()).unwrap_or(0)
+}
+
+// Pub fn 7: Get number of leaders a follower is following
+pub fn get_following_count(follower: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(FOLLOWING_COUNT_PREFIX + follower.to_string()).unwrap_or(0)
+}
+
+// Pub fn 8: Get leader reputation score
+pub fn get_leader_reputation(leader: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(LEADER_REP_PREFIX + leader.to_string()).unwrap_or(0)
+}
+
+// Entry 9: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 10: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 11: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 12: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 13: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 14: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 15: Get version
+entry get_version() -> string {
+    return VERSION
+}

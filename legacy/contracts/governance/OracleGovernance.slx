@@ -1,0 +1,911 @@
+// ============================================================================
+// OracleGovernance.slx — XELIS Vault v5.0
+// ----------------------------------------------------------------------------
+// FIX #2:  Corrected StakedOracle v5.0 entry IDs in execute_proposal():
+//            TYPE_ADD_FEED      → oracle.call(8u16, [...], {})
+//            TYPE_UPDATE_FEED   → oracle.call(9u16, [...], {})
+//            TYPE_REMOVE_FEED   → oracle.call(10u16, [feed_id, false], {})
+//                                 (StakedOracle v5.0 entry 2 = set_feed_active)
+//            TYPE_SET_PARAM:
+//              PARAM_MAX_STALE    → oracle.call(38u16, [value], {})  set_max_stale_blocks
+//              PARAM_HARD_STALE   → oracle.call(39u16, [value], {})  set_hard_stale_blocks
+//              PARAM_MAX_DEV      → oracle.call(35u16, [value], {})  set_max_deviation_bps
+//              PARAM_CB_THRESH    → oracle.call(36u16, [value], {})  set_cb_threshold_bps
+//              PARAM_SUBMIT_WINDOW→ oracle.call(37u16, [value], {})  set_aggregation_blocks
+//            TYPE_EMERGENCY_CB  → oracle.call(11u16, [feed_id, "governance"], {})
+//                                 (StakedOracle v5.0 entry 3 = trigger_feed_cb)
+//            TYPE_RESET_FEED    → oracle.call(12u16, [feed_id], {})
+//                                 (StakedOracle v5.0 entry 4 = reset_feed_cb)
+//
+// FIX #11: get_voting_power() now calls gv.call(7u16, [addr], {}) —
+//          GovernanceVault v5.0 entry 3 = get_voting_power_entry.
+//
+// FIX #15: TYPE_SET_REWARD branch implemented — calls
+//          XelisVaultMiner v5.0 entry 21 (set_base_reward_oracle) with
+//          proposal.reward_amount. A new set_miner_contract entry (ID 16)
+//          and MINER_CONTRACT_KEY storage are introduced.
+//
+// ENTRY IDs (sequential, starting at 0):
+//   0  : propose_add_feed(name, asset, decimals, min_price, max_price, description) -> u64
+//   1  : propose_update_feed(feed_id, min_price, max_price, decimals, description) -> u64
+//   2  : propose_remove_feed(feed_id, description) -> u64
+//   3  : propose_set_param(param_key, param_value, description) -> u64
+//   4  : propose_set_reward(reward_amount, description) -> u64
+//   5  : propose_emergency_cb(feed_id, description) -> u64
+//   6  : propose_reset_feed(feed_id, description) -> u64
+//   7  : vote(proposal_id, support) -> u64
+//   8  : execute_proposal(proposal_id) -> u64
+//   9  : cancel_proposal(proposal_id) -> u64
+//   10 : set_voting_period(blocks) -> u64
+//   11 : set_quorum_bps(bps) -> u64
+//   12 : set_approval_bps(bps) -> u64
+//   13 : set_execution_delay(blocks) -> u64
+//   14 : set_oracle(oracle: Hash) -> u64
+//   15 : set_governance_vault(gv: Hash) -> u64
+//   16 : set_miner_contract(mc: Hash) -> u64   [NEW — FIX #15]
+//   17 : set_timelock(tl: Hash) -> u64
+//   18 : set_guardian(g: Address) -> u64
+//   19 : transfer_admin(new_admin: Address) -> u64
+//   20 : get_version() -> string
+// ============================================================================
+
+const VERSION: string = "OracleGovernance v11.3"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const ORACLE_KEY: string = "or"
+const GOVERNANCE_VAULT_KEY: string = "gv"
+// FIX #15: miner contract (XelisVaultMiner) hash — used for TYPE_SET_REWARD
+const MINER_CONTRACT_KEY: string = "mc"
+
+const PROPOSAL_COUNT_KEY: string = "pc"
+const PROPOSAL_PREFIX: string = "pp_"
+const VOTE_PREFIX: string = "pv_"
+
+const VOTING_PERIOD_KEY: string = "vp"
+const QUORUM_BPS_KEY: string = "qb"
+const APPROVAL_BPS_KEY: string = "ab"
+const EXECUTION_DELAY_KEY: string = "ed"
+
+const BLOCKS_PER_DAY: u64 = 17280
+
+// Proposal types
+const TYPE_ADD_FEED: u8 = 1
+const TYPE_UPDATE_FEED: u8 = 2
+const TYPE_REMOVE_FEED: u8 = 3
+const TYPE_SET_PARAM: u8 = 4
+const TYPE_SET_REWARD: u8 = 5
+const TYPE_EMERGENCY_CB: u8 = 6
+const TYPE_RESET_FEED: u8 = 7
+// v10.9: New governance powers for emergency response
+const TYPE_EMERGENCY_SLASH: u8 = 8    // Slash a malicious miner via governance vote
+const TYPE_SET_MIN_STAKE: u8 = 9      // Change min stake (increase security)
+const TYPE_FREEZE_REWARDS: u8 = 10    // Freeze/unfreeze reward distribution
+const TYPE_BAN_MINER: u8 = 11         // Permanently ban a malicious miner
+
+// Param keys (value passed by the proposer; mapped to StakedOracle entries)
+const PARAM_MAX_STALE: u8 = 2
+const PARAM_HARD_STALE: u8 = 3
+const PARAM_MAX_DEV: u8 = 4
+const PARAM_CB_THRESH: u8 = 5
+const PARAM_SUBMIT_WINDOW: u8 = 6
+
+const DEFAULT_VOTING_PERIOD: u64 = 120960
+const DEFAULT_QUORUM_BPS: u64 = 1000
+const DEFAULT_APPROVAL_BPS: u64 = 6000
+const DEFAULT_EXECUTION_DELAY: u64 = 34560
+
+struct Proposal {
+    id: u64,
+    proposal_type: u8,
+    proposer: Address,
+    created_at: u64,
+    voting_deadline: u64,
+    executed: bool,
+    cancelled: bool,
+    yes_votes: u64,
+    no_votes: u64,
+
+    feed_id: u64,
+    feed_name: string,
+    feed_asset: Hash,
+    feed_decimals: u8,
+    feed_min: u64,
+    feed_max: u64,
+    param_key: u8,
+    param_value: u64,
+    reward_amount: u64,
+    target_addr: Address,
+    description: string
+}
+
+struct VoteInfo {
+    voter: Address,
+    support: bool,
+    voting_power: u64,
+    timestamp: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PROPOSAL_COUNT_KEY, 0u64)
+    s.store(VOTING_PERIOD_KEY, DEFAULT_VOTING_PERIOD)
+    s.store(QUORUM_BPS_KEY, DEFAULT_QUORUM_BPS)
+    s.store(APPROVAL_BPS_KEY, DEFAULT_APPROVAL_BPS)
+    s.store(EXECUTION_DELAY_KEY, DEFAULT_EXECUTION_DELAY)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin {
+        return
+    }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+// ============================================================================
+// FIX #11: get_voting_power() uses GovernanceVault v5.0 entry 3
+// (get_voting_power_entry).
+// ============================================================================
+fn get_voting_power(addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    let gv_hash: Hash = s.load(GOVERNANCE_VAULT_KEY).expect("err")
+    let gv: Contract = Contract::new(gv_hash).expect("err")
+    let vp: u64 = gv.call(7u16, [addr], {})
+    return vp
+}
+
+// Propose adding a new price feed to the StakedOracle.
+// @caller: any voting-power holder
+// @params: name - human-readable feed name
+// @params: asset - asset hash the feed tracks
+// @params: decimals - price decimals (e.g. 8)
+// @params: min_price - sanity-check minimum accepted price
+// @params: max_price - sanity-check maximum accepted price
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0; voting_deadline = current_topo + voting_period
+// ============================================================================
+// ID 0: propose_add_feed
+// ============================================================================
+entry propose_add_feed(
+    name: string,
+    asset: Hash,
+    decimals: u8,
+    min_price: u64,
+    max_price: u64,
+    description: string
+) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_ADD_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: name,
+        feed_asset: asset,
+        feed_decimals: decimals,
+        feed_min: min_price,
+        feed_max: max_price,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose updating an existing price feed's bounds and decimals.
+// @caller: any voting-power holder
+// @params: feed_id - target feed to update
+// @params: min_price - new sanity-check minimum accepted price
+// @params: max_price - new sanity-check maximum accepted price
+// @params: decimals - new decimals value
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0
+// ============================================================================
+// ID 1: propose_update_feed
+// ============================================================================
+entry propose_update_feed(
+    feed_id: u64,
+    min_price: u64,
+    max_price: u64,
+    decimals: u8,
+    description: string
+) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_UPDATE_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: decimals,
+        feed_min: min_price,
+        feed_max: max_price,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose deactivating (removing) an existing price feed.
+// @caller: any voting-power holder
+// @params: feed_id - target feed to deactivate
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0
+// ============================================================================
+// ID 2: propose_remove_feed
+// ============================================================================
+entry propose_remove_feed(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_REMOVE_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose changing a StakedOracle parameter (max_stale, hard_stale, max_dev, cb_thresh, submit_window).
+// @caller: any voting-power holder
+// @params: param_key - parameter selector (2..=6)
+// @params: param_value - new value for the parameter
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0; param_key range-checked 2..=6
+// ============================================================================
+// ID 3: propose_set_param
+// ----------------------------------------------------------------------------
+// param_key range 2..=6 (PARAM_WINDOW_SIZE removed — StakedOracle v5.0 no
+// longer exposes a window-size setter).
+// ============================================================================
+entry propose_set_param(param_key: u8, param_value: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+    require(param_key >= 2 && param_key <= 6, "badkey")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_SET_PARAM,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: param_key,
+        param_value: param_value,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose changing the XelisVaultMiner base reward oracle amount (FIX #15).
+// @caller: any voting-power holder
+// @params: reward_amount - new base reward oracle value
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0
+// ============================================================================
+// ID 4: propose_set_reward
+// ============================================================================
+entry propose_set_reward(reward_amount: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_SET_REWARD,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: 0,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: reward_amount,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose triggering an emergency circuit-breaker on a price feed.
+// @caller: any voting-power holder
+// @params: feed_id - target feed to trigger CB on
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0
+// ============================================================================
+// ID 5: propose_emergency_cb
+// ============================================================================
+entry propose_emergency_cb(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_EMERGENCY_CB,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Propose resetting the circuit-breaker state on a price feed.
+// @caller: any voting-power holder
+// @params: feed_id - target feed to reset CB on
+// @params: description - human-readable proposal description
+// @returns: the new proposal ID
+// @security: requires caller voting power > 0
+// ============================================================================
+// ID 6: propose_reset_feed
+// ============================================================================
+entry propose_reset_feed(feed_id: u64, description: string) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    require(get_voting_power(caller) > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let id: u64 = s.load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+    let topo: u64 = get_current_topoheight()
+    let voting_period: u64 = s.load(VOTING_PERIOD_KEY).unwrap_or(DEFAULT_VOTING_PERIOD)
+
+    let proposal: Proposal = Proposal {
+        id: id,
+        proposal_type: TYPE_RESET_FEED,
+        proposer: caller,
+        created_at: topo,
+        voting_deadline: topo + voting_period,
+        executed: false,
+        cancelled: false,
+        yes_votes: 0,
+        no_votes: 0,
+        feed_id: feed_id,
+        feed_name: "",
+        feed_asset: Hash::zero(),
+        feed_decimals: 0,
+        feed_min: 0,
+        feed_max: 0,
+        param_key: 0,
+        param_value: 0,
+        reward_amount: 0,
+        target_addr: Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")),
+        description: description
+    }
+    s.store(PROPOSAL_PREFIX + id.to_string(10u32), proposal)
+    s.store(PROPOSAL_COUNT_KEY, id + 1)
+    return 0
+}
+
+// Cast a yes/no vote on an active oracle governance proposal. One-vote-per-voter.
+// @caller: any voting-power holder
+// @params: proposal_id - target proposal to vote on
+// @params: support - true=yes, false=no (no abstain option)
+// @returns: 0 on success
+// @security: requires voting power > 0; voting must be within deadline; double-voting blocked
+// ============================================================================
+// ID 7: vote
+// ============================================================================
+entry vote(proposal_id: u64, support: bool) -> u64 {
+    let caller: Address = get_caller().expect("err")
+    let vp: u64 = get_voting_power(caller)
+    require(vp > 0, "novp")
+
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.executed, "executed")
+    require(!proposal.cancelled, "cancelled")
+
+    let topo: u64 = get_current_topoheight()
+    require(topo <= proposal.voting_deadline, "votingended")
+
+    let vote_key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + caller.to_string()
+    let existing: optional<Hash> = s.load(vote_key)
+    require(existing.is_none(), "alreadyvoted")
+
+    let vote_info: VoteInfo = VoteInfo {
+        voter: caller,
+        support: support,
+        voting_power: vp,
+        timestamp: topo
+    }
+    s.store(vote_key, vote_info)
+
+    if support {
+        proposal.yes_votes += vp
+    } else {
+        proposal.no_votes += vp
+    }
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    return 0
+}
+
+// Returns whether a proposal currently satisfies all conditions for execution (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to check
+// @returns: true if voting ended, quorum + approval met, and execution delay elapsed; false otherwise
+// @security: read-only, no state mutation
+pub fn is_executable(proposal_id: u64) -> bool {
+    let s: Storage = Storage::new()
+    let proposal_opt: optional<Proposal> = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32))
+    if proposal_opt.is_none() {
+        return false
+    }
+    let proposal: Proposal = proposal_opt.expect("err")
+    if proposal.executed || proposal.cancelled {
+        return false
+    }
+    let topo: u64 = get_current_topoheight()
+    if topo <= proposal.voting_deadline {
+        return false
+    }
+    let total_votes: u64 = proposal.yes_votes + proposal.no_votes
+    let quorum_bps: u64 = s.load(QUORUM_BPS_KEY).unwrap_or(DEFAULT_QUORUM_BPS)
+    if total_votes == 0 {
+        return false
+    }
+    let approval_bps: u64 = s.load(APPROVAL_BPS_KEY).unwrap_or(DEFAULT_APPROVAL_BPS)
+    let yes_bps: u64 = (proposal.yes_votes as u128 * 10000u128 / total_votes as u128) as u64
+    if yes_bps < approval_bps {
+        return false
+    }
+    let elapsed_since_voting_end: u64 = topo - proposal.voting_deadline
+    let delay: u64 = s.load(EXECUTION_DELAY_KEY).unwrap_or(DEFAULT_EXECUTION_DELAY)
+    if elapsed_since_voting_end < delay {
+        return false
+    }
+    return true
+}
+
+// Execute a passed oracle governance proposal, dispatching the action to StakedOracle/Miner.
+// @caller: anyone (open access once executable)
+// @params: proposal_id - target proposal to execute
+// @returns: 0 on success
+// @security: requires is_executable(proposal_id); one-shot execution; dispatches via StakedOracle entries (FIX #2) or XelisVaultMiner entry 21 (FIX #15)
+// ============================================================================
+// ID 8: execute_proposal
+// ----------------------------------------------------------------------------
+// FIX #2:  StakedOracle v5.0 entry IDs corrected.
+// FIX #15: TYPE_SET_REWARD now calls XelisVaultMiner.set_base_reward_oracle
+//          (entry 21).
+// ============================================================================
+entry execute_proposal(proposal_id: u64) -> u64 {
+    require(is_executable(proposal_id), "notexec")
+
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    proposal.executed = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+
+    let oracle_hash: Hash = s.load(ORACLE_KEY).expect("err")
+    let oracle: Contract = Contract::new(oracle_hash).expect("err")
+
+    if proposal.proposal_type == TYPE_ADD_FEED {
+        // StakedOracle v5.0 entry 0 = add_feed(name, asset, decimals, min, max)
+        let _ = oracle.call(8u16, [
+            proposal.feed_name,
+            proposal.feed_asset,
+            proposal.feed_decimals,
+            proposal.feed_min,
+            proposal.feed_max
+        ], {})
+    } else if proposal.proposal_type == TYPE_UPDATE_FEED {
+        // StakedOracle v5.0 entry 1 = update_feed(feed_id, min, max, decimals)
+        let _ = oracle.call(9u16, [
+            proposal.feed_id,
+            proposal.feed_min,
+            proposal.feed_max,
+            proposal.feed_decimals
+        ], {})
+    } else if proposal.proposal_type == TYPE_REMOVE_FEED {
+        // StakedOracle v5.0 entry 2 = set_feed_active(feed_id, active)
+        // FIX #2: deactivate the feed instead of calling a non-existent remove entry.
+        let _ = oracle.call(11u16, [proposal.feed_id, false], {})
+    } else if proposal.proposal_type == TYPE_SET_PARAM {
+        // FIX #2: corrected StakedOracle v5.0 entry IDs
+        if proposal.param_key == PARAM_MAX_STALE {
+            // entry 16 = set_max_stale_blocks
+            let _ = oracle.call(40u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_HARD_STALE {
+            // entry 17 = set_hard_stale_blocks
+            let _ = oracle.call(40u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_MAX_DEV {
+            // entry 13 = set_max_deviation_bps
+            let _ = oracle.call(38u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_CB_THRESH {
+            // entry 14 = set_cb_threshold_bps
+            let _ = oracle.call(38u16, [proposal.param_value], {})
+        } else if proposal.param_key == PARAM_SUBMIT_WINDOW {
+            // entry 15 = set_aggregation_blocks
+            let _ = oracle.call(38u16, [proposal.param_value], {})
+        }
+    } else if proposal.proposal_type == TYPE_SET_REWARD {
+        // FIX #15: implemented — call XelisVaultMiner v5.0 entry 21
+        // (set_base_reward_oracle) with proposal.reward_amount.
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(36u16, [proposal.reward_amount], {})
+    } else if proposal.proposal_type == TYPE_EMERGENCY_CB {
+        // StakedOracle v5.0 entry 3 = trigger_feed_cb(feed_id, reason)
+        let _ = oracle.call(12u16, [proposal.feed_id, "governance"], {})
+    } else if proposal.proposal_type == TYPE_RESET_FEED {
+        // StakedOracle v5.0 entry 4 = reset_feed_cb(feed_id)
+        let _ = oracle.call(13u16, [proposal.feed_id], {})
+    } else if proposal.proposal_type == TYPE_EMERGENCY_SLASH {
+        // v10.9: Governance can slash a malicious miner
+        // XelisVaultMiner entry 40 = emergency_slash_miner(addr, bps, reason)
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(84u16, [proposal.target_addr, proposal.param_value, "governance_slash"], {})
+    } else if proposal.proposal_type == TYPE_SET_MIN_STAKE {
+        // v10.9: Governance can change min stake
+        // XelisVaultMiner entry 43 = set_min_stake_entry(new_min_stake)
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(87u16, [proposal.param_value], {})
+    } else if proposal.proposal_type == TYPE_FREEZE_REWARDS {
+        // v10.9: Governance can freeze/unfreeze rewards
+        // XelisVaultMiner entry 42 = emergency_freeze_rewards(bool)
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(86u16, [proposal.param_value > 0], {})
+    } else if proposal.proposal_type == TYPE_BAN_MINER {
+        // v10.9: Governance can permanently ban a malicious miner
+        // XelisVaultMiner entry 41 = emergency_ban_miner(addr, reason)
+        let mc_hash: Hash = s.load(MINER_CONTRACT_KEY).expect("mcnoset")
+        let miner: Contract = Contract::new(mc_hash).expect("mcnf")
+        let _ = miner.call(85u16, [proposal.target_addr, "governance_ban"], {})
+    }
+
+    return 0
+}
+
+// Cancel a pending (unexecuted) proposal.
+// @caller: original proposer OR admin
+// @params: proposal_id - target proposal to cancel
+// @returns: 0 on success
+// @security: only proposer or admin; cannot cancel executed proposals
+// ============================================================================
+// ID 9: cancel_proposal
+// ============================================================================
+entry cancel_proposal(proposal_id: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let proposal: Proposal = s.load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    require(!proposal.executed, "executed")
+
+    let caller: Address = get_caller().expect("err")
+    let is_admin: bool = caller == s.load(ADMIN_KEY).expect("err")
+    require(caller == proposal.proposer || is_admin, "notauth")
+
+    proposal.cancelled = true
+    s.store(PROPOSAL_PREFIX + proposal_id.to_string(10u32), proposal)
+    return 0
+}
+
+// Set the voting period (in topo blocks) for new proposals.
+// @caller: admin (or timelock via contract call)
+// @params: blocks - voting period length (17280–518400 blocks = 1–30 days)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 10: set_voting_period
+// ============================================================================
+entry set_voting_period(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 17280 && blocks <= 518400, "badval")
+    Storage::new().store(VOTING_PERIOD_KEY, blocks)
+    return 0
+}
+
+// Set the quorum threshold (in bps of total voting power) required to execute.
+// @caller: admin (or timelock via contract call)
+// @params: bps - quorum in bps (100–5000 = 1%–50%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 11: set_quorum_bps
+// ============================================================================
+entry set_quorum_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 100 && bps <= 5000, "badval")
+    Storage::new().store(QUORUM_BPS_KEY, bps)
+    return 0
+}
+
+// Set the approval threshold (in bps of yes/no votes) required to execute.
+// @caller: admin (or timelock via contract call)
+// @params: bps - approval in bps (5000–8000 = 50%–80%)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 12: set_approval_bps
+// ============================================================================
+entry set_approval_bps(bps: u64) -> u64 {
+    only_admin()
+    require(bps >= 5000 && bps <= 8000, "badval")
+    Storage::new().store(APPROVAL_BPS_KEY, bps)
+    return 0
+}
+
+// Set the post-voting execution delay (in topo blocks) before a passed proposal can be executed.
+// @caller: admin (or timelock via contract call)
+// @params: blocks - execution delay (720–604800 blocks)
+// @returns: 0 on success
+// @security: only_admin, range-checked
+// ============================================================================
+// ID 13: set_execution_delay
+// ============================================================================
+entry set_execution_delay(blocks: u64) -> u64 {
+    only_admin()
+    require(blocks >= 720 && blocks <= 604800, "badval")
+    Storage::new().store(EXECUTION_DELAY_KEY, blocks)
+    return 0
+}
+
+// Set the StakedOracle contract hash (destination for execute_proposal dispatch).
+// @caller: admin (or timelock via contract call)
+// @params: oracle - StakedOracle contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 14: set_oracle
+// ============================================================================
+entry set_oracle(oracle: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(ORACLE_KEY, oracle)
+    return 0
+}
+
+// Set the GovernanceVault contract hash (used to read voting power).
+// @caller: admin (or timelock via contract call)
+// @params: gv - GovernanceVault contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 15: set_governance_vault
+// ============================================================================
+entry set_governance_vault(gv: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(GOVERNANCE_VAULT_KEY, gv)
+    return 0
+}
+
+// Set the XelisVaultMiner contract hash (destination for TYPE_SET_REWARD dispatch).
+// @caller: admin (or timelock via contract call)
+// @params: mc - XelisVaultMiner contract hash
+// @returns: 0 on success
+// @security: only_admin (FIX #15 — new entry)
+// ============================================================================
+// ID 16: set_miner_contract  [NEW — FIX #15]
+// ============================================================================
+entry set_miner_contract(mc: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(MINER_CONTRACT_KEY, mc)
+    return 0
+}
+
+// Set the timelock contract hash (allowed to call admin entries via contract call).
+// @caller: admin (or timelock via contract call)
+// @params: tl - timelock contract hash
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 17: set_timelock
+// ============================================================================
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    Storage::new().store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Set the guardian address (currently stored but not enforced in this contract).
+// @caller: admin (or timelock via contract call)
+// @params: g - guardian address
+// @returns: 0 on success
+// @security: only_admin
+// ============================================================================
+// ID 18: set_guardian
+// ============================================================================
+entry set_guardian(g: Address) -> u64 {
+    only_admin()
+    Storage::new().store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Transfer admin role to a new address (single-step).
+// @caller: admin (or timelock via contract call)
+// @params: new_admin - address that will become admin
+// @returns: 0 on success
+// @security: only_admin, single-step transfer (verify new_admin before calling)
+// ============================================================================
+// ID 19: transfer_admin
+// ============================================================================
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    Storage::new().store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Returns the contract version string.
+// @caller: anyone
+// @returns: VERSION constant ("OracleGovernance v5.0")
+// @security: read-only, no access restrictions
+// ============================================================================
+// ID 20: get_version
+// ============================================================================
+entry get_version() -> string {
+    return VERSION
+}
+
+// Returns an oracle-governance proposal snapshot by ID (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to read
+// @returns: (proposal_type, proposer, created_at, voting_deadline, executed, cancelled, yes_votes, no_votes, description)
+// @security: read-only, no access restrictions, panics if proposal missing
+// ----------------------------------------------------------------------------
+// Read-only helpers (do NOT count toward entry IDs)
+// ----------------------------------------------------------------------------
+pub fn get_proposal(proposal_id: u64) -> (u8, Address, u64, u64, bool, bool, u64, u64, string) {
+    let p: Proposal = Storage::new().load(PROPOSAL_PREFIX + proposal_id.to_string(10u32)).expect("err")
+    return (
+        p.proposal_type,
+        p.proposer,
+        p.created_at,
+        p.voting_deadline,
+        p.executed,
+        p.cancelled,
+        p.yes_votes,
+        p.no_votes,
+        p.description
+    )
+}
+
+// Returns the total number of oracle-governance proposals ever created (read-only view).
+// @caller: anyone
+// @returns: proposal counter value
+// @security: read-only, no access restrictions
+pub fn get_proposal_count() -> u64 {
+    return Storage::new().load(PROPOSAL_COUNT_KEY).unwrap_or(0)
+}
+
+// Returns whether a given voter has voted on a given proposal (read-only view).
+// @caller: anyone
+// @params: proposal_id - target proposal to check
+// @params: voter - address whose vote to verify
+// @returns: true if `voter` has voted on `proposal_id`, false otherwise
+// @security: read-only, no access restrictions
+pub fn has_voted(proposal_id: u64, voter: Address) -> bool {
+    let key: string = VOTE_PREFIX + proposal_id.to_string(10u32) + "_" + voter.to_string()
+    return Storage::new().load(key).is_some()
+}

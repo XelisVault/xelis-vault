@@ -1,108 +1,42 @@
 # ============================================================================
-# .gitignore — XELIS Vault v7.0
+# .gitignore — XELIS Vault v13
 # ============================================================================
 
-# Environment files (contain secrets)
+# Secrets & environment
 .env
-.env.local
-.env.*.local
+.env.*
+*.key
+*.pem
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-# build/ is NOT ignored: it contains the compiled contracts + chunk maps
-# (v12 machine-checked proof of compilation). Python packaging artifacts
-# don't exist in this repo.
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Logs
-*.log
-logs/
-
-# XELIS daemon data
-.xelis/
-*.db
-*.lock
-
-# Compiled contracts (if compiled locally)
-*.compiled
-contracts/**/*.compiled
-
-# Deployment artifacts
-deployment.json
-deployment-*.json
-
-# Testing
+.eggs/
+dist/
+build-pkg/
 .pytest_cache/
-.coverage
-htmlcov/
-.tox/
+.venv/
+venv/
 
-# Documentation build
-docs/_build/
-site/
+# CI artifacts
+reports/
 
-# Temporary files
-*.tmp
-*.bak
-*.cache
+# Bearer notes — NEVER commit a mixer note
+note*.json
+notes/
+*.note.json
 
-# XELIS chain data (devnet/testnet nodes)
-data/
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
 
-# Debug / test contracts (local experiments)
-contracts/debug_*.slx
-contracts/test_*.slx
-contracts/psm_*.slx
-contracts/vault/VaultEngine_bv*.slx
-contracts/vault/VaultEngine_v5.slx
-contracts/vault/VaultEngine_v6.slx
+# Binaries (download them from official releases)
+*.exe
+bin/xelis_wallet
+bin/xelis_daemon
 
-# Deployment scripts (local, one-time use)
-core_deploy.py
-
-# Agent notes (local only — contains seeds)
-AGENTS.md
-AI_WEBSITE_PROMPT.md
-test_report.md
-precomputed_tables_*.bin
-*.bin
-!docs/*.bin
+# Never track legacy build artifacts larger than what git can bear
+legacy/build/*.bin

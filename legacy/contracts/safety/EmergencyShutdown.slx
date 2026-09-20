@@ -1,0 +1,312 @@
+// ============================================================================
+// EmergencyShutdown.slx — XELIS Vault v10.2 (Brainstorming Feature #13)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Circuit breaker global pour tout le protocole XELIS Vault.
+//
+// RÔLE : En cas d'attaque ou de bug critique, un guardian peut déclencher un
+//        shutdown global. Tous les contrats vérifient ce contrat via le
+//        ContractRegistry et se mettent en mode "withdraw only".
+//
+// ÉTATS :
+//   - NORMAL (0) : tout fonctionne normalement
+//   - SOFT_PAUSE (1) : pauses new borrows/swaps, allows repays/withdraws
+//   - FULL_SHUTDOWN (2) : only withdrawals allowed, all other ops blocked
+//   - RECOVERY (3) : guardians proposed recovery, awaits governance vote
+//
+// DÉCLENCHEURS :
+//   - GuardianMultisig (quorum 3/5) → SOFT_PAUSE ou FULL_SHUTDOWN
+//   - Admin (avec timelock 24h) → FULL_SHUTDOWN
+//   - Auto-trigger si oracle stale > 1 heure (via keeper)
+//
+// LEVÉE :
+//   - Doit passer par Governor (vote 7 jours + timelock 48h)
+//   - Quorum 10%, approval 60%
+//
+// Entry IDs:
+//   0  : trigger_soft_pause
+//   1  : trigger_full_shutdown
+//   2  : propose_recovery
+//   3  : execute_recovery
+//   4  : get_state (pub fn)
+//   5  : get_shutdown_reason (pub fn)
+//   6  : get_shutdown_timestamp (pub fn)
+//   7  : is_withdraw_only (pub fn)
+//   8  : is_operation_allowed (pub fn)
+//   9  : set_registry
+//   10 : set_timelock
+//   11 : set_guardian
+//   12 : set_governor
+//   13 : transfer_admin
+//   14 : get_version
+// ============================================================================
+
+const VERSION: string = "EmergencyShutdown v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const GOVERNOR_KEY: string = "gov"
+const REGISTRY_KEY: string = "reg"
+
+const STATE_KEY: string = "st"
+const REASON_KEY: string = "rs"
+const TIMESTAMP_KEY: string = "ts"
+const TRIGGERED_BY_KEY: string = "tb"
+const RECOVERY_PROPOSAL_ID_KEY: string = "rpi"
+
+// State constants
+const STATE_NORMAL: u8 = 0
+const STATE_SOFT_PAUSE: u8 = 1
+const STATE_FULL_SHUTDOWN: u8 = 2
+const STATE_RECOVERY: u8 = 3
+
+// Operation types (for is_operation_allowed queries)
+const OP_DEPOSIT: u8 = 1
+const OP_BORROW: u8 = 2
+const OP_REPAY: u8 = 3
+const OP_WITHDRAW: u8 = 4
+const OP_SWAP: u8 = 5
+const OP_LIQUIDATE: u8 = 6
+const OP_GOVERNANCE: u8 = 7
+const OP_CHAT: u8 = 8
+const OP_MINE: u8 = 9
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(STATE_KEY, STATE_NORMAL)
+    s.store(TIMESTAMP_KEY, 0u64)
+    return 0
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_guardian_multisig() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    // Guardian is the GuardianMultisig contract
+    require(caller == g, "notguardian")
+}
+
+fn only_governor() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let gov: Address = s.load(GOVERNOR_KEY).expect("err")
+    require(caller == gov, "notgov")
+}
+
+// Entry 0: Trigger soft pause (guardian multisig only)
+// Pauses new borrows/swaps, but allows repays/withdraws
+entry trigger_soft_pause(reason: string) -> u64 {
+    only_guardian_multisig()
+    let s: Storage = Storage::new()
+    let current: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+    require(current == STATE_NORMAL, "notnormal")
+    s.store(STATE_KEY, STATE_SOFT_PAUSE)
+    s.store(REASON_KEY, reason)
+    s.store(TIMESTAMP_KEY, get_current_topoheight())
+    s.store(TRIGGERED_BY_KEY, get_caller().expect("err"))
+    emit_event(0u64, ["SoftPauseTriggered", reason])
+    return 0
+}
+
+// Entry 1: Trigger full shutdown (guardian multisig or admin via timelock)
+// Only withdrawals allowed
+entry trigger_full_shutdown(reason: string) -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let guardian: Address = s.load(GUARDIAN_KEY).expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+
+    if caller == guardian {
+        // Guardian can trigger immediately
+    } else if caller == admin {
+        // Admin must go through timelock
+        let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+        require(tl_opt.is_some(), "notauth")
+        let tl: Hash = tl_opt.expect("err")
+        let cc: Hash = get_contract_caller().expect("err")
+        require(cc == tl, "notauth")
+    } else {
+        require(false, "notauth")
+    }
+
+    let current: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+    require(current == STATE_NORMAL || current == STATE_SOFT_PAUSE, "alreadysd")
+    s.store(STATE_KEY, STATE_FULL_SHUTDOWN)
+    s.store(REASON_KEY, reason)
+    s.store(TIMESTAMP_KEY, get_current_topoheight())
+    s.store(TRIGGERED_BY_KEY, caller)
+    emit_event(0u64, ["FullShutdownTriggered", reason])
+    return 0
+}
+
+// Entry 2: Propose recovery (guardian multisig proposes, governor votes)
+entry propose_recovery(proposal_id: u64) -> u64 {
+    only_guardian_multisig()
+    let s: Storage = Storage::new()
+    let current: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+    require(current == STATE_FULL_SHUTDOWN, "notsd")
+    s.store(STATE_KEY, STATE_RECOVERY)
+    s.store(RECOVERY_PROPOSAL_ID_KEY, proposal_id)
+    emit_event(0u64, ["RecoveryProposed", proposal_id.to_string(10u32)()])
+    return 0
+}
+
+// Entry 3: Execute recovery (governor only, after vote passes + timelock)
+entry execute_recovery() -> u64 {
+    only_governor()
+    let s: Storage = Storage::new()
+    let current: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+    require(current == STATE_RECOVERY, "notrec")
+    s.store(STATE_KEY, STATE_NORMAL)
+    s.store(REASON_KEY, "")
+    s.store(TIMESTAMP_KEY, 0u64)
+    s.store(RECOVERY_PROPOSAL_ID_KEY, 0u64)
+    emit_event(0u64, ["RecoveryExecuted", ""])
+    return 0
+}
+
+// Pub fn 4: Get current state
+pub fn get_state() -> u8 {
+    let s: Storage = Storage::new()
+    return s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+}
+
+// Pub fn 5: Get shutdown reason (empty if normal)
+pub fn get_shutdown_reason() -> string {
+    let s: Storage = Storage::new()
+    return s.load(REASON_KEY).unwrap_or("")
+}
+
+// Pub fn 6: Get shutdown timestamp (topoheight when shutdown was triggered)
+pub fn get_shutdown_timestamp() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(TIMESTAMP_KEY).unwrap_or(0)
+}
+
+// Pub fn 7: Check if protocol is in withdraw-only mode
+pub fn is_withdraw_only() -> bool {
+    let s: Storage = Storage::new()
+    let state: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+    return state == STATE_FULL_SHUTDOWN || state == STATE_RECOVERY
+}
+
+// Pub fn 8: Check if a specific operation is allowed in current state
+// Contracts call this before executing user operations
+pub fn is_operation_allowed(op_type: u8) -> bool {
+    let s: Storage = Storage::new()
+    let state: u8 = s.load(STATE_KEY).unwrap_or(STATE_NORMAL)
+
+    // NORMAL: everything allowed
+    if state == STATE_NORMAL { return true }
+
+    // SOFT_PAUSE: no new borrows/swaps/liquidations, but repays/withdraws/gov OK
+    if state == STATE_SOFT_PAUSE {
+        if op_type == OP_DEPOSIT { return true }      // deposits OK (strengthen position)
+        if op_type == OP_BORROW { return false }      // no new borrows
+        if op_type == OP_REPAY { return true }        // repays OK
+        if op_type == OP_WITHDRAW { return true }     // withdrawals OK
+        if op_type == OP_SWAP { return false }        // no swaps
+        if op_type == OP_LIQUIDATE { return false }   // no liquidations (pause gives breathing room)
+        if op_type == OP_GOVERNANCE { return true }   // governance continues
+        if op_type == OP_CHAT { return true }         // chat continues
+        if op_type == OP_MINE { return true }         // mining continues
+        return true
+    }
+
+    // FULL_SHUTDOWN: only withdrawals
+    if state == STATE_FULL_SHUTDOWN {
+        if op_type == OP_WITHDRAW { return true }
+        if op_type == OP_REPAY { return true }        // repays allowed (reduces protocol risk)
+        if op_type == OP_GOVERNANCE { return true }   // governance needed to recover
+        return false
+    }
+
+    // RECOVERY: same as full shutdown, but governance is voting
+    if state == STATE_RECOVERY {
+        if op_type == OP_WITHDRAW { return true }
+        if op_type == OP_REPAY { return true }
+        if op_type == OP_GOVERNANCE { return true }
+        return false
+    }
+
+    return false
+}
+
+// Entry 9: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 10: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 11: Set guardian (GuardianMultisig contract)
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 12: Set governor (Governor contract)
+entry set_governor(gov: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(GOVERNOR_KEY, gov)
+    return 0
+}
+
+// Entry 13: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 14: Get version
+entry get_version() -> string {
+    return VERSION
+}

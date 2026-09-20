@@ -1,0 +1,205 @@
+{
+  "data": [
+    {
+      "entry_id": 8,
+      "name": "set_share",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contributor",
+          "type": "Address"
+        },
+        {
+          "name": "percentage_bps",
+          "type": "u64"
+        },
+        {
+          "name": "duration_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "revoke_share",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contributor",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "update_share_percentage",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contributor",
+          "type": "Address"
+        },
+        {
+          "name": "new_percentage_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "extend_share_duration",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contributor",
+          "type": "Address"
+        },
+        {
+          "name": "additional_blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "claim_founder_revenue",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "claim_contributor_revenue",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "receive_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "set_vlt_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "set_xel_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "xa",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "set_fee_distributor",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "fdh",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

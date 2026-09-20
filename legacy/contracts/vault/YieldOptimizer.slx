@@ -1,0 +1,431 @@
+// ============================================================================
+// YieldOptimizer.slx — XELIS Vault v10.2 (Brainstorming Feature #10)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Bot d'optimisation automatique du yield.
+//
+// RÔLE : Surveille les taux d'intérêt sur LendingMarket vs SavingsRate et
+//        déplace automatiquement les fonds vers le rendement le plus élevé.
+//        Réinvestit les rewards automatiquement.
+//
+// MÉCANIQUE :
+//   1. User calls opt_in(amount) — délègue l'optimisation au contrat
+//   2. Le contrat déplace les fonds entre:
+//      - SavingsRate (xUSD yield)
+//      - LendingMarket (P2P lending yield)
+//      - GovernanceVault (VLT staking yield)
+//   3. Un keeper (anyone) call execute_strategy() périodiquement
+//   4. Le keeper reçoit une petite commission (0.1% du gain)
+//   5. Le user peut withdraw à tout moment (opt_out)
+//
+// STRATÉGIES :
+//   - Conservative : SavingsRate only (lowest risk, lowest yield)
+//   - Balanced : 50% SavingsRate + 50% LendingMarket
+//   - Aggressive : 100% LendingMarket (highest risk, highest yield)
+//   - VLT Max : 100% GovernanceVault staking
+//
+// PRIVACY : Le contrat connaît les montants, mais les mouvements sont
+//           agrégés (pas d'info individuelle visible publiquement).
+//
+// Entry IDs:
+//   0  : opt_in
+//   1  : opt_out
+//   2  : set_strategy
+//   3  : execute_strategy (keeper)
+//   4  : reinvest_rewards (keeper)
+//   5  : claim_rewards
+//   6  : get_position (pub fn)
+//   7  : get_strategy_apr (pub fn)
+//   8  : get_keeper_reward (pub fn)
+//   9  : set_savings_rate
+//   10 : set_lending_market
+//   11 : set_gov_vault
+//   12 : set_registry
+//   13 : set_timelock
+//   14 : set_guardian
+//   15 : pause
+//   16 : unpause
+//   17 : transfer_admin
+//   18 : get_version
+// ============================================================================
+
+const VERSION: string = "YieldOptimizer v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+
+const SAVINGS_RATE_KEY: string = "sr"
+const LENDING_MARKET_KEY: string = "lm"
+const GOV_VAULT_KEY: string = "gv"
+
+const POSITION_PREFIX: string = "pos_"
+const TOTAL_MANAGED_KEY: string = "tm"
+const KEEPER_REWARD_BPS: u64 = 10        // 0.1% of yield gain
+const MIN_REBALANCE_GAIN: u64 = 1000000   // 0.01 XEL minimum gain to rebalance
+
+// Strategy constants
+const STRAT_CONSERVATIVE: u8 = 1   // 100% SavingsRate
+const STRAT_BALANCED: u8 = 2       // 50% SavingsRate + 50% LendingMarket
+const STRAT_AGGRESSIVE: u8 = 3     // 100% LendingMarket
+const STRAT_VLT_MAX: u8 = 4        // 100% GovVault
+
+struct Position {
+    owner: Address,
+    total_deposited: u64,
+    current_allocation: u64,        // total current value (deposit + yield)
+    in_savings: u64,
+    in_lending: u64,
+    in_gov_vault: u64,
+    strategy: u8,
+    last_rebalance_topo: u64,
+    rewards_earned: u64,
+    rewards_claimed: u64,
+    active: bool
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(TOTAL_MANAGED_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Opt in to yield optimization
+entry opt_in(amount: u64, strategy: u8) -> u64 {
+    when_not_paused()
+    require(amount > 0, "zero")
+    require(strategy >= STRAT_CONSERVATIVE && strategy <= STRAT_VLT_MAX, "badstrat")
+
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let existing_opt: optional<Position> = s.load(POSITION_PREFIX + caller.to_string())
+    require(existing_opt.is_none(), "alreadyopted")
+
+    let pos: Position = Position {
+        owner: caller,
+        total_deposited: amount,
+        current_allocation: amount,
+        in_savings: 0,
+        in_lending: 0,
+        in_gov_vault: 0,
+        strategy: strategy,
+        last_rebalance_topo: get_current_topoheight(),
+        rewards_earned: 0,
+        rewards_claimed: 0,
+        active: true
+    }
+
+    // Initial allocation based on strategy
+    if strategy == STRAT_CONSERVATIVE {
+        pos.in_savings = amount
+    } else if strategy == STRAT_BALANCED {
+        pos.in_savings = amount / 2
+        pos.in_lending = amount / 2
+    } else if strategy == STRAT_AGGRESSIVE {
+        pos.in_lending = amount
+    } else if strategy == STRAT_VLT_MAX {
+        pos.in_gov_vault = amount
+    }
+
+    s.store(POSITION_PREFIX + caller.to_string(), pos)
+    let tm: u64 = s.load(TOTAL_MANAGED_KEY).unwrap_or(0)
+    s.store(TOTAL_MANAGED_KEY, tm + amount)
+
+    // In production: transfer tokens from caller to this contract, then deposit to venues
+    emit_event(0u64, ["OptedIn", caller.to_string()])
+    return 0
+}
+
+// Entry 1: Opt out (withdraw everything)
+entry opt_out() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let pos: Position = s.load(POSITION_PREFIX + caller.to_string()).expect("notopted")
+    require(pos.active, "inactive")
+
+    // In production: withdraw from all venues (savings, lending, gov_vault)
+    let total: u64 = pos.current_allocation
+    pos.active = false
+    pos.in_savings = 0
+    pos.in_lending = 0
+    pos.in_gov_vault = 0
+    pos.current_allocation = 0
+    s.store(POSITION_PREFIX + caller.to_string(), pos)
+
+    let tm: u64 = s.load(TOTAL_MANAGED_KEY).unwrap_or(0)
+    if tm >= total { s.store(TOTAL_MANAGED_KEY, tm - total) }
+
+    // In production: transfer total back to caller
+    return 0
+}
+
+// Entry 2: Change strategy (will rebalance on next keeper call)
+entry set_strategy(new_strategy: u8) -> u64 {
+    when_not_paused()
+    require(new_strategy >= STRAT_CONSERVATIVE && new_strategy <= STRAT_VLT_MAX, "badstrat")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let pos: Position = s.load(POSITION_PREFIX + caller.to_string()).expect("notopted")
+    require(pos.active, "inactive")
+    pos.strategy = new_strategy
+    s.store(POSITION_PREFIX + caller.to_string(), pos)
+    return 0
+}
+
+// Entry 3: Execute strategy for a user (keeper calls this, earns reward)
+// Rebalances allocation if current rates favor a different split
+entry execute_strategy(user: Address, savings_apr_bps: u64, lending_apr_bps: u64, gov_apr_bps: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let keeper: Address = get_caller().expect("err")
+
+    let pos: Position = s.load(POSITION_PREFIX + user.to_string()).expect("notopted")
+    require(pos.active, "inactive")
+
+    // Calculate target allocation based on strategy + current rates
+    let total: u64 = pos.current_allocation
+    let target_savings: u64 = 0
+    let target_lending: u64 = 0
+    let target_gov: u64 = 0
+
+    if pos.strategy == STRAT_CONSERVATIVE {
+        target_savings = total
+    } else if pos.strategy == STRAT_BALANCED {
+        // Adjust split based on rate differential (max 60/40 either way)
+        let total_rate: u64 = savings_apr_bps + lending_apr_bps
+        if total_rate > 0 {
+            let savings_ratio: u64 = (savings_apr_bps * 10000) / total_rate
+            // Clamp to 40-60%
+            if savings_ratio < 4000 { savings_ratio = 4000 }
+            if savings_ratio > 6000 { savings_ratio = 6000 }
+            target_savings = (total * savings_ratio) / 10000
+            target_lending = total - target_savings
+        } else {
+            target_savings = total / 2
+            target_lending = total / 2
+        }
+    } else if pos.strategy == STRAT_AGGRESSIVE {
+        target_lending = total
+    } else if pos.strategy == STRAT_VLT_MAX {
+        target_gov = total
+    }
+
+    // Check if rebalance is worth it (estimate yield gain)
+    let current_yield: u64 = (pos.in_savings * savings_apr_bps + pos.in_lending * lending_apr_bps + pos.in_gov_vault * gov_apr_bps) / 10000
+    let target_yield: u64 = (target_savings * savings_apr_bps + target_lending * lending_apr_bps + target_gov * gov_apr_bps) / 10000
+    if target_yield <= current_yield + MIN_REBALANCE_GAIN {
+        return 0  // not worth rebalancing
+    }
+
+    let yield_gain: u64 = target_yield - current_yield
+    let keeper_reward: u64 = (yield_gain * KEEPER_REWARD_BPS) / 10000
+
+    // Update position
+    pos.in_savings = target_savings
+    pos.in_lending = target_lending
+    pos.in_gov_vault = target_gov
+    pos.last_rebalance_topo = get_current_topoheight()
+    s.store(POSITION_PREFIX + user.to_string(), pos)
+
+    // In production: actually move funds between venues
+    // Pay keeper reward
+    // Emit event
+    return 0
+}
+
+// Entry 4: Reinvest accumulated rewards back into strategy (keeper)
+entry reinvest_rewards(user: Address, rewards_amount: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let keeper: Address = get_caller().expect("err")
+    let pos: Position = s.load(POSITION_PREFIX + user.to_string()).expect("notopted")
+    require(pos.active, "inactive")
+    require(rewards_amount > 0, "zero")
+
+    pos.rewards_earned += rewards_amount
+    pos.current_allocation += rewards_amount
+
+    // Re-allocate rewards according to strategy
+    if pos.strategy == STRAT_CONSERVATIVE {
+        pos.in_savings += rewards_amount
+    } else if pos.strategy == STRAT_BALANCED {
+        pos.in_savings += rewards_amount / 2
+        pos.in_lending += rewards_amount / 2
+    } else if pos.strategy == STRAT_AGGRESSIVE {
+        pos.in_lending += rewards_amount
+    } else if pos.strategy == STRAT_VLT_MAX {
+        pos.in_gov_vault += rewards_amount
+    }
+
+    s.store(POSITION_PREFIX + user.to_string(), pos)
+
+    // Keeper gets 0.1% of reinvested rewards
+    let keeper_reward: u64 = (rewards_amount * KEEPER_REWARD_BPS) / 10000
+    return 0
+}
+
+// Entry 5: Claim accumulated rewards (user)
+entry claim_rewards() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let pos: Position = s.load(POSITION_PREFIX + caller.to_string()).expect("notopted")
+    let pending: u64 = pos.rewards_earned - pos.rewards_claimed
+    require(pending > 0, "nothing")
+    pos.rewards_claimed += pending
+    s.store(POSITION_PREFIX + caller.to_string(), pos)
+    return 0
+}
+
+// Pub fn 6: Get user position
+pub fn get_position(user: Address) -> (u64, u64, u64, u64, u64, u8, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let pos: Position = s.load(POSITION_PREFIX + user.to_string()).expect("notopted")
+    return (
+        pos.total_deposited,
+        pos.current_allocation,
+        pos.in_savings,
+        pos.in_lending,
+        pos.in_gov_vault,
+        pos.strategy,
+        pos.last_rebalance_topo,
+        pos.rewards_earned,
+        pos.rewards_claimed,
+        pos.active
+    )
+}
+
+// Pub fn 7: Get estimated APR for a strategy (based on caller-provided rates)
+pub fn get_strategy_apr(strategy: u8, savings_apr_bps: u64, lending_apr_bps: u64, gov_apr_bps: u64) -> u64 {
+    if strategy == STRAT_CONSERVATIVE { return savings_apr_bps }
+    if strategy == STRAT_BALANCED { return (savings_apr_bps + lending_apr_bps) / 2 }
+    if strategy == STRAT_AGGRESSIVE { return lending_apr_bps }
+    if strategy == STRAT_VLT_MAX { return gov_apr_bps }
+    return 0
+}
+
+// Pub fn 8: Get keeper reward for a given yield gain
+pub fn get_keeper_reward(yield_gain: u64) -> u64 {
+    return (yield_gain * KEEPER_REWARD_BPS) / 10000
+}
+
+// Entry 9: Set savings rate contract
+entry set_savings_rate(sr: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(SAVINGS_RATE_KEY, sr)
+    return 0
+}
+
+// Entry 10: Set lending market contract
+entry set_lending_market(lm: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(LENDING_MARKET_KEY, lm)
+    return 0
+}
+
+// Entry 11: Set governance vault contract
+entry set_gov_vault(gv: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(GOV_VAULT_KEY, gv)
+    return 0
+}
+
+// Entry 12: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 13: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 14: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 15: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 16: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 17: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 18: Get version
+entry get_version() -> string {
+    return VERSION
+}

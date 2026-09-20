@@ -1,0 +1,96 @@
+# ============================================================================
+# strict-ci — XelisVault protocol CI
+# ----------------------------------------------------------------------------
+# Every push / pull-request on main must pass ALL four gates. The gates encode
+# the findings of the v12 security audit:
+#   silex-lint  : the 10 dangerous Silex patterns (swallowed transfers, rug
+#                 switches, unguarded panics, 68-hex literals, ...) — a single
+#                 BLOCKER/ERROR fails the build
+#   chunk-ids   : documented chunk tables match the real XELIS entry-point
+#                 numbering, and the mixer keeps ZERO inter-contract calls
+#   tests       : pytest functional suite (sanity placeholder included so the
+#                 job is never empty)
+#   structure   : repo layout, no legacy imports, no secrets, no blobs
+# ============================================================================
+name: strict-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# cancel superseded runs of the same branch
+concurrency:
+  group: strict-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# least privilege
+permissions:
+  contents: read
+
+jobs:
+  silex-lint:
+    name: "Silex lint (static security analysis)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run lint_silex.py on contracts/ (legacy/ excluded)
+        run: python scripts/lint_silex.py --contracts contracts --json reports/lint-report.json
+      - name: Upload lint report (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: reports/lint-report.json
+          if-no-files-found: warn
+
+  chunk-ids:
+    name: "Chunk IDs & inter-contract calls"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run verify_chunk_ids.py
+        run: python scripts/verify_chunk_ids.py --contracts contracts
+
+  tests:
+    name: "Functional tests (pytest)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
+      - name: Run pytest on tests/
+        run: python -m pytest tests -v
+
+  structure:
+    name: "Repo structure, legacy isolation & secrets"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run check_structure.py
+        run: python scripts/check_structure.py

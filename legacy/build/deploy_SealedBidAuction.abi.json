@@ -1,0 +1,278 @@
+{
+  "data": [
+    {
+      "entry_id": 13,
+      "name": "create_auction",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "bid_asset",
+          "type": "Hash"
+        },
+        {
+          "name": "min_bid",
+          "type": "u64"
+        },
+        {
+          "name": "commit_duration",
+          "type": "u64"
+        },
+        {
+          "name": "reveal_duration",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "commit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        },
+        {
+          "name": "bid_hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "reveal",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        },
+        {
+          "name": "bid_amount",
+          "type": "u64"
+        },
+        {
+          "name": "nonce",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "settle",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "declare_winner",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        },
+        {
+          "name": "winner",
+          "type": "Address"
+        },
+        {
+          "name": "winning_bid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "refund_bid",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "claim_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "claim_proceeds",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "get_auction_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "auction_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_auctions_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "t",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

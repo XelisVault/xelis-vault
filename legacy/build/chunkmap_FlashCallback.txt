@@ -1,0 +1,10 @@
+=== CHUNK MAP for /home/z/xelis-vault/contracts/flashloan/FlashCallback.slx ===
+chunk 0: Hook { id: 0 } constructor (35 instructions)
+chunk 1: Internal only_admin (50 instructions)
+chunk 2: All { parameters: Some([Opaque(8), Number(U64), Number(U64), Opaque(9), Bytes]) } on_flash_loan (155 instructions)
+chunk 3: Entry { parameters: Some([Opaque(8)]) } claim_profit (64 instructions)
+chunk 4: Entry { parameters: Some([Opaque(8)]) } set_flash_loan (24 instructions)
+chunk 5: Entry { parameters: Some([Opaque(8)]) } set_registry (24 instructions)
+chunk 6: Entry { parameters: Some([Opaque(9)]) } transfer_admin (24 instructions)
+chunk 7: Entry { parameters: Some([]) } get_version (4 instructions)
+Wrote 547 bytes to /home/z/xelis-vault/build/deploy_FlashCallback.hex (+ .abi.json)

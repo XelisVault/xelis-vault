@@ -1,0 +1,116 @@
+{
+  "data": [
+    {
+      "entry_id": 3,
+      "name": "get_borrow_rate_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "utilization_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 5,
+      "name": "get_supply_rate_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "utilization_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "annual_to_per_block_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "annual_rate_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "get_rates_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "set_rates",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "base",
+          "type": "u64"
+        },
+        {
+          "name": "multiplier",
+          "type": "u64"
+        },
+        {
+          "name": "jump",
+          "type": "u64"
+        },
+        {
+          "name": "kink",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "set_reserve_factor",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "factor_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

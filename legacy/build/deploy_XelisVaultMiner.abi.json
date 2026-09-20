@@ -1,0 +1,550 @@
+{
+  "data": [
+    {
+      "entry_id": 15,
+      "name": "register_miner",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "endpoint_url",
+          "type": "string"
+        },
+        {
+          "name": "miner_pubkey",
+          "type": "Hash"
+        },
+        {
+          "name": "services_mask",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "enable_service",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "service_id",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "disable_service",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "service_id",
+          "type": "u8"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "increase_stake",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "decrease_stake",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "deregister_miner",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "submit_heartbeat",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "get_miner_stake_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "get_miner_reputation_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "get_miners_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "get_total_staked_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "get_base_reward_oracle_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "register_service",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "service_id",
+          "type": "u8"
+        },
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "unregister_service",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "contract_hash",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "set_min_stake",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 34,
+      "name": "set_heartbeat_interval",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 35,
+      "name": "set_heartbeat_timeout",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 37,
+      "name": "set_base_reward_chat",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "set_total_budget",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 39,
+      "name": "set_target_duration",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "blocks",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 40,
+      "name": "set_vlt_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 41,
+      "name": "set_vlt_asset",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "va",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "set_delegation_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "dck",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "set_treasury",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "t",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 44,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 48,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 49,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 50,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 51,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 52,
+      "name": "request_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 53,
+      "name": "cancel_emergency_withdraw",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 54,
+      "name": "execute_emergency_withdraw",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 63,
+      "name": "set_compound",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "enabled",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 65,
+      "name": "set_rep_decay_params",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "interval",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 75,
+      "name": "get_active_miners_count_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 76,
+      "name": "get_miner_at_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "index",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 77,
+      "name": "emergency_slash_miner",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "miner_addr",
+          "type": "Address"
+        },
+        {
+          "name": "slash_bps",
+          "type": "u64"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 78,
+      "name": "emergency_ban_miner",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "miner_addr",
+          "type": "Address"
+        },
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 79,
+      "name": "emergency_freeze_rewards",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "frozen",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 80,
+      "name": "set_min_stake_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_min_stake",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 81,
+      "name": "set_max_delegation_pct",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 82,
+      "name": "get_miner_own_stake_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 83,
+      "name": "is_rewards_frozen_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 91,
+      "name": "claim_rewards",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 92,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

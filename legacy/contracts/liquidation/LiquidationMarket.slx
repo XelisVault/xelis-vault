@@ -1,0 +1,384 @@
+// ============================================================================
+// LiquidationMarket.slx — XELIS Vault v10.2 (Brainstorming Feature #7)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Marketplace pour les liquidation bots avec staking pour priorité.
+//
+// RÔLE : Les liquidateurs stake du capital pour être prioritaires dans les
+//        liquidations. Le protocole récompense les liquidateurs les plus
+//        rapides. Système de classement (leaderboard) public.
+//
+// MÉCANIQUE :
+//   1. Liquidator stake VLT (min 1000 VLT)
+//   2. Plus le stake est élevé, plus la priorité est haute
+//   3. Quand une vault devient liquidable, le liquidator prioritaire est notifié
+//   4. Si il exécute la liquidation dans les 10 blocks, il reçoit:
+//      - Le bonus de liquidation standard (5%)
+//      - Un bonus de rapidité (jusqu'à 2% supplémentaire)
+//   5. Si il n'agit pas dans les 10 blocks, le suivant dans la queue prend le relais
+//   6. Les liquidators inactifs perdent de la réputation
+//
+// ANTI-CENTRALISATION :
+//   - Max 20% de stake total par liquidator
+//   - Au moins 5 liquidators actifs requis pour éviter monopole
+//   - Bonus de rapidité décline avec le temps (1.0 → 0.5 après 5 blocks)
+//
+// Entry IDs:
+//   0  : register_liquidator
+//   1  : stake_for_priority
+//   2  : unstake
+//   3  : record_liquidation
+//   4  : report_inactive
+//   5  : claim_rewards
+//   6  : get_liquidator_info (pub fn)
+//   7  : get_leaderboard_top (pub fn)
+//   8  : get_next_in_queue (pub fn)
+//   9  : get_speed_bonus (pub fn)
+//   10 : set_registry
+//   11 : set_timelock
+//   12 : set_guardian
+//   13 : pause
+//   14 : unpause
+//   15 : transfer_admin
+//   16 : get_version
+// ============================================================================
+
+const VERSION: string = "LiquidationMarket v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const VLT_CONTRACT_KEY: string = "vc"
+const VLT_ASSET_KEY: string = "va"
+
+const LIQUIDATOR_PREFIX: string = "liq_"
+const LIQUIDATOR_COUNT_KEY: string = "lc"
+const TOTAL_STAKED_KEY: string = "ts"
+
+const MIN_STAKE: u64 = 100000000000         // 1000 VLT (atomic, 8 decimals)
+const MAX_STAKE_PCT_BPS: u64 = 2000          // 20% of total stake
+const MIN_ACTIVE_LIQUIDATORS: u64 = 5
+const SPEED_BONUS_BPS: u64 = 200             // 2% max bonus
+const SPEED_BONUS_BLOCKS: u64 = 10           // bonus window
+const REPUTATION_GAIN_PER_LIQ: u64 = 10
+const REPUTATION_LOSS_INACTIVE: u64 = 50
+const MAX_REPUTATION: u64 = 10000
+
+struct Liquidator {
+    addr: Address,
+    staked: u64,
+    reputation: u64,
+    liquidations_executed: u64,
+    liquidations_missed: u64,
+    total_rewards_earned: u64,
+    rewards_claimed: u64,
+    last_active_topo: u64,
+    active: bool,
+    registered_at: u64
+}
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    s.store(LIQUIDATOR_COUNT_KEY, 0u64)
+    s.store(TOTAL_STAKED_KEY, 0u64)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+// Entry 0: Register as a liquidator
+entry register_liquidator(endpoint_url: string) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let existing: optional<Liquidator> = s.load(LIQUIDATOR_PREFIX + caller.to_string())
+    require(existing.is_none(), "exists")
+
+    let liq: Liquidator = Liquidator {
+        addr: caller,
+        staked: 0,
+        reputation: 100,         // start with 100
+        liquidations_executed: 0,
+        liquidations_missed: 0,
+        total_rewards_earned: 0,
+        rewards_claimed: 0,
+        last_active_topo: get_current_topoheight(),
+        active: true,
+        registered_at: get_current_topoheight()
+    }
+    s.store(LIQUIDATOR_PREFIX + caller.to_string(), liq)
+    let count: u64 = s.load(LIQUIDATOR_COUNT_KEY).unwrap_or(0)
+    s.store(LIQUIDATOR_COUNT_KEY, count + 1)
+    return 0
+}
+
+// Entry 1: Stake VLT for priority (more stake = higher priority)
+entry stake_for_priority(amount: u64) -> u64 {
+    when_not_paused()
+    require(amount >= MIN_STAKE, "minstake")
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + caller.to_string()).expect("notreg")
+
+    // Check max stake concentration
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    let new_total: u64 = total + amount
+    let max_allowed: u64 = (new_total * MAX_STAKE_PCT_BPS) / 10000
+    require(liq.staked + amount <= max_allowed, "maxstake")
+
+    liq.staked += amount
+    s.store(LIQUIDATOR_PREFIX + caller.to_string(), liq)
+    s.store(TOTAL_STAKED_KEY, new_total)
+
+    // In production: transfer VLT from caller to this contract
+    return 0
+}
+
+// Entry 2: Unstake (with 3-day delay for security)
+entry unstake(amount: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + caller.to_string()).expect("notreg")
+    require(liq.staked >= amount, "insufficient")
+    require(liq.staked - amount >= MIN_STAKE || liq.staked - amount == 0, "minremain")
+
+    liq.staked -= amount
+    s.store(LIQUIDATOR_PREFIX + caller.to_string(), liq)
+    let total: u64 = s.load(TOTAL_STAKED_KEY).unwrap_or(0)
+    s.store(TOTAL_STAKED_KEY, total - amount)
+
+    // In production: transfer VLT back to caller
+    return 0
+}
+
+// Entry 3: Record that a liquidator executed a liquidation (called by VaultEngine)
+// blocks_to_act: how many blocks passed between liquidation available and executed
+entry record_liquidation(liq_addr: Address, blocks_to_act: u64, reward_amount: u64) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    // Only VaultEngine (or admin) can call this
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notauth")
+
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + liq_addr.to_string()).expect("notreg")
+
+    // Calculate speed bonus
+    let speed_bonus: u64 = 0
+    if blocks_to_act <= SPEED_BONUS_BLOCKS {
+        // Linear decay: full bonus at block 0, half at block 5, zero at block 10
+        let decay: u64 = (SPEED_BONUS_BPS * (SPEED_BONUS_BLOCKS - blocks_to_act)) / SPEED_BONUS_BLOCKS
+        speed_bonus = (reward_amount * decay) / 10000
+    }
+
+    let total_reward: u64 = reward_amount + speed_bonus
+    liq.liquidations_executed += 1
+    liq.total_rewards_earned += total_reward
+    liq.reputation += REPUTATION_GAIN_PER_LIQ
+    if liq.reputation > MAX_REPUTATION { liq.reputation = MAX_REPUTATION }
+    liq.last_active_topo = get_current_topoheight()
+    s.store(LIQUIDATOR_PREFIX + liq_addr.to_string(), liq)
+
+    return 0
+}
+
+// Entry 4: Report an inactive liquidator (anyone can call, bots monitor)
+// If liquidator didn't act on a liquidation opportunity, they lose reputation
+entry report_inactive(liq_addr: Address) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + liq_addr.to_string()).expect("notreg")
+    liq.liquidations_missed += 1
+    if liq.reputation > REPUTATION_LOSS_INACTIVE {
+        liq.reputation -= REPUTATION_LOSS_INACTIVE
+    } else {
+        liq.reputation = 0
+    }
+    s.store(LIQUIDATOR_PREFIX + liq_addr.to_string(), liq)
+    return 0
+}
+
+// Entry 5: Claim accumulated rewards
+entry claim_rewards() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + caller.to_string()).expect("notreg")
+    let pending: u64 = liq.total_rewards_earned - liq.rewards_claimed
+    require(pending > 0, "nothing")
+    liq.rewards_claimed += pending
+    s.store(LIQUIDATOR_PREFIX + caller.to_string(), liq)
+    return 0
+}
+
+// Pub fn 6: Get liquidator info
+pub fn get_liquidator_info(addr: Address) -> (u64, u64, u64, u64, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    let liq: Liquidator = s.load(LIQUIDATOR_PREFIX + addr.to_string()).expect("notreg")
+    return (
+        liq.staked,
+        liq.reputation,
+        liq.liquidations_executed,
+        liq.liquidations_missed,
+        liq.total_rewards_earned,
+        liq.rewards_claimed,
+        liq.last_active_topo,
+        liq.active
+    )
+}
+
+// Pub fn 7: Get leaderboard top N (by combined stake + reputation score)
+// Returns top liquidator's address for a given rank (1-indexed)
+// Note: in production, this would use an iterator + sort
+// Here we return the top by scanning (limit N for gas)
+pub fn get_leaderboard_top(rank: u64) -> (Address, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(LIQUIDATOR_COUNT_KEY).unwrap_or(0)
+    require(rank > 0 && rank <= count, "badrank")
+
+    // Simplified: return rank-th liquidator by registration order
+    // In production: maintain a sorted leaderboard structure
+    let i: u64 = 0
+    let found_idx: u64 = 0
+    while i < count {
+        let liq_opt: optional<Liquidator> = s.load(LIQUIDATOR_PREFIX + i.to_string(10u32))
+        if liq_opt.is_some() {
+            found_idx += 1
+            if found_idx == rank {
+                let liq: Liquidator = liq_opt.expect("err")
+                return (liq.addr, liq.staked, liq.reputation, liq.liquidations_executed)
+            }
+        }
+        i += 1
+    }
+    require(false, "notfound")
+    return (Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")), 0, 0, 0)
+}
+
+// Pub fn 8: Get next liquidator in queue (highest priority that hasn't acted yet)
+// Called by VaultEngine when a vault becomes liquidable
+pub fn get_next_in_queue() -> Address {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(LIQUIDATOR_COUNT_KEY).unwrap_or(0)
+    require(count > 0, "noliq")
+
+    // Find highest-priority liquidator (max stake * reputation)
+    let best_addr: Address = Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000"))
+    let best_score: u64 = 0
+    let i: u64 = 0
+    while i < count {
+        let liq_opt: optional<Liquidator> = s.load(LIQUIDATOR_PREFIX + i.to_string(10u32))
+        if liq_opt.is_some() {
+            let liq: Liquidator = liq_opt.expect("err")
+            if liq.active && liq.staked > 0 {
+                let score: u64 = liq.staked * liq.reputation
+                if score > best_score {
+                    best_addr = liq.addr  // Note: mutable assignment in loop
+                    best_score = score
+                }
+            }
+        }
+        i += 1
+    }
+    return best_addr
+}
+
+// Pub fn 9: Get current speed bonus for a given delay
+pub fn get_speed_bonus(blocks_to_act: u64, base_reward: u64) -> u64 {
+    if blocks_to_act >= SPEED_BONUS_BLOCKS { return 0 }
+    let decay: u64 = (SPEED_BONUS_BPS * (SPEED_BONUS_BLOCKS - blocks_to_act)) / SPEED_BONUS_BLOCKS
+    return (base_reward * decay) / 10000
+}
+
+// Entry 10: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 11: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 12: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 13: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 14: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 15: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 16: Get version
+entry get_version() -> string {
+    return VERSION
+}

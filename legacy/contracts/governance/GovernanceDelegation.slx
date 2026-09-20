@@ -1,0 +1,333 @@
+// ============================================================================
+// GovernanceDelegation.slx — XELIS Vault v10.2 (Brainstorming Feature #12)
+// ============================================================================
+// ⚠️  DEPLOYMENT STATUS: PENDING — DO NOT DEPLOY YET
+// ----------------------------------------------------------------------------
+// This contract is a v10.2 brainstorming feature. It is NOT part of the
+// initial testnet deployment. Deploy ONLY if time remains after the 33 core
+// contracts (v5.0) are deployed, audited, and stable on testnet.
+//
+// Priority: LOWEST (Phase 5+ — post-mainnet)
+// Dependencies: requires ContractRegistry + core contracts already deployed
+// Audit: NOT YET AUDITED — external audit required before any deployment
+// ============================================================================
+
+// Liquid democracy pour la gouvernance XELIS Vault.
+//
+// RÔLE : Permet à un utilisateur de déléguer son voting power à un "delegate",
+//        qui vote avec son propre VP + celui de tous ses delegators. Les
+//        delegators peuvent reprendre leur VP à tout moment (liquid democracy).
+//
+// AVANTAGES :
+//   - Pas besoin de voter sur chaque proposition si vous faites confiance à un expert
+//   - Le delegate peut être changé instantanément (pas de lock)
+//   - Système de réputation pour les delegates (transparence)
+//   - Délégation transitive : A délègue à B, B délègue à C → C vote avec VP_A + VP_B + VP_C
+//   - Délégation par domaine : delegate pour "oracle" peut différer de "lending"
+//
+// LIMITES :
+//   - Profondeur max de délégation : 5 (évite les cycles)
+//   - Un delegate peut avoir max 1000 delegators (anti-concentration)
+//   - Pas de délégation à soi-même
+//
+// Entry IDs:
+//   0  : delegate
+//   1  : undelegate
+//   2  : delegate_by_topic
+//   3  : undelegate_by_topic
+//   4  : record_vote (called by Governor)
+//   5  : get_voting_power (pub fn)
+//   6  : get_delegate (pub fn)
+//   7  : get_delegators_count (pub fn)
+//   8  : get_delegate_reputation (pub fn)
+//   9  : get_topic_delegate (pub fn)
+//   10 : set_governance_vault
+//   11 : set_registry
+//   12 : set_timelock
+//   13 : set_guardian
+//   14 : pause
+//   15 : unpause
+//   16 : transfer_admin
+//   17 : get_version
+// ============================================================================
+
+const VERSION: string = "GovernanceDelegation v10.2"
+
+const ADMIN_KEY: string = "a"
+const TIMELOCK_KEY: string = "tl"
+const GUARDIAN_KEY: string = "gd"
+const PAUSED_KEY: string = "pz"
+const REGISTRY_KEY: string = "reg"
+const GOV_VAULT_KEY: string = "gv"
+
+const DELEGATE_PREFIX: string = "del_"      // user → delegate
+const DELEGATORS_PREFIX: string = "dels_"    // delegate → count
+const TOPIC_DELEGATE_PREFIX: string = "td_"  // user + topic → delegate
+const REPUTATION_PREFIX: string = "rep_"     // delegate → reputation score
+const VOTE_COUNT_PREFIX: string = "vc_"      // delegate → total votes cast
+
+const MAX_DELEGATION_DEPTH: u64 = 5
+const MAX_DELEGATORS: u64 = 1000
+
+// Topic constants
+const TOPIC_GENERAL: u8 = 0
+const TOPIC_ORACLE: u8 = 1
+const TOPIC_LENDING: u8 = 2
+const TOPIC_TREASURY: u8 = 3
+const TOPIC_GOVERNANCE: u8 = 4
+const TOPIC_UPGRADE: u8 = 5
+
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    s.store(ADMIN_KEY, caller)
+    s.store(GUARDIAN_KEY, caller)
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+fn when_not_paused() {
+    let s: Storage = Storage::new()
+    let paused: bool = s.load(PAUSED_KEY).unwrap_or(false)
+    require(!paused, "paused")
+}
+
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let admin: Address = s.load(ADMIN_KEY).expect("err")
+    if caller == admin { return }
+    let tl_opt: optional<Hash> = s.load(TIMELOCK_KEY)
+    require(tl_opt.is_some(), "notauth")
+    let tl: Hash = tl_opt.expect("err")
+    let cc: Hash = get_contract_caller().expect("err")
+    require(cc == tl, "notauth")
+}
+
+fn only_guardian_or_admin() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let g: Address = s.load(GUARDIAN_KEY).expect("err")
+    if caller == g { return }
+    only_admin()
+}
+
+fn only_governor_or_gov_vault() {
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let gov_vault: Address = s.load(GOV_VAULT_KEY).expect("err")
+    if caller == gov_vault { return }
+    // Allow via contract caller (Governor contract calling)
+    let cc_opt: optional<Hash> = get_contract_caller()
+    require(cc_opt.is_some(), "notgov")
+}
+
+// Check for delegation cycles (max depth 5)
+fn would_create_cycle(user: Address, delegate: Address) -> bool {
+    let s: Storage = Storage::new()
+    let current: Address = delegate
+    let depth: u64 = 0
+    while depth < MAX_DELEGATION_DEPTH {
+        if current == user { return true }
+        let next_opt: optional<Address> = s.load(DELEGATE_PREFIX + current.to_string())
+        if next_opt.is_none() { return false }
+        current = next_opt.expect("err")
+        depth += 1
+    }
+    return false  // depth limit reached, no cycle within range
+}
+
+// Entry 0: Delegate voting power to another address
+entry delegate(delegate_addr: Address) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(delegate_addr != caller, "selfdel")
+
+    // Check cycle
+    require(!would_create_cycle(caller, delegate_addr), "cycle")
+
+    // Check delegate hasn't exceeded max delegators
+    let del_count: u64 = s.load(DELEGATORS_PREFIX + delegate_addr.to_string()).unwrap_or(0)
+    require(del_count < MAX_DELEGATORS, "maxdels")
+
+    // Remove from previous delegate's count
+    let prev_opt: optional<Address> = s.load(DELEGATE_PREFIX + caller.to_string())
+    if prev_opt.is_some() {
+        let prev: Address = prev_opt.expect("err")
+        let prev_count: u64 = s.load(DELEGATORS_PREFIX + prev.to_string()).unwrap_or(0)
+        if prev_count > 0 {
+            s.store(DELEGATORS_PREFIX + prev.to_string(), prev_count - 1)
+        }
+    }
+
+    // Set new delegate
+    s.store(DELEGATE_PREFIX + caller.to_string(), delegate_addr)
+    s.store(DELEGATORS_PREFIX + delegate_addr.to_string(), del_count + 1)
+
+    emit_event(0u64, ["Delegated", caller.to_string() + "_" + delegate_addr.to_string()])
+    return 0
+}
+
+// Entry 1: Undelegate (reclaim voting power)
+entry undelegate() -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+
+    let prev_opt: optional<Address> = s.load(DELEGATE_PREFIX + caller.to_string())
+    require(prev_opt.is_some(), "notdel")
+    let prev: Address = prev_opt.expect("err")
+
+    s.delete(DELEGATE_PREFIX + caller.to_string())
+    let prev_count: u64 = s.load(DELEGATORS_PREFIX + prev.to_string()).unwrap_or(0)
+    if prev_count > 0 {
+        s.store(DELEGATORS_PREFIX + prev.to_string(), prev_count - 1)
+    }
+    return 0
+}
+
+// Entry 2: Delegate by topic (different delegate for oracle vs lending vs treasury)
+entry delegate_by_topic(topic: u8, delegate_addr: Address) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    require(delegate_addr != caller, "selfdel")
+    require(topic <= TOPIC_UPGRADE, "badtopic")
+
+    let key: string = TOPIC_DELEGATE_PREFIX + caller.to_string() + "_" + topic.to_string(10u32)
+    s.store(key, delegate_addr)
+    return 0
+}
+
+// Entry 3: Undelegate by topic
+entry undelegate_by_topic(topic: u8) -> u64 {
+    when_not_paused()
+    let s: Storage = Storage::new()
+    let caller: Address = get_caller().expect("err")
+    let key: string = TOPIC_DELEGATE_PREFIX + caller.to_string() + "_" + topic.to_string(10u32)
+    s.delete(key)
+    return 0
+}
+
+// Entry 4: Record that a delegate voted (called by Governor after each vote)
+// Increases delegate reputation
+entry record_vote(delegate_addr: Address, voted_with_majority: bool) -> u64 {
+    only_governor_or_gov_vault()
+    let s: Storage = Storage::new()
+    let vote_count: u64 = s.load(VOTE_COUNT_PREFIX + delegate_addr.to_string()).unwrap_or(0)
+    s.store(VOTE_COUNT_PREFIX + delegate_addr.to_string(), vote_count + 1)
+
+    // Reputation: +2 per vote, +5 bonus if voted with majority
+    let rep: u64 = s.load(REPUTATION_PREFIX + delegate_addr.to_string()).unwrap_or(0)
+    let gain: u64 = 2
+    if voted_with_majority { gain += 5 }
+    s.store(REPUTATION_PREFIX + delegate_addr.to_string(), rep + gain)
+    return 0
+}
+
+// Pub fn 5: Get effective voting power for a user (resolved through delegation chain)
+// Returns: own_stake + sum of all delegated stake to this user (transitively)
+// Note: caller must provide own_stake (queried from GovernanceVault)
+pub fn get_voting_power(user: Address, own_stake: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    // If user has delegated, they have 0 effective power (delegated away)
+    let del_opt: optional<Address> = s.load(DELEGATE_PREFIX + user.to_string())
+    if del_opt.is_some() { return 0 }
+
+    // Otherwise, user's power = own_stake + sum of delegators' stakes
+    // Note: iterating all delegators is expensive; in production, this is cached
+    // For now, return own_stake (delegators must be queried off-chain and summed)
+    return own_stake
+}
+
+// Pub fn 6: Get user's delegate (zero address if none)
+pub fn get_delegate(user: Address) -> Address {
+    let s: Storage = Storage::new()
+    let del_opt: optional<Address> = s.load(DELEGATE_PREFIX + user.to_string())
+    if del_opt.is_none() { return Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) }
+    return del_opt.expect("err")
+}
+
+// Pub fn 7: Get number of delegators for a delegate
+pub fn get_delegators_count(delegate_addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(DELEGATORS_PREFIX + delegate_addr.to_string()).unwrap_or(0)
+}
+
+// Pub fn 8: Get delegate reputation (higher = more trusted)
+pub fn get_delegate_reputation(delegate_addr: Address) -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(REPUTATION_PREFIX + delegate_addr.to_string()).unwrap_or(0)
+}
+
+// Pub fn 9: Get topic-specific delegate
+pub fn get_topic_delegate(user: Address, topic: u8) -> Address {
+    let s: Storage = Storage::new()
+    let key: string = TOPIC_DELEGATE_PREFIX + user.to_string() + "_" + topic.to_string(10u32)
+    let del_opt: optional<Address> = s.load(key)
+    if del_opt.is_none() { return Address::from_bytes(bytes::from_hex("00000000000000000000000000000000000000000000000000000000000000000000")) }
+    return del_opt.expect("err")
+}
+
+// Entry 10: Set governance vault (for stake queries)
+entry set_governance_vault(gv: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(GOV_VAULT_KEY, gv)
+    return 0
+}
+
+// Entry 11: Set registry
+entry set_registry(registry: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(REGISTRY_KEY, registry)
+    return 0
+}
+
+// Entry 12: Set timelock
+entry set_timelock(tl: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(TIMELOCK_KEY, tl)
+    return 0
+}
+
+// Entry 13: Set guardian
+entry set_guardian(g: Address) -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(GUARDIAN_KEY, g)
+    return 0
+}
+
+// Entry 14: Pause
+entry pause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    return 0
+}
+
+// Entry 15: Unpause
+entry unpause() -> u64 {
+    only_guardian_or_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, false)
+    return 0
+}
+
+// Entry 16: Transfer admin
+entry transfer_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    return 0
+}
+
+// Entry 17: Get version
+entry get_version() -> string {
+    return VERSION
+}

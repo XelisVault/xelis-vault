@@ -1,0 +1,135 @@
+{
+  "data": [
+    {
+      "entry_id": 8,
+      "name": "record_loan_opened",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "borrower",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "collateral_ratio_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "record_loan_repaid",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "borrower",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "duration_blocks",
+          "type": "u64"
+        },
+        {
+          "name": "days_late",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "record_loan_defaulted",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "borrower",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

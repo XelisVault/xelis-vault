@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xvault"
+version = "13.0.0"
+description = "XELIS Vault protocol CLI & SDK — PrivacyMixer V4 first, key-less by design"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "XelisVault" }]
+keywords = ["xelis", "mixer", "privacy", "defi", "blockchain"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "requests>=2.31",
+    "blake3>=1.0",
+]
+
+[project.scripts]
+xvault = "xvault.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xvault*"]

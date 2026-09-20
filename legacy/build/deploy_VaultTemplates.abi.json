@@ -1,0 +1,215 @@
+{
+  "data": [
+    {
+      "entry_id": 5,
+      "name": "execute_safe_vault",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_borrow_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 6,
+      "name": "execute_leverage_loop",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "initial_collateral",
+          "type": "u64"
+        },
+        {
+          "name": "min_final_collateral",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 7,
+      "name": "execute_yield_farmer",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_borrow_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 8,
+      "name": "execute_psm_arbitrage",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "current_xusd_price_cents",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "execute_lp_strategy",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "collateral_amount",
+          "type": "u64"
+        },
+        {
+          "name": "min_borrow_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "emergency_exit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "execution_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_vault_engine",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "ve",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_psm",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "psm",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_vault_swap",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "vs",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_savings_rate",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "sr",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "registry",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "pause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "unpause",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

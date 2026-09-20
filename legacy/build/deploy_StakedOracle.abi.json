@@ -1,0 +1,339 @@
+{
+  "data": [
+    {
+      "entry_id": 10,
+      "name": "add_feed_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        },
+        {
+          "name": "min_price",
+          "type": "u64"
+        },
+        {
+          "name": "max_price",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "submit_price",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "price",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "aggregate_now",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "get_price_by_feed_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "get_price_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "get_price_for_asset_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "get_feed_id_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 41,
+      "name": "disable_bootstrap",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "set_bootstrap_min_providers",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "n",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "set_min_providers",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "n",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 44,
+      "name": "set_miner_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "mc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "set_delegation_contract",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "dc",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "set_registry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reg",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "set_timelock",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "tl",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 48,
+      "name": "set_guardian",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "g",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 49,
+      "name": "set_emergency",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "e",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 50,
+      "name": "transfer_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 51,
+      "name": "get_version",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 52,
+      "name": "set_max_deviation_bps_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 53,
+      "name": "set_cb_threshold_bps_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 54,
+      "name": "set_aggregation_blocks_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "n",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 55,
+      "name": "set_max_stale_blocks_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "n",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 56,
+      "name": "set_hard_stale_blocks_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "n",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 57,
+      "name": "pause_entry",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 58,
+      "name": "unpause_entry",
+      "outputs": "u64",
+      "params": [],
+      "type": "entry"
+    },
+    {
+      "entry_id": 59,
+      "name": "force_update_price",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "feed_id",
+          "type": "u64"
+        },
+        {
+          "name": "new_price",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 60,
+      "name": "set_airdrop_tracker",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "at",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}
