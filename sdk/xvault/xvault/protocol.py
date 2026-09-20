@@ -84,6 +84,61 @@ MIXER_ENTRY_IDS_ALT = {
 }
 
 # ---------------------------------------------------------------------------
+# VaultLaunch chunk ids (constructor = 0, then EVERY function in declaration
+# order — matches the contract's CI-verified CHUNK TABLE).
+# ---------------------------------------------------------------------------
+LAUNCHPAD_CONTRACT = "VaultLaunch"
+
+LAUNCHPAD_ENTRY_IDS = {
+    "propose": 12,
+    "support": 13,
+    "report": 14,
+    "finalize_validation": 15,
+    "buy": 16,
+    "sell": 17,
+    "claim_refund": 18,
+    "request_revalidation": 19,
+    "update_project_info": 20,
+    "set_submission_fee": 21,
+    "set_trading_fee": 22,
+    "set_min_liquidity": 23,
+    "set_min_participants": 24,
+    "set_min_approval_ratio": 25,
+    "set_validation_duration": 26,
+    "set_graduation_multiplier": 27,
+    "set_recovery_fee": 28,
+    "set_recovery_params": 29,
+    "set_admin": 30,
+    "set_paused": 31,
+    "withdraw_fees": 32,
+}
+
+# Alternative numbering (entries only, 0-based) — kept ONLY for the probe.
+LAUNCHPAD_ENTRY_IDS_ALT = {
+    "propose": 0,
+    "support": 1,
+    "report": 2,
+    "finalize_validation": 3,
+    "buy": 4,
+    "sell": 5,
+    "claim_refund": 6,
+    "request_revalidation": 7,
+    "update_project_info": 8,
+    "set_submission_fee": 9,
+    "set_trading_fee": 10,
+    "set_min_liquidity": 11,
+    "set_min_participants": 12,
+    "set_min_approval_ratio": 13,
+    "set_validation_duration": 14,
+    "set_graduation_multiplier": 15,
+    "set_recovery_fee": 16,
+    "set_recovery_params": 17,
+    "set_admin": 18,
+    "set_paused": 19,
+    "withdraw_fees": 20,
+}
+
+# ---------------------------------------------------------------------------
 # ValueCell builders (adjacently tagged JSON, mirrors the official CLI)
 # ---------------------------------------------------------------------------
 

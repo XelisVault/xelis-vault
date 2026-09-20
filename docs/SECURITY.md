@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v14
+# Security Policy — XelisVault Protocol v15
 
 ## Reporting
 
@@ -9,20 +9,30 @@ credit; no bounties yet (community project).
 
 ## State of the codebase
 
-### v14 (current, this tree)
+### v15 (current, this tree)
 
-- `contracts/mixer/PrivacyMixerV5.slx` — the **only** production contract.
-  Written against the full v12 audit findings and the V4 disclosure below;
-  every dangerous pattern is excluded by construction and machine-checked
-  on every push:
+- `contracts/launchpad/VaultLaunch.slx` — the launchpad, built to the same
+  bar as the mixer and machine-checked on every push:
   - zero `let _ = transfer` (swallowed transfer failures) — linter rule R1
   - zero unchecked transfers — R2
-  - zero owner-drain entries — R3
+  - zero owner-drain entries; the admin's only XEL exit is
+    `withdraw_fees`, double-capped (accrued fees AND uncommitted balance) —
+    R3 + the I2 solvency invariant
   - every `.expect()`/`.unwrap()` guarded by a preceding `require` — R4
-  - zero 34-byte address literals — R5
-  - storage-write entries are either guarded or intentionally public — R7
-  - zero deposit entries carrying an Address parameter — R11 (the V4 flaw
-    can never ship again)
+  - every admin parameter range-checked against hard caps (trading fee
+    can never exceed 10%) — documented in docs/LAUNCHPAD.md §4
+  - public-by-design entries (`sell`, `finalize_validation`) carry written
+    exemptions in the linter; `support`/`report` are caller-bound by the
+    vote-marker key itself — R7
+  - listing views use const-bounded loops (R8) and rank accessors instead
+    of array returns (no compiled ABI ever returned an array — verified
+    against the v12 compiler ground truth)
+  - the SDK's entry-id table is CI-pinned to the contract's real chunk
+    numbering (tests/test_launchpad_reference.py) — a drift would invoke
+    the wrong entry, so it cannot happen silently
+- `contracts/mixer/PrivacyMixerV5.slx` — the privacy pool. Same lint bar,
+  fully implemented and tested, **on hold for mainnet** pending VM zk
+  primitives (see the status note in docs/MIXER.md).
 - `sdk/xvault` — client tooling; never handles keys (writes are prepared
   here, signed by your local wallet). The deposit commitment is computed
   client-side with a byte-exact port of Silex `Address::to_bytes()` (XELIS

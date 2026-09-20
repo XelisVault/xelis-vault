@@ -1,5 +1,15 @@
 # PrivacyMixer V5 "Dead-Drop" — Design Specification
 
+> **STATUS: ON HOLD (founder decision, 2026-09).** The dead-drop model is
+> sound (the recipient never appears on-chain and never pays gas), but the
+> fundamental limit documented in §3 stands: without zk-SNARK primitives in
+> the XELIS VM, a release transaction still reveals (secret, recipient) and
+> an archive node can link depositor → recipient. The mixer stays fully
+> implemented, tested and CI-green in this tree — do NOT deploy it on
+> mainnet until the VM ships the missing primitives (or the community
+> explicitly accepts the documented non-ZK guarantee). VaultLaunch is the
+> active product in the meantime.
+
 > contracts/mixer/PrivacyMixerV5.slx · v5.0.0 · mainnet-ready
 
 A single, self-contained privacy pool for XEL. Zero inter-contract calls,

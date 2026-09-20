@@ -40,3 +40,8 @@ bin/xelis_daemon
 
 # Never track legacy build artifacts larger than what git can bear
 legacy/build/*.bin
+
+# Python build artifacts (pip install ./sdk)
+sdk/xvault/build/
+sdk/xvault/*.egg-info/
+dist/

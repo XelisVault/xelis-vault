@@ -1,0 +1,1514 @@
+// ============================================================================
+// VaultLaunch — XelisVault Protocol
+// ============================================================================
+// A serious, self-contained launchpad for XEL. Real projects only: every
+// launch is filtered by a community validation vote, priced by a
+// constant-product bonding curve, and held to a long-term community trust
+// standard (Trusted / Untrusted). NOT a memecoin casino — the vote window is
+// the quality filter, and the trust system keeps founders accountable long
+// after graduation.
+//
+// ZERO inter-contract calls. ZERO external dependencies. ONE file.
+//
+// ----------------------------------------------------------------------------
+// DESIGN DECISIONS (and why — read before changing anything)
+// ----------------------------------------------------------------------------
+// D1. Tokens are an INTERNAL LEDGER inside this contract. XELIS smart
+//     contracts cannot call each other today, so a launched token cannot be
+//     a separately deployed contract the launchpad controls. Each project's
+//     token lives as per-address balances in this contract's storage and
+//     trades ONLY against its bonding curve here. The day the VM ships
+//     inter-contract calls, migrations become possible; until then this is
+//     the only mainnet-safe shape.
+//
+// D2. Graduation does NOT stop trading. There is no external DEX to migrate
+//     to (see D1), so freezing the curve at graduation would trap holders.
+//     Instead: the bonding PHASE ends (the launch milestone), the project
+//     becomes Graduated + Trusted, and the same constant-product math keeps
+//     serving trades forever. The contract IS the token's permanent venue.
+//
+// D3. Team tokens are minted AT GRADUATION, not at proposal. The curve's
+//     sellable supply excludes the team allocation from day one, so the
+//     allocation can never be over-sold; but the creator only RECEIVES those
+//     tokens once the project graduates. A project that never graduates
+//     costs the founder its liquidity (locked in the curve) and pays nothing
+//     to the team. Buyers can always exit via sell() while the curve lives.
+//
+// D4. Losing trust blocks BUYS, never SELLs. When a project is Untrusted,
+//     new buys are refused (protecting new entrants — the entire point of
+//     the trust system) but holders can always exit. A trust flip can never
+//     trap funds.
+//
+// D5. Fees ACCRUE and are pulled by withdraw_fees(). Submission, trading and
+//     recovery fees accumulate in `pending_fees`; the admin withdraws them
+//     capped at what the contract can spare after covering every curve's
+//     reserves and every refundable rejection. 100% of revenue goes to the
+//     admin — nothing is burned.
+//
+// D6. Voting is 1 address = 1 vote, per voting round. Every vote costs a
+//     network fee — that is the only (and honest) sybil cost on XELIS today.
+//     Votes reset when a new validation round opens; trust tallies otherwise
+//     accumulate for the whole life of the project.
+//
+// ----------------------------------------------------------------------------
+// LIFECYCLE (status codes)
+// ----------------------------------------------------------------------------
+//   0 Validation  project submitted; support/report window is open
+//                 (ends at validation_end topoheight; outcome applied by
+//                  finalize_validation, callable by ANYONE after the window)
+//       ├── pass (>= min_participants voters AND >= 80% support) ──> 2 Bonding
+//       └── fail ──> 1 Rejected ──> claim_refund() returns 100% of the
+//                                    founder's liquidity, once
+//   2 Bonding     curve is live: buy() / sell(); votes continue and can
+//                 flip the project Untrusted (see D4)
+//                 graduation when reserves >= liquidity * multiplier
+//                 ──> 3 Graduated (+ Trusted): team tokens minted, trading
+//                     continues (D2), trust votes keep accumulating
+//   5 Untrusted   reports reached the loss threshold while Bonding/
+//                 Graduated/Trusted: buys blocked, sells open, votes open
+//                 recovery: request_revalidation() by the creator —
+//                   * not graduated: free, normal thresholds
+//                   * graduated: pays recovery_fee (default 250 XEL to the
+//                     admin) and must pass STRICTER thresholds
+//                   ──> 6 Recovery window ──> pass: 2 (Bonding) or 4 (Trusted)
+//                                             fail: back to 5 (retryable)
+//   4 Trusted     recovered status for graduated projects (same trading
+//                 rules as Graduated)
+//
+// ----------------------------------------------------------------------------
+// BONDING-CURVE MATH (constant product, integer, contract-favouring floors)
+// ----------------------------------------------------------------------------
+// State per project: R = real XEL reserves, C = curve token supply
+// (sellable balance held by the curve). Price = R / C.
+//
+//   buy  with X XEL attached:      fee = X * trading_fee_bps / 10000
+//                                  net = X - fee                  (joins R)
+//                                  tokens_out = C * net / (R + net)
+//   sell of T tokens:             gross = R * T / (C + T)         (leaves R)
+//                                  fee  = gross * trading_fee_bps / 10000
+//                                  out  = gross - fee              (to caller)
+//
+// Both directions floor (integer division) in favour of the contract, so the
+// pool can never go insolvent from rounding. All intermediates are computed
+// in u128 (products are up to 1e31; u64 would overflow).
+//
+// Graduation: R >= liquidity_deposited * graduation_multiplier (u128 compare).
+// Market cap = R * (total_supply - C - unminted_team) / C (u128, saturating).
+//
+// ----------------------------------------------------------------------------
+// FEES (defaults — ALL admin-configurable, ALL revenue to the admin)
+// ----------------------------------------------------------------------------
+//   submission_fee            10 XEL     paid once per proposal (non-refundable)
+//   min_liquidity           500 XEL     founder's locked seed liquidity
+//   trading_fee_bps            50 bps    on every buy and every sell
+//   recovery_fee             250 XEL     to re-open validation after trust
+//                                        loss on a GRADUATED project
+//   validation window      51840 topos  ~3 days at ~5s per topoheight
+//   min_participants            20      minimum voters to validate a project
+//   min_approval_ratio_bps    8000      80% support required
+//   graduation_multiplier        4      graduate at 4x the deposited liquidity
+//   recovery_min_participants   40      stricter recovery quorum
+//   recovery_min_ratio_bps     9000     90% support to recover Trust
+//
+// ----------------------------------------------------------------------------
+// SECURITY MODEL (honest threat documentation)
+// ----------------------------------------------------------------------------
+//   * The admin is a hot role: it sets every fee/parameter and can pause NEW
+//     proposals and NEW buys. It can NEVER move curve reserves, user token
+//     balances, or refundable rejections — withdraw_fees() is capped at
+//     pending_fees and at the contract's uncommitted balance. Sells, votes,
+//     refunds and finalization are NEVER pausable: exits and community
+//     decisions cannot be frozen.
+//   * Voting sybil-resistance is the network fee, nothing more (documented,
+//     not hidden). min_participants and the 80% bar make cheap attack
+//     campaigns expensive: 20+ voting transactions, each paying network fees.
+//   * Params are range-checked on every setter (hard caps in constants):
+//     trading fee can never exceed 10%, ratios stay in (50%..100%],
+//     durations and multipliers stay sane. A compromised admin can hurt the
+//     fee model, not the funds.
+//   * No reentrancy surface: XELIS invokes are atomic and this contract
+//     calls no other contract.
+//   * Front-running buys/sells is possible (no mempool privacy) — same as
+//     every public DEX on XELIS today; quotes are view functions, use them.
+//
+// ----------------------------------------------------------------------------
+// INVARIANTS
+// ----------------------------------------------------------------------------
+//   I1. Ledger: curve_supply + sum(balances) + (graduated ? 0 : team_alloc)
+//       == total_supply, for every project, always.
+//   I2. Solvency: contract XEL balance >= total_curve_xel + pending_fees +
+//       locked_refunds, before and after every entry. Checked in
+//       withdraw_fees (the only exit path for fees).
+//   I3. A project's reserves can only grow by buy nets and shrink by sell
+//       grosses; the founder's liquidity only leaves via claim_refund on a
+//       Rejected project, exactly once.
+//   I4. Team tokens are minted exactly once, at graduation, to the creator.
+//   I5. Every vote is one storage key ("v:{id}:{round}:{addr}"); an address
+//       votes at most once per round; rounds only increase.
+//   I6. Status transitions are one-way per path (see LIFECYCLE); nobody,
+//       including the admin, can jump states arbitrarily.
+//   I7. All transfers are checked (no swallowed failures). Every panic
+//       message is a fixed short literal (no user data in panics).
+//   I8. Untrusted blocks buys ONLY (D4) — sells and refunds always work.
+//
+// ----------------------------------------------------------------------------
+// STORAGE MAP (string keys, flat KV — house style)
+// ----------------------------------------------------------------------------
+//   Global   : adm pc sub mnl tfe mnp mab vdt gmu rfe rmp rmr
+//              pfe fcl tvl tcx lrf pz xa        (see constants below)
+//   Project  : p:{id}:cr creator        p:{id}:st status (u64)
+//              p:{id}:nm name           p:{id}:sy symbol
+//              p:{id}:ds description    p:{id}:ws website
+//              p:{id}:lg logo           p:{id}:ts total_supply
+//              p:{id}:tb team_bps       p:{id}:lq liquidity deposited
+//              p:{id}:rv curve reserves p:{id}:cs curve token supply
+//              p:{id}:ct created topo   p:{id}:ve validation deadline
+//              p:{id}:sp supports       p:{id}:rp reports
+//              p:{id}:gr graduated      p:{id}:rc refund claimed
+//              p:{id}:rd vote round     p:{id}:vo trade volume
+//   Votes    : v:{id}:{round}:{addr} -> bool
+//   Balances : b:{id}:{addr}          -> u64 (token atomic units, 8 dec)
+//
+// ----------------------------------------------------------------------------
+// EVENTS (V6 contract events: id + array of string fields)
+// ----------------------------------------------------------------------------
+//    1 ProjectCreated      [id, name, symbol, liquidity]
+//    2 ProjectSupported    [id, round, voter]
+//    3 ProjectReported     [id, round, voter]
+//    4 ValidationFinished  [id, "1"|"0"]
+//    5 BondingOpened       [id]
+//    6 TokensBought        [id, xel_in, tokens_out, fee]
+//    7 TokensSold          [id, tokens_in, xel_out, fee]
+//    8 ProjectGraduated    [id, reserves, team_tokens_minted]
+//    9 TrustLost           [id, reports, supports]
+//   10 TrustRecovered      [id]
+//   11 FeesCollected       [amount]
+//   12 ParamSet            [param, value]
+//   13 Paused              ["admin"]        14 Unpaused ["admin"]
+//   15 AdminSet            [new_admin]
+//   16 RefundClaimed       [id, amount]
+//   17 RecoveryRequested   [id, round]
+//   18 ProjectInfoUpdated  [id]
+//
+// ----------------------------------------------------------------------------
+// CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
+// ----------------------------------------------------------------------------
+//    0 constructor           19 request_revalidation   38 get_bonding_info
+//    1 only_admin            20 update_project_info    39 get_current_price
+//    2 require_project       21 set_submission_fee     40 get_buy_quote
+//    3 proj_key              22 set_trading_fee        41 get_sell_quote
+//    4 vote_key              23 set_min_liquidity      42 get_market_cap
+//    5 bal_key               24 set_min_participants   43 get_token_balance
+//    6 fee_take              25 set_min_approval_ratio 44 has_voted
+//    7 buy_tokens_out        26 set_validation_duration 45 get_total_projects
+//    8 sell_xel_out          27 set_graduation_multiplier 46 get_projects_by_status
+//    9 team_alloc_of         28 set_recovery_fee       47 get_project_by_rank
+//   10 trust_guard           29 set_recovery_params    48 get_latest_projects
+//   11 graduate              30 set_admin              49 get_trusted_projects
+//   12 propose               31 set_paused             50 get_trusted_by_rank
+//   13 support               32 withdraw_fees          51 get_protocol_stats
+//   14 report                33 get_project            52 get_config
+//   15 finalize_validation   34 get_project_info       53 get_status_label
+//   16 buy                   35 get_project_status     54 get_version
+//   17 sell                  36 get_project_tokenomics
+//   18 claim_refund          37 get_project_trust
+//
+//   Auto-verified by scripts/verify_chunk_ids.py on every push: the table
+//   above MUST match the declaration order in this file. Renumbering any
+//   function invalidates the table — regenerate it, never hand-edit around.
+// ============================================================================
+
+const VERSION: string = "VaultLaunch v1.0.0"
+
+// ---------------------------------------------------------------------------
+// Status codes (see LIFECYCLE)
+// ---------------------------------------------------------------------------
+const ST_VALIDATION: u64 = 0
+const ST_REJECTED: u64 = 1
+const ST_BONDING: u64 = 2
+const ST_GRADUATED: u64 = 3
+const ST_TRUSTED: u64 = 4
+const ST_UNTRUSTED: u64 = 5
+const ST_RECOVERY: u64 = 6
+
+// ---------------------------------------------------------------------------
+// Global capacity (storage growth bound; also the static loop bound of the
+// listing views — R8-clean)
+// ---------------------------------------------------------------------------
+const MAX_PROJECTS: u64 = 8192
+
+// ---------------------------------------------------------------------------
+// Defaults (atomic units, 8 decimals — 1 XEL = 100000000)
+// ---------------------------------------------------------------------------
+const DEFAULT_SUBMISSION_FEE: u64 = 1000000000
+const DEFAULT_MIN_LIQUIDITY: u64 = 50000000000
+const DEFAULT_TRADING_FEE_BPS: u64 = 50
+const DEFAULT_MIN_PARTICIPANTS: u64 = 20
+const DEFAULT_MIN_APPROVAL_BPS: u64 = 8000
+const DEFAULT_VALIDATION_TOPO: u64 = 51840
+const DEFAULT_GRAD_MULTIPLIER: u64 = 4
+const DEFAULT_RECOVERY_FEE: u64 = 25000000000
+const DEFAULT_RECOVERY_PARTICIPANTS: u64 = 40
+const DEFAULT_RECOVERY_RATIO_BPS: u64 = 9000
+
+// ---------------------------------------------------------------------------
+// Hard caps for admin parameters (a compromised admin can hurt the fee
+// model, never the funds)
+// ---------------------------------------------------------------------------
+const MAX_SUBMISSION_FEE: u64 = 10000000000
+const MIN_LIQUIDITY_FLOOR: u64 = 100000000
+const MAX_MIN_LIQUIDITY: u64 = 10000000000000
+const MAX_TRADING_FEE_BPS: u64 = 1000
+const MAX_PARTICIPANTS: u64 = 100000
+const MIN_RATIO_BPS: u64 = 5001
+const MIN_VALIDATION_TOPO: u64 = 720
+const MAX_VALIDATION_TOPO: u64 = 259200
+const MIN_GRAD_MULTIPLIER: u64 = 2
+const MAX_GRAD_MULTIPLIER: u64 = 100
+const MAX_RECOVERY_FEE: u64 = 100000000000
+
+// ---------------------------------------------------------------------------
+// Per-project caps (checked in propose)
+// ---------------------------------------------------------------------------
+const MIN_TOTAL_SUPPLY: u64 = 100000000
+const MAX_TOTAL_SUPPLY: u64 = 10000000000000000
+const MAX_TEAM_BPS: u64 = 2000
+const MAX_NAME_LEN: u32 = 64
+const MAX_SYMBOL_LEN: u32 = 16
+const MAX_DESC_LEN: u32 = 512
+const MAX_URL_LEN: u32 = 256
+
+// ---------------------------------------------------------------------------
+// Trade guards (dust & overflow containment)
+// ---------------------------------------------------------------------------
+const MIN_BUY_XEL: u64 = 1000000
+const MAX_TRADE_XEL: u64 = 10000000000000
+const MAX_LIQUIDITY: u64 = 1000000000000000
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+const BPS_DENOM: u64 = 10000
+const PRICE_SCALE: u64 = 100000000
+const U64_MAX: u64 = 18446744073709551615
+const U64_MAX_128: u128 = 18446744073709551615u128
+
+// ---------------------------------------------------------------------------
+// Global storage keys
+// ---------------------------------------------------------------------------
+const ADMIN_KEY: string = "adm"
+const COUNT_KEY: string = "pc"
+const SUBMISSION_FEE_KEY: string = "sub"
+const MIN_LIQUIDITY_KEY: string = "mnl"
+const TRADING_FEE_KEY: string = "tfe"
+const MIN_PARTICIPANTS_KEY: string = "mnp"
+const MIN_APPROVAL_KEY: string = "mab"
+const VALIDATION_DURATION_KEY: string = "vdt"
+const GRAD_MULTIPLIER_KEY: string = "gmu"
+const RECOVERY_FEE_KEY: string = "rfe"
+const RECOVERY_PARTICIPANTS_KEY: string = "rmp"
+const RECOVERY_RATIO_KEY: string = "rmr"
+const PENDING_FEES_KEY: string = "pfe"
+const FEES_LIFETIME_KEY: string = "fcl"
+const TOTAL_VOLUME_KEY: string = "tvl"
+const TOTAL_CURVE_XEL_KEY: string = "tcx"
+const LOCKED_REFUNDS_KEY: string = "lrf"
+const PAUSED_KEY: string = "pz"
+const XEL_ASSET_KEY: string = "xa"
+
+// ---------------------------------------------------------------------------
+// Project field keys (p:{id}:{field})
+// ---------------------------------------------------------------------------
+const F_CREATOR: string = "cr"
+const F_STATUS: string = "st"
+const F_NAME: string = "nm"
+const F_SYMBOL: string = "sy"
+const F_DESC: string = "ds"
+const F_WEBSITE: string = "ws"
+const F_LOGO: string = "lg"
+const F_SUPPLY: string = "ts"
+const F_TEAM_BPS: string = "tb"
+const F_LIQUIDITY: string = "lq"
+const F_RESERVES: string = "rv"
+const F_CURVE: string = "cs"
+const F_CREATED: string = "ct"
+const F_DEADLINE: string = "ve"
+const F_SUPPORTS: string = "sp"
+const F_REPORTS: string = "rp"
+const F_GRADUATED: string = "gr"
+const F_REFUND: string = "rc"
+const F_ROUND: string = "rd"
+const F_VOLUME: string = "vo"
+
+const PROJ_PREFIX: string = "p:"
+const VOTE_PREFIX: string = "v:"
+const BAL_PREFIX: string = "b:"
+
+// ---------------------------------------------------------------------------
+// Event IDs
+// ---------------------------------------------------------------------------
+const EV_PROJECT_CREATED: u64 = 1
+const EV_SUPPORTED: u64 = 2
+const EV_REPORTED: u64 = 3
+const EV_VALIDATION_FINISHED: u64 = 4
+const EV_BONDING_OPENED: u64 = 5
+const EV_TOKENS_BOUGHT: u64 = 6
+const EV_TOKENS_SOLD: u64 = 7
+const EV_PROJECT_GRADUATED: u64 = 8
+const EV_TRUST_LOST: u64 = 9
+const EV_TRUST_RECOVERED: u64 = 10
+const EV_FEES_COLLECTED: u64 = 11
+const EV_PARAM_SET: u64 = 12
+const EV_PAUSED: u64 = 13
+const EV_UNPAUSED: u64 = 14
+const EV_ADMIN_SET: u64 = 15
+const EV_REFUND_CLAIMED: u64 = 16
+const EV_RECOVERY_REQUESTED: u64 = 17
+const EV_PROJECT_INFO_UPDATED: u64 = 18
+
+// ============================================================================
+// 0. CONSTRUCTOR
+// ============================================================================
+// Admin = deployer (signer of the deployment transaction). All parameters
+// start at their documented defaults; the admin adjusts them with the
+// set_* entries (range-checked against the hard caps).
+// ============================================================================
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+
+    let deployer: Address = Transaction::current().unwrap().source()
+    s.store(ADMIN_KEY, deployer)
+
+    s.store(COUNT_KEY, 0u64)
+    s.store(SUBMISSION_FEE_KEY, DEFAULT_SUBMISSION_FEE)
+    s.store(MIN_LIQUIDITY_KEY, DEFAULT_MIN_LIQUIDITY)
+    s.store(TRADING_FEE_KEY, DEFAULT_TRADING_FEE_BPS)
+    s.store(MIN_PARTICIPANTS_KEY, DEFAULT_MIN_PARTICIPANTS)
+    s.store(MIN_APPROVAL_KEY, DEFAULT_MIN_APPROVAL_BPS)
+    s.store(VALIDATION_DURATION_KEY, DEFAULT_VALIDATION_TOPO)
+    s.store(GRAD_MULTIPLIER_KEY, DEFAULT_GRAD_MULTIPLIER)
+    s.store(RECOVERY_FEE_KEY, DEFAULT_RECOVERY_FEE)
+    s.store(RECOVERY_PARTICIPANTS_KEY, DEFAULT_RECOVERY_PARTICIPANTS)
+    s.store(RECOVERY_RATIO_KEY, DEFAULT_RECOVERY_RATIO_BPS)
+
+    s.store(PENDING_FEES_KEY, 0u64)
+    s.store(FEES_LIFETIME_KEY, 0u64)
+    s.store(TOTAL_VOLUME_KEY, 0u64)
+    s.store(TOTAL_CURVE_XEL_KEY, 0u64)
+    s.store(LOCKED_REFUNDS_KEY, 0u64)
+    s.store(PAUSED_KEY, false)
+
+    s.store(XEL_ASSET_KEY, get_xelis_asset())
+
+    return 0
+}
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+// 1. Access control — every admin entry funnels through this.
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let admin: Address = admin_opt.expect("guarded")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == admin, "notauth")
+}
+
+// 2. Project existence — every project-scoped entry and view starts here.
+fn require_project(pid: u64) {
+    let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
+    require(pid < count, "noproj")
+}
+
+// 3. Storage key of a project field: "p:{id}:{field}".
+fn proj_key(pid: u64, field: string) -> string {
+    return PROJ_PREFIX + pid.to_string(10u32) + ":" + field
+}
+
+// 4. Storage key of a vote marker: "v:{id}:{round}:{addr}".
+//    One key per (project, round, voter) — I5.
+fn vote_key(pid: u64, round: u64, voter: Address) -> string {
+    return VOTE_PREFIX + pid.to_string(10u32) + ":" + round.to_string(10u32) + ":" + voter.to_string()
+}
+
+// 5. Storage key of a token balance: "b:{id}:{addr}".
+fn bal_key(pid: u64, owner: Address) -> string {
+    return BAL_PREFIX + pid.to_string(10u32) + ":" + owner.to_string()
+}
+
+// 6. Fee split — floor, in favour of the contract.
+fn fee_take(amount: u64, bps: u64) -> u64 {
+    let wide: u128 = (amount as u128) * (bps as u128) / (BPS_DENOM as u128)
+    return wide as u64
+}
+
+// 7. Curve buy math: tokens out for a NET xel amount (fee already removed).
+//    tokens_out = C * net / (R + net), floored. Always < C.
+fn buy_tokens_out(reserves: u64, curve_supply: u64, net_xel: u64) -> u64 {
+    let wide: u128 = (curve_supply as u128) * (net_xel as u128) / ((reserves as u128) + (net_xel as u128))
+    return wide as u64
+}
+
+// 8. Curve sell math: XEL out (gross, before fee) for T tokens.
+//    gross = R * T / (C + T), floored. Always < R.
+fn sell_xel_out(reserves: u64, curve_supply: u64, tokens: u64) -> u64 {
+    let wide: u128 = (reserves as u128) * (tokens as u128) / ((curve_supply as u128) + (tokens as u128))
+    return wide as u64
+}
+
+// 9. Team allocation of a project (atomic token units), reserved in the
+//    curve from day one, minted to the creator at graduation (I1, I4).
+fn team_alloc_of(total_supply: u64, team_bps: u64) -> u64 {
+    let wide: u128 = (total_supply as u128) * (team_bps as u128) / (BPS_DENOM as u128)
+    return wide as u64
+}
+
+// 10. TRUST GUARD — evaluated after every vote on a project that already
+//     trades (Bonding / Graduated / Trusted). When reports reach the loss
+//     threshold (same bar as validation: quorum + ratio), the project flips
+//     to Untrusted: buys blocked, sells and votes stay open (D4).
+fn trust_guard(pid: u64, status: u64) {
+    if status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED {
+        let s: Storage = Storage::new()
+        let supports: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
+        let reports: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
+        let total: u64 = supports + reports
+        let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
+        let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
+        if total >= min_p {
+            if (reports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
+                s.store(proj_key(pid, F_STATUS), ST_UNTRUSTED)
+                emit_event(EV_TRUST_LOST, [pid.to_string(10u32), reports.to_string(10u32), supports.to_string(10u32)])
+            }
+        }
+    }
+}
+
+// 11. GRADUATE — flips a Bonding project to Graduated + Trusted and mints
+//     the reserved team allocation to the creator, exactly once (I4).
+//     Called from buy() when the curve crossed the graduation threshold.
+fn graduate(pid: u64) {
+    let s: Storage = Storage::new()
+
+    s.store(proj_key(pid, F_STATUS), ST_GRADUATED)
+    s.store(proj_key(pid, F_GRADUATED), true)
+
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+
+    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
+    let team_bps: u64 = s.load(proj_key(pid, F_TEAM_BPS)).unwrap_or(0)
+    let team: u64 = team_alloc_of(total_supply, team_bps)
+
+    if team > 0 {
+        let bkey: string = bal_key(pid, creator)
+        let bal: u64 = s.load(bkey).unwrap_or(0)
+        s.store(bkey, bal + team)
+    }
+
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    emit_event(EV_PROJECT_GRADUATED, [pid.to_string(10u32), reserves.to_string(10u32), team.to_string(10u32)])
+}
+
+// ============================================================================
+// 12. PROPOSE — submit a project to the community filter.
+// ============================================================================
+// @caller: the project creator (a wallet).
+// @params: name, symbol, description, website, logo — display metadata
+//             (length-capped, see constants);
+//          total_supply — token supply in atomic units (8 decimals),
+//             capped to [MIN_TOTAL_SUPPLY, MAX_TOTAL_SUPPLY];
+//          team_bps — team allocation in basis points, <= 20%.
+// @attached: EXACTLY submission_fee + the founder's liquidity, where the
+//             liquidity is >= min_liquidity and <= MAX_LIQUIDITY. The fee
+//             joins pending_fees immediately (non-refundable); the liquidity
+//             is locked as the curve's seed reserves.
+// @returns: the project id.
+// @security: paused check, capacity check, metadata caps, supply/team caps,
+//            deposit lower bound (fee + min_liquidity), everything stored
+//            under fresh keys — no user-controlled key material.
+// ============================================================================
+entry propose(name: string, symbol: string, description: string, website: string, logo: string, total_supply: u64, team_bps: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require(s.load(PAUSED_KEY).unwrap_or(false) == false, "paused")
+
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    require(count < MAX_PROJECTS, "full")
+
+    // Metadata caps.
+    require(name.len() >= 1u32 && name.len() <= MAX_NAME_LEN, "badname")
+    require(symbol.len() >= 1u32 && symbol.len() <= MAX_SYMBOL_LEN, "badsym")
+    require(description.len() <= MAX_DESC_LEN, "baddesc")
+    require(website.len() <= MAX_URL_LEN, "badurl")
+    require(logo.len() <= MAX_URL_LEN, "badlogo")
+
+    // Tokenomics caps.
+    require(total_supply >= MIN_TOTAL_SUPPLY && total_supply <= MAX_TOTAL_SUPPLY, "badsupply")
+    require(team_bps <= MAX_TEAM_BPS, "badteam")
+
+    // Funds: fee (to the admin) + seed liquidity (locked in the curve).
+    let sub_fee: u64 = s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE)
+    let min_liq: u64 = s.load(MIN_LIQUIDITY_KEY).unwrap_or(DEFAULT_MIN_LIQUIDITY)
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= sub_fee + min_liq, "needliq")
+    let liquidity: u64 = dep - sub_fee
+    require(liquidity <= MAX_LIQUIDITY, "toobig")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let pid: u64 = count
+    s.store(proj_key(pid, F_CREATOR), caller)
+    s.store(proj_key(pid, F_STATUS), ST_VALIDATION)
+    s.store(proj_key(pid, F_NAME), name)
+    s.store(proj_key(pid, F_SYMBOL), symbol)
+    s.store(proj_key(pid, F_DESC), description)
+    s.store(proj_key(pid, F_WEBSITE), website)
+    s.store(proj_key(pid, F_LOGO), logo)
+    s.store(proj_key(pid, F_SUPPLY), total_supply)
+    s.store(proj_key(pid, F_TEAM_BPS), team_bps)
+    s.store(proj_key(pid, F_LIQUIDITY), liquidity)
+
+    // Curve opening state: reserves = seed liquidity; the curve's sellable
+    // supply EXCLUDES the team allocation (reserved until graduation — D3).
+    s.store(proj_key(pid, F_RESERVES), liquidity)
+    s.store(proj_key(pid, F_CURVE), total_supply - team_alloc_of(total_supply, team_bps))
+
+    // Voting round 0 opens now.
+    s.store(proj_key(pid, F_ROUND), 0u64)
+    s.store(proj_key(pid, F_SUPPORTS), 0u64)
+    s.store(proj_key(pid, F_REPORTS), 0u64)
+    s.store(proj_key(pid, F_CREATED), get_current_topoheight())
+    let duration: u64 = s.load(VALIDATION_DURATION_KEY).unwrap_or(DEFAULT_VALIDATION_TOPO)
+    s.store(proj_key(pid, F_DEADLINE), get_current_topoheight() + duration)
+
+    s.store(proj_key(pid, F_GRADUATED), false)
+    s.store(proj_key(pid, F_REFUND), false)
+    s.store(proj_key(pid, F_VOLUME), 0u64)
+
+    s.store(COUNT_KEY, pid + 1)
+
+    if sub_fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, pending + sub_fee)
+    }
+
+    emit_event(EV_PROJECT_CREATED, [pid.to_string(10u32), name, symbol, liquidity.to_string(10u32)])
+    return pid
+}
+
+// ============================================================================
+// 13. SUPPORT — vote FOR a project (validation round or ongoing trust).
+// ============================================================================
+// One vote per address per round (I5). During an open validation window the
+// vote counts towards the pass threshold; afterwards it keeps accumulating
+// in the project's trust tallies (trust_guard evaluates the flip).
+// ============================================================================
+entry support(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status != ST_REJECTED, "dead")
+    if status == ST_VALIDATION || status == ST_RECOVERY {
+        let deadline: u64 = s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0)
+        require(get_current_topoheight() < deadline, "ended")
+    }
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
+    let vkey: string = vote_key(pid, round, caller)
+    require(s.load(vkey).unwrap_or(false) == false, "voted")
+    s.store(vkey, true)
+
+    let tally: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
+    s.store(proj_key(pid, F_SUPPORTS), tally + 1)
+
+    emit_event(EV_SUPPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
+    trust_guard(pid, status)
+    return tally + 1
+}
+
+// ============================================================================
+// 14. REPORT — vote AGAINST a project (validation round or ongoing trust).
+// ============================================================================
+// Mirror of support(). Enough reports on a trading project flip it to
+// Untrusted (buys blocked, sells open — D4).
+// ============================================================================
+entry report(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status != ST_REJECTED, "dead")
+    if status == ST_VALIDATION || status == ST_RECOVERY {
+        let deadline: u64 = s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0)
+        require(get_current_topoheight() < deadline, "ended")
+    }
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
+    let vkey: string = vote_key(pid, round, caller)
+    require(s.load(vkey).unwrap_or(false) == false, "voted")
+    s.store(vkey, true)
+
+    let tally: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
+    s.store(proj_key(pid, F_REPORTS), tally + 1)
+
+    emit_event(EV_REPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
+    trust_guard(pid, status)
+    return tally + 1
+}
+
+// ============================================================================
+// 15. FINALIZE VALIDATION — apply the outcome of a closed voting window.
+// ============================================================================
+// @caller: ANYONE, after the window's deadline (permissionless finalizer —
+//          the outcome is fully determined by the public tallies, this only
+//          executes it; the founder has a natural incentive to call it for
+//          a refund on failure, the community on success).
+// @rules:  initial window  : pass >= min_participants voters AND >= 80%
+//                             support -> Bonding; else -> Rejected
+//                             (liquidity becomes refundable once)
+//          recovery window : graduated projects use the STRICTER recovery
+//                             thresholds; pass -> Trusted, fail -> Untrusted
+// ============================================================================
+entry finalize_validation(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status == ST_VALIDATION || status == ST_RECOVERY, "nowindow")
+    let deadline: u64 = s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0)
+    require(get_current_topoheight() >= deadline, "open")
+
+    let supports: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
+    let reports: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
+    let total: u64 = supports + reports
+
+    if status == ST_VALIDATION {
+        let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
+        let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
+        if total >= min_p && (supports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
+            s.store(proj_key(pid, F_STATUS), ST_BONDING)
+            emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "1"])
+            emit_event(EV_BONDING_OPENED, [pid.to_string(10u32)])
+            return 1
+        }
+        s.store(proj_key(pid, F_STATUS), ST_REJECTED)
+        let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+        let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
+        s.store(LOCKED_REFUNDS_KEY, locked + liquidity)
+        emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "0"])
+        return 0
+    }
+
+    // Recovery window: stricter bar for graduated projects (D-lifecycle).
+    let graduated: bool = s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
+    let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
+    let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
+    if graduated {
+        min_p = s.load(RECOVERY_PARTICIPANTS_KEY).unwrap_or(DEFAULT_RECOVERY_PARTICIPANTS)
+        ratio = s.load(RECOVERY_RATIO_KEY).unwrap_or(DEFAULT_RECOVERY_RATIO_BPS)
+    }
+    if total >= min_p && (supports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
+        if graduated {
+            s.store(proj_key(pid, F_STATUS), ST_TRUSTED)
+        } else {
+            s.store(proj_key(pid, F_STATUS), ST_BONDING)
+        }
+        emit_event(EV_TRUST_RECOVERED, [pid.to_string(10u32)])
+        return 1
+    }
+    s.store(proj_key(pid, F_STATUS), ST_UNTRUSTED)
+    emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "0"])
+    return 0
+}
+
+// ============================================================================
+// 16. BUY — trade XEL for tokens on a project's curve.
+// ============================================================================
+// @caller: anyone (a wallet). Blocked while paused and while the project is
+//          Untrusted or in a voting window (D4) — the ONLY ways buys stop.
+// @attached: XEL in [MIN_BUY_XEL, MAX_TRADE_XEL]. The trading fee goes to
+//            pending_fees; the NET amount joins the reserves; tokens out
+//            follow the constant-product formula (floored, u128 math).
+// @returns: tokens received (atomic units).
+// @graduation: if this buy pushes the reserves to
+//              liquidity * graduation_multiplier while Bonding, the project
+//              graduates: status flips, team tokens are minted to the
+//              creator (D3). Trading continues (D2).
+// ============================================================================
+entry buy(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    require(s.load(PAUSED_KEY).unwrap_or(false) == false, "paused")
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED, "notrade")
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= MIN_BUY_XEL, "tiny")
+    require(dep <= MAX_TRADE_XEL, "toobig")
+
+    let bps: u64 = s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+    let fee: u64 = fee_take(dep, bps)
+    let net: u64 = dep - fee
+
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    require(reserves > 0 && curve_supply > 0, "empty")
+
+    let tokens: u64 = buy_tokens_out(reserves, curve_supply, net)
+    require(tokens >= 1, "tinyout")
+    require(curve_supply >= tokens, "curverr")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    // Curve state (net joins reserves, tokens leave the curve).
+    let new_reserves: u64 = reserves + net
+    s.store(proj_key(pid, F_RESERVES), new_reserves)
+    s.store(proj_key(pid, F_CURVE), curve_supply - tokens)
+
+    // Buyer's internal ledger.
+    let bkey: string = bal_key(pid, caller)
+    let bal: u64 = s.load(bkey).unwrap_or(0)
+    s.store(bkey, bal + tokens)
+
+    // Accounting (volume, solvency counters, fees).
+    let volume: u64 = s.load(proj_key(pid, F_VOLUME)).unwrap_or(0)
+    s.store(proj_key(pid, F_VOLUME), volume + dep)
+    let total_volume: u64 = s.load(TOTAL_VOLUME_KEY).unwrap_or(0)
+    s.store(TOTAL_VOLUME_KEY, total_volume + dep)
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel + net)
+    if fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, pending + fee)
+    }
+
+    emit_event(EV_TOKENS_BOUGHT, [pid.to_string(10u32), dep.to_string(10u32), tokens.to_string(10u32), fee.to_string(10u32)])
+
+    // Graduation check (I4): only from Bonding, only once.
+    if status == ST_BONDING {
+        let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+        let multiplier: u64 = s.load(GRAD_MULTIPLIER_KEY).unwrap_or(DEFAULT_GRAD_MULTIPLIER)
+        if (new_reserves as u128) >= (liquidity as u128) * (multiplier as u128) {
+            graduate(pid)
+        }
+    }
+    return tokens
+}
+
+// ============================================================================
+// 17. SELL — trade tokens back for XEL. NEVER blockable (D4, I8).
+// ============================================================================
+// Works in Bonding, Graduated, Trusted, Untrusted AND during a recovery
+// window: holders can always exit. The gross XEL leaves the reserves; the
+// trading fee goes to pending_fees; the rest is transferred to the caller
+// (checked transfer).
+// ============================================================================
+entry sell(pid: u64, token_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED || status == ST_UNTRUSTED || status == ST_RECOVERY, "nosell")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    require(token_amount >= 1, "badamt")
+    let bkey: string = bal_key(pid, caller)
+    let bal: u64 = s.load(bkey).unwrap_or(0)
+    require(bal >= token_amount, "nobal")
+
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    require(reserves > 0 && curve_supply > 0, "empty")
+
+    let bps: u64 = s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+    let gross: u64 = sell_xel_out(reserves, curve_supply, token_amount)
+    require(gross >= 1, "tiny")
+    let fee: u64 = fee_take(gross, bps)
+    let out: u64 = gross - fee
+    require(out >= 1, "tinyout")
+    require(reserves >= gross, "curverr")
+
+    // Curve state (tokens return to the curve, gross XEL leaves reserves).
+    s.store(proj_key(pid, F_RESERVES), reserves - gross)
+    s.store(proj_key(pid, F_CURVE), curve_supply + token_amount)
+    s.store(bkey, bal - token_amount)
+
+    // Accounting.
+    let volume: u64 = s.load(proj_key(pid, F_VOLUME)).unwrap_or(0)
+    s.store(proj_key(pid, F_VOLUME), volume + gross)
+    let total_volume: u64 = s.load(TOTAL_VOLUME_KEY).unwrap_or(0)
+    s.store(TOTAL_VOLUME_KEY, total_volume + gross)
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    require(curve_xel >= gross, "accerr")
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel - gross)
+    if fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, pending + fee)
+    }
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let ok: bool = transfer(caller, out, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_TOKENS_SOLD, [pid.to_string(10u32), token_amount.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
+    return out
+}
+
+// ============================================================================
+// 18. CLAIM REFUND — the founder's exit on a REJECTED project.
+// ============================================================================
+// Only for a project that FAILED its initial validation, only by the
+// creator, exactly once: 100% of the deposited liquidity is returned.
+// (Projects that reached Bonding can never be "rejected" — the curve's XEL
+// then belongs to the market, not to the founder alone.)
+// ============================================================================
+entry claim_refund(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status == ST_REJECTED, "norefund")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+    require(caller == creator, "notauth")
+
+    require(s.load(proj_key(pid, F_REFUND)).unwrap_or(false) == false, "claimed")
+    let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+    s.store(proj_key(pid, F_REFUND), true)
+
+    let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
+    require(locked >= liquidity, "accerr")
+    s.store(LOCKED_REFUNDS_KEY, locked - liquidity)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let ok: bool = transfer(caller, liquidity, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_REFUND_CLAIMED, [pid.to_string(10u32), liquidity.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 19. REQUEST REVALIDATION — the creator's path back from Untrusted.
+// ============================================================================
+// Opens a fresh voting window (tallies and the voted-map reset via a new
+// round number). For a project that already graduated, the recovery_fee is
+// charged (attached deposit must equal it EXACTLY — it goes to the admin
+// via pending_fees) and the STRICTER thresholds apply at finalization.
+// Non-graduated projects retry for free under normal thresholds.
+// ============================================================================
+entry request_revalidation(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status == ST_UNTRUSTED, "badstate")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+    require(caller == creator, "notauth")
+
+    let graduated: bool = s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
+    if graduated {
+        let recovery_fee: u64 = s.load(RECOVERY_FEE_KEY).unwrap_or(DEFAULT_RECOVERY_FEE)
+        let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+        let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+        require(dep == recovery_fee, "badfee")
+        if recovery_fee > 0 {
+            let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+            s.store(PENDING_FEES_KEY, pending + recovery_fee)
+        }
+    }
+
+    let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
+    s.store(proj_key(pid, F_ROUND), round + 1)
+    s.store(proj_key(pid, F_SUPPORTS), 0u64)
+    s.store(proj_key(pid, F_REPORTS), 0u64)
+    let duration: u64 = s.load(VALIDATION_DURATION_KEY).unwrap_or(DEFAULT_VALIDATION_TOPO)
+    s.store(proj_key(pid, F_DEADLINE), get_current_topoheight() + duration)
+    s.store(proj_key(pid, F_STATUS), ST_RECOVERY)
+
+    emit_event(EV_RECOVERY_REQUESTED, [pid.to_string(10u32), (round + 1).to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 20. UPDATE PROJECT INFO — metadata maintenance (creator only).
+// ============================================================================
+// Description, website and logo can be updated at any time (except on a
+// Rejected project); name, symbol, supply and team allocation are
+// structural and immutable by design.
+// ============================================================================
+entry update_project_info(pid: u64, description: string, website: string, logo: string) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    require(status != ST_REJECTED, "dead")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+    require(caller == creator, "notauth")
+
+    require(description.len() <= MAX_DESC_LEN, "baddesc")
+    require(website.len() <= MAX_URL_LEN, "badurl")
+    require(logo.len() <= MAX_URL_LEN, "badlogo")
+
+    s.store(proj_key(pid, F_DESC), description)
+    s.store(proj_key(pid, F_WEBSITE), website)
+    s.store(proj_key(pid, F_LOGO), logo)
+
+    emit_event(EV_PROJECT_INFO_UPDATED, [pid.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// ADMIN — parameter setters (all range-checked) + fee withdrawal.
+// ============================================================================
+
+// 21. Submission fee (one-time, per proposal). Cap: 100 XEL.
+entry set_submission_fee(fee: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(fee <= MAX_SUBMISSION_FEE, "toohigh")
+    s.store(SUBMISSION_FEE_KEY, fee)
+    emit_event(EV_PARAM_SET, ["submission_fee", fee.to_string(10u32)])
+    return 0
+}
+
+// 22. Trading fee in basis points, on buys AND sells. Hard cap: 10%.
+entry set_trading_fee(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps <= MAX_TRADING_FEE_BPS, "toohigh")
+    s.store(TRADING_FEE_KEY, bps)
+    emit_event(EV_PARAM_SET, ["trading_fee_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 23. Minimum founder liquidity, in [1 XEL, 100k XEL].
+entry set_min_liquidity(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount >= MIN_LIQUIDITY_FLOOR, "toolow")
+    require(amount <= MAX_MIN_LIQUIDITY, "toohigh")
+    s.store(MIN_LIQUIDITY_KEY, amount)
+    emit_event(EV_PARAM_SET, ["min_liquidity", amount.to_string(10u32)])
+    return 0
+}
+
+// 24. Minimum voters to validate/reject a project, in [1, 100k].
+entry set_min_participants(count: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(count >= 1, "toolow")
+    require(count <= MAX_PARTICIPANTS, "toohigh")
+    s.store(MIN_PARTICIPANTS_KEY, count)
+    emit_event(EV_PARAM_SET, ["min_participants", count.to_string(10u32)])
+    return 0
+}
+
+// 25. Minimum support ratio, in (50%, 100%] basis points.
+entry set_min_approval_ratio(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps >= MIN_RATIO_BPS, "toolow")
+    require(bps <= 10000, "toohigh")
+    s.store(MIN_APPROVAL_KEY, bps)
+    emit_event(EV_PARAM_SET, ["min_approval_ratio_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 26. Validation window length in topoheights, [~1h, ~15d].
+entry set_validation_duration(topos: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(topos >= MIN_VALIDATION_TOPO, "toolow")
+    require(topos <= MAX_VALIDATION_TOPO, "toohigh")
+    s.store(VALIDATION_DURATION_KEY, topos)
+    emit_event(EV_PARAM_SET, ["validation_duration", topos.to_string(10u32)])
+    return 0
+}
+
+// 27. Graduation multiplier: graduate at liquidity x multiplier, [2, 100].
+entry set_graduation_multiplier(multiplier: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(multiplier >= MIN_GRAD_MULTIPLIER, "toolow")
+    require(multiplier <= MAX_GRAD_MULTIPLIER, "toohigh")
+    s.store(GRAD_MULTIPLIER_KEY, multiplier)
+    emit_event(EV_PARAM_SET, ["graduation_multiplier", multiplier.to_string(10u32)])
+    return 0
+}
+
+// 28. Recovery fee for GRADUATED projects requesting revalidation.
+//     Cap: 1000 XEL. (Non-graduated projects always retry for free.)
+entry set_recovery_fee(fee: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(fee <= MAX_RECOVERY_FEE, "toohigh")
+    s.store(RECOVERY_FEE_KEY, fee)
+    emit_event(EV_PARAM_SET, ["recovery_fee", fee.to_string(10u32)])
+    return 0
+}
+
+// 29. Stricter recovery thresholds: quorum in [1, 100k], ratio in (50%, 100%].
+entry set_recovery_params(participants: u64, ratio_bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(participants >= 1, "toolow")
+    require(participants <= MAX_PARTICIPANTS, "toohigh")
+    require(ratio_bps >= MIN_RATIO_BPS, "toolow")
+    require(ratio_bps <= 10000, "toohigh")
+    s.store(RECOVERY_PARTICIPANTS_KEY, participants)
+    s.store(RECOVERY_RATIO_KEY, ratio_bps)
+    emit_event(EV_PARAM_SET, ["recovery_params", participants.to_string(10u32) + ":" + ratio_bps.to_string(10u32)])
+    return 0
+}
+
+// 30. Transfer the admin role (single-step — use a cold wallet).
+entry set_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    emit_event(EV_ADMIN_SET, [new_admin.to_string()])
+    return 0
+}
+
+// 31. Circuit breaker: pauses NEW proposals and NEW buys only (D-security).
+//     Sells, votes, refunds and finalization are never pausable.
+entry set_paused(flag: bool) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, flag)
+    if flag {
+        emit_event(EV_PAUSED, ["admin"])
+    } else {
+        emit_event(EV_UNPAUSED, ["admin"])
+    }
+    return 0
+}
+
+// 32. WITHDRAW FEES — the protocol's entire revenue stream.
+// ============================================================================
+// Admin-only. Capped twice: by the accrued pending_fees AND by the
+// contract's uncommitted balance (balance - curve reserves - refundable
+// rejections) — the admin can never make the protocol insolvent (I2).
+// ============================================================================
+entry withdraw_fees(amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let admin: Address = admin_opt.expect("guarded")
+    require(caller == admin, "notauth")
+
+    require(amount > 0, "badamt")
+    let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+    require(amount <= pending, "badamt")
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
+    let committed: u128 = (curve_xel as u128) + (locked as u128)
+    require((amount as u128) + committed <= (balance as u128), "notavail")
+
+    s.store(PENDING_FEES_KEY, pending - amount)
+    let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+    s.store(FEES_LIFETIME_KEY, lifetime + amount)
+
+    let ok: bool = transfer(caller, amount, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_FEES_COLLECTED, [amount.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// VIEWS (pub fn — read-only, no storage writes; the frontend's API)
+// ============================================================================
+
+// 33. Lifecycle snapshot: (creator, status, created_topo, validation_end,
+//     graduated). creator is a display string; status is the code (see
+//     get_status_label).
+pub fn get_project(pid: u64) -> (string, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let creator: string = "unknown"
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    if creator_opt.is_some() {
+        let c: Address = creator_opt.expect("guarded")
+        creator = c.to_string()
+    }
+
+    return (
+        creator,
+        s.load(proj_key(pid, F_STATUS)).unwrap_or(0),
+        s.load(proj_key(pid, F_CREATED)).unwrap_or(0),
+        s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0),
+        s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
+    )
+}
+
+// 34. Display metadata: (name, symbol, description, website, logo).
+pub fn get_project_info(pid: u64) -> (string, string, string, string, string) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    return (
+        s.load(proj_key(pid, F_NAME)).unwrap_or(""),
+        s.load(proj_key(pid, F_SYMBOL)).unwrap_or(""),
+        s.load(proj_key(pid, F_DESC)).unwrap_or(""),
+        s.load(proj_key(pid, F_WEBSITE)).unwrap_or(""),
+        s.load(proj_key(pid, F_LOGO)).unwrap_or("")
+    )
+}
+
+// 35. Status code of a project (see get_status_label for the text).
+pub fn get_project_status(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    return s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+}
+
+// 36. Tokenomics: (total_supply, team_bps, liquidity_deposited, reserves,
+//     curve_supply). All atomic units.
+pub fn get_project_tokenomics(pid: u64) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    return (
+        s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0),
+        s.load(proj_key(pid, F_TEAM_BPS)).unwrap_or(0),
+        s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0),
+        s.load(proj_key(pid, F_RESERVES)).unwrap_or(0),
+        s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    )
+}
+
+// 37. Trust state: (supports, reports, vote_round, graduated).
+pub fn get_project_trust(pid: u64) -> (u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    return (
+        s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0),
+        s.load(proj_key(pid, F_REPORTS)).unwrap_or(0),
+        s.load(proj_key(pid, F_ROUND)).unwrap_or(0),
+        s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
+    )
+}
+
+// 38. Curve state: (reserves, curve_supply, volume, graduation_target).
+//     graduation_target = liquidity_deposited * graduation_multiplier.
+pub fn get_bonding_info(pid: u64) -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+    let multiplier: u64 = s.load(GRAD_MULTIPLIER_KEY).unwrap_or(DEFAULT_GRAD_MULTIPLIER)
+    let target: u128 = (liquidity as u128) * (multiplier as u128)
+    if target > U64_MAX_128 {
+        return (
+            s.load(proj_key(pid, F_RESERVES)).unwrap_or(0),
+            s.load(proj_key(pid, F_CURVE)).unwrap_or(0),
+            s.load(proj_key(pid, F_VOLUME)).unwrap_or(0),
+            U64_MAX
+        )
+    }
+    return (
+        s.load(proj_key(pid, F_RESERVES)).unwrap_or(0),
+        s.load(proj_key(pid, F_CURVE)).unwrap_or(0),
+        s.load(proj_key(pid, F_VOLUME)).unwrap_or(0),
+        target as u64
+    )
+}
+
+// 39. Spot price: XEL (scaled by 1e8) per 1 whole token — i.e.
+//     reserves * 1e8 / curve_supply. Frontends divide the display token
+//     amount by 1e8 exactly like XEL amounts. Saturates at u64 max.
+pub fn get_current_price(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    if curve_supply == 0 {
+        return 0
+    }
+    let scaled: u128 = (reserves as u128) * (PRICE_SCALE as u128) / (curve_supply as u128)
+    if scaled > U64_MAX_128 {
+        return U64_MAX
+    }
+    return scaled as u64
+}
+
+// 40. Buy quote: tokens out for an attached XEL amount (fee included).
+//     Pure math on the current curve state — no state change.
+pub fn get_buy_quote(pid: u64, xel_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    let bps: u64 = s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+    let net: u64 = xel_amount - fee_take(xel_amount, bps)
+    return buy_tokens_out(reserves, curve_supply, net)
+}
+
+// 41. Sell quote: XEL out (net of fee) for a token amount.
+pub fn get_sell_quote(pid: u64, token_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    let bps: u64 = s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+    let gross: u64 = sell_xel_out(reserves, curve_supply, token_amount)
+    return gross - fee_take(gross, bps)
+}
+
+// 42. Market cap in atomic XEL: reserves * circulating / curve_supply,
+//     where circulating = total_supply - curve_supply - unminted team
+//     allocation. Saturates at u64 max (u128 math throughout).
+pub fn get_market_cap(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
+    let team_bps: u64 = s.load(proj_key(pid, F_TEAM_BPS)).unwrap_or(0)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    let graduated: bool = s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
+    if curve_supply == 0 {
+        return 0
+    }
+    let team: u128 = team_alloc_of(total_supply, team_bps) as u128
+    if graduated {
+        team = 0
+    }
+    let circulating: u128 = (total_supply as u128) - (curve_supply as u128) - team
+    if circulating == 0 {
+        return 0
+    }
+    let cap: u128 = (reserves as u128) * circulating / (curve_supply as u128)
+    if cap > U64_MAX_128 {
+        return U64_MAX
+    }
+    return cap as u64
+}
+
+// 43. Token balance of an address (atomic units) — the launched token IS
+//     this internal ledger (D1); frontends display it like any balance.
+pub fn get_token_balance(pid: u64, owner: Address) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    return s.load(bal_key(pid, owner)).unwrap_or(0)
+}
+
+// 44. Has this address already voted in the project's CURRENT round?
+pub fn has_voted(pid: u64, voter: Address) -> bool {
+    let s: Storage = Storage::new()
+    require_project(pid)
+    let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
+    return s.load(vote_key(pid, round, voter)).unwrap_or(false)
+}
+
+// 45. Total number of projects ever proposed.
+pub fn get_total_projects() -> u64 {
+    return Storage::new().load(COUNT_KEY).unwrap_or(0)
+}
+
+// 46. COUNT of projects with a given status code (listing helper — pair
+//     with get_project_by_rank; ids themselves are never returned as an
+//     array, Silex ABI ground truth has no array returns).
+pub fn get_projects_by_status(status: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let found: u64 = 0
+    for i: u64 = 0; i < MAX_PROJECTS; i += 1 {
+        if i < count {
+            if s.load(proj_key(i, F_STATUS)).unwrap_or(0) == status {
+                found += 1
+            }
+        }
+    }
+    return found
+}
+
+// 47. Id of the rank-th (0-based, oldest first) project with a given
+//     status. Returns project_count (an invalid id) when rank is out of
+//     range — the documented sentinel for "no such project".
+pub fn get_project_by_rank(status: u64, rank: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let seen: u64 = 0
+    for i: u64 = 0; i < MAX_PROJECTS; i += 1 {
+        if i < count {
+            if s.load(proj_key(i, F_STATUS)).unwrap_or(0) == status {
+                if seen == rank {
+                    return i
+                }
+                seen += 1
+            }
+        }
+    }
+    return count
+}
+
+// 48. Id of the rank-th LATEST project (any status; rank 0 = newest).
+//     Sentinel: project_count when out of range.
+pub fn get_latest_projects(rank: u64) -> u64 {
+    let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
+    if rank < count {
+        return count - 1 - rank
+    }
+    return count
+}
+
+// 49. COUNT of trusted projects (Graduated or Trusted — both mean the
+//     community currently backs the project).
+pub fn get_trusted_projects() -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let found: u64 = 0
+    for i: u64 = 0; i < MAX_PROJECTS; i += 1 {
+        if i < count {
+            let status: u64 = s.load(proj_key(i, F_STATUS)).unwrap_or(0)
+            if status == ST_GRADUATED || status == ST_TRUSTED {
+                found += 1
+            }
+        }
+    }
+    return found
+}
+
+// 50. Id of the rank-th trusted (Graduated/Trusted) project, oldest first.
+//     Sentinel: project_count when out of range.
+pub fn get_trusted_by_rank(rank: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let seen: u64 = 0
+    for i: u64 = 0; i < MAX_PROJECTS; i += 1 {
+        if i < count {
+            let status: u64 = s.load(proj_key(i, F_STATUS)).unwrap_or(0)
+            if status == ST_GRADUATED || status == ST_TRUSTED {
+                if seen == rank {
+                    return i
+                }
+                seen += 1
+            }
+        }
+    }
+    return count
+}
+
+// 51. Protocol stats: (total_projects, pending_fees, fees_collected_lifetime,
+//     total_volume, total_curve_xel, locked_refunds, balance, paused,
+//     trading_fee_bps). balance is the live contract XEL balance — the
+//     solvency invariant says it covers curve_xel + pending + locked.
+pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    return (
+        s.load(COUNT_KEY).unwrap_or(0),
+        s.load(PENDING_FEES_KEY).unwrap_or(0),
+        s.load(FEES_LIFETIME_KEY).unwrap_or(0),
+        s.load(TOTAL_VOLUME_KEY).unwrap_or(0),
+        s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0),
+        s.load(LOCKED_REFUNDS_KEY).unwrap_or(0),
+        get_balance_for_asset(xel).unwrap_or(0),
+        s.load(PAUSED_KEY).unwrap_or(false),
+        s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+    )
+}
+
+// 52. Full parameter set: (submission_fee, min_liquidity, trading_fee_bps,
+//     min_participants, min_approval_ratio_bps, validation_duration,
+//     graduation_multiplier, recovery_fee, recovery_min_participants,
+//     recovery_min_ratio_bps).
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE),
+        s.load(MIN_LIQUIDITY_KEY).unwrap_or(DEFAULT_MIN_LIQUIDITY),
+        s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS),
+        s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS),
+        s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS),
+        s.load(VALIDATION_DURATION_KEY).unwrap_or(DEFAULT_VALIDATION_TOPO),
+        s.load(GRAD_MULTIPLIER_KEY).unwrap_or(DEFAULT_GRAD_MULTIPLIER),
+        s.load(RECOVERY_FEE_KEY).unwrap_or(DEFAULT_RECOVERY_FEE),
+        s.load(RECOVERY_PARTICIPANTS_KEY).unwrap_or(DEFAULT_RECOVERY_PARTICIPANTS),
+        s.load(RECOVERY_RATIO_KEY).unwrap_or(DEFAULT_RECOVERY_RATIO_BPS)
+    )
+}
+
+// 53. Human-readable status label (frontend convenience).
+pub fn get_status_label(status: u64) -> string {
+    if status == ST_VALIDATION {
+        return "validation"
+    }
+    if status == ST_REJECTED {
+        return "rejected"
+    }
+    if status == ST_BONDING {
+        return "bonding"
+    }
+    if status == ST_GRADUATED {
+        return "graduated"
+    }
+    if status == ST_TRUSTED {
+        return "trusted"
+    }
+    if status == ST_UNTRUSTED {
+        return "untrusted"
+    }
+    if status == ST_RECOVERY {
+        return "recovery"
+    }
+    return "unknown"
+}
+
+// 54. Contract version.
+pub fn get_version() -> string {
+    return VERSION
+}

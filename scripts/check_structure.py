@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """check_structure.py — repository structure & hygiene gate (CI job `structure`).
 
-Enforces the v13 repository layout decided after the XelisVault audit:
+Enforces the repository layout decided after the XelisVault audit (v13,
+extended in v15 when VaultLaunch joined the mixer as the second active
+contract):
 
   1. contracts/ contains ONLY .slx files, and only inside contracts/mixer/
-     (one active, self-contained contract — anything else needs a deliberate
-     layout decision, not a stray file).
+     and contracts/launchpad/ (the active, self-contained contracts — one
+     per product family; anything else needs a deliberate layout decision,
+     not a stray file).
   2. No active script imports the archived legacy/ code. Reading legacy files
      as DATA (e.g. lint_silex.py --scan-legacy, explicitly a non-CI flag) is
      allowed; importing legacy Python modules would resurrect known-broken
@@ -47,22 +50,28 @@ def check_contracts_layout(repo: Path) -> List[str]:
         if p.suffix != ".slx":
             problems.append(f"contracts/ must contain only .slx files — found {p.relative_to(repo)}")
 
+    # Active contract families, one directory each (v15: mixer + launchpad).
+    # Adding a family is a deliberate layout decision: extend this tuple,
+    # the CI workflow comment and docs/ARCHITECTURE.md in the same commit.
+    active_families = ("mixer", "launchpad")
     for p in slx_files:
         parts = p.relative_to(contracts).parts
-        # active mixer contract: contracts/mixer/*.slx (exactly one level)
-        if len(parts) == 2 and parts[0] == "mixer":
+        # active contract: contracts/<family>/<Name>.slx (exactly one level)
+        if len(parts) == 2 and parts[0] in active_families:
             continue
         # superseded archive: contracts/mixer/superseded/*.slx (banner-marked,
         # excluded from lint; kept for history + lint regression corpus)
         if len(parts) == 3 and parts[0] == "mixer" and parts[1] == "superseded":
             continue
         problems.append(
-            f"active contract outside contracts/mixer/: {p.relative_to(repo)} "
-            f"(the mixer is the only active contract in v13)")
+            f"active contract outside contracts/<{'|'.join(active_families)}/>/: "
+            f"{p.relative_to(repo)} (each active contract lives in its own "
+            f"family directory — stray files are not a layout decision)")
 
-    if not (contracts / "mixer").is_dir() or not any(
-            (contracts / "mixer").glob("*.slx")):
-        problems.append("contracts/mixer/ is empty — the active mixer contract is missing")
+    for family in active_families:
+        if not (contracts / family).is_dir() or not any(
+                (contracts / family).glob("*.slx")):
+            problems.append(f"contracts/{family}/ is empty — its active contract is missing")
     return problems
 
 
@@ -167,7 +176,7 @@ def main(argv=None) -> int:
     print("=" * 78)
 
     sections = [
-        ("contracts/ layout (only .slx under contracts/mixer/)", check_contracts_layout),
+        ("contracts/ layout (only .slx under contracts/mixer|launchpad/)", check_contracts_layout),
         ("no legacy/ imports in active scripts", check_no_legacy_imports),
         ("no secrets in active files", check_no_secrets),
         ("no binary blobs outside legacy/", check_no_blobs),

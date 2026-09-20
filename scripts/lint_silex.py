@@ -152,6 +152,21 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "deposits (a strictly safety-increasing write; releases are never "
         "blockable); unpause stays owner-only"
     ),
+    ("VaultLaunch", "sell"): (
+        "exit path, public by design and NEVER blockable (not by pause, not "
+        "by Untrusted status, not by a voting window): the payout goes ONLY "
+        "to the caller and is bounded by the caller's OWN internal token "
+        "balance, which the entry debits — the balance debit IS the "
+        "authorization (holders must always be able to exit)"
+    ),
+    ("VaultLaunch", "finalize_validation"): (
+        "permissionless deadline executor: once a voting window has ended, "
+        "anyone can trigger the outcome that the public tallies already "
+        "determine (pass -> Bonding/Trusted, fail -> Rejected/Untrusted); "
+        "it moves no funds, mints nothing, and cannot act before the "
+        "deadline — the founder and the community both have natural "
+        "incentives to call it"
+    ),
 }
 
 

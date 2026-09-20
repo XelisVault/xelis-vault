@@ -1,8 +1,9 @@
 # xvault — XELIS Vault CLI & SDK
 
-Python tooling for the XelisVault protocol (v14, PrivacyMixer V5). **Key-less
-by design**: the CLI prepares transactions and reads state; your local wallet
-(`xelis_wallet --rpc-server`, or Genesix via XSWD) signs and broadcasts.
+Python tooling for the XelisVault protocol (v15, VaultLaunch + PrivacyMixer
+V5). **Key-less by design**: the CLI prepares transactions and reads state;
+your local wallet (`xelis_wallet --rpc-server`, or Genesix via XSWD) signs
+and broadcasts.
 
 ## Install
 
@@ -12,7 +13,34 @@ pip install ./sdk/xvault      # or: pip install -e ./sdk/xvault[dev]
 
 Requires Python ≥ 3.10. Dependencies: `requests`, `blake3`.
 
-## Mixer workflow
+## Launchpad workflow (VaultLaunch)
+
+```bash
+# protocol health, parameters, fee pot, solvency
+xvault launchpad status --contract <hash> --network mainnet
+
+# one project card (status, curve, price, votes, volume, balances)
+xvault launchpad project --contract <hash> --id 0 --owner xel:...
+
+# offline curve calculator (mirrors the contract math exactly)
+xvault launchpad quote --reserves 500 --curve 90000000 --buy 100 --sell 1000000
+
+# prepare / send a proposal (deposit = submission fee + seed liquidity)
+xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
+    --team-bps 1000 --liquidity 500 --contract <hash> --network mainnet
+# add --broadcast to send via the local wallet
+
+# entry-point chunk ids for every invoke
+xvault launchpad entries
+```
+
+Other entries (support/report/finalize/buy/sell/claim_refund/
+request_revalidation + admin setters) follow the same wallet flow: build
+params with `xvault.launchpad`, invoke with the chunk ids from
+`xvault launchpad entries`. The SDK's id table is CI-checked against the
+contract's declaration order on every push.
+
+## Mixer workflow (V5 — on hold for mainnet)
 
 ### 1. Deposit
 

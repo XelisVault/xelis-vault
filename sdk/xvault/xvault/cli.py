@@ -30,9 +30,13 @@ from pathlib import Path
 from typing import Optional
 
 from . import crypto
+from .launchpad import (DEFAULTS, LaunchpadReader, buy_quote, current_price,
+                         fmt_token, market_cap, propose_deposits,
+                         propose_params, sell_quote, team_alloc_of)
 from .mixer import (MixerReader, Note, deposit_deposits, deposit_params,
                     prepare_deposit, release_many_params, release_params)
 from .protocol import (DaemonClient, MIXER_ENTRY_IDS, MIXER_ENTRY_IDS_ALT,
+                       LAUNCHPAD_ENTRY_IDS, LAUNCHPAD_ENTRY_IDS_ALT,
                        NETWORKS, WALLET_AUTH, WALLET_URL, WalletClient,
                        val_addr, val_str, val_u64)
 
@@ -346,14 +350,160 @@ def cmd_entries(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# launchpad status / project / quote / propose
+# ---------------------------------------------------------------------------
+
+def cmd_launchpad_status(args) -> None:
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    cfg = reader.config()
+    st = reader.stats()
+    xel = NETWORKS[args.network]["xelis_asset"]
+    balance = reader.d.get_contract_balance(contract, xel)
+    print(f"VaultLaunch — {contract[:16]}… ({args.network})")
+    print(f"  projects        : {st['count']}")
+    print(f"  paused          : {'YES — new proposals & buys frozen' if st['paused'] else 'no'}")
+    print(f"  curve XEL       : {crypto.fmt_xel(st['total_curve_xel'])}")
+    print(f"  refundable XEL  : {crypto.fmt_xel(st['locked_refunds'])}")
+    print(f"  contract bal.   : {crypto.fmt_xel(balance)}")
+    solvent = balance >= (st['total_curve_xel'] + st['locked_refunds']
+                          + st['pending_fees'])
+    print(f"  solvent         : {'YES' if solvent else 'NO — balance below commitments!'}")
+    print(f"  pending fees    : {crypto.fmt_xel(st['pending_fees'])} "
+          f"(lifetime {crypto.fmt_xel(st['fees_collected_lifetime'])})")
+    print(f"  total volume    : {crypto.fmt_xel(st['total_volume'])}")
+    print("  parameters      :")
+    print(f"    submission fee        : {crypto.fmt_xel(cfg['submission_fee'])}")
+    print(f"    min liquidity         : {crypto.fmt_xel(cfg['min_liquidity'])}")
+    print(f"    trading fee           : {cfg['trading_fee_bps'] / 100:.2f}%")
+    print(f"    validation            : {cfg['min_participants']} voters, "
+          f">= {cfg['min_approval_ratio_bps'] / 100:.0f}% support, "
+          f"{cfg['validation_duration']} topos window")
+    print(f"    graduation            : x{cfg['graduation_multiplier']} liquidity")
+    print(f"    recovery (graduated)  : {crypto.fmt_xel(cfg['recovery_fee'])}, "
+          f"{cfg['recovery_min_participants']} voters, "
+          f">= {cfg['recovery_min_ratio_bps'] / 100:.0f}%")
+
+
+def cmd_launchpad_project(args) -> None:
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    if args.id >= reader.count():
+        sys.exit(f"error: project {args.id} does not exist "
+                 f"(total: {reader.count()})")
+    p = reader.project(args.id)
+    q = reader.quotes(args.id)
+    print(f"#{p['id']} {p['name']} ({p['symbol']}) — {p['status_label']}")
+    print(f"  creator    : {p['creator']}")
+    print(f"  created    : topo {p['created_topo']}  "
+          f"(window ends topo {p['deadline']})")
+    if p['website']:
+        print(f"  website    : {p['website']}")
+    print(f"  supply     : {fmt_token(p['total_supply'])} "
+          f"({p['total_supply'] / 1e8:,.0f} tokens), "
+          f"team {p['team_bps'] / 100:.0f}%")
+    print(f"  liquidity  : {crypto.fmt_xel(p['liquidity'])} deposited")
+    print(f"  curve      : {crypto.fmt_xel(p['reserves'])} reserves, "
+          f"{fmt_token(p['curve'])} sellable")
+    print(f"  price      : {q['price'] / 1e8:.8f} XEL/token  "
+          f"(mc {crypto.fmt_xel(q['market_cap'])})")
+    print(f"  votes      : {p['supports']} support / {p['reports']} report "
+          f"(round {p['round']}, graduated: {bool(p['graduated'])})")
+    print(f"  volume     : {crypto.fmt_xel(p['volume'])}")
+    if args.owner:
+        bal = reader.token_balance(args.id, args.owner)
+        print(f"  balance    : {fmt_token(bal)} tokens ({args.owner})")
+
+
+def cmd_launchpad_quote(args) -> None:
+    """Offline curve calculator — mirrors the contract math exactly."""
+    reserves = int(round(args.reserves * 1e8))
+    curve = int(round(args.curve * 1e8))
+    fee_bps = args.fee_bps
+    if reserves <= 0 or curve <= 0:
+        sys.exit("error: --reserves and --curve must be positive")
+    price = current_price(reserves, curve)
+    print(f"curve: {crypto.fmt_xel(reserves)} reserves / "
+          f"{fmt_token(curve)} sellable "
+          f"-> price {price / 1e8:.8f} XEL/token")
+    if args.buy is not None:
+        xel_in = int(round(args.buy * 1e8))
+        out = buy_quote(reserves, curve, xel_in, fee_bps)
+        print(f"buy  {crypto.fmt_xel(xel_in)} (fee {fee_bps / 100:.2f}%) "
+              f"-> {fmt_token(out)} tokens "
+              f"(avg {out / (xel_in / 1e8) / 1e8:,.2f} tokens/XEL)")
+    if args.sell is not None:
+        tokens = int(round(args.sell * 1e8))
+        out = sell_quote(reserves, curve, tokens, fee_bps)
+        print(f"sell {fmt_token(tokens)} tokens "
+              f"-> {crypto.fmt_xel(out)} out (fee {fee_bps / 100:.2f}%)")
+
+
+def cmd_launchpad_propose(args) -> None:
+    """Prepare a propose() invoke — signs & sends via the LOCAL wallet."""
+    contract = _require_contract(args)
+    if not (1 <= len(args.name) <= 64):
+        sys.exit("error: --name length must be 1..64")
+    if not (1 <= len(args.symbol) <= 16):
+        sys.exit("error: --symbol length must be 1..16")
+    total_supply = int(round(args.supply * 1e8))
+    if not (100_000_000 <= total_supply <= 10_000_000_000_000_000):
+        sys.exit("error: --supply must be within [1, 100M] tokens")
+    if not (0 <= args.team_bps <= 2000):
+        sys.exit("error: --team-bps must be within [0, 2000] (max 20%)")
+    liquidity = int(round(args.liquidity * 1e8))
+
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    cfg = reader.config()
+    if liquidity < cfg["min_liquidity"]:
+        sys.exit(f"error: liquidity below min_liquidity "
+                 f"({crypto.fmt_xel(cfg['min_liquidity'])})")
+    deposit = cfg["submission_fee"] + liquidity
+    team = team_alloc_of(total_supply, args.team_bps)
+
+    print(f"propose() — chunk {LAUNCHPAD_ENTRY_IDS['propose']}")
+    print(f"  name/symbol : {args.name} ({args.symbol})")
+    print(f"  supply      : {args.supply:,.0f} tokens, "
+          f"team {args.team_bps / 100:.0f}% ({team / 1e8:,.0f} tokens, "
+          f"minted at graduation)")
+    print(f"  deposit     : {crypto.fmt_xel(deposit)} total = "
+          f"{crypto.fmt_xel(cfg['submission_fee'])} fee + "
+          f"{crypto.fmt_xel(liquidity)} seed liquidity")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    params = propose_params(args.name, args.symbol, args.description,
+                            args.website, args.logo, total_supply, args.team_bps)
+    deposits = propose_deposits(cfg["submission_fee"], liquidity,
+                                NETWORKS[args.network]["xelis_asset"])
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["propose"], params,
+                  deposits=deposits)
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — project created (id = total_projects - 1)")
+
+
+def cmd_launchpad_entries(args) -> None:
+    print("VaultLaunch chunk ids — compiler numbering "
+          "(constructor=0 + every function in declaration order, CI-verified):")
+    for name, eid in sorted(LAUNCHPAD_ENTRY_IDS.items(), key=lambda kv: kv[1]):
+        print(f"  {eid:>3}  {name}")
+    print("\nlegacy entries-only numbering (kept for probe only):")
+    for name, eid in sorted(LAUNCHPAD_ENTRY_IDS_ALT.items(), key=lambda kv: kv[1]):
+        print(f"  {eid:>3}  {name}")
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="xvault",
-        description="XELIS Vault protocol CLI (v14) — dead-drop mixer, "
-                    "key-less by design.")
+        description="XELIS Vault protocol CLI (v15) — dead-drop mixer + "
+                    "VaultLaunch launchpad, key-less by design.")
     p.add_argument("--wallet-url", default=WALLET_URL,
                    help="local wallet RPC url (default: %(default)s)")
     p.add_argument("--wallet-auth", default=":".join(WALLET_AUTH),
@@ -427,6 +577,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     e = sub.add_parser("entries", help="show mixer chunk-id tables")
     e.set_defaults(func=cmd_entries, need_contract=False)
+
+    lp = sub.add_parser("launchpad", help="VaultLaunch operations")
+    ls = lp.add_subparsers(dest="launchpad_cmd", required=True)
+
+    sp = ls.add_parser("status"); common(sp)
+    sp.set_defaults(func=cmd_launchpad_status)
+
+    sp = ls.add_parser("project"); common(sp)
+    sp.add_argument("--id", type=int, required=True, help="project id")
+    sp.add_argument("--owner", help="check this address's token balance")
+    sp.set_defaults(func=cmd_launchpad_project)
+
+    sp = ls.add_parser("quote")
+    sp.add_argument("--reserves", type=float, required=True,
+                    help="curve XEL reserves")
+    sp.add_argument("--curve", type=float, required=True,
+                    help="curve sellable token supply")
+    sp.add_argument("--buy", type=float, help="XEL amount to quote a buy")
+    sp.add_argument("--sell", type=float, help="token amount to quote a sell")
+    sp.add_argument("--fee-bps", type=int,
+                    default=DEFAULTS["trading_fee_bps"],
+                    help="trading fee in bps (default: %(default)s)")
+    sp.set_defaults(func=cmd_launchpad_quote, need_contract=False)
+
+    sp = ls.add_parser("propose"); common(sp)
+    sp.add_argument("--name", required=True, help="token name (1..64 chars)")
+    sp.add_argument("--symbol", required=True, help="symbol (1..16 chars)")
+    sp.add_argument("--description", default="", help="short description")
+    sp.add_argument("--website", default="", help="project website")
+    sp.add_argument("--logo", default="", help="logo URL")
+    sp.add_argument("--supply", type=float, required=True,
+                    help="total supply in whole tokens (1..100M)")
+    sp.add_argument("--team-bps", type=int, default=1000,
+                    help="team allocation in bps, max 2000 (default: 10%%)")
+    sp.add_argument("--liquidity", type=float, required=True,
+                    help="seed liquidity in XEL (>= min_liquidity)")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send via local wallet (default: prepare only)")
+    sp.set_defaults(func=cmd_launchpad_propose)
+
+    sp = ls.add_parser("entries")
+    sp.set_defaults(func=cmd_launchpad_entries, need_contract=False)
 
     return p
 
