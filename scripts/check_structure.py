@@ -49,10 +49,16 @@ def check_contracts_layout(repo: Path) -> List[str]:
 
     for p in slx_files:
         parts = p.relative_to(contracts).parts
-        if len(parts) != 2 or parts[0] != "mixer":
-            problems.append(
-                f"active contract outside contracts/mixer/: {p.relative_to(repo)} "
-                f"(the mixer is the only active contract in v13)")
+        # active mixer contract: contracts/mixer/*.slx (exactly one level)
+        if len(parts) == 2 and parts[0] == "mixer":
+            continue
+        # superseded archive: contracts/mixer/superseded/*.slx (banner-marked,
+        # excluded from lint; kept for history + lint regression corpus)
+        if len(parts) == 3 and parts[0] == "mixer" and parts[1] == "superseded":
+            continue
+        problems.append(
+            f"active contract outside contracts/mixer/: {p.relative_to(repo)} "
+            f"(the mixer is the only active contract in v13)")
 
     if not (contracts / "mixer").is_dir() or not any(
             (contracts / "mixer").glob("*.slx")):

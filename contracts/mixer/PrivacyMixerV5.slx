@@ -1,0 +1,960 @@
+// ============================================================================
+// PrivacyMixer V5 "Dead-Drop" — XelisVault Protocol
+// ============================================================================
+// A single, self-contained, mainnet-ready privacy pool for XEL.
+// ZERO inter-contract calls. ZERO external dependencies. ZERO trusted relayers.
+//
+// ----------------------------------------------------------------------------
+// WHAT CHANGED FROM V4 (and why) — the gas-link problem
+// ----------------------------------------------------------------------------
+// V4 required the RECIPIENT to call withdraw() itself. That means the fresh
+// receiving wallet had to pay gas BEFORE receiving anything — so it had to be
+// funded first, and funding it from the depositor's wallet paints a permanent
+// on-chain link between them. The mixer was undoing its own work.
+// V4 also took `recipient` as a plaintext deposit parameter: the link between
+// depositor and recipient was readable in the deposit transaction itself.
+//
+// V5 inverts the model — "dead-drop payout":
+//
+//   * deposit() receives ONLY a hash commitment. The recipient address and
+//     the secret NEVER appear in any deposit parameter. Nothing identifying
+//     is stored: the note is a 32-byte commitment plus an unlock topoheight.
+//   * The depositor picks a random delay, on-chain bounded to
+//     [MIN_DELAY_TOPO, MAX_DELAY_TOPO] (~1 hour to ~3 days at 5s topoheights).
+//     The note becomes payable at deposit_topoheight + delay.
+//   * release() is PERMISSIONLESS: anyone (a release bot, a friend, the
+//     depositor from a burner, even the recipient) can trigger the payout
+//     AFTER the unlock topoheight. The payout ALWAYS goes to the address
+//     committed inside the note — the releaser cannot steal it, cannot
+//     redirect it, and front-running a release transaction changes nothing
+//     (the thief only pays the gas). A small, capped BOUNTY is paid from the
+//     note to whoever releases it, so bots can keep the pool flowing without
+//     any trust, registry or privilege.
+//   * The recipient NEVER transacts with the contract. It never needs gas.
+//     Funds simply arrive in its wallet, at a random moment inside the
+//     chosen window, from the SHARED pool.
+//
+// ----------------------------------------------------------------------------
+// DESIGN — bearer-note pool mixer with dead-drop payouts
+// ----------------------------------------------------------------------------
+// A note is a bearer instrument created by a deposit:
+//
+//     note_commitment = blake3("XVMIX5:NOTE:" || secret
+//                              || recipient_bytes || amount_decimal)
+//
+//   * `secret`    — 256-bit CSPRNG value generated client-side, NEVER sent
+//                   to the contract (only its commitment is);
+//   * `recipient` — the ONLY address the note will ever pay;
+//   * `amount`    — one of the three fixed denominations (10 / 100 / 1000 XEL).
+//
+// deposit(commitment, delay):
+//   * the attached XEL deposit must EXACTLY equal a denomination;
+//   * the client-computed commitment is inserted into an incremental Merkle
+//     tree (depth 20, 1,048,576 notes capacity);
+//   * the note's unlock topoheight = current topoheight + delay is stored
+//     (a plain number — it reveals nothing about who or how much);
+//   * nothing else is stored: no sender, no recipient, no secret.
+//
+// release(recipient, secret, amount, leaf_index, siblings):
+//   * callable by ANYONE once the unlock topoheight is reached;
+//   * the contract recomputes the commitment from (secret, recipient, amount)
+//     and checks it against the stored leaf — so the releaser PROVES the
+//     payout address but cannot choose it;
+//   * the Merkle proof is checked against the last 64 accepted roots;
+//   * the leaf is marked spent; the payout (denomination - fee - bounty) is
+//     transferred to the COMMITTED recipient, the bounty to the caller.
+//
+// ----------------------------------------------------------------------------
+// SECURITY MODEL (honest threat documentation)
+// ----------------------------------------------------------------------------
+// XELIS encrypts transfer amounts and balances (confidential transactions),
+// but smart-contract interactions (invoke params, attached deposits, contract
+// balances and storage) are PUBLIC, and Silex provides no zk-SNARK
+// primitives. Consequences, stated honestly:
+//
+//   1. While a note is outstanding, NOTHING on-chain links it to any address:
+//      the deposit shows a random-looking hash, the recipient never appears.
+//   2. At release time, the release transaction necessarily reveals
+//      (secret, recipient) — an archive node can recompute the commitment and
+//      match it to the deposit, linking depositor to recipient. This is the
+//      fundamental limit of a non-ZK mixer and is documented, not hidden.
+//      What protects users in practice:
+//        - the recipient address is fresh (no history, no funding trail);
+//        - the payout time is uniformly random inside the window (timing
+//          decorrelation from the deposit);
+//        - every payout of a class is identical (fixed denominations) and
+//          comes from the shared pool;
+//        - the release transaction itself can come from ANY third party
+//          (bot, friend, burner) — the releaser is not the recipient.
+//   3. The Merkle tree and note format are the standard Tornado-style shape:
+//      the day the XELIS VM exposes zk primitives, this becomes a ZK mixer
+//      without changing the tree.
+//
+// ----------------------------------------------------------------------------
+// OWNERSHIP — launch training wheels, renounceable
+// ----------------------------------------------------------------------------
+//   * pause() / unpause()     — freeze NEW DEPOSITS only. Releases ALWAYS
+//                               work: the owner can never freeze exits;
+//   * emergency_exit()        — IRREVERSIBLE: deposits die forever, fees are
+//                               waived, releases keep working pro-rata of
+//                               the live pool until the last note is spent;
+//   * raise_alarm()           — PERMISSIONLESS: anyone who observes
+//                               insolvency (balance < pending) persists a
+//                               deposit freeze on-chain;
+//   * set_fee_bps()           — hard-capped at 100 bps (1%), dead in emode;
+//   * set_bounty()            — release bounty, hard-capped at 0.5 XEL;
+//   * set_fee_recipient()     — survives renunciation (fees keep flowing);
+//   * propose_owner / accept_owner — two-step transfer;
+//   * renounce_ownership()    — burns every privilege forever.
+//
+//   *** There is NO owner withdrawal of user funds. The owner can NEVER
+//   *** move deposited XEL. The only paths out of this contract are a valid
+//   *** note release and the fee accumulator.
+//
+// ----------------------------------------------------------------------------
+// FEES & BOUNTY
+// ----------------------------------------------------------------------------
+//   * withdrawal fee in basis points, default 30 (0.3%), HARD CAP 100 (1%);
+//   * release bounty, default 0.05 XEL, HARD CAP 0.5 XEL, paid from the note
+//     to whoever submits the release (zero trust: the releaser cannot
+//     influence where the payout goes);
+//   * fees stay in the contract balance until claimed by the fee recipient,
+//     capped at what the pool can spare after covering every outstanding note.
+//
+// ----------------------------------------------------------------------------
+// INVARIANTS
+// ----------------------------------------------------------------------------
+//   I1. pending == sum of the denominations of all unspent notes.
+//   I2. balance >= pending in normal mode (checked on every deposit and
+//       release; violation reverts and can be persisted via raise_alarm).
+//   I3. A leaf can be spent at most once ("sp:<index>" marker).
+//   I4. A valid proof always lands on one of the last 64 roots.
+//   I5. Payouts only go to the commitment-embedded recipient, only after
+//       every check passed. Bounties only go to the release caller.
+//   I6. All transfers are checked (no swallowed failures — zero `let _ =`).
+//   I7. No panic path reachable with public data: every optional load uses a
+//       safe default, every unwrap is guarded by a preceding require.
+//   I8. A note can never be released before its unlock topoheight.
+//   I9. The owner can never block a release (pause affects deposits only).
+//
+// ----------------------------------------------------------------------------
+// CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
+// ----------------------------------------------------------------------------
+//    0 constructor         14 release            28 get_root_valid
+//    1 only_owner          15 release_many       29 get_sibling
+//    2 node_hash           16 pause              30 get_leaf_count
+//    3 note_commitment     17 unpause            31 get_note_leaf
+//    4 is_denomination     18 emergency_exit     32 get_unlock_topo
+//    5 node_key            19 raise_alarm        33 is_spent
+//    6 zero_key            20 set_fee_bps        34 get_stats
+//    7 root_key            21 set_bounty         35 get_state
+//    8 spent_key           22 set_fee_recipient  36 get_denominations
+//    9 unlock_key          23 claim_fees         37 get_delay_bounds
+//   10 solvency_guard      24 propose_owner      38 get_bounty
+//   11 xel_asset           25 accept_owner       39 get_owner
+//   12 process_release     26 renounce_ownership 40 get_fee_recipient
+//   13 deposit             27 get_root           41 get_capacity
+//                                                  42 get_version
+//
+//   Auto-verified by scripts/verify_chunk_ids.py on every push: the table
+//   above MUST match the declaration order in this file. Renumbering any
+//   function invalidates the table — regenerate it, never hand-edit around.
+// ============================================================================
+
+const VERSION: string = "PrivacyMixer v5.0.0"
+
+// ---------------------------------------------------------------------------
+// Fixed denominations (atomic units, 8 decimals): 10 / 100 / 1000 XEL
+// ---------------------------------------------------------------------------
+const DENOM_1: u64 = 1000000000
+const DENOM_2: u64 = 10000000000
+const DENOM_3: u64 = 100000000000
+
+// ---------------------------------------------------------------------------
+// Merkle tree
+// ---------------------------------------------------------------------------
+const TREE_DEPTH: u32 = 20
+const CAPACITY: u64 = 1048576
+const ROOT_HISTORY: u64 = 64
+
+// ---------------------------------------------------------------------------
+// Dead-drop window (topoheights; ~5s each since the V3 hard fork)
+//   MIN ~ 1 hour, MAX ~ 3 days — the depositor picks uniformly at random
+//   inside this window (client-side CSPRNG); the contract enforces the bound.
+// ---------------------------------------------------------------------------
+const MIN_DELAY_TOPO: u64 = 720
+const MAX_DELAY_TOPO: u64 = 51840
+
+// ---------------------------------------------------------------------------
+// Batch release cap (notes per release_many call — gas containment)
+// ---------------------------------------------------------------------------
+const BATCH_MAX: u64 = 16
+
+// ---------------------------------------------------------------------------
+// Fees & bounty
+// ---------------------------------------------------------------------------
+const DEFAULT_FEE_BPS: u64 = 30
+const MAX_FEE_BPS: u64 = 100
+const DEFAULT_BOUNTY: u64 = 5000000
+const MAX_BOUNTY: u64 = 50000000
+
+// ---------------------------------------------------------------------------
+// Domain separation tags (never reuse across hash purposes)
+// ---------------------------------------------------------------------------
+const NOTE_DOMAIN: string = "XVMIX5:NOTE:"
+const NODE_DOMAIN: string = "XVMIX5:N:"
+const ZERO_DOMAIN: string = "XVMIX5:Z:"
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+const OWNER_KEY: string = "own"
+const NOMINEE_KEY: string = "nom"
+const PAUSED_KEY: string = "pz"
+const EMODE_KEY: string = "em"
+const FEE_BPS_KEY: string = "fb"
+const FEES_OWED_KEY: string = "fo"
+const FEE_RECIPIENT_KEY: string = "frc"
+const BOUNTY_KEY: string = "bty"
+const XEL_ASSET_KEY: string = "xa"
+const LEAF_COUNT_KEY: string = "lc"
+const ROOT_COUNT_KEY: string = "rc"
+const PENDING_KEY: string = "pd"
+const TOTAL_DEPOSITED_KEY: string = "td"
+const TOTAL_RELEASED_KEY: string = "tr"
+const BOUNTY_PAID_KEY: string = "bp"
+const NOTES_ISSUED_KEY: string = "ni"
+const NOTES_SPENT_KEY: string = "ns"
+
+const NODE_PREFIX: string = "nd:"
+const ZERO_PREFIX: string = "z:"
+const ROOT_PREFIX: string = "rt:"
+const ROOT_VALID_PREFIX: string = "rv:"
+const SPENT_PREFIX: string = "sp:"
+const UNLOCK_PREFIX: string = "u:"
+
+// ---------------------------------------------------------------------------
+// Event IDs
+// ---------------------------------------------------------------------------
+const EV_DEPOSIT: u64 = 1
+const EV_RELEASE: u64 = 2
+const EV_PAUSED: u64 = 3
+const EV_UNPAUSED: u64 = 4
+const EV_EMERGENCY_EXIT: u64 = 5
+const EV_FEE_SET: u64 = 6
+const EV_BOUNTY_SET: u64 = 7
+const EV_FEE_RECIPIENT_SET: u64 = 8
+const EV_FEES_CLAIMED: u64 = 9
+const EV_OWNER_PROPOSED: u64 = 10
+const EV_OWNER_ACCEPTED: u64 = 11
+const EV_OWNERSHIP_RENOUNCED: u64 = 12
+const EV_INSOLVENCY_ALARM: u64 = 13
+
+// ============================================================================
+// 0. CONSTRUCTOR
+// ============================================================================
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+
+    // Owner = deployer (signer of the deployment transaction).
+    let deployer: Address = Transaction::current().unwrap().source()
+    s.store(OWNER_KEY, deployer)
+    s.store(FEE_RECIPIENT_KEY, deployer)
+
+    // Cache the native XEL asset hash (works on mainnet and testnet).
+    s.store(XEL_ASSET_KEY, get_xelis_asset())
+
+    // State flags.
+    s.store(PAUSED_KEY, false)
+    s.store(EMODE_KEY, false)
+    s.store(FEE_BPS_KEY, DEFAULT_FEE_BPS)
+    s.store(FEES_OWED_KEY, 0u64)
+    s.store(BOUNTY_KEY, DEFAULT_BOUNTY)
+
+    // Counters.
+    s.store(LEAF_COUNT_KEY, 0u64)
+    s.store(ROOT_COUNT_KEY, 0u64)
+    s.store(PENDING_KEY, 0u64)
+    s.store(TOTAL_DEPOSITED_KEY, 0u64)
+    s.store(TOTAL_RELEASED_KEY, 0u64)
+    s.store(BOUNTY_PAID_KEY, 0u64)
+    s.store(NOTES_ISSUED_KEY, 0u64)
+    s.store(NOTES_SPENT_KEY, 0u64)
+
+    // Pre-compute the zero hashes: z[0] = blake3(ZERO_DOMAIN),
+    // z[i] = node_hash(z[i-1], z[i-1]).
+    let current: Hash = Hash::blake3(ZERO_DOMAIN.to_bytes())
+    s.store(zero_key(0u32), current)
+    for level: u32 = 1; level <= TREE_DEPTH; level += 1 {
+        let next: Hash = node_hash(current, current)
+        s.store(zero_key(level), next)
+        current = next
+    }
+
+    // The empty-tree root is the first accepted root.
+    s.store(root_key(0u64), current)
+    s.store(ROOT_VALID_PREFIX + current.to_hex(), true)
+    s.store(ROOT_COUNT_KEY, 1u64)
+
+    return 0
+}
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+// 1. Access control — every privileged entry funnels through this.
+//    After renounce_ownership() the stored owner is null and ALL privileged
+//    entries permanently revert.
+fn only_owner() {
+    let s: Storage = Storage::new()
+    let owner_opt: optional<Address> = s.load(OWNER_KEY)
+    require(owner_opt.is_some(), "renounced")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let owner: Address = owner_opt.expect("guarded")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == owner, "notauth")
+}
+
+// 2. Internal Merkle node hash (domain-separated from note commitments).
+fn node_hash(left: Hash, right: Hash) -> Hash {
+    return Hash::blake3(NODE_DOMAIN.to_bytes() + left.to_bytes() + right.to_bytes())
+}
+
+// 3. Note commitment. Binds the secret to the payout recipient and to the
+//    exact denomination. `amount` is decimal-encoded to avoid any
+//    byte-ambiguity with the fixed-width hashes around it.
+//    Computed CLIENT-SIDE at deposit time; recomputed here at release time.
+fn note_commitment(secret: Hash, recipient: Address, amount: u64) -> Hash {
+    return Hash::blake3(NOTE_DOMAIN.to_bytes() + secret.to_bytes() + recipient.to_bytes() + amount.to_string(10u32).to_bytes())
+}
+
+// 4. Denomination check — the ONLY amounts this contract will ever accept.
+fn is_denomination(amount: u64) -> bool {
+    if amount == DENOM_1 { return true }
+    if amount == DENOM_2 { return true }
+    if amount == DENOM_3 { return true }
+    return false
+}
+
+// 5. Storage key of a tree node: "nd:<level>:<index>".
+fn node_key(level: u32, index: u64) -> string {
+    return NODE_PREFIX + level.to_string(10u32) + ":" + index.to_string(10u32)
+}
+
+// 6. Storage key of a zero hash: "z:<level>".
+fn zero_key(level: u32) -> string {
+    return ZERO_PREFIX + level.to_string(10u32)
+}
+
+// 7. Storage key of an archived root: "rt:<counter>".
+fn root_key(counter: u64) -> string {
+    return ROOT_PREFIX + counter.to_string(10u32)
+}
+
+// 8. Storage key of a spent marker: "sp:<leaf_index>".
+fn spent_key(leaf_index: u64) -> string {
+    return SPENT_PREFIX + leaf_index.to_string(10u32)
+}
+
+// 9. Storage key of a note's unlock topoheight: "u:<leaf_index>".
+fn unlock_key(leaf_index: u64) -> string {
+    return UNLOCK_PREFIX + leaf_index.to_string(10u32)
+}
+
+// 10. Solvency guard (defense in depth — invariant I2). Reverts if the shared
+//     pool cannot cover every outstanding note. By construction this can only
+//     trigger on a VM-level bug or protocol anomaly; raise_alarm() lets anyone
+//     persist a deposit freeze when it is observed.
+fn solvency_guard() {
+    let s: Storage = Storage::new()
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    require(balance >= pending, "insolvent")
+}
+
+// 11. Cached native asset (single source of truth, set at deployment).
+fn xel_asset() -> Hash {
+    return Storage::new().load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+}
+
+// 12. PROCESS RELEASE — the shared core of `release` and `release_many`.
+//     Verifies one note, consumes it, pays the COMMITTED recipient, pays the
+//     bounty to the caller, updates the accounting. `offset` indexes into
+//     the flat siblings array (release uses 0, release_many uses i*DEPTH).
+//     Returns the payout sent to the recipient.
+//     SECURITY: the payout address comes from recomputing the commitment —
+//     the caller PROVES it, never chooses it. Front-running this logic
+//     changes nothing: the funds still land on the committed address.
+fn process_release(recipient: Address, secret: Hash, amount: u64, leaf_index: u64, siblings: Hash[], offset: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    // Releases are NEVER blockable — not by pause, not by emergency mode
+    // (invariant I9). This is the whole point of the dead-drop model: the
+    // recipient does not act, so exits must not depend on any state the
+    // owner controls.
+    require(is_denomination(amount), "baddenom")
+
+    let leaf_count: u64 = s.load(LEAF_COUNT_KEY).unwrap_or(0)
+    require(leaf_index < leaf_count, "badindex")
+
+    // Invariant I8 — the dead-drop window is enforced on-chain.
+    let unlock_opt: optional<u64> = s.load(unlock_key(leaf_index))
+    require(unlock_opt.is_some(), "nodelay")
+    let unlock: u64 = unlock_opt.expect("guarded")
+    require(get_current_topoheight() >= unlock, "locked")
+
+    let skey: string = spent_key(leaf_index)
+    require(s.load(skey).unwrap_or(false) == false, "spent")
+
+    // Recompute the note commitment bound to THIS recipient, then verify
+    // the Merkle proof against it.
+    let commitment: Hash = note_commitment(secret, recipient, amount)
+
+    let current: Hash = commitment
+    let idx: u64 = leaf_index
+    for level: u32 = 0; level < TREE_DEPTH; level += 1 {
+        let sibling: Hash = siblings[offset + (level as u64)]
+        if idx % 2 == 0 {
+            current = node_hash(current, sibling)
+        } else {
+            current = node_hash(sibling, current)
+        }
+        idx = idx / 2
+    }
+
+    let root_ok: bool = s.load(ROOT_VALID_PREFIX + current.to_hex()).unwrap_or(false)
+    require(root_ok, "badproof")
+
+    // Every check passed — consume the note.
+    s.store(skey, true)
+
+    let emode: bool = s.load(EMODE_KEY).unwrap_or(false)
+    let xel: Hash = xel_asset()
+    let share: u64 = 0
+
+    if emode {
+        // Emergency mode: depositors have ABSOLUTE priority over fees; each
+        // release receives its pro-rata share of everything the pool still
+        // holds. The ratio is recomputed live, so donations arriving during
+        // the exit are shared fairly and the pool drains to zero.
+        let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+        let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+        let ratio128: u128 = 0u128
+        if pending > 0 {
+            ratio128 = (balance as u128) * 10000u128 / (pending as u128)
+        }
+        if ratio128 > 10000u128 {
+            ratio128 = 10000u128
+        }
+        share = ((amount as u128) * ratio128 / 10000u128) as u64
+    } else {
+        // Normal mode: fee + solvency guard (invariant I2).
+        solvency_guard()
+        let fee_bps: u64 = s.load(FEE_BPS_KEY).unwrap_or(DEFAULT_FEE_BPS)
+        let fee: u64 = amount * fee_bps / 10000
+        share = amount - fee
+        if fee > 0 {
+            let fees_owed: u64 = s.load(FEES_OWED_KEY).unwrap_or(0)
+            s.store(FEES_OWED_KEY, fees_owed + fee)
+        }
+    }
+
+    // Bounty: paid from the note to the releaser, capped by the share.
+    // (Bots live on this; friends may release with it; the recipient
+    // self-releasing simply gets it back.)
+    let bounty_cfg: u64 = s.load(BOUNTY_KEY).unwrap_or(DEFAULT_BOUNTY)
+    let bounty: u64 = bounty_cfg < share ? bounty_cfg : share
+    let payout: u64 = share - bounty
+
+    // Global accounting (I1): pending always decreases by the full nominal.
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    require(pending >= amount, "accerr")
+    s.store(PENDING_KEY, pending - amount)
+    let total_released: u64 = s.load(TOTAL_RELEASED_KEY).unwrap_or(0)
+    s.store(TOTAL_RELEASED_KEY, total_released + payout)
+    if bounty > 0 {
+        let bounty_paid: u64 = s.load(BOUNTY_PAID_KEY).unwrap_or(0)
+        s.store(BOUNTY_PAID_KEY, bounty_paid + bounty)
+    }
+    let notes_spent: u64 = s.load(NOTES_SPENT_KEY).unwrap_or(0)
+    s.store(NOTES_SPENT_KEY, notes_spent + 1)
+
+    // Payout FIRST to the committed recipient (invariant I5) — the releaser
+    // is paid after, from what remains of the note.
+    if payout > 0 {
+        let ok: bool = transfer(recipient, payout, xel)
+        require(ok, "txfail")
+    }
+    if bounty > 0 {
+        let caller_opt: optional<Address> = get_caller()
+        require(caller_opt.is_some(), "walletonly")
+        let caller: Address = caller_opt.expect("guarded")
+        let ok_b: bool = transfer(caller, bounty, xel)
+        require(ok_b, "txfail")
+    }
+
+    emit_event(EV_RELEASE, [leaf_index.to_string(10u32), payout.to_string(10u32)])
+    return payout
+}
+
+// ============================================================================
+// 13. DEPOSIT — create a bearer note and join the shared pool.
+// ============================================================================
+// @caller: anyone (a wallet — contract invocations carry no caller address).
+// @params: commitment — CLIENT-COMPUTED blake3("XVMIX5:NOTE:" || secret ||
+//             recipient || amount). The secret and the recipient NEVER
+//             appear on-chain at deposit time (this is the V4 fix);
+//          delay — topoheights until the note becomes payable, bounded to
+//             [MIN_DELAY_TOPO, MAX_DELAY_TOPO] (~1h..~3d). Pick it uniformly
+//             at random client-side: this is the payout window.
+// @attached: EXACTLY one denomination (10 / 100 / 1000 XEL) of native XEL.
+// @returns: the leaf index of the created note (exit value).
+// @security: not paused, not emergency mode, denomination enforced, delay
+//            bounds enforced, capacity enforced, solvency guard. Nothing
+//            but the commitment and the unlock topoheight ever touches
+//            storage — no addresses, no amounts per note.
+// ============================================================================
+entry deposit(commitment: Hash, delay: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    // Pause freezes NEW DEPOSITS only (invariant I9 — releases never stop).
+    require(s.load(PAUSED_KEY).unwrap_or(false) == false, "paused")
+    require(s.load(EMODE_KEY).unwrap_or(false) == false, "emode")
+
+    let xel: Hash = xel_asset()
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(is_denomination(dep), "baddenom")
+
+    // Dead-drop window (invariant I8): enforce the bound on-chain.
+    require(delay >= MIN_DELAY_TOPO, "toosoon")
+    require(delay <= MAX_DELAY_TOPO, "toolate")
+
+    let leaf_count: u64 = s.load(LEAF_COUNT_KEY).unwrap_or(0)
+    require(leaf_count < CAPACITY, "full")
+
+    // Invariant I2 (defense in depth — see raise_alarm for persistence).
+    solvency_guard()
+
+    // ---------------------------------------------------------------------------
+    // Incremental Merkle insertion. For each level we store the node then fold
+    // it with its sibling: right sibling is the zero hash when the index is
+    // even (subtree not yet started), left sibling was necessarily written by
+    // a previous insertion when the index is odd (incremental-tree property).
+    // ---------------------------------------------------------------------------
+    let index: u64 = leaf_count
+    let current: Hash = commitment
+    let idx: u64 = index
+    for level: u32 = 0; level < TREE_DEPTH; level += 1 {
+        s.store(node_key(level, idx), current)
+        if idx % 2 == 0 {
+            // Right subtree not started yet: fold with the level zero hash.
+            let zero_opt: optional<Hash> = s.load(zero_key(level))
+            require(zero_opt.is_some(), "zerr")
+            let zero: Hash = zero_opt.expect("guarded")
+            current = node_hash(current, zero)
+        } else {
+            // Left sibling was necessarily written by an earlier insertion.
+            let left_opt: optional<Hash> = s.load(node_key(level, idx - 1))
+            require(left_opt.is_some(), "treerr")
+            let left: Hash = left_opt.expect("guarded")
+            current = node_hash(left, current)
+        }
+        idx = idx / 2
+    }
+
+    // Archive the new root (ring buffer of ROOT_HISTORY valid roots).
+    let root_count: u64 = s.load(ROOT_COUNT_KEY).unwrap_or(0)
+    if root_count >= ROOT_HISTORY {
+        let oldest: Hash = s.load(root_key(root_count - ROOT_HISTORY)).unwrap_or(Hash::zero())
+        if oldest != Hash::zero() {
+            s.delete(ROOT_VALID_PREFIX + oldest.to_hex())
+        }
+    }
+    s.store(root_key(root_count), current)
+    s.store(ROOT_VALID_PREFIX + current.to_hex(), true)
+    s.store(ROOT_COUNT_KEY, root_count + 1)
+
+    // The note's unlock topoheight — a plain number, reveals nothing.
+    s.store(unlock_key(index), get_current_topoheight() + delay)
+
+    // Global accounting (aggregate only — I1).
+    s.store(LEAF_COUNT_KEY, leaf_count + 1)
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    s.store(PENDING_KEY, pending + dep)
+    let total_deposited: u64 = s.load(TOTAL_DEPOSITED_KEY).unwrap_or(0)
+    s.store(TOTAL_DEPOSITED_KEY, total_deposited + dep)
+    let notes_issued: u64 = s.load(NOTES_ISSUED_KEY).unwrap_or(0)
+    s.store(NOTES_ISSUED_KEY, notes_issued + 1)
+
+    emit_event(EV_DEPOSIT, [commitment.to_hex(), index.to_string(10u32), dep.to_string(10u32), delay.to_string(10u32)])
+    return index
+}
+
+// ============================================================================
+// 14. RELEASE — dead-drop payout, permissionless.
+// ============================================================================
+// @caller: ANYONE with gas (bot, friend, the depositor from a burner, the
+//          recipient itself). The caller cannot influence the payout address:
+//          it is recovered by recomputing the commitment from the params.
+//          Front-running a release is harmless — the copy pays the gas, the
+//          funds still land on the committed address.
+// @params: recipient  — the committed payout address (proved, not chosen);
+//          secret     — the note secret;
+//          amount     — the exact denomination of the note;
+//          leaf_index — the note position (returned by deposit / events);
+//          siblings   — the 20 Merkle sibling hashes (client-built, or read
+//                       via get_sibling / contract storage through RPC).
+// @returns: the payout sent to the recipient.
+// @security: unlock topoheight enforced, denomination, index bound, proof
+//            length, spent marker, Merkle proof against the archived roots,
+//            solvency guard (normal mode), checked transfers. Works while
+//            paused and in emergency mode — exits can never be frozen.
+// ============================================================================
+entry release(recipient: Address, secret: Hash, amount: u64, leaf_index: u64, siblings: Hash[]) -> u64 {
+    require(siblings.len() == TREE_DEPTH, "badproof")
+    let payout: u64 = process_release(recipient, secret, amount, leaf_index, siblings, 0u64)
+    return payout
+}
+
+// ============================================================================
+// 15. RELEASE MANY — batch dead-drop payouts (gas amortization for bots).
+// ============================================================================
+// All-or-nothing: if any note fails, the whole transaction reverts and no
+// state changes survive. Siblings are a FLAT array of 20 hashes per note.
+// ============================================================================
+entry release_many(recipients: Address[], secrets: Hash[], amounts: u64[], leaf_indices: u64[], siblings: Hash[]) -> u64 {
+    let n: u64 = recipients.len()
+    require(n > 0, "empty")
+    require(n <= BATCH_MAX, "toomany")
+    require(secrets.len() == n, "badlen")
+    require(amounts.len() == n, "badlen")
+    require(leaf_indices.len() == n, "badlen")
+    require(siblings.len() == n * (TREE_DEPTH as u64), "badproof")
+
+    // Static bound (BATCH_MAX): the loop range is a compile-time constant,
+    // the actual batch size is guarded per iteration. All-or-nothing: if any
+    // note fails, the whole transaction reverts and no state changes survive.
+    let total: u64 = 0
+    for i: u64 = 0; i < BATCH_MAX; i += 1 {
+        if i < n {
+            let payout: u64 = process_release(recipients[i], secrets[i], amounts[i], leaf_indices[i], siblings, i * (TREE_DEPTH as u64))
+            total = total + payout
+        }
+    }
+    return total
+}
+
+// ============================================================================
+// 16/17. PAUSE — freeze NEW DEPOSITS only (owner-only, incident response).
+// ============================================================================
+// Releases keep flowing: the owner can never freeze exits (invariant I9).
+// During an insolvency event, raise_alarm() persists the same freeze
+// permissionlessly.
+// ============================================================================
+entry pause() -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, true)
+    emit_event(EV_PAUSED, ["owner"])
+    return 0
+}
+
+entry unpause() -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    // Works in emergency mode too: a pause during an exit only froze new
+    // deposits, unpause resumes them if the exit was not triggered yet.
+    s.store(PAUSED_KEY, false)
+    emit_event(EV_UNPAUSED, ["owner"])
+    return 0
+}
+
+// ============================================================================
+// 18. EMERGENCY EXIT — the irreversible community escape hatch.
+// ============================================================================
+// Freezes deposits FOREVER and waives all future fees. Releases keep working
+// pro-rata of the live pool until the last note is spent. Previously accrued
+// fees are trimmed down to whatever the pool can spare after covering every
+// outstanding note (depositors first — invariant I2). From this point the
+// contract can never accept a deposit again.
+// ============================================================================
+entry emergency_exit() -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    require(s.load(EMODE_KEY).unwrap_or(false) == false, "already")
+
+    let xel: Hash = xel_asset()
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    let fees_owed: u64 = s.load(FEES_OWED_KEY).unwrap_or(0)
+
+    // Fees survive only if every note is still covered (depositors first).
+    let surplus: u64 = balance > pending ? balance - pending : 0
+    let kept_fees: u64 = fees_owed < surplus ? fees_owed : surplus
+    s.store(FEES_OWED_KEY, kept_fees)
+
+    s.store(EMODE_KEY, true)
+    s.store(PAUSED_KEY, false)
+
+    emit_event(EV_EMERGENCY_EXIT, [balance.to_string(10u32), pending.to_string(10u32), kept_fees.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 19. RAISE ALARM — permissionless insolvency circuit breaker.
+// ============================================================================
+// Anyone (keeper, CLI, community member) can call this at any time. If the
+// shared pool cannot cover every outstanding note, the contract freezes new
+// deposits on-chain, persistently. Releases are NOT blocked — in emergency
+// conditions they must keep flowing (pro-rata if the owner triggers the
+// exit, or normally once the anomaly is understood).
+// ============================================================================
+entry raise_alarm() -> u64 {
+    let s: Storage = Storage::new()
+    let xel: Hash = xel_asset()
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    if balance < pending {
+        s.store(PAUSED_KEY, true)
+        emit_event(EV_INSOLVENCY_ALARM, [balance.to_string(10u32), pending.to_string(10u32)])
+        return 0
+    }
+    return 1
+}
+
+// ============================================================================
+// 20/21. FEE & BOUNTY CONFIGURATION (hard-capped).
+// ============================================================================
+entry set_fee_bps(bps: u64) -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    require(s.load(EMODE_KEY).unwrap_or(false) == false, "emode")
+    require(bps <= MAX_FEE_BPS, "toohigh")
+    s.store(FEE_BPS_KEY, bps)
+    emit_event(EV_FEE_SET, [bps.to_string(10u32)])
+    return 0
+}
+
+entry set_bounty(bounty: u64) -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    require(bounty <= MAX_BOUNTY, "toohigh")
+    s.store(BOUNTY_KEY, bounty)
+    emit_event(EV_BOUNTY_SET, [bounty.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 22. SET FEE RECIPIENT — survives renunciation (fees keep flowing).
+// ============================================================================
+entry set_fee_recipient(recipient: Address) -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    require(s.load(EMODE_KEY).unwrap_or(false) == false, "emode")
+    s.store(FEE_RECIPIENT_KEY, recipient)
+    emit_event(EV_FEE_RECIPIENT_SET, [recipient.to_string()])
+    return 0
+}
+
+// ============================================================================
+// 23. CLAIM FEES — the protocol's revenue stream.
+// ============================================================================
+// Callable only by the fee recipient. The claimable amount is capped at
+// min(accrued fees, balance - pending): accrued fees can NEVER make the pool
+// insolvent, even if that means the recipient has to wait (depositors first).
+// ============================================================================
+entry claim_fees(amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let recipient_opt: optional<Address> = s.load(FEE_RECIPIENT_KEY)
+    require(recipient_opt.is_some(), "nofrc")
+    let recipient: Address = recipient_opt.expect("guarded")
+    require(caller == recipient, "notauth")
+
+    require(amount > 0, "badamt")
+    let fees_owed: u64 = s.load(FEES_OWED_KEY).unwrap_or(0)
+    require(amount <= fees_owed, "badamt")
+
+    let xel: Hash = xel_asset()
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    let pending: u64 = s.load(PENDING_KEY).unwrap_or(0)
+    let available: u64 = balance > pending ? balance - pending : 0
+    require(amount <= available, "notavail")
+
+    s.store(FEES_OWED_KEY, fees_owed - amount)
+
+    let ok: bool = transfer(caller, amount, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_FEES_CLAIMED, [amount.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 24/25/26. OWNERSHIP — two-step transfer, one-way renounce.
+// ============================================================================
+entry propose_owner(nominee: Address) -> u64 {
+    only_owner()
+    Storage::new().store(NOMINEE_KEY, nominee)
+    emit_event(EV_OWNER_PROPOSED, [nominee.to_string()])
+    return 0
+}
+
+entry accept_owner() -> u64 {
+    let s: Storage = Storage::new()
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let nominee_opt: optional<Address> = s.load(NOMINEE_KEY)
+    require(nominee_opt.is_some(), "nonominee")
+    let nominee: Address = nominee_opt.expect("guarded")
+    require(caller == nominee, "notauth")
+
+    s.store(OWNER_KEY, nominee)
+    s.delete(NOMINEE_KEY)
+    emit_event(EV_OWNER_ACCEPTED, [nominee.to_string()])
+    return 0
+}
+
+entry renounce_ownership() -> u64 {
+    only_owner()
+    let s: Storage = Storage::new()
+    s.delete(OWNER_KEY)
+    s.delete(NOMINEE_KEY)
+    emit_event(EV_OWNERSHIP_RENOUNCED, ["final"])
+    return 0
+}
+
+// ============================================================================
+// 27. GET ROOT — latest Merkle root (proof building anchor).
+// ============================================================================
+pub fn get_root() -> Hash {
+    let s: Storage = Storage::new()
+    let root_count: u64 = s.load(ROOT_COUNT_KEY).unwrap_or(0)
+    if root_count == 0 {
+        return Hash::zero()
+    }
+    return s.load(root_key(root_count - 1)).unwrap_or(Hash::zero())
+}
+
+// 28. Is this root one of the last 64 accepted roots?
+pub fn get_root_valid(root: Hash) -> bool {
+    return Storage::new().load(ROOT_VALID_PREFIX + root.to_hex()).unwrap_or(false)
+}
+
+// 29. Merkle sibling of a leaf position at a given level
+//     (release bots read this to build proofs; the flat 20-sibling proof for
+//     leaf L is [get_sibling(L,0), ..., get_sibling(L,19)]).
+pub fn get_sibling(leaf_index: u64, level: u64) -> Hash {
+    let s: Storage = Storage::new()
+    let pos: u64 = (leaf_index >> level) ^ 1u64
+    let lvl: u32 = level as u32
+    let node_opt: optional<Hash> = s.load(node_key(lvl, pos))
+    if node_opt.is_some() {
+        return node_opt.expect("guarded")
+    }
+    let zero_opt: optional<Hash> = s.load(zero_key(lvl))
+    require(zero_opt.is_some(), "zerr")
+    return zero_opt.expect("guarded")
+}
+
+// 30. Number of notes ever inserted (= next leaf index).
+pub fn get_leaf_count() -> u64 {
+    return Storage::new().load(LEAF_COUNT_KEY).unwrap_or(0)
+}
+
+// 31. Commitment stored at a leaf position.
+pub fn get_note_leaf(index: u64) -> Hash {
+    return Storage::new().load(node_key(0u32, index)).unwrap_or(Hash::zero())
+}
+
+// 32. Unlock topoheight of a note (when it becomes payable).
+pub fn get_unlock_topo(index: u64) -> u64 {
+    return Storage::new().load(unlock_key(index)).unwrap_or(0)
+}
+
+// 33. Has this leaf been spent?
+pub fn is_spent(index: u64) -> bool {
+    return Storage::new().load(spent_key(index)).unwrap_or(false)
+}
+
+// 34. Aggregate stats: (notes_issued, notes_spent, leaf_count, pending,
+//     balance, fees_owed, fee_bps, bounty, total_deposited, total_released).
+pub fn get_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    let xel: Hash = xel_asset()
+    return (
+        s.load(NOTES_ISSUED_KEY).unwrap_or(0),
+        s.load(NOTES_SPENT_KEY).unwrap_or(0),
+        s.load(LEAF_COUNT_KEY).unwrap_or(0),
+        s.load(PENDING_KEY).unwrap_or(0),
+        get_balance_for_asset(xel).unwrap_or(0),
+        s.load(FEES_OWED_KEY).unwrap_or(0),
+        s.load(FEE_BPS_KEY).unwrap_or(DEFAULT_FEE_BPS),
+        s.load(BOUNTY_KEY).unwrap_or(DEFAULT_BOUNTY),
+        s.load(TOTAL_DEPOSITED_KEY).unwrap_or(0),
+        s.load(TOTAL_RELEASED_KEY).unwrap_or(0)
+    )
+}
+
+// 35. State flags: (paused, emergency_mode).
+pub fn get_state() -> (bool, bool) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(PAUSED_KEY).unwrap_or(false),
+        s.load(EMODE_KEY).unwrap_or(false)
+    )
+}
+
+// 36. The three fixed denominations.
+pub fn get_denominations() -> (u64, u64, u64) {
+    return (DENOM_1, DENOM_2, DENOM_3)
+}
+
+// 37. The dead-drop window bounds (topoheights): (min_delay, max_delay).
+pub fn get_delay_bounds() -> (u64, u64) {
+    return (MIN_DELAY_TOPO, MAX_DELAY_TOPO)
+}
+
+// 38. Current release bounty (atomic units).
+pub fn get_bounty() -> u64 {
+    return Storage::new().load(BOUNTY_KEY).unwrap_or(DEFAULT_BOUNTY)
+}
+
+// 39. Current owner ("renounced" once ownership was burned).
+pub fn get_owner() -> string {
+    let owner_opt: optional<Address> = Storage::new().load(OWNER_KEY)
+    if owner_opt.is_some() {
+        let owner: Address = owner_opt.expect("guarded")
+        return owner.to_string()
+    }
+    return "renounced"
+}
+
+// 40. Fee recipient.
+pub fn get_fee_recipient() -> string {
+    let recipient_opt: optional<Address> = Storage::new().load(FEE_RECIPIENT_KEY)
+    if recipient_opt.is_some() {
+        let recipient: Address = recipient_opt.expect("guarded")
+        return recipient.to_string()
+    }
+    return "unset"
+}
+
+// 41. Maximum number of notes the tree can hold.
+pub fn get_capacity() -> u64 {
+    return CAPACITY
+}
+
+// 42. Contract version.
+pub fn get_version() -> string {
+    return VERSION
+}

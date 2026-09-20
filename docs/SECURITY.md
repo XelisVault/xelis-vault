@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v13
+# Security Policy — XelisVault Protocol v14
 
 ## Reporting
 
@@ -9,19 +9,43 @@ credit; no bounties yet (community project).
 
 ## State of the codebase
 
-### v13 (current, this tree)
+### v14 (current, this tree)
 
-- `contracts/mixer/PrivacyMixerV4.slx` — the **only** production contract.
-  Written against the full v12 audit findings; every dangerous pattern is
-  excluded by construction and machine-checked on every push:
+- `contracts/mixer/PrivacyMixerV5.slx` — the **only** production contract.
+  Written against the full v12 audit findings and the V4 disclosure below;
+  every dangerous pattern is excluded by construction and machine-checked
+  on every push:
   - zero `let _ = transfer` (swallowed transfer failures) — linter rule R1
   - zero unchecked transfers — R2
   - zero owner-drain entries — R3
   - every `.expect()`/`.unwrap()` guarded by a preceding `require` — R4
   - zero 34-byte address literals — R5
   - storage-write entries are either guarded or intentionally public — R7
+  - zero deposit entries carrying an Address parameter — R11 (the V4 flaw
+    can never ship again)
 - `sdk/xvault` — client tooling; never handles keys (writes are prepared
-  here, signed by your local wallet).
+  here, signed by your local wallet). The deposit commitment is computed
+  client-side with a byte-exact port of Silex `Address::to_bytes()` (XELIS
+  Bech32, separator `:` — verified against xelis-blockchain source).
+
+### PrivacyMixer V4 disclosure (superseded before deployment)
+
+V4 was never deployed on any network. During the V5 design review two
+flaws were found and are documented so they can never be reintroduced:
+
+1. **Recipient leak at deposit time** — `deposit(secret, recipient)` carried
+   the payout address in plaintext invoke parameters, linking depositor and
+   recipient in the deposit transaction itself. Lint rule R11 now blocks
+   this pattern repository-wide; the archived file is the regression
+   corpus.
+2. **Recipient-gas problem** — `withdraw` required the recipient wallet to
+   pay gas, forcing an on-chain funding transaction that defeats the mixer.
+   V5's dead-drop model removes the need for the recipient to transact at
+   all.
+
+The archived contract lives in `contracts/mixer/superseded/` with a
+banner; it is excluded from CI lint but scanned explicitly by the test
+suite to prove R11 still detects the flaw.
 
 ### legacy/ (read-only archive)
 
@@ -39,14 +63,16 @@ the CI rules.
 
 Every push and PR runs `.github/workflows/ci.yml`:
 
-1. **silex-lint** — the 10 audit-derived rules; any BLOCKER/ERROR fails the
+1. **silex-lint** — the 11 audit-derived rules; any BLOCKER/ERROR fails the
    build. Reports are uploaded as artifacts.
 2. **chunk-ids** — the documented chunk table of each contract must match
    the declaration order exactly, and the mixer must contain **zero**
    inter-contract calls (single-contract invariant).
 3. **tests** — the reference test-suite proves the Python reference
-   (`sdk/xvault/xvault/crypto.py`) reproduces the contract's hashing, tree,
-   fee and emergency-exit math byte-for-byte.
+   (`sdk/xvault/xvault/crypto.py`) reproduces the contract's hashing (incl.
+   the XELIS Bech32 address encoding and `Address::to_bytes()` format),
+   tree, fee/bounty and emergency-exit math byte-for-byte, and models the
+   front-run resistance of the release flow.
 4. **structure** — layout rules and a secret scan (PATs, private keys,
    tokens) over all active files.
 
@@ -76,10 +102,12 @@ Local equivalents: `python3 scripts/lint_silex.py`,
 
 | Privilege | Holder | After `renounce_ownership()` |
 |---|---|---|
-| pause/unpause | owner | gone |
+| pause/unpause (deposits only) | owner | gone |
 | emergency_exit | owner | gone (if never used before) |
 | fee up to 1% | owner, hard-capped | fee rate frozen at last value |
+| release bounty up to 0.5 XEL | owner, hard-capped | frozen at last value |
 | fee collection | fee_recipient | unchanged (revenue continues) |
+| releases (exits) | **nobody can block them** — not even the owner, not even paused | unchanged |
 | user funds | **nobody** — not even the owner | unchanged |
 
 Recommended community timeline: renounce 30–90 days after a stable mainnet

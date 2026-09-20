@@ -35,6 +35,11 @@ Rules (id, severity):
                index (declaration order) of the function they document
   R10 INFO     dead code: private `fn` whose name appears exactly once in
                the file (its own declaration) — never called
+  R11 BLOCKER  deposit-params address leak: a public `deposit*` entry that
+               takes an `Address` parameter — the recipient would be
+               readable in plaintext invoke params at deposit time
+               (PrivacyMixer V4 flaw, fixed in V5: deposits take ONLY a
+               client-computed commitment hash)
 
 Exit code: 0 if no BLOCKER/ERROR, 1 otherwise, 2 on tool error.
 
@@ -129,6 +134,23 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "permissionless circuit breaker by design: it can only pause the "
         "contract (a strictly safety-increasing write); unpause stays "
         "owner-only"
+    ),
+    ("PrivacyMixerV5", "release"): (
+        "payout is cryptographically authorized and FRONT-RUN-PROOF: the "
+        "recipient is recovered by recomputing the note commitment from the "
+        "release params, so the caller can neither choose nor redirect the "
+        "payout — the Merkle proof against the archived roots IS the access "
+        "guard; the release caller only ever receives the capped bounty"
+    ),
+    ("PrivacyMixerV5", "release_many"): (
+        "batched form of `release`: same cryptographic authorization, same "
+        "front-run-proof payout binding, all-or-nothing semantics; the "
+        "caller only ever receives the capped bounties"
+    ),
+    ("PrivacyMixerV5", "raise_alarm"): (
+        "permissionless circuit breaker by design: it can only freeze NEW "
+        "deposits (a strictly safety-increasing write; releases are never "
+        "blockable); unpause stays owner-only"
     ),
 }
 
@@ -692,6 +714,26 @@ class SilexLinter:
 
     # -- run everything ----------------------------------------------------------
 
+    def check_deposit_addr_leak(self) -> None:
+        """R11 — a public deposit entry must never take an Address param.
+
+        XELIS invoke parameters are public. A mixer deposit that names the
+        payout recipient in its parameters leaks the depositor->recipient
+        link at deposit time, defeating the whole purpose of the pool
+        (the exact flaw shipped in PrivacyMixer V4). Deposits must carry
+        ONLY a client-side commitment hash.
+        """
+        for fn in self.functions():
+            if fn.kind != "entry" or not fn.name.startswith("deposit"):
+                continue
+            signature = self.sf.src[fn.decl_start:fn.body_start]
+            if re.search(r"\bAddress\b", signature):
+                self.add("R11-deposit-addr-leak", "BLOCKER", fn.decl_line,
+                         f"entry `{fn.name}` takes an Address parameter: the "
+                         f"recipient would leak in plaintext invoke params "
+                         f"at deposit time (PrivacyMixer V4 flaw) — accept a "
+                         f"client-computed commitment hash instead")
+
     def run(self) -> List[Finding]:
         self.check_transfers()
         self.check_rug_switch()
@@ -702,6 +744,7 @@ class SilexLinter:
         self.check_loops()
         self.check_stale_comments()
         self.check_dead_code()
+        self.check_deposit_addr_leak()
         self.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.line, f.rule))
         return self.findings
 
@@ -778,7 +821,8 @@ def build_json(results: List[dict], mode: str, exit_code: int) -> dict:
 
 def collect_slx(root: Path) -> List[Path]:
     return sorted(p for p in root.rglob("*.slx")
-                  if "legacy" not in p.relative_to(root).parts)
+                  if "legacy" not in p.relative_to(root).parts
+                  and "superseded" not in p.relative_to(root).parts)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

@@ -25,7 +25,7 @@ NETWORKS = {
     "testnet": {
         "daemon": "https://testnet-node.xelis.io/json_rpc",
         "xelis_asset": "0" * 64,
-        "address_prefix": "xtv",
+        "address_prefix": "xet",
     },
 }
 
@@ -40,43 +40,47 @@ INVOKE_FEE = 10_000_000        # 0.1 XEL
 INVOKE_GAS = 5_000_000
 
 # ---------------------------------------------------------------------------
-# PrivacyMixer V4 chunk ids (constructor = 0, then EVERY function in
+# PrivacyMixer V5 chunk ids (constructor = 0, then EVERY function in
 # declaration order — matches the compiler's chunk maps, CI-verified).
 # The MIXER_ENTRY_IDS_ALT table is the legacy "entries-only" numbering; use
 # `xvault mixer probe` on testnet to confirm which one the VM expects before
 # any mainnet interaction.
 # ---------------------------------------------------------------------------
-MIXER_CONTRACT = "PrivacyMixerV4"
+MIXER_CONTRACT = "PrivacyMixerV5"
 
 MIXER_ENTRY_IDS = {
-    "deposit": 11,
-    "withdraw": 12,
-    "pause": 13,
-    "unpause": 14,
-    "emergency_exit": 15,
-    "raise_alarm": 16,
-    "set_fee_bps": 17,
-    "set_fee_recipient": 18,
-    "claim_fees": 19,
-    "propose_owner": 20,
-    "accept_owner": 21,
-    "renounce_ownership": 22,
+    "deposit": 13,
+    "release": 14,
+    "release_many": 15,
+    "pause": 16,
+    "unpause": 17,
+    "emergency_exit": 18,
+    "raise_alarm": 19,
+    "set_fee_bps": 20,
+    "set_bounty": 21,
+    "set_fee_recipient": 22,
+    "claim_fees": 23,
+    "propose_owner": 24,
+    "accept_owner": 25,
+    "renounce_ownership": 26,
 }
 
 # Alternative numbering (entries only, 0-based) — kept ONLY for the probe.
 MIXER_ENTRY_IDS_ALT = {
     "deposit": 0,
-    "withdraw": 1,
-    "pause": 2,
-    "unpause": 3,
-    "emergency_exit": 4,
-    "raise_alarm": 5,
-    "set_fee_bps": 6,
-    "set_fee_recipient": 7,
-    "claim_fees": 8,
-    "propose_owner": 9,
-    "accept_owner": 10,
-    "renounce_ownership": 11,
+    "release": 1,
+    "release_many": 2,
+    "pause": 3,
+    "unpause": 4,
+    "emergency_exit": 5,
+    "raise_alarm": 6,
+    "set_fee_bps": 7,
+    "set_bounty": 8,
+    "set_fee_recipient": 9,
+    "claim_fees": 10,
+    "propose_owner": 11,
+    "accept_owner": 12,
+    "renounce_ownership": 13,
 }
 
 # ---------------------------------------------------------------------------

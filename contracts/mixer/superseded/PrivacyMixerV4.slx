@@ -1,5 +1,16 @@
 // ============================================================================
-// PrivacyMixer V4 — XelisVault Protocol
+// PrivacyMixer V4 — SUPERSEDED, DO NOT DEPLOY
+// ============================================================================
+// Rejected design flaw (found during the V5 review, see docs/SECURITY.md):
+//   1. `deposit(secret, recipient)` carried the recipient address in the
+//      plaintext invoke parameters — the depositor->recipient link was
+//      readable in the deposit transaction itself, before any withdrawal.
+//   2. `withdraw` required the RECIPIENT wallet to pay gas, so the fresh
+//      receiving address had to be funded first — an on-chain funding link
+//      that defeats the mixer's purpose.
+// Kept for history and as the regression corpus for lint rule R11
+// (deposit-params address leak). Never deployed on any network.
+// Successor: ../PrivacyMixerV5.slx (dead-drop payouts).
 // ============================================================================
 // A single, self-contained, mainnet-ready privacy pool for XEL.
 // ZERO inter-contract calls. ZERO external dependencies. ZERO keepers.

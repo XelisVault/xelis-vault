@@ -2,7 +2,7 @@
 
 The founder's requirement is "zero false negatives on the audited patterns,
 zero blocking false positives on the mixer". The mixer side is checked by
-running the real linter on contracts/mixer/PrivacyMixerV4.slx (it must stay
+running the real linter on contracts/mixer/PrivacyMixerV5.slx (it must stay
 free of BLOCKER/ERROR/WARNING). This file pins the other side: a synthetic
 contract containing ONE instance of every audited dangerous pattern must
 trigger the matching rule, and the linter must exit non-zero.
@@ -16,7 +16,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LINTER = REPO_ROOT / "scripts" / "lint_silex.py"
-V4 = REPO_ROOT / "contracts" / "mixer" / "PrivacyMixerV4.slx"
+V5 = REPO_ROOT / "contracts" / "mixer" / "PrivacyMixerV5.slx"
+V4_SUPERSEDED = REPO_ROOT / "contracts" / "mixer" / "superseded" / "PrivacyMixerV4.slx"
 
 BAD_CONTRACT = """\
 // Bad.slx — synthetic contract covering every audit pattern
@@ -83,8 +84,9 @@ class TestLinterCatchesAuditPatterns(unittest.TestCase):
     def test_exit_code_nonzero(self):
         self.assertEqual(self.code, 1, "BLOCKER/ERROR findings must exit 1")
 
-    def test_all_ten_rules_fire(self):
-        for rule in ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"]:
+    def test_all_eleven_rules_fire(self):
+        for rule in ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10",
+                     "R11-deposit-addr-leak"]:
             self.assertIn(rule, self.out, f"rule {rule} did not fire on its pattern")
 
     def test_severities(self):
@@ -92,21 +94,36 @@ class TestLinterCatchesAuditPatterns(unittest.TestCase):
         for rule, sev in [("R1", "BLOCKER"), ("R2", "BLOCKER"), ("R3", "BLOCKER"),
                           ("R4", "BLOCKER"), ("R5", "ERROR"), ("R6", "ERROR"),
                           ("R7", "WARNING"), ("R8", "WARNING"),
-                          ("R9", "INFO"), ("R10", "INFO")]:
+                          ("R9", "INFO"), ("R10", "INFO"),
+                          ("R11-deposit-addr-leak", "BLOCKER")]:
             self.assertIn(f"[{sev}", self.out, f"{rule} must be {sev}")
 
 
-class TestMixerV4StaysClean(unittest.TestCase):
+class TestMixerV5StaysClean(unittest.TestCase):
     """The active contract must never gain a blocking/warning finding."""
 
-    def test_v4_has_no_blocker_error_or_warning(self):
-        self.assertTrue(V4.is_file(), "contracts/mixer/PrivacyMixerV4.slx missing")
-        code, out = run_linter(V4.parent.parent)
-        self.assertEqual(code, 0, f"linter must pass on V4:\n{out}")
+    def test_v5_has_no_blocker_error_or_warning(self):
+        self.assertTrue(V5.is_file(), "contracts/mixer/PrivacyMixerV5.slx missing")
+        code, out = run_linter(V5.parent.parent)
+        self.assertEqual(code, 0, f"linter must pass on V5:\n{out}")
         for line in out.splitlines():
             self.assertNotIn("[BLOCKER]", line)
             self.assertNotIn("[ERROR]", line)
             self.assertNotIn("[WARNING]", line)
+
+    def test_superseded_v4_is_excluded_from_ci_lint(self):
+        """V4 (archived, known-flawed) must NOT be linted by the CI scan —
+        it is the R11 regression corpus, scanned explicitly instead."""
+        self.assertTrue(V4_SUPERSEDED.is_file(), "superseded V4 archive missing")
+        code, out = run_linter(V4_SUPERSEDED.parent.parent)
+        self.assertEqual(code, 0, f"CI lint must exclude superseded/:\n{out}")
+        # ... but the explicit scan MUST flag the archived flaw (regression)
+        proc = subprocess.run(
+            [sys.executable, str(LINTER), "--scan-legacy", str(V4_SUPERSEDED)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 1,
+                         "R11 must still detect the V4 deposit-addr leak")
+        self.assertIn("R11-deposit-addr-leak", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":
