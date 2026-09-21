@@ -8,140 +8,242 @@
 // the quality filter, and the trust system keeps founders accountable long
 // after graduation.
 //
-// v2.0 — TWO-PATH GRADUATION: a founder who locks serious liquidity from day
-// one (>= direct_listing_threshold) graduates DIRECTLY (D7); smaller floats
-// discover price on the bonding curve first. Graduation is worth reaching:
-// graduated projects trade at a LOWER fee (D8) and the team allocation
-// unlocks (D3). A small migration fee is taken from the curve once, at
-// graduation (D9).
+// v2.0 — TWO-PATH GRADUATION (D7): a founder who locks serious liquidity
+// from day one (>= direct_listing_threshold) graduates DIRECTLY; smaller
+// floats discover price on the bonding curve first. Graduation is worth
+// reaching: graduated projects trade at a LOWER fee (D8) and the team
+// allocation unlocks (D3). A small migration fee is taken from the curve
+// once, at graduation (D9).
 //
-// v3.0 — FULL PROPOSAL DATA: the vote happens with EVERYTHING on the table
-// (D10): the creator declares a vesting plan AT PROPOSITION TIME and the
-// contract enforces it at graduation — the community votes on the exact
-// unlock schedule it will get, not a promise. Projects carry SOCIAL LINKS
+// v3.0 — FULL PROPOSAL DATA (D10): the vote happens with EVERYTHING on the
+// table — the creator declares a vesting plan AT PROPOSITION TIME and the
+// contract enforces it at graduation. Projects carry SOCIAL LINKS
 // (Twitter / Telegram / Discord, D11) the team can update at any time. And
-// the contract itself keeps the market's scoreboard (D12): per-project
-// buy/sell volume, trade count, last trade topoheight, spot market cap,
-// all-time-high market cap and the market cap at graduation are all
-// calculated and STORED on-chain — no indexer required to know how a token
-// is doing.
+// the contract keeps the market's scoreboard (D12): per-project buy/sell
+// volume, trade count, spot market cap, ATH and the graduation snapshot
+// are all calculated and STORED on-chain.
 //
-// ZERO inter-contract calls. ZERO external dependencies. ONE file.
+// v4.0 — REAL ASSETS, REAL MIGRATION. Every launched token is now a TRUE
+// XELIS confidential asset (D13): created by the contract at validation
+// success via Asset::create with MaxSupplyMode::Fixed — the ENTIRE supply
+// exists from birth, is held by the contract, and can NEVER be minted past
+// its cap (the cap is enforced by the XELIS protocol itself, not by our
+// code). The bonding curve trades REAL tokens (D14): buys transfer actual
+// assets to the buyer's wallet, sells consume the buyer's attached token
+// deposit — no internal ledger anywhere. And graduation now really means
+// migration (D15): the curve's XEL reserves and its remaining token
+// inventory move ATOMICALLY into a permanent LaunchDEX pool via one
+// cross-contract call with attached deposits. Buyers hold their tokens in
+// their own wallets from the first second, can transfer them freely
+// anywhere on XELIS, and keep trading them on the DEX long after the
+// launchpad's job is done.
+//
+// ONE launchpad contract + ONE pinned DEX contract. No other dependencies.
 //
 // ----------------------------------------------------------------------------
 // DESIGN DECISIONS (and why — read before changing anything)
 // ----------------------------------------------------------------------------
-// D1. Tokens are an INTERNAL LEDGER inside this contract. XELIS smart
-//     contracts cannot call each other today, so a launched token cannot be
-//     a separately deployed contract the launchpad controls. Each project's
-//     token lives as per-address balances in this contract's storage and
-//     trades ONLY against its bonding curve here. The day the VM ships
-//     inter-contract calls, migrations to an external DEX become possible;
-//     until then this contract IS the pool a graduated project "migrates"
-//     onto.
+// D1. (v4, supersedes v1's internal ledger) REAL CONFIDENTIAL ASSETS. The
+//     token of every validated project is a native XELIS asset created by
+//     this contract at finalize_validation (D13) — buyers' balances live in
+//     their own wallets, are fully confidential at the base layer, and are
+//     usable by every wallet/exchange/service on XELIS. Nothing is owed to
+//     the launchpad: what you bought is yours, transferable from the first
+//     block.
 //
-// D2. Graduation does NOT stop trading. There is no external DEX to migrate
-//     to (see D1), so freezing the curve at graduation would trap holders.
-//     Instead: the bonding PHASE ends (the launch milestone), the project
-//     becomes Graduated + Trusted, and the same constant-product math keeps
-//     serving trades forever — at the REDUCED graduated fee (D8). The
-//     contract IS the token's permanent venue.
+// D2. (v4, supersedes v2's "the contract IS the venue") GRADUATION IS A
+//     REAL MIGRATION. When a project graduates, its XEL reserves and token
+//     inventory move to a permanent LaunchDEX pool (D15/D16). Between
+//     graduation and migration the curve keeps serving trades at the
+//     reduced graduated fee (D8) — a slow admin never strands a hot
+//     project — and migrate() (permissionless, anyone) executes the move
+//     atomically. After migration the curve is closed; all trading happens
+//     on the DEX at the DEX fee.
 //
 // D3. Team tokens are RESERVED from day one and CLAIMED after graduation.
-//     The curve's sellable supply excludes the team allocation from day one,
-//     so the allocation can never be over-sold. Once the project graduates,
-//     the creator chooses: claim the full allocation immediately (the
-//     migration reward) OR lock it into a linear vesting (a public
+//     The curve's sellable supply excludes the team allocation from day
+//     one, so the allocation can never be over-sold. Once the project
+//     graduates, the creator chooses: claim the full allocation immediately
+//     (the migration reward) OR lock it into a linear vesting (a public
 //     commitment signal — visible to every buyer via get_team_allocation).
 //     A project that never graduates does not hold the team hostage: after
 //     team_unlock_delay (~6 months) of bonding, the creator may claim the
-//     allocation late, so a slow start never becomes a dead loss. Claims are
-//     debited against a running team_paid counter — the allocation is paid
-//     EXACTLY once across all paths (I4).
+//     allocation late. Claims are debited against a running team_paid
+//     counter — the allocation is paid EXACTLY once across all paths (I4).
+//     v4: claims pay REAL tokens from the contract's escrow (the launchpad
+//     retains exactly team_remaining after migration — I10), and the claim
+//     event carries NO amount (the payout is a native confidential
+//     transfer; only the creator sees it — D18).
 //
 // D4. Losing trust blocks BUYS, never SELLs. When a project is Untrusted,
-//     new buys are refused (protecting new entrants — the entire point of
-//     the trust system) but holders can always exit. A trust flip can never
-//     trap funds.
+//     new buys are refused (protecting new entrants) but holders can
+//     always exit. v4 extends this across the migration: the DEX pool's
+//     BUYS can be paused (sync_trust_to_dex) while its sells stay open
+//     forever — a trust flip can never trap funds, on either venue.
 //
 // D5. Fees ACCRUE and are pulled by withdraw_fees(). Submission, trading,
 //     migration and recovery fees accumulate in `pending_fees`; the admin
 //     withdraws them capped at what the contract can spare after covering
-//     every curve's reserves and every refundable rejection. 100% of revenue
-//     goes to the admin — nothing is burned.
+//     every curve's reserves, every refundable rejection and every
+//     earmarked asset budget. 100% of revenue goes to the admin — nothing
+//     is burned.
 //
 // D6. Voting is 1 address = 1 vote, per voting round. Every vote costs a
-//     network fee — that is the only (and honest) sybil cost on XELIS today.
-//     Votes reset when a new validation round opens; trust tallies otherwise
-//     accumulate for the whole life of the project.
+//     network fee — that is the only (and honest) sybil cost on XELIS
+//     today. Votes reset when a new validation round opens; trust tallies
+//     otherwise accumulate for the whole life of the project.
 //
 // D7. TWO-PATH GRADUATION (the liquidity cap). A founder may lock ANY
 //     liquidity >= min_liquidity; whether the project skips the bonding
 //     phase is decided by the DIRECT LISTING THRESHOLD, an admin-tunable
-//     cap (default 2000 XEL — what a 500 XEL float graduates at under the
-//     default x4 multiplier). Liquidity >= threshold at propose time means
-//     the project graduates the moment validation passes: a "migration to
-//     the pool" on day one (deep reserves, graduated fee, Trusted badge,
-//     team unlock — the full set of graduation advantages, immediately).
-//     Below the threshold: the classic bonding curve and its price
-//     discovery. The threshold is snapshotted per project at propose time
-//     (founders get the rules they signed up for, whatever the admin tunes
-//     later), and it can never undercut min_liquidity (cross-checked
-//     setters).
+//     cap (default 2000 XEL). Liquidity >= threshold at propose time means
+//     the project graduates the moment validation passes: asset creation,
+//     migration fee and a same-block pool seeding (deep reserves,
+//     graduated fee, Trusted badge, team unlock — the full set of
+//     graduation advantages, immediately). Below the threshold: the
+//     classic bonding curve and its price discovery. The threshold is
+//     snapshotted per project at propose time (founders get the rules
+//     they signed up for), and it can never undercut min_liquidity
+//     (cross-checked setters).
 //
-// D8. GRADUATION PAYS. Graduated projects trade at graduated_fee_bps
-//     (default 0.25%), not trading_fee_bps (default 0.50% while bonding).
-//     The setters cross-check graduated_fee_bps <= trading_fee_bps and the
-//     fee helper re-clamps at read time, so the graduation discount can
-//     never be inverted by any parameter combination. The discount is
-//     acquired at graduation and survives a later trust loss (holders exit
-//     cheap; the milestone is what is rewarded, not ongoing behaviour).
+// D8. GRADUATION PAYS. Between graduation and migration the curve trades
+//     at graduated_fee_bps (default 0.25%) instead of trading_fee_bps
+//     (default 0.50% while bonding); after migration the DEX's own fee
+//     (default 0.30%) applies. The setters cross-check graduated_fee_bps
+//     <= trading_fee_bps and the fee helper re-clamps at read time, so
+//     the graduation discount can never be inverted by any parameter
+//     combination. The discount is acquired at graduation and survives a
+//     later trust loss (holders exit cheap; the milestone is what is
+//     rewarded, not ongoing behaviour).
 //
 // D9. MIGRATION FEE — protocol revenue at migration, pump.fun-style but
 //     small: when a project graduates — by curve growth OR by direct
 //     listing — migration_fee_bps (default 0.5%) is taken ONCE from the
-//     project's curve reserves and accrues to pending_fees (admin revenue,
-//     D5). Reserves dip by exactly that fee and every subsequent trade
-//     prices it in. Charged on the reserves AT the graduation moment, so a
-//     direct listing pays it on its seed liquidity and a curve graduate on
-//     its (>= 4x larger) grown reserves.
+//     project's curve reserves and accrues to pending_fees (admin
+//     revenue, D5). Charged on the reserves AT the graduation moment, so
+//     a direct listing pays it on its seed liquidity and a curve graduate
+//     on its (>= 4x larger) grown reserves. What is left is exactly what
+//     migrate() will seed the pool with.
 //
-// D10. VESTING PLAN AT PROPOSITION — the votable commitment. propose() takes
-//     a vesting_duration: 0 means "team claims at graduation" (the classic
-//     migration reward), any value inside the admin-bounded window
-//     [vesting_min, vesting_max] is a DECLARED PLAN that the contract
-//     BINDS at graduation: graduate() starts the linear vesting
-//     automatically with exactly that duration. The community votes with
-//     the unlock schedule on the table (get_proposal_data exposes it before
-//     a single vote is cast); a creator cannot water the commitment down
-//     afterwards — start_team_vesting refuses planned projects ("planned")
-//     because the plan IS the vesting. The plan is validated against the
-//     bounds snapshotted at propose time (founders get the rules they
-//     signed up for, D7-consistent) and only binds at graduation: a project
-//     that never graduates falls back to the late-claim path (D3) — after
-//     ~6 months of bonding the allocation is claimable, plan or no plan.
+// D10. VESTING PLAN AT PROPOSITION — the votable commitment. propose()
+//     takes a vesting_duration: 0 means "team claims at graduation", any
+//     value inside the admin-bounded window [vesting_min, vesting_max] is
+//     a DECLARED PLAN that the contract BINDS at graduation: graduate()
+//     starts the linear vesting automatically with exactly that duration.
+//     The community votes with the unlock schedule on the table
+//     (get_proposal_data exposes it before a single vote is cast); a
+//     creator cannot water the commitment down afterwards. The plan is
+//     validated against the bounds snapshotted at propose time and only
+//     binds at graduation: a project that never graduates falls back to
+//     the late-claim path (D3).
 //
 // D11. SOCIAL LINKS — mutable project metadata. Twitter, Telegram and
-//     Discord links are part of the proposal (empty = "no link") and can be
-//     updated by the creator AT ANY TIME via update_project_info, exactly
-//     like description/website/logo: communities move, channels get
-//     rebuilt, and a launchpad that freezes social pointers forces teams
-//     to abandon their own project page. Length-capped display metadata,
-//     same trust model as the website field — the frontend renders, the
-//     voters judge. Name/symbol/supply/team stay immutable (structural).
+//     Discord links are part of the proposal (empty = "no link") and can
+//     be updated by the creator AT ANY TIME via update_project_info,
+//     exactly like description/website/logo. Name/symbol/supply/team stay
+//     immutable (structural) — the symbol is moreover RESERVED in the
+//     launchpad's ticker registry at propose time (first project wins it;
+//     chain-wide, XELIS asset tickers are self-declared, so this registry
+//     is what keeps launchpad listings unambiguous).
 //
 // D12. ON-CHAIN TRADING DATA — the contract keeps the scoreboard itself.
-//     Every buy/sell records: directional volumes (buy_volume = attached
-//     XEL, sell_volume = pre-fee gross out), the running total, the trade
-//     count, the last trade topoheight — per project AND protocol-wide —
-//     plus the spot market cap recomputed and STORED after every trade, its
-//     all-time high (only ever grows), and the market cap snapshotted at
-//     graduation (the milestone number). All via record_trade() and
-//     update_market_cap(), all additions overflow-guarded (checked_add).
-//     The stored spot value can never drift from the live one: it is
-//     rewritten by the same formula after every state change of the curve.
-//     get_market_cap stays a pure recompute (never trusts storage);
-//     get_market_cap_history exposes the stored series.
+//     Every curve buy/sell records: directional volumes, the running
+//     total, the trade count, the last trade topoheight — per project AND
+//     protocol-wide — plus the spot market cap recomputed and STORED
+//     after every trade, its all-time high, and the market cap snapshotted
+//     at graduation. v4 scopes this to the CURVE ERA: after migration the
+//     curve is closed (its scoreboard freezes) and LaunchDEX keeps the
+//     pool-era scoreboard (per-pool volumes, reserves, spot price) — the
+//     SDK aggregates both eras for the frontend.
+//
+// D13. ASSET CREATION AT VALIDATION SUCCESS (not before). The real asset
+//     is born the moment the community says yes: failed proposals never
+//     pollute the chain with dead assets and never pay the protocol's
+//     asset-creation cost. Asset::create is called with the project id as
+//     the asset's local id, the proposed name/symbol, 8 decimals (XEL
+//     parity, so curve math is unit-honest) and
+//     MaxSupplyMode::Fixed { max_supply: total_supply }: the WHOLE supply
+//     is minted to this contract at creation and NOBODY — not the admin,
+//     not the founder, not this contract — can ever mint one more unit.
+//     The chain fee for creating an asset is paid from an EARMARKED
+//     BUDGET collected at propose time (asset_budget, admin-tunable):
+//     create_project_asset measures the ACTUAL fee by balance-delta
+//     (robust to any future fee change), accepts a top-up deposit on the
+//     finalize transaction if the chain got more expensive, refunds the
+//     unused part to the creator, and verifies on the spot that the full
+//     supply actually landed in the contract's balance ("assetbal") —
+//     a failed or partial creation reverts the whole finalize.
+//
+// D14. THE CURVE TRADES REAL TOKENS. buy(pid): attach XEL, receive real
+//     tokens in your wallet (a native confidential transfer from the
+//     contract's inventory). sell(pid): attach tokens (the WHOLE deposit
+//     is sold — symmetric with buy, nothing can be stranded), receive
+//     XEL. The curve's state is pure bookkeeping over the contract's real
+//     balances, and the identity balance == curve_supply + team_remaining
+//     holds at every block (I10) — auditable by anyone, any time.
+//
+// D15. ATOMIC TWO-STEP MIGRATION. Crossing the graduation threshold (or
+//     passing validation as a direct listing) flips the project Graduated
+//     — the milestone, the fee discount, the team unlock, the vesting
+//     bind — but does NOT touch any funds: the curve keeps trading at the
+//     graduated fee until the pool exists (admin-lag tolerant). Then
+//     migrate(pid), callable by ANYONE: one transaction that takes the
+//     curve's whole XEL reserves and its whole token inventory (team
+//     escrow excepted) and seeds a permanent LaunchDEX pool with them, by
+//     cross-contract call with attached deposits (Contract::call with a
+//     deposits map — the funds and the pool creation are one atomic
+//     operation; a failure anywhere reverts everything). The DEX address
+//     is admin-pinned and FREEZES at the first migration (a repinned DEX
+//     could orphan live pools). After migration the curve is closed
+//     forever ("migrated") and the launchpad remains the project's home
+//     for votes, socials, trust and team claims.
+//
+// D16. THE POOL IS PERMANENT (see LaunchDEX X2). Liquidity that migrates
+//     can never be withdrawn by anyone — not the admin, not the founder,
+//     not the launchpad. This is the anti-rug guarantee: the deeper the
+//     pool, the safer the market. Anyone (project, community, protocol)
+//     may deepen it further via LaunchDEX add_liquidity — also permanent.
+//
+// D17. TRUST ACROSS VENUES, WITHOUT PERMISSION TRAPS. Cross-contract
+//     calls consume the CALLING transaction's contract-call permission —
+//     embedding one inside report/support would force every voter's
+//     wallet to grant it. So the trust flip stays a pure launchpad state
+//     change, and a separate permissionless entry, sync_trust_to_dex,
+//     mirrors it to the pool's buys-pause (keeper bots, a frontend
+//     button, or anyone). If the project is Untrusted AT migration time,
+//     migrate() pauses the pool's buys in the SAME transaction — no gap.
+//     Sells on the pool are never pausable (D4).
+//
+// D18. PRIVACY, MAXIMALLY. (1) Every launched token is a native XELIS
+//     confidential asset: balances and transfer amounts are encrypted at
+//     the base layer — invisible to third parties, visible in every
+//     wallet, usable everywhere. (2) Team claims pay from escrow via a
+//     native confidential transfer and the TeamClaimed event carries NO
+//     amount — the payout is the creator's private business. (3) Wallet
+//     to wallet trades of launched tokens (outside the launchpad/DEX)
+//     inherit XELIS privacy automatically. Honest limitation, by chain
+//     design: deposits ATTACHED to contract invocations are public (the
+//     contract must read the amount) — curve buys' XEL in, sells' tokens
+//     in, and DEX swaps' inputs are therefore public; everything else
+//     (wallet balances, transfers, payouts out of contracts) is
+//     confidential.
+//
+// D19. DEX PINNING. set_dex_address (admin) is possible only while NO
+//     project has ever migrated; after the first migration the pin is
+//     frozen forever (the pools live inside that contract — repointing
+//     would orphan them). LaunchDEX mirrors this: its launchpad pin
+//     freezes at its first pool. The two cross-called chunk ids
+//     (create_pool, set_pool_buys_paused) are PINNED CONSTANTS here and
+//     asserted against LaunchDEX's real chunk numbering by CI — renumbering
+//     either contract without the other fails the build.
+//
+// D20. SOUND XEL ACCOUNTING (I2, tightened from v2). total_curve_xel is
+//     the exact sum of every live curve's reserves (seeds included — v2
+//     left them as slack; migration needs exactness), and
+//     locked_refunds + pending_fees + earmarked budgets complete the
+//     committed side. balance >= committed at every block; every path
+//     that moves XEL (buy, sell, fee, refund, asset creation, migration)
+//     updates both sides in the same transaction.
 //
 // ----------------------------------------------------------------------------
 // LIFECYCLE (status codes)
@@ -150,24 +252,32 @@
 //                 (ends at validation_end topoheight; outcome applied by
 //                  finalize_validation, callable by ANYONE after the window)
 //       ├── pass (>= min_participants voters AND >= 80% support)
+//       │     ├── [D13] Asset::create — the REAL token is born (Fixed
+//       │     │        supply, whole balance held by this contract)
 //       │     ├── liquidity >= direct_listing_threshold ──> 3 Graduated
-//       │     │     (direct listing: skip bonding; migration fee taken;
-//       │     │      graduated fee; Trusted badge; team unlock — D7/D8/D9)
-//       │     └── else ──> 2 Bonding (curve is live)
+//       │     │     (direct listing: migration fee taken; the pool can be
+//       │     │      seeded the same block via migrate; graduated fee;
+//       │     │      Trusted badge; team unlock — D7/D8/D9/D15)
+//       │     └── else ──> 2 Bonding (curve is live, real tokens out/in)
 //       └── fail ──> 1 Rejected ──> claim_refund() returns 100% of the
-//                                    founder's liquidity, once
-//   2 Bonding     curve is live: buy() / sell(); votes continue and can
-//                 flip the project Untrusted (see D4)
+//                                    founder's liquidity + asset budget
+//   2 Bonding     curve is live: buy() / sell() on REAL assets; votes
+//                 continue and can flip the project Untrusted (see D4)
 //                 graduation when reserves >= liquidity * multiplier
 //                 ──> 3 Graduated (+ Trusted): migration fee taken (D9),
-//                     team allocation claimable (D3), trading continues at
-//                     the graduated fee (D2/D8), trust votes keep going
+//                     team allocation claimable (D3), curve keeps trading
+//                     at the graduated fee until migration (D15)
+//   3 Graduated   awaiting migrate() — permissionless, atomic (D15):
+//                 curve reserves + token inventory -> permanent LaunchDEX
+//                 pool; curve closes ("migrated"); votes, socials, trust
+//                 and team claims continue on the launchpad (D3/D11/D17)
 //   5 Untrusted   reports reached the loss threshold while Bonding/
-//                 Graduated/Trusted: buys blocked, sells open, votes open
+//                 Graduated/Trusted: buys blocked (curve AND, once
+//                 synced/migrated, pool), sells open everywhere (D4/D17)
 //                 recovery: request_revalidation() by the creator —
 //                   * not graduated: free, normal thresholds
-//                   * graduated: pays recovery_fee (default 250 XEL to the
-//                     admin) and must pass STRICTER thresholds
+//                   * graduated: pays recovery_fee (default 250 XEL to
+//                     the admin) and must pass STRICTER thresholds
 //                   ──> 6 Recovery window ──> pass: 2 (Bonding) or 4 (Trusted)
 //                                             fail: back to 5 (retryable)
 //   4 Trusted     recovered status for graduated projects (same trading
@@ -177,12 +287,13 @@
 // BONDING-CURVE MATH (constant product, integer, contract-favouring floors)
 // ----------------------------------------------------------------------------
 // State per project: R = real XEL reserves, C = curve token supply
-// (sellable balance held by the curve). Price = R / C.
+// (sellable inventory held by the contract, team allocation excluded).
+// Price = R / C.
 //
 //   buy  with X XEL attached:      fee = X * fee_bps / 10000
 //                                  net = X - fee                  (joins R)
 //                                  tokens_out = C * net / (R + net)
-//   sell of T tokens:             gross = R * T / (C + T)         (leaves R)
+//   sell of T tokens (attached):   gross = R * T / (C + T)         (leaves R)
 //                                  fee  = gross * fee_bps / 10000
 //                                  out  = gross - fee              (to caller)
 //
@@ -192,13 +303,17 @@
 //   quote can never disagree with the trade it previews.
 //
 // Both directions floor (integer division) in favour of the contract, so the
-// pool can never go insolvent from rounding. All intermediates are computed
+// curve can never go insolvent from rounding. All intermediates are computed
 // in u128 (products are up to 1e31; u64 would overflow).
 //
 // Graduation (curve path): R >= liquidity_deposited * graduation_multiplier
 // (u128 compare), checked after every buy while Bonding. At that moment
 // take_migration_fee() applies: fee = fee_take(R, migration_fee_bps);
 // R -= fee; pending_fees += fee (D9).
+//
+// Migration (D15): pool_xel = R (post-fee, net of any pending-window
+// sells), pool_tokens = C. Both are attached to the LaunchDEX create_pool
+// cross-call; the launchpad keeps ONLY the team escrow (team_remaining).
 //
 // Team unlock (D3): unlocked =
 //   vesting active (vs > 0) : team * (topo - vs) / vd   (linear, floored)
@@ -208,9 +323,9 @@
 // claimable = unlocked - team_paid (paid EXACTLY once across paths — I4).
 //
 // Market cap = R * (total_supply - C - team_remaining) / C (u128, saturating)
-// where team_remaining = team_alloc - team_paid. Stored per project after
-// every trade (mc), its all-time high (mh) and the graduation snapshot (mg)
-// are updated by update_market_cap / graduate (D12).
+// — the CURVE-ERA cap (D12): after migration the launchpad's stored cap
+// freezes at 0 (curve closed, C = 0) and the live cap is the DEX pool's
+// price * circulating supply (SDK-composed).
 //
 // Volume (D12): buy_volume sums the ATTACHED XEL of every buy (fee
 // included, like an exchange's quote-side volume), sell_volume sums the
@@ -223,9 +338,13 @@
 // FEES (defaults — ALL admin-configurable, ALL revenue to the admin)
 // ----------------------------------------------------------------------------
 //   submission_fee             10 XEL     paid once per proposal (non-refundable)
+//   asset_budget               10 XEL     earmarked for the protocol's asset
+//                                         creation cost; unused part refunded
+//                                         to the creator (D13)
 //   min_liquidity            500 XEL     founder's locked seed liquidity
 //   trading_fee_bps             50 bps    on every buy and sell while bonding
-//   graduated_fee_bps           25 bps    once graduated (<= trading fee, D8)
+//   graduated_fee_bps           25 bps    curve trades between graduation and
+//                                         migration (<= trading fee, D8)
 //   migration_fee_bps           50 bps    taken ONCE from reserves at
 //                                         graduation (D9), on both paths
 //   direct_listing_threshold 2000 XEL     liquidity that skips bonding (D7)
@@ -242,74 +361,105 @@
 //   recovery_min_participants   40      stricter recovery quorum
 //   recovery_min_ratio_bps     9000     90% support to recover Trust
 //
+//   LaunchDEX (the pool era): swap fee 30 bps default, capped 10%, 100%
+//   admin — set on the DEX contract, cross-checked nowhere here by design
+//   (the two fee models are independent venues; the graduation discount is
+//   the curve's 25 bps window + the DEX's default being below the bonding
+//   50 bps).
+//
 // ----------------------------------------------------------------------------
 // SECURITY MODEL (honest threat documentation)
 // ----------------------------------------------------------------------------
-//   * The admin is a hot role: it sets every fee/parameter and can pause NEW
-//     proposals and NEW buys. It can NEVER move curve reserves, user token
-//     balances, or refundable rejections — withdraw_fees() is capped at
-//     pending_fees and at the contract's uncommitted balance. Sells, votes,
-//     refunds and finalization are NEVER pausable: exits and community
-//     decisions cannot be frozen.
+//   * The admin is a hot role: it sets every fee/parameter, pins the DEX
+//     (before the first migration only, D19) and can pause NEW proposals
+//     and NEW buys. It can NEVER move curve reserves, token inventory,
+//     team escrow or refundable rejections — withdraw_fees is capped at
+//     pending_fees and at the contract's uncommitted balance (D20). Sells,
+//     votes, refunds, migration and finalization are NEVER pausable:
+//     exits, community decisions and the migration itself cannot be
+//     frozen.
+//   * The migration is permissionless and its outcome fully determined:
+//     migrate() can only send the project's OWN reserves and inventory to
+//     the PINNED DEX contract (D19) — no destination, no amount, no
+//     caller choice anywhere. A malicious migrator can only... execute
+//     the migration the community is waiting for.
+//   * Cross-contract surface (the ONLY calls this contract ever makes):
+//     LaunchDEX.create_pool (chunk 6) from migrate, LaunchDEX.
+//     set_pool_buys_paused (chunk 7) from sync_trust_to_dex and from
+//     migrate's untrusted-at-migration path. Both are inbound-guarded on
+//     the DEX side (pinned launchpad address) and outbound-guarded here
+//     (frozen dex pin, is_contract_callable permission precheck). The
+//     calling transaction must carry the contract-call permission — the
+//     clear "txperm" refusal documents it for wallets.
 //   * Fee parameters are CROSS-CHECKED pairs: graduated_fee_bps <=
-//     trading_fee_bps (the graduation discount can never invert, D8) and
-//     direct_listing_threshold >= min_liquidity (the fast track can never
-//     swallow every proposal, D7). Both setters read the partner value; the
-//     fee helper re-clamps defensively at every use.
+//     trading_fee_bps (D8) and direct_listing_threshold >= min_liquidity
+//     (D7). Both setters read the partner value; the fee helper re-clamps
+//     defensively at every use.
+//   * Asset creation is balance-verified: if Fixed-mode semantics ever
+//     delivered less than the full supply to this contract, finalize
+//     reverts ("assetbal") — no partial-asset project can ever open.
 //   * Voting sybil-resistance is the network fee, nothing more (documented,
 //     not hidden). min_participants and the 80% bar make cheap attack
 //     campaigns expensive: 20+ voting transactions, each paying network fees.
-//   * Params are range-checked on every setter (hard caps in constants):
-//     trading/graduated fees can never exceed 10%, the migration fee can
-//     never exceed 5%, ratios stay in (50%..100%], durations and multipliers
-//     stay sane. A compromised admin can hurt the fee model, not the funds.
-//   * No reentrancy surface: XELIS invokes are atomic and this contract
-//     calls no other contract.
+//   * Params are range-checked on every setter (hard caps in constants);
+//     a compromised admin can hurt the fee model, not the funds.
+//   * No reentrancy surface: XELIS invokes are atomic; this contract's
+//     outbound calls happen last in their entries (state first), and the
+//     two callees never call back (LaunchDEX calls no contract at all).
 //   * Front-running buys/sells is possible (no mempool privacy) — same as
 //     every public DEX on XELIS today; quotes are view functions, use them.
 //
 // ----------------------------------------------------------------------------
 // INVARIANTS
 // ----------------------------------------------------------------------------
-//   I1. Ledger: curve_supply + sum(balances) + team_remaining
-//       == total_supply, for every project, always — where
-//       team_remaining = team_alloc - team_paid. Team tokens enter balances
-//       ONLY through claim_team_allocation (graduation path or delayed
-//       path), always debited from team_paid.
-//   I2. Solvency: contract XEL balance >= total_curve_xel + pending_fees +
-//       locked_refunds, before and after every entry. The migration fee
-//       moves value from a curve's reserves into pending_fees without
-//       touching total_curve_xel — safe because every live project's seed
-//       liquidity sits uncommitted in the balance (it only ever leaves as a
-//       rejected refund, which is locked_refunds; and the fee is a small
-//       fraction of that seed). Checked in withdraw_fees (the only exit
-//       path for fees).
+//   I1. ASSET LEDGER (v4): for every created asset, the launchpad's
+//       balance of that asset == curve_supply + team_remaining at EVERY
+//       block — where team_remaining = team_alloc - team_paid. Tokens
+//       leave the contract ONLY through buy payouts, sell... no: sells
+//       ADD to the contract (the deposit). Tokens leave through buy
+//       payouts and team claims ONLY; they enter through asset creation
+//       (the full supply) and sell deposits. Post-migration the identity
+//       degenerates to balance == team_remaining (the pool owns the
+//       rest). Auditable by anyone: get_asset_info / get_balance_for_asset.
+//   I2. XEL SOLVENCY (D20, tightened): contract XEL balance >=
+//       total_curve_xel + pending_fees + locked_refunds + total_budgets,
+//       before and after every entry — where total_curve_xel is the exact
+//       sum of live curve reserves (seeds included, minus rejected
+//       projects' refunds-in-waiting, minus taken fees, minus migrated
+//       reserves), total_budgets the sum of earmarked asset budgets.
+//       Every XEL path updates both sides atomically. Checked in
+//       withdraw_fees (the only exit path for fees).
 //   I3. A project's reserves can only grow by buy nets and shrink by sell
-//       grosses and the one-time migration fee; the founder's liquidity only
-//       leaves via claim_refund on a Rejected project, exactly once.
+//       grosses, the one-time migration fee, and the migration itself;
+//       the founder's liquidity only leaves via claim_refund on a
+//       Rejected project, exactly once (with the unused asset budget).
 //   I4. Team tokens are paid to the creator EXACTLY once across all claim
-//       paths: every claim adds unlocked - team_paid and team_paid only ever
-//       increases, capped at team_alloc.
+//       paths: every claim adds unlocked - team_paid and team_paid only
+//       ever increases, capped at team_alloc.
 //   I5. Every vote is one storage key ("v:{id}:{round}:{addr}"); an address
 //       votes at most once per round; rounds only increase.
 //   I6. Status transitions are one-way per path (see LIFECYCLE); nobody,
-//       including the admin, can jump states arbitrarily.
+//       including the admin, can jump states arbitrarily. The migrated
+//       flag is one-way: once set, the curve is closed forever.
 //   I7. All transfers are checked (no swallowed failures). Every panic
 //       message is a fixed short literal (no user data in panics).
-//   I8. Untrusted blocks buys ONLY (D4) — sells and refunds always work.
-//   I9. Volume identity: per project, vo == bv + sv at ALL times (vo only
-//       grows through record_trade, once per trade, by exactly the recorded
-//       amount); protocol-wide, tvl == tbv + tsv. The stored market cap mc
-//       is refreshed by update_market_cap after EVERY change of its inputs
-//       (buy, sell, graduation fee, team claim), so it always equals the
-//       recomputed R * circulating / C; mh only ever grows, and mg is
-//       written exactly once, at graduation.
+//   I8. Untrusted blocks buys ONLY (D4) — on the curve directly, on the
+//       pool via sync (D17). Sells and refunds always work, everywhere.
+//   I9. Volume identity: per project, vo == bv + sv at ALL times; protocol
+//       wide, tvl == tbv + tsv. The stored market cap mc is refreshed by
+//       update_market_cap after EVERY change of its inputs, so it always
+//       equals the recomputed R * circulating / C; mh only ever grows,
+//       and mg is written exactly once, at graduation.
+//   I10. TOKEN SOLVENCY: the migration sends EXACTLY the curve's
+//       inventory (C) — the team escrow (team_remaining) never leaves
+//       except through claims (I1/I4). A migration can never strand the
+//       team or short the pool.
 //
 // ----------------------------------------------------------------------------
 // STORAGE MAP (string keys, flat KV — house style)
 // ----------------------------------------------------------------------------
-//   Global   : adm pc sub mnl tfe gfe mgf dlt mnp mab vdt gmu tdy vmn vmx
-//              rfe rmp rmr pfe fcl tvl tcx lrf pz xa tbv tsv ttc
+//   Global   : adm pc sub abd mnl tfe gfe mgf dlt mnp mab vdt gmu tdy vmn vmx
+//              rfe rmp rmr pfe fcl tvl tcx lrf pz xa tbv tsv ttc tbb mgc dxa
 //              (see constants below)
 //   Project  : p:{id}:cr creator        p:{id}:st status (u64)
 //              p:{id}:nm name           p:{id}:sy symbol
@@ -331,8 +481,13 @@
 //              p:{id}:tc trade count    p:{id}:lt last trade topo
 //              p:{id}:mc market cap (stored spot, D12)
 //              p:{id}:mh market cap ATH p:{id}:mg market cap at graduation
+//              p:{id}:ah asset hash (set at creation, D13)
+//              p:{id}:ab asset budget earmark (D13)
+//              p:{id}:mi migrated flag  p:{id}:ma migrated at topo (D15)
+//              p:{id}:mx migrated XEL   p:{id}:mt migrated tokens (D15)
+//              p:{id}:ds dex trust synced flag (D17)
 //   Votes    : v:{id}:{round}:{addr} -> bool
-//   Balances : b:{id}:{addr}          -> u64 (token atomic units, 8 dec)
+//   Registry : t:{symbol} -> project id (ticker reservation, D11)
 //
 // ----------------------------------------------------------------------------
 // EVENTS (V6 contract events: id + array of string fields)
@@ -355,45 +510,52 @@
 //   17 RecoveryRequested   [id, round]
 //   18 ProjectInfoUpdated  [id]
 //   19 TeamVestingStarted  [id, duration]
-//   20 TeamClaimed         [id, amount]
+//   20 TeamClaimed         [id]                       — NO amount (D18)
 //   21 DirectListed        [id, liquidity]
 //   22 MigrationFeeTaken   [id, fee]
+//   23 AssetCreated        [id, asset_hex, fee_paid]  (D13)
+//   24 MigratedToDex       [id, xel_sent, tokens_sent] (D15)
+//   25 DexTrustSynced      [id, "1"|"0"]              (D17)
+//   26 DexAddressSet       [dex_hex]                  (D19)
 //
 // ----------------------------------------------------------------------------
 // CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
-//    0   constructor                   1   only_admin                    2   require_project
-//    3   proj_key                      4   vote_key                      5   bal_key
-//    6   fee_take                      7   buy_tokens_out                8   sell_xel_out
-//    9   team_alloc_of                 10  trust_guard                   11  graduate
-//    12  take_migration_fee            13  current_fee_bps               14  team_remaining
-//    15  team_unlocked                 16  propose                       17  support
-//    18  report                        19  finalize_validation           20  buy
-//    21  sell                          22  claim_refund                  23  request_revalidation
-//    24  update_project_info           25  start_team_vesting            26  claim_team_allocation
-//    27  set_submission_fee            28  set_trading_fee               29  set_graduated_trading_fee
-//    30  set_migration_fee             31  set_direct_listing_threshold  32  set_min_liquidity
-//    33  set_min_participants          34  set_min_approval_ratio        35  set_validation_duration
-//    36  set_graduation_multiplier     37  set_team_unlock_delay         38  set_vesting_bounds
-//    39  set_recovery_fee              40  set_recovery_params           41  set_admin
-//    42  set_paused                    43  withdraw_fees                 44  checked_add
-//    45  update_market_cap             46  record_trade                  47  get_project
-//    48  get_project_info              49  get_project_status            50  get_project_tokenomics
-//    51  get_project_trust             52  get_bonding_info              53  get_current_price
-//    54  get_buy_quote                 55  get_sell_quote                56  get_market_cap
-//    57  get_token_balance             58  has_voted                     59  get_total_projects
-//    60  get_projects_by_status        61  get_project_by_rank           62  get_latest_projects
-//    63  get_trusted_projects          64  get_trusted_by_rank           65  get_team_allocation
-//    66  get_protocol_stats            67  get_config                    68  get_recovery_config
-//    69  get_team_config               70  get_social_links              71  get_trading_stats
-//    72  get_market_cap_history        73  get_proposal_data             74  get_volume_stats
-//    75  get_status_label              76  get_version
+//     0  constructor              1  only_admin            2  require_project
+//     3  proj_key                 4  vote_key             5  fee_take
+//     6  buy_tokens_out           7  sell_xel_out         8  team_alloc_of
+//     9  checked_add             10  current_fee_bps     11  team_remaining
+//    12  team_unlocked           13  trust_guard         14  take_migration_fee
+//    15  update_market_cap       16  record_trade        17  graduate
+//    18  create_project_asset    19  migrate_to_dex      20  propose
+//    21  support                 22  report              23  finalize_validation
+//    24  buy                     25  sell                26  claim_refund
+//    27  request_revalidation    28  update_project_info 29  start_team_vesting
+//    30  claim_team_allocation   31  migrate             32  sync_trust_to_dex
+//    33  set_submission_fee      34  set_trading_fee     35  set_graduated_trading_fee
+//    36  set_migration_fee       37  set_direct_listing_threshold
+//    38  set_min_liquidity       39  set_min_participants
+//    40  set_min_approval_ratio  41  set_validation_duration
+//    42  set_graduation_multiplier 43  set_team_unlock_delay
+//    44  set_vesting_bounds      45  set_recovery_fee    46  set_recovery_params
+//    47  set_asset_budget        48  set_dex_address     49  set_admin
+//    50  set_paused              51  withdraw_fees       52  get_project
+//    53  get_project_info        54  get_project_status  55  get_project_tokenomics
+//    56  get_project_trust       57  get_bonding_info    58  get_current_price
+//    59  get_buy_quote           60  get_sell_quote      61  get_market_cap
+//    62  has_voted               63  get_total_projects  64  get_projects_by_status
+//    65  get_project_by_rank     66  get_latest_projects 67  get_trusted_projects
+//    68  get_trusted_by_rank     69  get_team_allocation 70  get_protocol_stats
+//    71  get_config              72  get_recovery_config 73  get_team_config
+//    74  get_social_links        75  get_trading_stats   76  get_market_cap_history
+//    77  get_proposal_data       78  get_volume_stats    79  get_asset_info
+//    80  get_migration_info      81  get_status_label    82  get_version
 //
 //   Auto-verified by scripts/verify_chunk_ids.py on every push: the table
 //   above MUST match the declaration order in this file. Renumbering any
 //   function invalidates the table — regenerate it, never hand-edit around.
 // ============================================================================
 
-const VERSION: string = "VaultLaunch v3.0.0"
+const VERSION: string = "VaultLaunch v4.0.0"
 
 // ---------------------------------------------------------------------------
 // Status codes (see LIFECYCLE)
@@ -413,9 +575,22 @@ const ST_RECOVERY: u64 = 6
 const MAX_PROJECTS: u64 = 8192
 
 // ---------------------------------------------------------------------------
+// Asset parameters (D13)
+// ---------------------------------------------------------------------------
+const TOKEN_DECIMALS: u8 = 8
+
+// ---------------------------------------------------------------------------
+// LaunchDEX cross-call pins (D19) — asserted against the DEX's real chunk
+// table by tests/test_dex_reference.py. DO NOT renumber one side alone.
+// ---------------------------------------------------------------------------
+const DEX_CREATE_POOL_CHUNK: u16 = 6
+const DEX_SET_PAUSED_CHUNK: u16 = 7
+
+// ---------------------------------------------------------------------------
 // Defaults (atomic units, 8 decimals — 1 XEL = 100000000)
 // ---------------------------------------------------------------------------
 const DEFAULT_SUBMISSION_FEE: u64 = 1000000000
+const DEFAULT_ASSET_BUDGET: u64 = 1000000000
 const DEFAULT_MIN_LIQUIDITY: u64 = 50000000000
 const DEFAULT_TRADING_FEE_BPS: u64 = 50
 const DEFAULT_GRADUATED_FEE_BPS: u64 = 25
@@ -437,6 +612,7 @@ const DEFAULT_VESTING_MAX: u64 = 6307200
 // model, never the funds)
 // ---------------------------------------------------------------------------
 const MAX_SUBMISSION_FEE: u64 = 10000000000
+const MAX_ASSET_BUDGET: u64 = 10000000000
 const MIN_LIQUIDITY_FLOOR: u64 = 100000000
 const MAX_MIN_LIQUIDITY: u64 = 10000000000000
 const MAX_TRADING_FEE_BPS: u64 = 1000
@@ -487,6 +663,7 @@ const U64_MAX_128: u128 = 18446744073709551615u128
 const ADMIN_KEY: string = "adm"
 const COUNT_KEY: string = "pc"
 const SUBMISSION_FEE_KEY: string = "sub"
+const ASSET_BUDGET_KEY: string = "abd"
 const MIN_LIQUIDITY_KEY: string = "mnl"
 const TRADING_FEE_KEY: string = "tfe"
 const GRADUATED_FEE_KEY: string = "gfe"
@@ -512,6 +689,9 @@ const XEL_ASSET_KEY: string = "xa"
 const TOTAL_BUY_VOL_KEY: string = "tbv"
 const TOTAL_SELL_VOL_KEY: string = "tsv"
 const TOTAL_TRADES_KEY: string = "ttc"
+const TOTAL_BUDGETS_KEY: string = "tbb"
+const MIGRATED_COUNT_KEY: string = "mgc"
+const DEX_ADDRESS_KEY: string = "dxa"
 
 // ---------------------------------------------------------------------------
 // Project field keys (p:{id}:{field})
@@ -552,10 +732,17 @@ const F_LAST_TRADE: string = "lt"
 const F_MCAP: string = "mc"
 const F_MCAP_HIGH: string = "mh"
 const F_MCAP_GRAD: string = "mg"
+const F_ASSET: string = "ah"
+const F_BUDGET: string = "ab"
+const F_MIGRATED: string = "mi"
+const F_MIG_AT: string = "ma"
+const F_MIG_XEL: string = "mx"
+const F_MIG_TOK: string = "mt"
+const F_DEX_SYNCED: string = "ds"
 
 const PROJ_PREFIX: string = "p:"
 const VOTE_PREFIX: string = "v:"
-const BAL_PREFIX: string = "b:"
+const TICKER_PREFIX: string = "t:"
 
 // ---------------------------------------------------------------------------
 // Event IDs
@@ -582,6 +769,10 @@ const EV_TEAM_VESTING_STARTED: u64 = 19
 const EV_TEAM_CLAIMED: u64 = 20
 const EV_DIRECT_LISTED: u64 = 21
 const EV_MIGRATION_FEE: u64 = 22
+const EV_ASSET_CREATED: u64 = 23
+const EV_MIGRATED: u64 = 24
+const EV_DEX_SYNCED: u64 = 25
+const EV_DEX_ADDRESS: u64 = 26
 
 // ============================================================================
 // 0. CONSTRUCTOR
@@ -589,7 +780,8 @@ const EV_MIGRATION_FEE: u64 = 22
 // Admin = deployer (signer of the deployment transaction). All parameters
 // start at their documented defaults; the admin adjusts them with the
 // set_* entries (range-checked against the hard caps, cross-checked in
-// pairs — see SECURITY).
+// pairs — see SECURITY) and pins the LaunchDEX address (set_dex_address)
+// before the first migration.
 // ============================================================================
 hook constructor() -> u64 {
     let s: Storage = Storage::new()
@@ -599,6 +791,7 @@ hook constructor() -> u64 {
 
     s.store(COUNT_KEY, 0u64)
     s.store(SUBMISSION_FEE_KEY, DEFAULT_SUBMISSION_FEE)
+    s.store(ASSET_BUDGET_KEY, DEFAULT_ASSET_BUDGET)
     s.store(MIN_LIQUIDITY_KEY, DEFAULT_MIN_LIQUIDITY)
     s.store(TRADING_FEE_KEY, DEFAULT_TRADING_FEE_BPS)
     s.store(GRADUATED_FEE_KEY, DEFAULT_GRADUATED_FEE_BPS)
@@ -623,6 +816,8 @@ hook constructor() -> u64 {
     s.store(TOTAL_BUY_VOL_KEY, 0u64)
     s.store(TOTAL_SELL_VOL_KEY, 0u64)
     s.store(TOTAL_TRADES_KEY, 0u64)
+    s.store(TOTAL_BUDGETS_KEY, 0u64)
+    s.store(MIGRATED_COUNT_KEY, 0u64)
     s.store(PAUSED_KEY, false)
 
     s.store(XEL_ASSET_KEY, get_xelis_asset())
@@ -663,129 +858,50 @@ fn vote_key(pid: u64, round: u64, voter: Address) -> string {
     return VOTE_PREFIX + pid.to_string(10u32) + ":" + round.to_string(10u32) + ":" + voter.to_string()
 }
 
-// 5. Storage key of a token balance: "b:{id}:{addr}".
-fn bal_key(pid: u64, owner: Address) -> string {
-    return BAL_PREFIX + pid.to_string(10u32) + ":" + owner.to_string()
-}
-
-// 6. Fee split — floor, in favour of the contract.
+// 5. Fee split — floor, in favour of the contract.
 fn fee_take(amount: u64, bps: u64) -> u64 {
     let wide: u128 = (amount as u128) * (bps as u128) / (BPS_DENOM as u128)
     return wide as u64
 }
 
-// 7. Curve buy math: tokens out for a NET xel amount (fee already removed).
+// 6. Curve buy math: tokens out for a NET xel amount (fee already removed).
 //    tokens_out = C * net / (R + net), floored. Always < C.
 fn buy_tokens_out(reserves: u64, curve_supply: u64, net_xel: u64) -> u64 {
     let wide: u128 = (curve_supply as u128) * (net_xel as u128) / ((reserves as u128) + (net_xel as u128))
     return wide as u64
 }
 
-// 8. Curve sell math: XEL out (gross, before fee) for T tokens.
+// 7. Curve sell math: XEL out (gross, before fee) for T tokens.
 //    gross = R * T / (C + T), floored. Always < R.
 fn sell_xel_out(reserves: u64, curve_supply: u64, tokens: u64) -> u64 {
     let wide: u128 = (reserves as u128) * (tokens as u128) / ((curve_supply as u128) + (tokens as u128))
     return wide as u64
 }
 
-// 9. Team allocation of a project (atomic token units), reserved in the
+// 8. Team allocation of a project (atomic token units), reserved in the
 //    curve from day one, paid out via claim_team_allocation (I1, I4).
 fn team_alloc_of(total_supply: u64, team_bps: u64) -> u64 {
     let wide: u128 = (total_supply as u128) * (team_bps as u128) / (BPS_DENOM as u128)
     return wide as u64
 }
 
-// 10. TRUST GUARD — evaluated after every vote on a project that already
-//     trades (Bonding / Graduated / Trusted). When reports reach the loss
-//     threshold (same bar as validation: quorum + ratio), the project flips
-//     to Untrusted: buys blocked, sells and votes stay open (D4).
-fn trust_guard(pid: u64, status: u64) {
-    if status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED {
-        let s: Storage = Storage::new()
-        let supports: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
-        let reports: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
-        let total: u64 = supports + reports
-        let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
-        let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
-        if total >= min_p {
-            if (reports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
-                s.store(proj_key(pid, F_STATUS), ST_UNTRUSTED)
-                emit_event(EV_TRUST_LOST, [pid.to_string(10u32), reports.to_string(10u32), supports.to_string(10u32)])
-            }
-        }
-    }
+// 9. CHECKED ADD — u64 + u64 with an explicit overflow refusal (I9's
+//    arithmetic backbone). The volume/fee/budget accumulators are the only
+//    counters that grow without bound by design, so every addition on them
+//    goes through this: unreachable in practice, guarded anyway — a
+//    corrupted counter is worse than a refused trade.
+fn checked_add(a: u64, b: u64) -> u64 {
+    let wide: u128 = (a as u128) + (b as u128)
+    require(wide <= U64_MAX_128, "ovf")
+    return wide as u64
 }
 
-// 11. GRADUATE — flips a trading project to Graduated (the milestone), then
-//     takes the one-time migration fee from the curve (D9), BINDS the
-//     declared vesting plan if there is one (D10), and snapshots the
-//     graduation market cap (D12). Team tokens are NOT minted here: they
-//     become claimable (immediately, or through the plan's linear stream)
-//     via claim_team_allocation (D3). Called from buy() when the curve
-//     crossed the graduation threshold, and from finalize_validation() for
-//     a direct listing (both paths converge here — one set of
-//     post-graduation rules).
-fn graduate(pid: u64) {
-    let s: Storage = Storage::new()
-
-    s.store(proj_key(pid, F_STATUS), ST_GRADUATED)
-    s.store(proj_key(pid, F_GRADUATED), true)
-
-    take_migration_fee(pid)
-
-    // D10 — bind the declared vesting plan: the community voted on this
-    // exact schedule; graduate() is where it becomes real. Irreversible by
-    // design (start_team_vesting refuses planned projects afterwards).
-    let plan: u64 = s.load(proj_key(pid, F_VESTING_PLAN)).unwrap_or(0)
-    if plan > 0 {
-        s.store(proj_key(pid, F_VESTING_START), get_current_topoheight())
-        s.store(proj_key(pid, F_VESTING_DURATION), plan)
-        emit_event(EV_TEAM_VESTING_STARTED, [pid.to_string(10u32), plan.to_string(10u32)])
-    }
-
-    // D12 — the milestone number: market cap recomputed AFTER the migration
-    // fee (the honest post-graduation state), stored as the graduation cap.
-    update_market_cap(pid)
-    let cap: u64 = s.load(proj_key(pid, F_MCAP)).unwrap_or(0)
-    s.store(proj_key(pid, F_MCAP_GRAD), cap)
-
-    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
-    let team_bps: u64 = s.load(proj_key(pid, F_TEAM_BPS)).unwrap_or(0)
-    let team: u64 = team_alloc_of(total_supply, team_bps)
-    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
-    emit_event(EV_PROJECT_GRADUATED, [pid.to_string(10u32), reserves.to_string(10u32), team.to_string(10u32)])
-}
-
-// 12. MIGRATION FEE (D9) — taken ONCE per project, at graduation (both
-//     paths, via graduate()). fee = fee_take(reserves, migration_fee_bps)
-//     leaves the curve's reserves and accrues to pending_fees. Safe for I2:
-//     total_curve_xel is untouched and the project's seed liquidity (never
-//     withdrawable except as a locked refund) covers the fee many times
-//     over. No-op when the fee rate is zero.
-fn take_migration_fee(pid: u64) {
-    let s: Storage = Storage::new()
-    let bps: u64 = s.load(MIGRATION_FEE_KEY).unwrap_or(DEFAULT_MIGRATION_FEE_BPS)
-    if bps == 0 {
-        return
-    }
-    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
-    let fee: u64 = fee_take(reserves, bps)
-    if fee == 0 {
-        return
-    }
-    require(reserves >= fee, "curverr")
-    s.store(proj_key(pid, F_RESERVES), reserves - fee)
-    let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
-    s.store(PENDING_FEES_KEY, pending + fee)
-    emit_event(EV_MIGRATION_FEE, [pid.to_string(10u32), fee.to_string(10u32)])
-}
-
-// 13. EFFECTIVE TRADING FEE (D8) — graduated projects trade at
-//     graduated_fee_bps; bonding projects at trading_fee_bps. The clamp
-//     guarantees graduated_fee <= trading_fee even if storage were somehow
-//     inconsistent (defence in depth on top of the cross-checked setters).
-//     Used by buy, sell AND both quotes — a quote can never disagree with
-//     the trade it previews.
+// 10. EFFECTIVE TRADING FEE (D8) — graduated projects trade at
+//     graduated_fee_bps (the curve's post-graduation window, D15); bonding
+//     projects at trading_fee_bps. The clamp guarantees graduated_fee <=
+//     trading_fee even if storage were somehow inconsistent (defence in
+//     depth on top of the cross-checked setters). Used by buy, sell AND
+//     both quotes — a quote can never disagree with the trade it previews.
 fn current_fee_bps(graduated: bool) -> u64 {
     let s: Storage = Storage::new()
     let bonding_fee: u64 = s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
@@ -799,8 +915,9 @@ fn current_fee_bps(graduated: bool) -> u64 {
     return graduated_fee
 }
 
-// 14. Team allocation still owed to the creator: team_alloc - team_paid
-//     (never negative — I4). This is the "unminted team tokens" term of I1.
+// 11. Team allocation still owed to the creator: team_alloc - team_paid
+//     (never negative — I4). This is the escrow the launchpad retains
+//     after migration (I10).
 fn team_remaining(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
@@ -813,7 +930,7 @@ fn team_remaining(pid: u64) -> u64 {
     return team - paid
 }
 
-// 15. TEAM UNLOCK AMOUNT (D3) — how much of the allocation the creator may
+// 12. TEAM UNLOCK AMOUNT (D3) — how much of the allocation the creator may
 //     claim RIGHT NOW: the linear vesting stream if a vesting was started;
 //     the full allocation once graduated (no vesting); the full allocation
 //     for a never-graduated project after team_unlock_delay of bonding (the
@@ -855,7 +972,7 @@ fn team_unlocked(pid: u64) -> u64 {
 
     // Never graduated but still alive after the unlock delay: the late
     // claim that keeps founders motivated (D3). Rejected/Validation
-    // projects return 0 — a rejected launch never mints team tokens.
+    // projects return 0 — a rejected launch never pays team tokens.
     let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
     if status == ST_BONDING || status == ST_UNTRUSTED || status == ST_RECOVERY {
         let bonding_start: u64 = s.load(proj_key(pid, F_BONDING_START)).unwrap_or(0)
@@ -869,36 +986,346 @@ fn team_unlocked(pid: u64) -> u64 {
     return 0
 }
 
+// 13. TRUST GUARD — evaluated after every vote on a project that already
+//     trades (Bonding / Graduated / Trusted). When reports reach the loss
+//     threshold (same bar as validation: quorum + ratio), the project flips
+//     to Untrusted: buys blocked (curve directly; pool after sync — D17),
+//     sells and votes stay open (D4).
+fn trust_guard(pid: u64, status: u64) {
+    if status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED {
+        let s: Storage = Storage::new()
+        let supports: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
+        let reports: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
+        let total: u64 = supports + reports
+        let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
+        let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
+        if total >= min_p {
+            if (reports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
+                s.store(proj_key(pid, F_STATUS), ST_UNTRUSTED)
+                emit_event(EV_TRUST_LOST, [pid.to_string(10u32), reports.to_string(10u32), supports.to_string(10u32)])
+            }
+        }
+    }
+}
+
+// 14. MIGRATION FEE (D9) — taken ONCE per project, at graduation (both
+//     paths, via graduate()). fee = fee_take(reserves, migration_fee_bps)
+//     leaves the curve's reserves (and total_curve_xel with it — D20) and
+//     accrues to pending_fees. The XEL commitment identity is untouched:
+//     the fee moves from the curve side to the fees side of I2's RHS.
+//     No-op when the fee rate is zero.
+fn take_migration_fee(pid: u64) {
+    let s: Storage = Storage::new()
+    let bps: u64 = s.load(MIGRATION_FEE_KEY).unwrap_or(DEFAULT_MIGRATION_FEE_BPS)
+    if bps == 0 {
+        return
+    }
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let fee: u64 = fee_take(reserves, bps)
+    if fee == 0 {
+        return
+    }
+    require(reserves >= fee, "curverr")
+    s.store(proj_key(pid, F_RESERVES), reserves - fee)
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    require(curve_xel >= fee, "accerr")
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel - fee)
+    let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+    s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+    emit_event(EV_MIGRATION_FEE, [pid.to_string(10u32), fee.to_string(10u32)])
+}
+
+// 15. UPDATE MARKET CAP (D12) — recompute the spot market cap from the
+//     curve's live state (same formula as the pure get_market_cap view) and
+//     STORE it: mc = current spot, mh = all-time high (monotone). Idempotent
+//     by construction. Post-migration the curve is closed (curve_supply 0)
+//     and mc freezes at 0 — the live cap moves to the DEX era (D12).
+fn update_market_cap(pid: u64) {
+    let s: Storage = Storage::new()
+    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    let cap: u64 = 0
+    if curve_supply > 0 {
+        let team_rem: u128 = team_remaining(pid) as u128
+        let circulating: u128 = (total_supply as u128) - (curve_supply as u128) - team_rem
+        if circulating > 0 {
+            let wide: u128 = (reserves as u128) * circulating / (curve_supply as u128)
+            if wide <= U64_MAX_128 {
+                cap = wide as u64
+            } else {
+                cap = U64_MAX
+            }
+        }
+    }
+    s.store(proj_key(pid, F_MCAP), cap)
+    let high: u64 = s.load(proj_key(pid, F_MCAP_HIGH)).unwrap_or(0)
+    if cap > high {
+        s.store(proj_key(pid, F_MCAP_HIGH), cap)
+    }
+}
+
+// 16. RECORD TRADE (D12) — the single funnel through which every curve
+//     buy/sell updates the scoreboard, so the volume identity (I9) holds by
+//     construction. Buy side records the ATTACHED amount (fee included);
+//     sell side records the PRE-FEE gross out.
+fn record_trade(pid: u64, buy_side: bool, xel_amount: u64) {
+    let s: Storage = Storage::new()
+    if buy_side {
+        let bv: u64 = s.load(proj_key(pid, F_BUY_VOL)).unwrap_or(0)
+        s.store(proj_key(pid, F_BUY_VOL), checked_add(bv, xel_amount))
+        let tbv: u64 = s.load(TOTAL_BUY_VOL_KEY).unwrap_or(0)
+        s.store(TOTAL_BUY_VOL_KEY, checked_add(tbv, xel_amount))
+    } else {
+        let sv: u64 = s.load(proj_key(pid, F_SELL_VOL)).unwrap_or(0)
+        s.store(proj_key(pid, F_SELL_VOL), checked_add(sv, xel_amount))
+        let tsv: u64 = s.load(TOTAL_SELL_VOL_KEY).unwrap_or(0)
+        s.store(TOTAL_SELL_VOL_KEY, checked_add(tsv, xel_amount))
+    }
+    let vo: u64 = s.load(proj_key(pid, F_VOLUME)).unwrap_or(0)
+    s.store(proj_key(pid, F_VOLUME), checked_add(vo, xel_amount))
+    let tvl: u64 = s.load(TOTAL_VOLUME_KEY).unwrap_or(0)
+    s.store(TOTAL_VOLUME_KEY, checked_add(tvl, xel_amount))
+    let tc: u64 = s.load(proj_key(pid, F_TRADES)).unwrap_or(0)
+    s.store(proj_key(pid, F_TRADES), checked_add(tc, 1))
+    let ttc: u64 = s.load(TOTAL_TRADES_KEY).unwrap_or(0)
+    s.store(TOTAL_TRADES_KEY, checked_add(ttc, 1))
+    s.store(proj_key(pid, F_LAST_TRADE), get_current_topoheight())
+}
+
+// 17. GRADUATE — flips a trading project to Graduated (the milestone), then
+//     takes the one-time migration fee from the curve (D9), BINDS the
+//     declared vesting plan if there is one (D10), and snapshots the
+//     graduation market cap (D12). Team tokens are NOT sent here: they
+//     stay in the escrow (I10) and become claimable (immediately, or
+//     through the plan's linear stream) via claim_team_allocation (D3).
+//     Funds are NOT moved either: the curve keeps trading at the graduated
+//     fee (D8) until the permissionless migrate() moves everything to the
+//     LaunchDEX pool (D15). Called from buy() when the curve crossed the
+//     graduation threshold, and from finalize_validation() for a direct
+//     listing (both paths converge here — one set of post-graduation
+//     rules).
+fn graduate(pid: u64) {
+    let s: Storage = Storage::new()
+
+    s.store(proj_key(pid, F_STATUS), ST_GRADUATED)
+    s.store(proj_key(pid, F_GRADUATED), true)
+
+    take_migration_fee(pid)
+
+    // D10 — bind the declared vesting plan: the community voted on this
+    // exact schedule; graduate() is where it becomes real. Irreversible by
+    // design (start_team_vesting refuses planned projects afterwards).
+    let plan: u64 = s.load(proj_key(pid, F_VESTING_PLAN)).unwrap_or(0)
+    if plan > 0 {
+        s.store(proj_key(pid, F_VESTING_START), get_current_topoheight())
+        s.store(proj_key(pid, F_VESTING_DURATION), plan)
+        emit_event(EV_TEAM_VESTING_STARTED, [pid.to_string(10u32), plan.to_string(10u32)])
+    }
+
+    // D12 — the milestone number: market cap recomputed AFTER the migration
+    // fee (the honest post-graduation state), stored as the graduation cap.
+    update_market_cap(pid)
+    let cap: u64 = s.load(proj_key(pid, F_MCAP)).unwrap_or(0)
+    s.store(proj_key(pid, F_MCAP_GRAD), cap)
+
+    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
+    let team_bps: u64 = s.load(proj_key(pid, F_TEAM_BPS)).unwrap_or(0)
+    let team: u64 = team_alloc_of(total_supply, team_bps)
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    emit_event(EV_PROJECT_GRADUATED, [pid.to_string(10u32), reserves.to_string(10u32), team.to_string(10u32)])
+}
+
+// 18. CREATE PROJECT ASSET (D13) — the real token is born. Called by
+//     finalize_validation on a PASSED vote, BEFORE any state flip (a
+//     failed creation reverts the whole finalize: the project stays in
+//     Validation and can be finalized again — e.g. with a budget top-up).
+//
+//     Asset::create with MaxSupplyMode::Fixed: the ENTIRE supply is minted
+//     to this contract at creation and can never be increased — the max
+//     cap is enforced by the XELIS protocol itself. The chain's asset
+//     creation cost is measured by balance-delta (robust to any fee
+//     change), paid from the project's earmarked budget (collected at
+//     propose) plus any top-up attached to the finalize transaction, and
+//     the unused part is refunded to the creator on the spot.
+fn create_project_asset(pid: u64) {
+    let s: Storage = Storage::new()
+
+    // The asset is created exactly once per project (finalize only runs on
+    // a Validation/Recovery pass, and the asset slot is write-once).
+    require(s.load(proj_key(pid, F_ASSET)).is_none(), "exists")
+
+    let name: string = s.load(proj_key(pid, F_NAME)).unwrap_or("")
+    let symbol: string = s.load(proj_key(pid, F_SYMBOL)).unwrap_or("")
+    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let topup: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+
+    // Measure the protocol's creation fee by balance-delta. The deposit
+    // (if any) is already credited, so the delta isolates exactly what
+    // Asset::create charged.
+    let bal_before: u64 = get_balance_for_asset(xel).unwrap_or(0)
+
+    let asset_opt: optional<Asset> = Asset::create(
+        pid,
+        name,
+        symbol,
+        TOKEN_DECIMALS,
+        MaxSupplyMode::Fixed { max_supply: total_supply }
+    )
+    require(asset_opt.is_some(), "assetcr")
+    let asset: Asset = asset_opt.expect("guarded")
+    let hash: Hash = asset.get_hash()
+
+    let bal_after: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    require(bal_before >= bal_after, "accerr")
+    let fee_paid: u64 = bal_before - bal_after
+
+    // D13's safety check: Fixed mode must have delivered the WHOLE supply
+    // to this contract. Anything less reverts the finalize.
+    let tok_bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+    require(tok_bal == total_supply, "assetbal")
+
+    // Budget accounting: earmark + top-up must cover the fee; the unused
+    // part goes back to the creator immediately.
+    let budget: u64 = s.load(proj_key(pid, F_BUDGET)).unwrap_or(0)
+    let avail: u64 = checked_add(budget, topup)
+    require(avail >= fee_paid, "budget")
+
+    s.store(proj_key(pid, F_BUDGET), 0u64)
+    if budget > 0 {
+        let tbb: u64 = s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
+        require(tbb >= budget, "accerr")
+        s.store(TOTAL_BUDGETS_KEY, tbb - budget)
+    }
+
+    let creator_opt: optional<Address> = s.load(proj_key(pid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+
+    let refund: u64 = avail - fee_paid
+    if refund > 0 {
+        let ok: bool = transfer(creator, refund, xel)
+        require(ok, "txfail")
+    }
+
+    s.store(proj_key(pid, F_ASSET), hash)
+    emit_event(EV_ASSET_CREATED, [pid.to_string(10u32), hash.to_hex(), fee_paid.to_string(10u32)])
+}
+
+// 19. MIGRATE TO DEX (D15, internal) — the atomic move. Takes the curve's
+//     whole XEL reserves and its whole token inventory (team escrow
+//     excepted — I10) and seeds a permanent LaunchDEX pool with them via
+//     ONE cross-contract call carrying both amounts as attached deposits.
+//     Everything (state flips, global accounting, the deposits, the pool
+//     creation) is one transaction: a failure anywhere reverts it all.
+//     If the project is Untrusted at migration time, the pool's buys are
+//     paused in the SAME transaction (D17 — no unprotected window).
+fn migrate_to_dex(pid: u64) {
+    let s: Storage = Storage::new()
+
+    let dex_opt: optional<Hash> = s.load(DEX_ADDRESS_KEY)
+    require(dex_opt.is_some(), "nodex")
+    let dex: Hash = dex_opt.expect("guarded")
+
+    let asset_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+
+    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
+    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
+    require(reserves >= 1 && curve_supply >= 1, "empty")
+
+    // Belt-and-braces solvency (I2/I10 guarantee these; refuse loudly if
+    // accounting ever disagrees — a broken migration is better than a
+    // short one).
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let xel_bal: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    require(reserves <= xel_bal, "accerr")
+    let tok_bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    let team_rem: u64 = team_remaining(pid)
+    require((curve_supply as u128) + (team_rem as u128) <= (tok_bal as u128), "accerr")
+
+    // STATE FIRST (atomic with the call below): close the curve, snapshot
+    // what is being sent, update the global XEL accounting (D20).
+    s.store(proj_key(pid, F_MIGRATED), true)
+    s.store(proj_key(pid, F_MIG_AT), get_current_topoheight())
+    s.store(proj_key(pid, F_MIG_XEL), reserves)
+    s.store(proj_key(pid, F_MIG_TOK), curve_supply)
+    s.store(proj_key(pid, F_RESERVES), 0u64)
+    s.store(proj_key(pid, F_CURVE), 0u64)
+
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    require(curve_xel >= reserves, "accerr")
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel - reserves)
+
+    let migrated_count: u64 = s.load(MIGRATED_COUNT_KEY).unwrap_or(0)
+    s.store(MIGRATED_COUNT_KEY, checked_add(migrated_count, 1))
+
+    update_market_cap(pid)
+
+    // Permission precheck (clear refusal for wallets that did not grant
+    // the contract-call permission on this transaction).
+    require(is_contract_callable(dex, DEX_CREATE_POOL_CHUNK), "txperm")
+
+    let target_opt: optional<Contract> = Contract::new(dex)
+    require(target_opt.is_some(), "dexgone")
+    let target: Contract = target_opt.expect("guarded")
+
+    // The deposits carry BOTH sides of the seed; the DEX reads exactly
+    // what arrived (single source of truth).
+    let deposits: map<Hash, u64> = {}
+    deposits.insert(xel, reserves)
+    deposits.insert(asset, curve_supply)
+    target.call(DEX_CREATE_POOL_CHUNK, [asset], deposits)
+
+    // Untrusted at migration time: pause the pool's buys in the SAME
+    // transaction (D17). Sells stay open on both venues, always (D4).
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    if status == ST_UNTRUSTED {
+        require(is_contract_callable(dex, DEX_SET_PAUSED_CHUNK), "txperm")
+        target.call(DEX_SET_PAUSED_CHUNK, [asset, true], {})
+        s.store(proj_key(pid, F_DEX_SYNCED), true)
+    }
+}
 // ============================================================================
-// 16. PROPOSE — submit a project to the community filter.
+// 20. PROPOSE — submit a project to the community filter.
 // ============================================================================
 // @caller: the project creator (a wallet).
 // @params: name, symbol, description, website, logo, twitter, telegram,
 //             discord — display metadata (length-capped; social links may be
 //             empty = "no link"; the team can update description, website,
 //             logo AND socials at any time via update_project_info — D11);
-//          total_supply — token supply in atomic units (8 decimals),
-//             capped to [MIN_TOTAL_SUPPLY, MAX_TOTAL_SUPPLY];
+//          total_supply — the token's FIXED supply in atomic units
+//             (8 decimals), capped to [MIN_TOTAL_SUPPLY, MAX_TOTAL_SUPPLY].
+//             This is the asset's max_supply at creation (D13): the WHOLE
+//             supply is minted to the contract at validation success and
+//             NOTHING can ever be minted past it;
 //          team_bps — team allocation in basis points, <= 20%;
 //          vesting_duration — the TEAM VESTING PLAN (D10): 0 = claim at
-//             graduation (the classic reward), any value inside
-//             [vesting_min, vesting_max] (SNAPSHOTTED NOW, like the
-//             direct-listing threshold) is a declared plan that
-//             graduate() will BIND automatically: the community votes with
-//             the exact unlock schedule on the table.
-// @attached: EXACTLY submission_fee + the founder's liquidity, where the
-//             liquidity is >= min_liquidity and <= MAX_LIQUIDITY. The fee
-//             joins pending_fees immediately (non-refundable); the liquidity
-//             is locked as the curve's seed reserves.
+//             graduation, any value inside [vesting_min, vesting_max]
+//             (SNAPSHOTTED NOW) is a declared plan that graduate() will
+//             BIND automatically.
+// @attached: EXACTLY submission_fee + asset_budget + the founder's
+//             liquidity, where liquidity is >= min_liquidity and <=
+//             MAX_LIQUIDITY. The fee joins pending_fees immediately
+//             (non-refundable); the budget is EARMARKED for the chain's
+//             asset creation cost (D13 — unused part refunded at creation,
+//             or with the refund on rejection); the liquidity is locked as
+//             the curve's seed reserves.
 // @returns: the project id.
 // @direct listing (D7): if the locked liquidity >= direct_listing_threshold
-//             (SNAPSHOTTED NOW — later admin tuning never reclassifies an
-//             existing proposal), the project is flagged to graduate the
+//             (SNAPSHOTTED NOW), the project is flagged to graduate the
 //             moment validation passes.
-// @security: paused check, capacity check, metadata caps (socials included),
-//            supply/team caps, plan bounds snapshot, deposit lower bound
-//            (fee + min_liquidity), everything stored under fresh keys — no
-//            user-controlled key material.
+// @ticker registry (D11): the symbol is reserved launchpad-wide at propose
+//             time — first project wins it, forever (chain-wide, XELIS
+//             tickers are self-declared; this registry keeps OUR listings
+//             unambiguous).
+// @security: paused check, capacity check, metadata caps, supply/team caps,
+//            plan bounds snapshot, ticker reservation, deposit lower bound,
+//            everything stored under fresh keys (the ticker registry key is
+//            built from a length-capped symbol in a dedicated "t:" namespace).
 // ============================================================================
 entry propose(name: string, symbol: string, description: string, website: string, logo: string, twitter: string, telegram: string, discord: string, total_supply: u64, team_bps: u64, vesting_duration: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -917,6 +1344,10 @@ entry propose(name: string, symbol: string, description: string, website: string
     require(telegram.len() <= MAX_URL_LEN, "badtg")
     require(discord.len() <= MAX_URL_LEN, "baddc")
 
+    // Ticker reservation (D11): one launchpad project per symbol, forever.
+    let ticker_key: string = TICKER_PREFIX + symbol
+    require(s.load(ticker_key).is_none(), "tick")
+
     // Tokenomics caps.
     require(total_supply >= MIN_TOTAL_SUPPLY && total_supply <= MAX_TOTAL_SUPPLY, "badsupply")
     require(team_bps <= MAX_TEAM_BPS, "badteam")
@@ -929,13 +1360,15 @@ entry propose(name: string, symbol: string, description: string, website: string
     let plan_max: u64 = s.load(VESTING_MAX_KEY).unwrap_or(DEFAULT_VESTING_MAX)
     require(vesting_duration == 0 || (vesting_duration >= plan_min && vesting_duration <= plan_max), "badplan")
 
-    // Funds: fee (to the admin) + seed liquidity (locked in the curve).
+    // Funds: fee (to the admin) + asset budget (earmarked, D13) + seed
+    // liquidity (locked in the curve).
     let sub_fee: u64 = s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE)
+    let budget: u64 = s.load(ASSET_BUDGET_KEY).unwrap_or(DEFAULT_ASSET_BUDGET)
     let min_liq: u64 = s.load(MIN_LIQUIDITY_KEY).unwrap_or(DEFAULT_MIN_LIQUIDITY)
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
     let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
-    require(dep >= sub_fee + min_liq, "needliq")
-    let liquidity: u64 = dep - sub_fee
+    require(dep >= sub_fee + budget + min_liq, "needliq")
+    let liquidity: u64 = dep - sub_fee - budget
     require(liquidity <= MAX_LIQUIDITY, "toobig")
 
     let caller_opt: optional<Address> = get_caller()
@@ -956,11 +1389,16 @@ entry propose(name: string, symbol: string, description: string, website: string
     s.store(proj_key(pid, F_SUPPLY), total_supply)
     s.store(proj_key(pid, F_TEAM_BPS), team_bps)
     s.store(proj_key(pid, F_LIQUIDITY), liquidity)
+    s.store(proj_key(pid, F_BUDGET), budget)
 
     // Curve opening state: reserves = seed liquidity; the curve's sellable
     // supply EXCLUDES the team allocation (reserved until claimed — D3).
     s.store(proj_key(pid, F_RESERVES), liquidity)
     s.store(proj_key(pid, F_CURVE), total_supply - team_alloc_of(total_supply, team_bps))
+
+    // D20: the seed joins the global curve accounting (exact-sum model).
+    s.store(TOTAL_CURVE_XEL_KEY, checked_add(s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0), liquidity))
+    s.store(TOTAL_BUDGETS_KEY, checked_add(s.load(TOTAL_BUDGETS_KEY).unwrap_or(0), budget))
 
     // Two-path snapshot (D7): big liquidity graduates directly at
     // validation success; the threshold is read ONCE, here.
@@ -975,6 +1413,13 @@ entry propose(name: string, symbol: string, description: string, website: string
     s.store(proj_key(pid, F_VESTING_DURATION), 0u64)
     s.store(proj_key(pid, F_VESTING_PLAN), vesting_duration)
     s.store(proj_key(pid, F_BONDING_START), 0u64)
+
+    // Migration bookkeeping (D15/D17): nothing migrated, nothing synced.
+    s.store(proj_key(pid, F_MIGRATED), false)
+    s.store(proj_key(pid, F_MIG_AT), 0u64)
+    s.store(proj_key(pid, F_MIG_XEL), 0u64)
+    s.store(proj_key(pid, F_MIG_TOK), 0u64)
+    s.store(proj_key(pid, F_DEX_SYNCED), false)
 
     // Voting round 0 opens now.
     s.store(proj_key(pid, F_ROUND), 0u64)
@@ -998,10 +1443,11 @@ entry propose(name: string, symbol: string, description: string, website: string
     s.store(proj_key(pid, F_MCAP_GRAD), 0u64)
 
     s.store(COUNT_KEY, pid + 1)
+    s.store(ticker_key, pid)
 
     if sub_fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
-        s.store(PENDING_FEES_KEY, pending + sub_fee)
+        s.store(PENDING_FEES_KEY, checked_add(pending, sub_fee))
     }
 
     emit_event(EV_PROJECT_CREATED, [pid.to_string(10u32), name, symbol, liquidity.to_string(10u32)])
@@ -1009,7 +1455,7 @@ entry propose(name: string, symbol: string, description: string, website: string
 }
 
 // ============================================================================
-// 17. SUPPORT — vote FOR a project (validation round or ongoing trust).
+// 21. SUPPORT — vote FOR a project (validation round or ongoing trust).
 // ============================================================================
 // One vote per address per round (I5). During an open validation window the
 // vote counts towards the pass threshold; afterwards it keeps accumulating
@@ -1044,10 +1490,11 @@ entry support(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 18. REPORT — vote AGAINST a project (validation round or ongoing trust).
+// 22. REPORT — vote AGAINST a project (validation round or ongoing trust).
 // ============================================================================
 // Mirror of support(). Enough reports on a trading project flip it to
-// Untrusted (buys blocked, sells open — D4).
+// Untrusted (buys blocked on the curve directly and — once synced — on the
+// pool; sells open everywhere — D4/D17).
 // ============================================================================
 entry report(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1078,18 +1525,26 @@ entry report(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 19. FINALIZE VALIDATION — apply the outcome of a closed voting window.
+// 23. FINALIZE VALIDATION — apply the outcome of a closed voting window.
 // ============================================================================
 // @caller: ANYONE, after the window's deadline (permissionless finalizer —
 //          the outcome is fully determined by the public tallies, this only
 //          executes it; the founder has a natural incentive to call it for
 //          a refund on failure, the community on success).
+// @attached (optional): a XEL top-up for the asset budget (D13) — only
+//          useful if the chain's asset creation cost rose above the
+//          earmarked budget between propose and finalize; the unused part
+//          of budget + top-up is refunded to the creator in the same
+//          transaction.
 // @rules:  initial window  : pass >= min_participants voters AND >= 80%
-//                             support -> Bonding, OR direct listing when
-//                             the proposal locked >= the threshold (D7):
+//                             support -> [D13] Asset::create (the REAL
+//                             token is born; failure reverts everything),
+//                             then Bonding, OR direct listing when the
+//                             proposal locked >= the threshold (D7):
 //                             graduation on the spot (migration fee taken,
-//                             graduated fee, team unlock). Fail -> Rejected
-//                             (liquidity becomes refundable once).
+//                             pool seedable the same block via migrate).
+//                             Fail -> Rejected (liquidity + asset budget
+//                             become refundable once).
 //          recovery window : graduated projects use the STRICTER recovery
 //                             thresholds; pass -> Trusted, fail -> Untrusted
 // ============================================================================
@@ -1110,12 +1565,18 @@ entry finalize_validation(pid: u64) -> u64 {
         let min_p: u64 = s.load(MIN_PARTICIPANTS_KEY).unwrap_or(DEFAULT_MIN_PARTICIPANTS)
         let ratio: u64 = s.load(MIN_APPROVAL_KEY).unwrap_or(DEFAULT_MIN_APPROVAL_BPS)
         if total >= min_p && (supports as u128) * 10000u128 >= (ratio as u128) * (total as u128) {
+            // The REAL token is born HERE (D13) — before any state flip, so
+            // a failed creation (budget overrun, chain refusal) leaves the
+            // project untouched in Validation, retryable with a top-up.
+            create_project_asset(pid)
+
             // Trading starts now, one way or the other.
             s.store(proj_key(pid, F_BONDING_START), get_current_topoheight())
             let dl: bool = s.load(proj_key(pid, F_DL)).unwrap_or(false)
             if dl {
                 // Direct listing (D7): serious liquidity skips the bonding
-                // phase — graduation (and its advantages) on day one.
+                // phase — graduation (and its advantages) on day one. The
+                // pool can be seeded the same block via migrate(pid).
                 graduate(pid)
                 let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
                 emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "1"])
@@ -1129,8 +1590,16 @@ entry finalize_validation(pid: u64) -> u64 {
         }
         s.store(proj_key(pid, F_STATUS), ST_REJECTED)
         let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+        let budget: u64 = s.load(proj_key(pid, F_BUDGET)).unwrap_or(0)
         let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
-        s.store(LOCKED_REFUNDS_KEY, locked + liquidity)
+        s.store(LOCKED_REFUNDS_KEY, checked_add(locked, liquidity))
+        // D20: the rejected curve's seed leaves the live-reserve sum (it is
+        // now a refund-in-waiting); the budget stays earmarked until the
+        // refund is claimed.
+        let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+        require(curve_xel >= liquidity, "accerr")
+        s.store(TOTAL_CURVE_XEL_KEY, curve_xel - liquidity)
+        s.store(proj_key(pid, F_RESERVES), 0u64)
         emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "0"])
         return 0
     }
@@ -1158,20 +1627,25 @@ entry finalize_validation(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 20. BUY — trade XEL for tokens on a project's curve.
+// 24. BUY — trade XEL for REAL tokens on a project's curve (D14).
 // ============================================================================
-// @caller: anyone (a wallet). Blocked while paused and while the project is
-//          Untrusted or in a voting window (D4) — the ONLY ways buys stop.
+// @caller: anyone (a wallet). Blocked while paused, while the project is
+//          Untrusted or in a voting window (D4), and after migration (the
+//          curve is closed — buy on the DEX, D15) — the ONLY ways curve
+//          buys stop.
 // @attached: XEL in [MIN_BUY_XEL, MAX_TRADE_XEL]. The trading fee (bonding
 //            or graduated rate, D8) goes to pending_fees; the NET amount
 //            joins the reserves; tokens out follow the constant-product
-//            formula (floored, u128 math).
-// @returns: tokens received (atomic units).
+//            formula (floored, u128 math) and are TRANSFERRED to the
+//            caller's wallet — a native confidential transfer of a real
+//            XELIS asset (D1/D18).
+// @returns: tokens received (atomic units), already in the caller's wallet.
 // @graduation: if this buy pushes the reserves to
 //              liquidity * graduation_multiplier while Bonding, the project
-//              graduates (status flip + one-time migration fee — D9);
-//              the team allocation becomes claimable (D3). Trading
-//              continues (D2).
+//              graduates (status flip + one-time migration fee — D9); the
+//              team allocation becomes claimable (D3). The curve keeps
+//              serving trades at the graduated fee until migrate() moves
+//              everything to the DEX pool (D15).
 // ============================================================================
 entry buy(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1180,6 +1654,7 @@ entry buy(pid: u64) -> u64 {
 
     let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
     require(status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED, "notrade")
+    require(s.load(proj_key(pid, F_MIGRATED)).unwrap_or(false) == false, "migrated")
 
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
     let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
@@ -1203,25 +1678,28 @@ entry buy(pid: u64) -> u64 {
     require(caller_opt.is_some(), "walletonly")
     let caller: Address = caller_opt.expect("guarded")
 
-    // Curve state (net joins reserves, tokens leave the curve).
+    // Curve state (net joins reserves, tokens leave the inventory — D14).
     let new_reserves: u64 = reserves + net
     s.store(proj_key(pid, F_RESERVES), new_reserves)
     s.store(proj_key(pid, F_CURVE), curve_supply - tokens)
-
-    // Buyer's internal ledger.
-    let bkey: string = bal_key(pid, caller)
-    let bal: u64 = s.load(bkey).unwrap_or(0)
-    s.store(bkey, bal + tokens)
+    s.store(TOTAL_CURVE_XEL_KEY, checked_add(s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0), net))
 
     // Accounting (D12): directional + total volume, trade count, last
     // trade topo — per project and protocol-wide, all overflow-guarded.
     record_trade(pid, true, dep)
-    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
-    s.store(TOTAL_CURVE_XEL_KEY, curve_xel + net)
     if fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
-        s.store(PENDING_FEES_KEY, pending + fee)
+        s.store(PENDING_FEES_KEY, checked_add(pending, fee))
     }
+
+    // The REAL tokens go to the buyer's wallet (I1: balance follows the
+    // inventory — the transfer and the curve update cancel out on the
+    // contract's asset balance).
+    let asset_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let ok: bool = transfer(caller, tokens, asset)
+    require(ok, "txfail")
 
     emit_event(EV_TOKENS_BOUGHT, [pid.to_string(10u32), dep.to_string(10u32), tokens.to_string(10u32), fee.to_string(10u32)])
 
@@ -1241,28 +1719,37 @@ entry buy(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 21. SELL — trade tokens back for XEL. NEVER blockable (D4, I8).
+// 25. SELL — trade REAL tokens back for XEL. NEVER blockable (D4, I8).
 // ============================================================================
-// Works in Bonding, Graduated, Trusted, Untrusted AND during a recovery
-// window: holders can always exit. The gross XEL leaves the reserves; the
-// trading fee (graduated rate if the project graduated — D8) goes to
-// pending_fees; the rest is transferred to the caller (checked transfer).
+// Works in Bonding, Graduated (pre-migration), Trusted, Untrusted AND
+// during a recovery window: holders can always exit. The WHOLE attached
+// token deposit is sold (symmetric with buy — nothing can be stranded);
+// the tokens return to the curve's inventory (the deposit credited the
+// contract's balance), the gross XEL leaves the reserves, the trading fee
+// (graduated rate if the project graduated — D8) goes to pending_fees, and
+// the rest is transferred to the caller (checked transfer). After
+// migration the curve is closed — holders sell on the DEX pool instead
+// (sells there are never pausable either, D4/D17).
 // ============================================================================
-entry sell(pid: u64, token_amount: u64) -> u64 {
+entry sell(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
 
     let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
     require(status == ST_BONDING || status == ST_GRADUATED || status == ST_TRUSTED || status == ST_UNTRUSTED || status == ST_RECOVERY, "nosell")
+    require(s.load(proj_key(pid, F_MIGRATED)).unwrap_or(false) == false, "migrated")
 
     let caller_opt: optional<Address> = get_caller()
     require(caller_opt.is_some(), "walletonly")
     let caller: Address = caller_opt.expect("guarded")
 
-    require(token_amount >= 1, "badamt")
-    let bkey: string = bal_key(pid, caller)
-    let bal: u64 = s.load(bkey).unwrap_or(0)
-    require(bal >= token_amount, "nobal")
+    // The sale amount IS the attached token deposit (D14 — whole-deposit
+    // semantics; a partial sale would strand the rest).
+    let asset_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let dep: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+    require(dep >= 1, "nosell")
 
     let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
     let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
@@ -1270,34 +1757,33 @@ entry sell(pid: u64, token_amount: u64) -> u64 {
 
     let graduated: bool = s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false)
     let bps: u64 = current_fee_bps(graduated)
-    let gross: u64 = sell_xel_out(reserves, curve_supply, token_amount)
+    let gross: u64 = sell_xel_out(reserves, curve_supply, dep)
     require(gross >= 1, "tiny")
     let fee: u64 = fee_take(gross, bps)
     let out: u64 = gross - fee
     require(out >= 1, "tinyout")
     require(reserves >= gross, "curverr")
 
-    // Curve state (tokens return to the curve, gross XEL leaves reserves).
+    // Curve state (tokens return to the inventory, gross XEL leaves
+    // reserves — D14/D20).
     s.store(proj_key(pid, F_RESERVES), reserves - gross)
-    s.store(proj_key(pid, F_CURVE), curve_supply + token_amount)
-    s.store(bkey, bal - token_amount)
-
-    // Accounting (D12): sell-side volume uses the PRE-FEE gross, exactly
-    // like the legacy total (vo) always did.
-    record_trade(pid, false, gross)
+    s.store(proj_key(pid, F_CURVE), curve_supply + dep)
     let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
     require(curve_xel >= gross, "accerr")
     s.store(TOTAL_CURVE_XEL_KEY, curve_xel - gross)
+
+    // Accounting (D12): sell-side volume uses the PRE-FEE gross.
+    record_trade(pid, false, gross)
     if fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
-        s.store(PENDING_FEES_KEY, pending + fee)
+        s.store(PENDING_FEES_KEY, checked_add(pending, fee))
     }
 
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
     let ok: bool = transfer(caller, out, xel)
     require(ok, "txfail")
 
-    emit_event(EV_TOKENS_SOLD, [pid.to_string(10u32), token_amount.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
+    emit_event(EV_TOKENS_SOLD, [pid.to_string(10u32), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
 
     // D12 — stored market cap follows every curve state change.
     update_market_cap(pid)
@@ -1305,12 +1791,13 @@ entry sell(pid: u64, token_amount: u64) -> u64 {
 }
 
 // ============================================================================
-// 22. CLAIM REFUND — the founder's exit on a REJECTED project.
+// 26. CLAIM REFUND — the founder's exit on a REJECTED project.
 // ============================================================================
 // Only for a project that FAILED its initial validation, only by the
-// creator, exactly once: 100% of the deposited liquidity is returned.
-// (Projects that reached trading can never be "rejected" — the curve's XEL
-// then belongs to the market, not to the founder alone.)
+// creator, exactly once: 100% of the deposited liquidity AND the unused
+// asset budget (no asset was ever created — D13) are returned. (Projects
+// that reached trading can never be "rejected" — the curve's XEL then
+// belongs to the market, not to the founder alone.)
 // ============================================================================
 entry claim_refund(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1330,22 +1817,30 @@ entry claim_refund(pid: u64) -> u64 {
 
     require(s.load(proj_key(pid, F_REFUND)).unwrap_or(false) == false, "claimed")
     let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
+    let budget: u64 = s.load(proj_key(pid, F_BUDGET)).unwrap_or(0)
     s.store(proj_key(pid, F_REFUND), true)
+    s.store(proj_key(pid, F_BUDGET), 0u64)
 
     let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
     require(locked >= liquidity, "accerr")
     s.store(LOCKED_REFUNDS_KEY, locked - liquidity)
+    if budget > 0 {
+        let tbb: u64 = s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
+        require(tbb >= budget, "accerr")
+        s.store(TOTAL_BUDGETS_KEY, tbb - budget)
+    }
 
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
-    let ok: bool = transfer(caller, liquidity, xel)
+    let total: u64 = checked_add(liquidity, budget)
+    let ok: bool = transfer(caller, total, xel)
     require(ok, "txfail")
 
-    emit_event(EV_REFUND_CLAIMED, [pid.to_string(10u32), liquidity.to_string(10u32)])
+    emit_event(EV_REFUND_CLAIMED, [pid.to_string(10u32), total.to_string(10u32)])
     return 0
 }
 
 // ============================================================================
-// 23. REQUEST REVALIDATION — the creator's path back from Untrusted.
+// 27. REQUEST REVALIDATION — the creator's path back from Untrusted.
 // ============================================================================
 // Opens a fresh voting window (tallies and the voted-map reset via a new
 // round number). For a project that already graduated, the recovery_fee is
@@ -1377,7 +1872,7 @@ entry request_revalidation(pid: u64) -> u64 {
         require(dep == recovery_fee, "badfee")
         if recovery_fee > 0 {
             let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
-            s.store(PENDING_FEES_KEY, pending + recovery_fee)
+            s.store(PENDING_FEES_KEY, checked_add(pending, recovery_fee))
         }
     }
 
@@ -1394,13 +1889,14 @@ entry request_revalidation(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 24. UPDATE PROJECT INFO — metadata maintenance (creator only).
+// 28. UPDATE PROJECT INFO — metadata maintenance (creator only).
 // ============================================================================
 // Description, website, logo AND the social links (D11) can be updated at
 // any time (except on a Rejected project) — communities move, channels get
 // rebuilt; name, symbol, supply, team allocation and the vesting plan are
 // structural and immutable by design (the plan is the votable commitment,
-// D10 — changing it after the vote would be changing the ballot).
+// D10 — changing it after the vote would be changing the ballot; the symbol
+// is moreover reserved in the ticker registry).
 // ============================================================================
 entry update_project_info(pid: u64, description: string, website: string, logo: string, twitter: string, telegram: string, discord: string) -> u64 {
     let s: Storage = Storage::new()
@@ -1437,7 +1933,7 @@ entry update_project_info(pid: u64, description: string, website: string, logo: 
 }
 
 // ============================================================================
-// 25. START TEAM VESTING — the creator's voluntary long-term commitment.
+// 29. START TEAM VESTING — the creator's voluntary long-term commitment.
 // ============================================================================
 // @caller: the project creator (a wallet).
 // @params: duration — linear vesting length in topoheights, within the
@@ -1446,11 +1942,10 @@ entry update_project_info(pid: u64, description: string, website: string, logo: 
 //          graduation (immediately), or for a never-graduated project after
 //          team_unlock_delay of bonding (D3). Once started, the vesting is
 //          IRREVERSIBLE — that is the point: it is a public commitment the
-//          frontend can show (get_team_allocation). No partial claim before
-//          the stream starts paying. NOT available to projects that
-//          declared a vesting plan at propose time (D10): the plan binds
-//          itself at graduation — exactly the schedule the community voted
-//          on, no re-tuning possible.
+//          frontend can show (get_team_allocation). NOT available to
+//          projects that declared a vesting plan at propose time (D10): the
+//          plan binds itself at graduation — exactly the schedule the
+//          community voted on, no re-tuning possible.
 // ============================================================================
 entry start_team_vesting(pid: u64, duration: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1489,10 +1984,12 @@ entry start_team_vesting(pid: u64, duration: u64) -> u64 {
 }
 
 // ============================================================================
-// 26. CLAIM TEAM ALLOCATION — the creator's payout, all paths, once (I4).
+// 30. CLAIM TEAM ALLOCATION — the creator's payout, all paths, once (I4).
 // ============================================================================
 // @caller: the project creator (a wallet).
-// @rules:  pays team_unlocked(pid) - team_paid:
+// @rules:  pays team_unlocked(pid) - team_paid, as REAL tokens transferred
+//            from the launchpad's escrow (the contract retains exactly
+//            team_remaining after migration — I10):
 //            * vesting active  -> the linear share accrued so far (D3);
 //            * graduated       -> the full remaining allocation (the
 //                                 migration reward), unless a vesting is
@@ -1502,7 +1999,9 @@ entry start_team_vesting(pid: u64, duration: u64) -> u64 {
 //                                 claim — founders are never hostage);
 //            * otherwise (Validation / Rejected / too early) -> revert.
 //          team_paid debits every payout, so the allocation is paid exactly
-//          once across ALL paths (I4).
+//          once across ALL paths (I4). The event carries NO amount: the
+//          payout is a native confidential transfer, and only the creator
+//          sees it (D18).
 // ============================================================================
 entry claim_team_allocation(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1524,25 +2023,113 @@ entry claim_team_allocation(pid: u64) -> u64 {
     let pay: u64 = unlocked - paid
     s.store(proj_key(pid, F_TEAM_PAID), paid + pay)
 
-    let bkey: string = bal_key(pid, creator)
-    let bal: u64 = s.load(bkey).unwrap_or(0)
-    s.store(bkey, bal + pay)
+    // The REAL escrow payout (I1/I10: the transfer and the team_remaining
+    // drop cancel out on the contract's asset balance).
+    let asset_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let ok: bool = transfer(creator, pay, asset)
+    require(ok, "txfail")
 
     // D12 — a claim shrinks team_remaining, i.e. GROWS circulating supply:
-    // the stored market cap follows immediately (it must never lag a state
-    // change of the curve's inputs — reserves, curve supply, team_paid).
+    // the stored market cap follows immediately (curve era only).
     update_market_cap(pid)
 
-    emit_event(EV_TEAM_CLAIMED, [pid.to_string(10u32), pay.to_string(10u32)])
+    // D18 — NO amount in the event: the payout is the creator's private
+    // business (a native confidential transfer).
+    emit_event(EV_TEAM_CLAIMED, [pid.to_string(10u32)])
     return pay
 }
 
+// ============================================================================
+// 31. MIGRATE — the permissionless, atomic move to LaunchDEX (D15).
+// ============================================================================
+// @caller: ANYONE (a wallet). The outcome is fully determined by the
+//          project's state: the curve's whole XEL reserves and its whole
+//          token inventory (team escrow excepted) seed a permanent pool on
+//          the PINNED DEX contract (D19). No destination, no amount, no
+//          caller choice anywhere — a "malicious" migrator can only
+//          execute the migration the community is waiting for.
+// @permission: this transaction must carry the contract-call permission
+//          (it cross-calls the DEX). The precheck refuses with "txperm"
+//          instead of an opaque failure.
+// @rules:  requires the project graduated (curve path or direct listing)
+//          and has not migrated yet. After success the curve is closed
+//          forever; the launchpad remains the project's home for votes,
+//          socials, trust and team claims (D3/D11/D17). If the project is
+//          Untrusted at migration time, the pool's buys are paused in the
+//          same transaction (D17 — no unprotected window).
+// ============================================================================
+entry migrate(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    require(s.load(proj_key(pid, F_GRADUATED)).unwrap_or(false) == true, "notgrad")
+    require(s.load(proj_key(pid, F_MIGRATED)).unwrap_or(false) == false, "done")
+
+    migrate_to_dex(pid)
+
+    let xel: u64 = s.load(proj_key(pid, F_MIG_XEL)).unwrap_or(0)
+    let tok: u64 = s.load(proj_key(pid, F_MIG_TOK)).unwrap_or(0)
+    emit_event(EV_MIGRATED, [pid.to_string(10u32), xel.to_string(10u32), tok.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 32. SYNC TRUST TO DEX — the community keeper for the pool's buys-pause
+//     (D17).
+// ============================================================================
+// @caller: ANYONE (a wallet) — keeper bots, a frontend button, anyone.
+//          Mirrors the launchpad's trust status to the migrated pool:
+//          Untrusted -> pool buys paused; recovered (Trusted/Graduated
+//          from a recovery pass) -> pool buys unpaused. Sells are never
+//          touched (D4). No-op when already in sync ("insync").
+// @permission: cross-calls the DEX — the transaction must carry the
+//          contract-call permission ("txperm" refusal otherwise).
+// @why permissionless and separate: embedding the cross-call inside
+//          report/support would force EVERY voter's wallet to grant the
+//          contract-call permission — a trap this design refuses (D17).
+// ============================================================================
+entry sync_trust_to_dex(pid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    require(s.load(proj_key(pid, F_MIGRATED)).unwrap_or(false) == true, "notmig")
+
+    let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
+    let flag: bool = status == ST_UNTRUSTED
+    require(s.load(proj_key(pid, F_DEX_SYNCED)).unwrap_or(false) != flag, "insync")
+
+    let dex_opt: optional<Hash> = s.load(DEX_ADDRESS_KEY)
+    require(dex_opt.is_some(), "nodex")
+    let dex: Hash = dex_opt.expect("guarded")
+
+    let asset_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+
+    // State first (atomic with the call), transfer of authority last.
+    s.store(proj_key(pid, F_DEX_SYNCED), flag)
+
+    require(is_contract_callable(dex, DEX_SET_PAUSED_CHUNK), "txperm")
+    let target_opt: optional<Contract> = Contract::new(dex)
+    require(target_opt.is_some(), "dexgone")
+    let target: Contract = target_opt.expect("guarded")
+    target.call(DEX_SET_PAUSED_CHUNK, [asset, flag], {})
+
+    if flag {
+        emit_event(EV_DEX_SYNCED, [pid.to_string(10u32), "1"])
+    } else {
+        emit_event(EV_DEX_SYNCED, [pid.to_string(10u32), "0"])
+    }
+    return 0
+}
 // ============================================================================
 // ADMIN — parameter setters (all range-checked, pairs cross-checked) + fee
 // withdrawal.
 // ============================================================================
 
-// 27. Submission fee (one-time, per proposal). Cap: 100 XEL.
+// 33. Submission fee (one-time, per proposal). Cap: 100 XEL.
 entry set_submission_fee(fee: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1552,7 +2139,7 @@ entry set_submission_fee(fee: u64) -> u64 {
     return 0
 }
 
-// 28. Trading fee in basis points, on buys AND sells while bonding.
+// 34. Trading fee in basis points, on buys AND sells while bonding.
 //     Hard cap: 10%. Cross-checked (D8): can never drop below the
 //     graduated fee — graduation must always be the cheaper regime.
 entry set_trading_fee(bps: u64) -> u64 {
@@ -1566,9 +2153,10 @@ entry set_trading_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 29. Graduated trading fee (D8): what a graduated project pays on every
-//     trade. Hard cap: 10%. Cross-checked: <= trading_fee_bps, so the
-//     graduation discount can never invert.
+// 35. Graduated trading fee (D8): what a graduated project pays on every
+//     curve trade between graduation and migration. Hard cap: 10%.
+//     Cross-checked: <= trading_fee_bps, so the graduation discount can
+//     never invert.
 entry set_graduated_trading_fee(bps: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1580,7 +2168,7 @@ entry set_graduated_trading_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 30. Migration fee (D9): taken once from a project's reserves when it
+// 36. Migration fee (D9): taken once from a project's reserves when it
 //     graduates (curve path or direct listing). Hard cap: 5%.
 entry set_migration_fee(bps: u64) -> u64 {
     only_admin()
@@ -1591,7 +2179,7 @@ entry set_migration_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 31. Direct-listing threshold (D7): the liquidity that skips the bonding
+// 37. Direct-listing threshold (D7): the liquidity that skips the bonding
 //     phase. Cross-checked: >= min_liquidity, so the fast track can never
 //     swallow every proposal (a small float always gets its curve).
 //     Snapshotted per project at propose time.
@@ -1606,7 +2194,7 @@ entry set_direct_listing_threshold(amount: u64) -> u64 {
     return 0
 }
 
-// 32. Minimum founder liquidity, in [1 XEL, 100k XEL]. Cross-checked
+// 38. Minimum founder liquidity, in [1 XEL, 100k XEL]. Cross-checked
 //     (D7): can never exceed the direct-listing threshold.
 entry set_min_liquidity(amount: u64) -> u64 {
     only_admin()
@@ -1620,7 +2208,7 @@ entry set_min_liquidity(amount: u64) -> u64 {
     return 0
 }
 
-// 33. Minimum voters to validate/reject a project, in [1, 100k].
+// 39. Minimum voters to validate/reject a project, in [1, 100k].
 entry set_min_participants(count: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1631,7 +2219,7 @@ entry set_min_participants(count: u64) -> u64 {
     return 0
 }
 
-// 34. Minimum support ratio, in (50%, 100%] basis points.
+// 40. Minimum support ratio, in (50%, 100%] basis points.
 entry set_min_approval_ratio(bps: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1642,7 +2230,7 @@ entry set_min_approval_ratio(bps: u64) -> u64 {
     return 0
 }
 
-// 35. Validation window length in topoheights, [~1h, ~15d].
+// 41. Validation window length in topoheights, [~1h, ~15d].
 entry set_validation_duration(topos: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1653,7 +2241,7 @@ entry set_validation_duration(topos: u64) -> u64 {
     return 0
 }
 
-// 36. Graduation multiplier: graduate at liquidity x multiplier, [2, 100].
+// 42. Graduation multiplier: graduate at liquidity x multiplier, [2, 100].
 entry set_graduation_multiplier(multiplier: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1664,7 +2252,7 @@ entry set_graduation_multiplier(multiplier: u64) -> u64 {
     return 0
 }
 
-// 37. Team unlock delay (D3): how long a NEVER-graduated project must
+// 43. Team unlock delay (D3): how long a NEVER-graduated project must
 //     trade before its creator may claim the team allocation late.
 //     [~5 days, ~2 years].
 entry set_team_unlock_delay(topos: u64) -> u64 {
@@ -1677,7 +2265,7 @@ entry set_team_unlock_delay(topos: u64) -> u64 {
     return 0
 }
 
-// 38. Vesting bounds (D3): the window inside which a creator may choose a
+// 44. Vesting bounds (D3): the window inside which a creator may choose a
 //     linear vesting duration. Absolute caps: [~1 day, ~2 years]; the
 //     window itself must stay non-empty (min < max).
 entry set_vesting_bounds(min_topos: u64, max_topos: u64) -> u64 {
@@ -1692,7 +2280,7 @@ entry set_vesting_bounds(min_topos: u64, max_topos: u64) -> u64 {
     return 0
 }
 
-// 39. Recovery fee for GRADUATED projects requesting revalidation.
+// 45. Recovery fee for GRADUATED projects requesting revalidation.
 //     Cap: 1000 XEL. (Non-graduated projects always retry for free.)
 entry set_recovery_fee(fee: u64) -> u64 {
     only_admin()
@@ -1703,7 +2291,7 @@ entry set_recovery_fee(fee: u64) -> u64 {
     return 0
 }
 
-// 40. Stricter recovery thresholds: quorum in [1, 100k], ratio in (50%, 100%].
+// 46. Stricter recovery thresholds: quorum in [1, 100k], ratio in (50%, 100%].
 entry set_recovery_params(participants: u64, ratio_bps: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1717,7 +2305,35 @@ entry set_recovery_params(participants: u64, ratio_bps: u64) -> u64 {
     return 0
 }
 
-// 41. Transfer the admin role (single-step — use a cold wallet).
+// 47. ASSET BUDGET (D13): what every proposal earmarks for the chain's
+//     asset creation cost. The actual fee is measured at creation and the
+//     unused part is refunded; a raise only affects FUTURE proposals
+//     (existing ones top up at finalize if needed). Cap: 100 XEL.
+entry set_asset_budget(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount <= MAX_ASSET_BUDGET, "toohigh")
+    s.store(ASSET_BUDGET_KEY, amount)
+    emit_event(EV_PARAM_SET, ["asset_budget", amount.to_string(10u32)])
+    return 0
+}
+
+// 48. DEX ADDRESS PIN (D19): the LaunchDEX contract migrations seed.
+//     Settable ONLY while no project has ever migrated (migrated_count
+//     must be 0) — after the first migration the pin is FROZEN FOREVER
+//     (the pools live inside that contract; repointing would orphan them).
+//     LaunchDEX mirrors the freeze: its launchpad pin freezes at ITS first
+//     pool. Both sides verified by CI against each other's chunk numbering.
+entry set_dex_address(addr: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(s.load(MIGRATED_COUNT_KEY).unwrap_or(0) == 0, "frozen")
+    s.store(DEX_ADDRESS_KEY, addr)
+    emit_event(EV_DEX_ADDRESS, [addr.to_hex()])
+    return 0
+}
+
+// 49. Transfer the admin role (single-step — use a cold wallet).
 entry set_admin(new_admin: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1726,8 +2342,10 @@ entry set_admin(new_admin: Address) -> u64 {
     return 0
 }
 
-// 42. Circuit breaker: pauses NEW proposals and NEW buys only (D-security).
-//     Sells, votes, refunds, team claims and finalization are never pausable.
+// 50. Circuit breaker: pauses NEW proposals and NEW buys only (D-security).
+//     Sells, votes, refunds, team claims, migration and finalization are
+//     never pausable: exits, community decisions and the move to the DEX
+//     cannot be frozen.
 entry set_paused(flag: bool) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -1740,11 +2358,12 @@ entry set_paused(flag: bool) -> u64 {
     return 0
 }
 
-// 43. WITHDRAW FEES — the protocol's entire revenue stream.
+// 51. WITHDRAW FEES — the protocol's entire revenue stream.
 // ============================================================================
 // Admin-only. Capped twice: by the accrued pending_fees AND by the
-// contract's uncommitted balance (balance - curve commitments - refundable
-// rejections) — the admin can never make the protocol insolvent (I2).
+// contract's uncommitted balance (balance - live curve reserves - locked
+// refunds - earmarked asset budgets — D20) — the admin can never make the
+// protocol insolvent (I2).
 // ============================================================================
 entry withdraw_fees(amount: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1766,12 +2385,13 @@ entry withdraw_fees(amount: u64) -> u64 {
     let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
     let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
     let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
-    let committed: u128 = (curve_xel as u128) + (locked as u128)
+    let budgets: u64 = s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
+    let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128)
     require((amount as u128) + committed <= (balance as u128), "notavail")
 
     s.store(PENDING_FEES_KEY, pending - amount)
     let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
-    s.store(FEES_LIFETIME_KEY, lifetime + amount)
+    s.store(FEES_LIFETIME_KEY, checked_add(lifetime, amount))
 
     let ok: bool = transfer(caller, amount, xel)
     require(ok, "txfail")
@@ -1779,100 +2399,13 @@ entry withdraw_fees(amount: u64) -> u64 {
     emit_event(EV_FEES_COLLECTED, [amount.to_string(10u32)])
     return 0
 }
-
-// ============================================================================
-// 44. CHECKED ADD — u64 + u64 with an explicit overflow refusal (I9's
-//     arithmetic backbone). The volume accumulators are the only counters in
-//     the contract that grow without bound by design, so every addition on
-//     them goes through this: unreachable in practice (a u64 volume at the
-//     10 000 XEL per-trade cap would need ~18 million full-size trades),
-//     guarded anyway — a corrupted counter is worse than a refused trade.
-//     (Declared AFTER the entries on purpose: chunks 16..43 are the entry
-//     ids real transactions are built from — keeping them byte-stable
-//     across versions is worth the forward references below.)
-// ============================================================================
-fn checked_add(a: u64, b: u64) -> u64 {
-    let wide: u128 = (a as u128) + (b as u128)
-    require(wide <= U64_MAX_128, "ovf")
-    return wide as u64
-}
-
-// ============================================================================
-// 45. UPDATE MARKET CAP (D12) — recompute the spot market cap from the
-//     curve's live state (same formula as the pure get_market_cap view) and
-//     STORE it: mc = current spot, mh = all-time high (monotone). Idempotent
-//     by construction — it derives everything from storage, never from
-//     its own previous output, so calling it twice in one entry (graduate
-//     then the closing update_market_cap of buy) is a harmless no-op write.
-// ============================================================================
-fn update_market_cap(pid: u64) {
-    let s: Storage = Storage::new()
-    let total_supply: u64 = s.load(proj_key(pid, F_SUPPLY)).unwrap_or(0)
-    let reserves: u64 = s.load(proj_key(pid, F_RESERVES)).unwrap_or(0)
-    let curve_supply: u64 = s.load(proj_key(pid, F_CURVE)).unwrap_or(0)
-    let cap: u64 = 0
-    if curve_supply > 0 {
-        let team_rem: u128 = team_remaining(pid) as u128
-        let circulating: u128 = (total_supply as u128) - (curve_supply as u128) - team_rem
-        if circulating > 0 {
-            let wide: u128 = (reserves as u128) * circulating / (curve_supply as u128)
-            if wide <= U64_MAX_128 {
-                cap = wide as u64
-            } else {
-                cap = U64_MAX
-            }
-        }
-    }
-    s.store(proj_key(pid, F_MCAP), cap)
-    let high: u64 = s.load(proj_key(pid, F_MCAP_HIGH)).unwrap_or(0)
-    if cap > high {
-        s.store(proj_key(pid, F_MCAP_HIGH), cap)
-    }
-}
-
-// ============================================================================
-// 46. RECORD TRADE (D12) — the single funnel through which every buy/sell
-//     updates the scoreboard, so the volume identity (I9) holds by
-//     construction: vo only ever grows here, by exactly the recorded amount,
-//     and bv/sv partition the trades. Also bumps trade counts and stamps the
-//     last-trade topoheight. Buy side records the ATTACHED amount (fee
-//     included — an exchange's quote-side convention); sell side records the
-//     PRE-FEE gross out; exactly the two quantities the v1 total always
-//     summed. update_market_cap is also called from claim_team_allocation:
-//     a claim changes circulating supply, and the stored cap must never lag
-//     ANY input of its formula (reserves, curve supply, team_paid).
-// ============================================================================
-fn record_trade(pid: u64, buy_side: bool, xel_amount: u64) {
-    let s: Storage = Storage::new()
-    if buy_side {
-        let bv: u64 = s.load(proj_key(pid, F_BUY_VOL)).unwrap_or(0)
-        s.store(proj_key(pid, F_BUY_VOL), checked_add(bv, xel_amount))
-        let tbv: u64 = s.load(TOTAL_BUY_VOL_KEY).unwrap_or(0)
-        s.store(TOTAL_BUY_VOL_KEY, checked_add(tbv, xel_amount))
-    } else {
-        let sv: u64 = s.load(proj_key(pid, F_SELL_VOL)).unwrap_or(0)
-        s.store(proj_key(pid, F_SELL_VOL), checked_add(sv, xel_amount))
-        let tsv: u64 = s.load(TOTAL_SELL_VOL_KEY).unwrap_or(0)
-        s.store(TOTAL_SELL_VOL_KEY, checked_add(tsv, xel_amount))
-    }
-    let vo: u64 = s.load(proj_key(pid, F_VOLUME)).unwrap_or(0)
-    s.store(proj_key(pid, F_VOLUME), checked_add(vo, xel_amount))
-    let tvl: u64 = s.load(TOTAL_VOLUME_KEY).unwrap_or(0)
-    s.store(TOTAL_VOLUME_KEY, checked_add(tvl, xel_amount))
-    let tc: u64 = s.load(proj_key(pid, F_TRADES)).unwrap_or(0)
-    s.store(proj_key(pid, F_TRADES), checked_add(tc, 1))
-    let ttc: u64 = s.load(TOTAL_TRADES_KEY).unwrap_or(0)
-    s.store(TOTAL_TRADES_KEY, checked_add(ttc, 1))
-    s.store(proj_key(pid, F_LAST_TRADE), get_current_topoheight())
-}
-
 // ============================================================================
 // VIEWS (pub fn — read-only, no storage writes; the frontend's API)
 // ============================================================================
 
-// 47. Lifecycle snapshot: (creator, status, created_topo, validation_end,
+// 52. Lifecycle snapshot: (creator, status, created_topo, validation_end,
 //     graduated). creator is a display string; status is the code (see
-//     get_status_label).
+//     get_status_label). For the migration state use get_migration_info.
 pub fn get_project(pid: u64) -> (string, u64, u64, u64, bool) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1893,7 +2426,7 @@ pub fn get_project(pid: u64) -> (string, u64, u64, u64, bool) {
     )
 }
 
-// 48. Display metadata: (name, symbol, description, website, logo).
+// 53. Display metadata: (name, symbol, description, website, logo).
 pub fn get_project_info(pid: u64) -> (string, string, string, string, string) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1906,15 +2439,17 @@ pub fn get_project_info(pid: u64) -> (string, string, string, string, string) {
     )
 }
 
-// 49. Status code of a project (see get_status_label for the text).
+// 54. Status code of a project (see get_status_label for the text).
 pub fn get_project_status(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
     return s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
 }
 
-// 50. Tokenomics: (total_supply, team_bps, liquidity_deposited, reserves,
-//     curve_supply). All atomic units.
+// 55. Tokenomics: (total_supply, team_bps, liquidity_deposited, reserves,
+//     curve_supply). All atomic units. total_supply is the asset's FIXED
+//     max supply (D13); reserves/curve_supply are the live curve state
+//     (both 0 once migrated — the pool owns the market then).
 pub fn get_project_tokenomics(pid: u64) -> (u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1927,7 +2462,7 @@ pub fn get_project_tokenomics(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 51. Trust state: (supports, reports, vote_round, graduated).
+// 56. Trust state: (supports, reports, vote_round, graduated).
 pub fn get_project_trust(pid: u64) -> (u64, u64, u64, bool) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1939,11 +2474,12 @@ pub fn get_project_trust(pid: u64) -> (u64, u64, u64, bool) {
     )
 }
 
-// 52. Curve state: (reserves, curve_supply, volume, graduation_target,
+// 57. Curve state: (reserves, curve_supply, volume, graduation_target,
 //     bonding_start). graduation_target = liquidity_deposited *
 //     graduation_multiplier (the curve path's goal; a direct-listed project
 //     starts beyond it). bonding_start = when trading opened (0 while in
-//     validation) — the anchor of the team unlock delay.
+//     validation) — the anchor of the team unlock delay. Post-migration the
+//     reserves/curve_supply read 0 (the curve is closed — D15).
 pub fn get_bonding_info(pid: u64) -> (u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1963,9 +2499,10 @@ pub fn get_bonding_info(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 53. Spot price: XEL (scaled by 1e8) per 1 whole token — i.e.
-//     reserves * 1e8 / curve_supply. Frontends divide the display token
-//     amount by 1e8 exactly like XEL amounts. Saturates at u64 max.
+// 58. Spot price: XEL (scaled by 1e8) per 1 whole token — i.e.
+//     reserves * 1e8 / curve_supply. CURVE-ERA price: returns 0 once
+//     migrated (the live price is LaunchDEX's get_spot_price — the SDK
+//     composes both). Saturates at u64 max.
 pub fn get_current_price(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -1981,7 +2518,7 @@ pub fn get_current_price(pid: u64) -> u64 {
     return scaled as u64
 }
 
-// 54. Buy quote: tokens out for an attached XEL amount (fee included).
+// 59. Buy quote: tokens out for an attached XEL amount (fee included).
 //     Uses the project's EFFECTIVE fee (graduated rate once graduated —
 //     D8), exactly like buy() — a quote can never disagree with the trade.
 pub fn get_buy_quote(pid: u64, xel_amount: u64) -> u64 {
@@ -1995,8 +2532,9 @@ pub fn get_buy_quote(pid: u64, xel_amount: u64) -> u64 {
     return buy_tokens_out(reserves, curve_supply, net)
 }
 
-// 55. Sell quote: XEL out (net of fee) for a token amount — same effective
-//     fee rule as sell().
+// 60. Sell quote: XEL out (net of fee) for a token amount — same effective
+//     fee rule as sell(). (sell() itself takes no amount: it sells the
+//     whole attached deposit; this quote is the preview for any amount.)
 pub fn get_sell_quote(pid: u64, token_amount: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2008,10 +2546,11 @@ pub fn get_sell_quote(pid: u64, token_amount: u64) -> u64 {
     return gross - fee_take(gross, bps)
 }
 
-// 56. Market cap in atomic XEL: reserves * circulating / curve_supply,
+// 61. Market cap in atomic XEL: reserves * circulating / curve_supply,
 //     where circulating = total_supply - curve_supply - team_remaining
-//     (the allocation not yet paid to the creator). Saturates at u64 max
-//     (u128 math throughout).
+//     (the allocation not yet paid to the creator). CURVE-ERA cap (D12):
+//     0 once migrated — the live cap is the DEX pool's price x circulating
+//     (SDK-composed). Saturates at u64 max (u128 math throughout).
 pub fn get_market_cap(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2033,15 +2572,7 @@ pub fn get_market_cap(pid: u64) -> u64 {
     return cap as u64
 }
 
-// 57. Token balance of an address (atomic units) — the launched token IS
-//     this internal ledger (D1); frontends display it like any balance.
-pub fn get_token_balance(pid: u64, owner: Address) -> u64 {
-    let s: Storage = Storage::new()
-    require_project(pid)
-    return s.load(bal_key(pid, owner)).unwrap_or(0)
-}
-
-// 58. Has this address already voted in the project's CURRENT round?
+// 62. Has this address already voted in the project's CURRENT round?
 pub fn has_voted(pid: u64, voter: Address) -> bool {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2049,12 +2580,12 @@ pub fn has_voted(pid: u64, voter: Address) -> bool {
     return s.load(vote_key(pid, round, voter)).unwrap_or(false)
 }
 
-// 59. Total number of projects ever proposed.
+// 63. Total number of projects ever proposed.
 pub fn get_total_projects() -> u64 {
     return Storage::new().load(COUNT_KEY).unwrap_or(0)
 }
 
-// 60. COUNT of projects with a given status code (listing helper — pair
+// 64. COUNT of projects with a given status code (listing helper — pair
 //     with get_project_by_rank; ids themselves are never returned as an
 //     array, Silex ABI ground truth has no array returns).
 pub fn get_projects_by_status(status: u64) -> u64 {
@@ -2071,7 +2602,7 @@ pub fn get_projects_by_status(status: u64) -> u64 {
     return found
 }
 
-// 61. Id of the rank-th (0-based, oldest first) project with a given
+// 65. Id of the rank-th (0-based, oldest first) project with a given
 //     status. Returns project_count (an invalid id) when rank is out of
 //     range — the documented sentinel for "no such project".
 pub fn get_project_by_rank(status: u64, rank: u64) -> u64 {
@@ -2091,7 +2622,7 @@ pub fn get_project_by_rank(status: u64, rank: u64) -> u64 {
     return count
 }
 
-// 62. Id of the rank-th LATEST project (any status; rank 0 = newest).
+// 66. Id of the rank-th LATEST project (any status; rank 0 = newest).
 //     Sentinel: project_count when out of range.
 pub fn get_latest_projects(rank: u64) -> u64 {
     let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
@@ -2101,7 +2632,7 @@ pub fn get_latest_projects(rank: u64) -> u64 {
     return count
 }
 
-// 63. COUNT of trusted projects (Graduated or Trusted — both mean the
+// 67. COUNT of trusted projects (Graduated or Trusted — both mean the
 //     community currently backs the project).
 pub fn get_trusted_projects() -> u64 {
     let s: Storage = Storage::new()
@@ -2118,7 +2649,7 @@ pub fn get_trusted_projects() -> u64 {
     return found
 }
 
-// 64. Id of the rank-th trusted (Graduated/Trusted) project, oldest first.
+// 68. Id of the rank-th trusted (Graduated/Trusted) project, oldest first.
 //     Sentinel: project_count when out of range.
 pub fn get_trusted_by_rank(rank: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -2138,14 +2669,16 @@ pub fn get_trusted_by_rank(rank: u64) -> u64 {
     return count
 }
 
-// 65. TEAM ALLOCATION STATE (D3, D10) — the frontend's commitment panel:
+// 69. TEAM ALLOCATION STATE (D3, D10) — the frontend's commitment panel:
 //     (team_alloc, team_paid, vesting_start, vesting_duration,
 //      claimable_now, vesting_plan). vesting_start == 0 means no vesting is
-//      running; vesting_plan == 0 means "claim at graduation" was declared,
-//      any other value is the plan graduate() binds automatically (D10) —
-//      show it on the proposal card BEFORE the vote. claimable_now is
-//      exactly what claim_team_allocation would pay at the current
-//      topoheight (0 = nothing yet — show a countdown).
+//     running; vesting_plan == 0 means "claim at graduation" was declared,
+//     any other value is the plan graduate() binds automatically (D10) —
+//     show it on the proposal card BEFORE the vote. claimable_now is
+//     exactly what claim_team_allocation would pay at the current
+//     topoheight (0 = nothing yet — show a countdown). The CLAIMED amounts
+//     are the creator's private data (D18): paid is bookkeeping, payouts
+//     were confidential transfers.
 pub fn get_team_allocation(pid: u64) -> (u64, u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2168,11 +2701,14 @@ pub fn get_team_allocation(pid: u64) -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
-// 66. Protocol stats: (total_projects, pending_fees, fees_collected_lifetime,
+// 70. Protocol stats: (total_projects, pending_fees, fees_collected_lifetime,
 //     total_volume, total_curve_xel, locked_refunds, balance, paused,
-//     trading_fee_bps). balance is the live contract XEL balance — the
-//     solvency invariant says it covers curve_xel + pending + locked.
-pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64) {
+//     trading_fee_bps, migrated_count, asset_budgets_earmarked). balance is
+//     the live contract XEL balance — the solvency invariant says it covers
+//     curve_xel + pending + locked + budgets (I2/D20). migrated_count is
+//     the number of projects whose liquidity moved to LaunchDEX; once > 0
+//     the DEX pin is frozen (D19).
+pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64, u64, u64) {
     let s: Storage = Storage::new()
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
     return (
@@ -2184,19 +2720,23 @@ pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64) {
         s.load(LOCKED_REFUNDS_KEY).unwrap_or(0),
         get_balance_for_asset(xel).unwrap_or(0),
         s.load(PAUSED_KEY).unwrap_or(false),
-        s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS)
+        s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS),
+        s.load(MIGRATED_COUNT_KEY).unwrap_or(0),
+        s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
     )
 }
 
-// 67. Launch parameter set: (submission_fee, min_liquidity, trading_fee_bps,
-//     graduated_fee_bps, min_participants, min_approval_ratio_bps,
-//     validation_duration, graduation_multiplier, direct_listing_threshold,
-//     migration_fee_bps). Recovery and team parameters live in their own
-//     views (get_recovery_config / get_team_config).
-pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+// 71. Launch parameter set: (submission_fee, asset_budget, min_liquidity,
+//     trading_fee_bps, graduated_fee_bps, min_participants,
+//     min_approval_ratio_bps, validation_duration, graduation_multiplier,
+//     direct_listing_threshold, migration_fee_bps). Recovery and team
+//     parameters live in their own views (get_recovery_config /
+//     get_team_config); the DEX pin lives in get_migration_info.
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
         s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE),
+        s.load(ASSET_BUDGET_KEY).unwrap_or(DEFAULT_ASSET_BUDGET),
         s.load(MIN_LIQUIDITY_KEY).unwrap_or(DEFAULT_MIN_LIQUIDITY),
         s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS),
         s.load(GRADUATED_FEE_KEY).unwrap_or(DEFAULT_GRADUATED_FEE_BPS),
@@ -2209,7 +2749,7 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     )
 }
 
-// 68. Recovery parameter set: (recovery_fee, recovery_min_participants,
+// 72. Recovery parameter set: (recovery_fee, recovery_min_participants,
 //     recovery_min_ratio_bps).
 pub fn get_recovery_config() -> (u64, u64, u64) {
     let s: Storage = Storage::new()
@@ -2220,7 +2760,7 @@ pub fn get_recovery_config() -> (u64, u64, u64) {
     )
 }
 
-// 69. Team parameter set: (team_unlock_delay, vesting_min, vesting_max),
+// 73. Team parameter set: (team_unlock_delay, vesting_min, vesting_max),
 //     all in topoheights (D3).
 pub fn get_team_config() -> (u64, u64, u64) {
     let s: Storage = Storage::new()
@@ -2231,7 +2771,7 @@ pub fn get_team_config() -> (u64, u64, u64) {
     )
 }
 
-// 70. SOCIAL LINKS (D11): (twitter, telegram, discord) — empty string
+// 74. SOCIAL LINKS (D11): (twitter, telegram, discord) — empty string
 //     means "no link". Updatable by the creator at any time via
 //     update_project_info; the frontend renders, the voters judge.
 pub fn get_social_links(pid: u64) -> (string, string, string) {
@@ -2244,12 +2784,13 @@ pub fn get_social_links(pid: u64) -> (string, string, string) {
     )
 }
 
-// 71. TRADING STATS (D12): (buy_volume, sell_volume, total_volume,
-//     trade_count, last_trade_topo) — the project's on-chain scoreboard,
-//     maintained by record_trade on every buy/sell. buy_volume sums the
-//     attached XEL of every buy (fee included); sell_volume sums the pre-fee
-//     gross of every sell; total == buy + sell (I9). last_trade_topo == 0
-//     means the project never traded.
+// 75. TRADING STATS (D12): (buy_volume, sell_volume, total_volume,
+//     trade_count, last_trade_topo) — the project's CURVE-ERA scoreboard,
+//     maintained by record_trade on every curve buy/sell. buy_volume sums
+//     the attached XEL of every buy (fee included); sell_volume sums the
+//     pre-fee gross of every sell; total == buy + sell (I9). Post-migration
+//     the curve scoreboard freezes — the pool-era stats live on LaunchDEX
+//     (get_pool_volume; the SDK composes both eras).
 pub fn get_trading_stats(pid: u64) -> (u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2262,14 +2803,12 @@ pub fn get_trading_stats(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 72. MARKET CAP HISTORY (D12): (current, all_time_high, at_graduation) —
+// 76. MARKET CAP HISTORY (D12): (current, all_time_high, at_graduation) —
 //     the stored series maintained by update_market_cap / graduate. current
-//     is rewritten after every trade with the same formula as the pure
-//     get_market_cap view; all_time_high only ever grows; at_graduation is
-//     snapshotted once, after the migration fee (0 = never graduated, OR a
-//     direct listing at t0 — nothing is circulating before the first buy,
-//     so the honest snapshot is 0; mc/mh light up on the first trade).
-//     All in atomic XEL.
+//     is rewritten after every curve trade; all_time_high only ever grows;
+//     at_graduation is snapshotted once, after the migration fee. CURVE
+//     ERA: current reads 0 once migrated (the curve is closed); the live
+//     cap is the DEX pool's (SDK-composed). All in atomic XEL.
 pub fn get_market_cap_history(pid: u64) -> (u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2280,17 +2819,19 @@ pub fn get_market_cap_history(pid: u64) -> (u64, u64, u64) {
     )
 }
 
-// 73. PROPOSAL DATA (D10, D7) — the ONE-CALL voting card: everything the
+// 77. PROPOSAL DATA (D10, D7) — the ONE-CALL voting card: everything the
 //     community needs to judge a proposal BEFORE the vote, in one view:
 //     (liquidity, total_supply, team_bps, vesting_plan, direct_listed,
-//      created_topo, validation_end). vesting_plan == 0 -> the team claims
-//     at graduation; any other value is the linear vesting the contract
-//     will bind at graduation (the votable commitment). direct_listed is
-//     the D7 snapshot: liquidity >= threshold at propose time -> graduates
-//     the moment validation passes (no bonding phase). Metadata lives in
-//     get_project_info / get_social_links; live curve numbers in
-//     get_project_tokenomics / get_bonding_info / get_current_price.
-pub fn get_proposal_data(pid: u64) -> (u64, u64, u64, u64, bool, u64, u64) {
+//      created_topo, validation_end, asset_budget). vesting_plan == 0 ->
+//     the team claims at graduation; any other value is the linear vesting
+//     the contract will bind at graduation (the votable commitment).
+//     direct_listed is the D7 snapshot: liquidity >= threshold at propose
+//     time -> graduates the moment validation passes. asset_budget is the
+//     earmarked creation cost (D13 — the unused part is refunded to the
+//     creator at creation). Metadata lives in get_project_info /
+//     get_social_links; live curve numbers in get_project_tokenomics /
+//     get_bonding_info / get_current_price.
+pub fn get_proposal_data(pid: u64) -> (u64, u64, u64, u64, bool, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_project(pid)
     return (
@@ -2300,13 +2841,15 @@ pub fn get_proposal_data(pid: u64) -> (u64, u64, u64, u64, bool, u64, u64) {
         s.load(proj_key(pid, F_VESTING_PLAN)).unwrap_or(0),
         s.load(proj_key(pid, F_DL)).unwrap_or(false),
         s.load(proj_key(pid, F_CREATED)).unwrap_or(0),
-        s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0)
+        s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0),
+        s.load(proj_key(pid, F_BUDGET)).unwrap_or(0)
     )
 }
 
-// 74. PROTOCOL VOLUME STATS (D12): (total_volume, total_buy_volume,
+// 78. PROTOCOL VOLUME STATS (D12): (total_volume, total_buy_volume,
 //     total_sell_volume, total_trades) across every project ever launched —
-//     the launchpad's own scoreboard. total == buy + sell (I9).
+//     the launchpad's CURVE-ERA scoreboard. total == buy + sell (I9). The
+//     pool-era volumes live on LaunchDEX (per pool; the SDK composes).
 pub fn get_volume_stats() -> (u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
@@ -2317,7 +2860,75 @@ pub fn get_volume_stats() -> (u64, u64, u64, u64) {
     )
 }
 
-// 75. Human-readable status label (frontend convenience).
+// 79. ASSET INFO (D13) — the real token's on-chain identity:
+//     (created, asset_hash, max_supply, circulating_supply, mintable).
+//     created == false while the project is still in validation (no asset
+//     yet — the hash reads as zero and the supplies as 0). Once created:
+//     max_supply is the FIXED cap (MaxSupplyMode::Fixed at creation — the
+//     whole supply was minted to this contract and mintable reads false
+//     FOREVER; the frontend can show this as the on-chain proof of the
+//     cap); circulating_supply is the chain's own count.
+pub fn get_asset_info(pid: u64) -> (bool, Hash, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let none_hash: Hash = Hash::zero()
+    let asset_hash_opt: optional<Hash> = s.load(proj_key(pid, F_ASSET))
+    if asset_hash_opt.is_none() {
+        return (false, none_hash, 0u64, 0u64, false)
+    }
+    let hash: Hash = asset_hash_opt.expect("guarded")
+
+    let max_supply: u64 = 0
+    let supply: u64 = 0
+    let mintable: bool = false
+    let fetched: optional<Asset> = Asset::get_by_hash(hash)
+    if fetched.is_some() {
+        let asset: Asset = fetched.expect("guarded")
+        let ms: optional<u64> = asset.get_max_supply()
+        if ms.is_some() {
+            max_supply = ms.expect("guarded")
+        }
+        supply = asset.get_supply()
+        mintable = asset.is_mintable()
+    }
+    return (true, hash, max_supply, supply, mintable)
+}
+
+// 80. MIGRATION INFO (D15, D19) — the pool-era bridge:
+//     (migrated, migrated_at_topo, xel_sent, tokens_sent, dex_address_hex,
+//      dex_trust_synced). migrated == false until migrate() succeeded;
+//     then migrated_at is the topoheight of the move and xel/tokens are
+//     exactly what seeded the LaunchDEX pool (query the pool itself with
+//     the project's asset hash — get_asset_info). dex_address_hex is the
+//     pinned DEX contract (empty while unset). dex_trust_synced tells
+//     whether the pool's buys-pause mirrors the current trust status
+//     (sync_trust_to_dex brings it up to date — D17).
+pub fn get_migration_info(pid: u64) -> (bool, u64, u64, u64, string, bool) {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let dex_hex: string = ""
+    let dex_opt: optional<Hash> = s.load(DEX_ADDRESS_KEY)
+    if dex_opt.is_some() {
+        let dex: Hash = dex_opt.expect("guarded")
+        dex_hex = dex.to_hex()
+    }
+
+    return (
+        s.load(proj_key(pid, F_MIGRATED)).unwrap_or(false),
+        s.load(proj_key(pid, F_MIG_AT)).unwrap_or(0),
+        s.load(proj_key(pid, F_MIG_XEL)).unwrap_or(0),
+        s.load(proj_key(pid, F_MIG_TOK)).unwrap_or(0),
+        dex_hex,
+        s.load(proj_key(pid, F_DEX_SYNCED)).unwrap_or(false)
+    )
+}
+
+// 81. Human-readable status label (frontend convenience). The migrated
+//     state is a FLAG on top of the status (get_migration_info), not a
+//     status code — the launchpad remains the project's home for votes,
+//     socials and trust after the move (D15).
 pub fn get_status_label(status: u64) -> string {
     if status == ST_VALIDATION {
         return "validation"
@@ -2343,7 +2954,7 @@ pub fn get_status_label(status: u64) -> string {
     return "unknown"
 }
 
-// 76. Contract version.
+// 82. Contract version.
 pub fn get_version() -> string {
     return VERSION
 }

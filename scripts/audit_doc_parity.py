@@ -27,6 +27,10 @@ for field, const in [
     ("dc", "F_DISCORD"), ("bv", "F_BUY_VOL"), ("sv", "F_SELL_VOL"),
     ("tc", "F_TRADES"), ("lt", "F_LAST_TRADE"),
     ("mc", "F_MCAP"), ("mh", "F_MCAP_HIGH"), ("mg", "F_MCAP_GRAD"),
+    # v4 (D13/D15/D17)
+    ("ah", "F_ASSET"), ("ab", "F_BUDGET"), ("mi", "F_MIGRATED"),
+    ("ma", "F_MIG_AT"), ("mx", "F_MIG_XEL"), ("mt", "F_MIG_TOK"),
+    ("ds", "F_DEX_SYNCED"),
 ]:
     if f'const {const}: string = "{field}"' not in CONTRACT:
         fails.append(f"contract: field key {field} ({const}) missing")
@@ -41,6 +45,9 @@ for key, const in [
     # v3 (D12 protocol-wide scoreboard)
     ("tbv", "TOTAL_BUY_VOL_KEY"), ("tsv", "TOTAL_SELL_VOL_KEY"),
     ("ttc", "TOTAL_TRADES_KEY"),
+    # v4 (D13/D19/D20)
+    ("abd", "ASSET_BUDGET_KEY"), ("tbb", "TOTAL_BUDGETS_KEY"),
+    ("mgc", "MIGRATED_COUNT_KEY"), ("dxa", "DEX_ADDRESS_KEY"),
 ]:
     if f'const {const}: string = "{key}"' not in CONTRACT:
         fails.append(f"contract: global key {key} ({const}) missing")
@@ -61,7 +68,7 @@ for const, value in [
 # 4. every view named in the doc's frontend guide exists in the contract
 for view in ["get_current_price", "get_market_cap", "get_bonding_info",
              "get_project_trust", "get_team_allocation", "get_buy_quote",
-             "get_sell_quote", "get_token_balance", "get_projects_by_status",
+             "get_sell_quote", "get_projects_by_status",
              "get_project_by_rank", "get_latest_projects",
              "get_trusted_projects", "get_trusted_by_rank",
              "get_status_label", "get_config", "get_recovery_config",
@@ -71,7 +78,11 @@ for view in ["get_current_price", "get_market_cap", "get_bonding_info",
              "get_social_links", "get_trading_stats",
              "get_market_cap_history", "get_proposal_data",
              "get_volume_stats", "get_protocol_stats",
-             "update_project_info"]:
+             "update_project_info",
+             # v4 (D13/D15): real assets + migration. get_token_balance is
+             # GONE on purpose (no internal ledger — wallets hold the asset)
+             "get_asset_info", "get_migration_info",
+             "migrate", "sync_trust_to_dex"]:
     if f"fn {view}(" not in CONTRACT and f"entry {view}(" not in CONTRACT:
         fails.append(f"contract: view/entry {view} named in the doc is missing")
     if view not in DOC:
@@ -88,20 +99,30 @@ for name, eid in [("EV_PROJECT_CREATED", 1), ("EV_SUPPORTED", 2),
                   ("EV_REFUND_CLAIMED", 16), ("EV_RECOVERY_REQUESTED", 17),
                   ("EV_PROJECT_INFO_UPDATED", 18),
                   ("EV_TEAM_VESTING_STARTED", 19), ("EV_TEAM_CLAIMED", 20),
-                  ("EV_DIRECT_LISTED", 21), ("EV_MIGRATION_FEE", 22)]:
+                  ("EV_DIRECT_LISTED", 21), ("EV_MIGRATION_FEE", 22),
+                  # v4
+                  ("EV_ASSET_CREATED", 23), ("EV_MIGRATED", 24),
+                  ("EV_DEX_SYNCED", 25), ("EV_DEX_ADDRESS", 26)]:
     if f"const {name}: u64 = {eid}" not in CONTRACT:
         fails.append(f"contract: event {name} = {eid} missing")
 
 # 6. version strings agree
-if 'const VERSION: string = "VaultLaunch v3.0.0"' not in CONTRACT:
-    fails.append("contract: VERSION is not v3.0.0")
-if "v3.0.0" not in DOC:
-    fails.append("doc: LAUNCHPAD.md does not say v3.0.0")
+if 'const VERSION: string = "VaultLaunch v4.0.0"' not in CONTRACT:
+    fails.append("contract: VERSION is not v4.0.0")
+if "v4.0.0" not in DOC:
+    fails.append("doc: LAUNCHPAD.md does not say v4.0.0")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
     if concept not in DOC:
         fails.append(f"doc: v3 concept {concept} not documented")
+
+# v4 sanity: the real-asset concepts are documented
+for concept in ["Asset::create", "Fixed", "asset_budget", "migrate",
+                "sync_trust_to_dex", "LaunchDEX", "get_asset_info",
+                "get_migration_info", "confidential"]:
+    if concept not in DOC:
+        fails.append(f"doc: v4 concept {concept} not documented")
 
 # 7. the doc's fee schedule quotes the real default pair
 if "0.25%" not in DOC or "0.50%" not in DOC or "0.5%" not in DOC:

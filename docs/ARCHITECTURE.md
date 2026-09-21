@@ -81,3 +81,52 @@ tests green, and a written threat model in docs/.
   outlives centralization.
 - Future modules follow the same pattern: capped, transparent, claim-only,
   never able to touch principal.
+
+
+---
+
+## v18 — VaultLaunch v4 + LaunchDEX (real assets, real migration)
+
+**The launchpad finally launches REAL tokens.** Every validated project's
+token is a native XELIS confidential asset: `Asset::create` with
+`MaxSupplyMode::Fixed` at `finalize_validation` (D13) — the whole supply
+is minted to the contract, the cap is enforced by the XELIS protocol
+itself, and the creation cost is measured by balance-delta from an
+earmarked budget (refunded if unused). The bonding curve trades real
+deposits (D14): buys transfer actual tokens to wallets, sells consume
+the whole attached token deposit. The internal ledger of v1-v3 is gone.
+
+**Graduation is now a real migration (D15).** Between graduation and
+migration the curve keeps trading at the graduated fee (admin-lag
+tolerant); then `migrate()` — permissionless, atomic — seeds a permanent
+LaunchDEX pool with the curve's whole reserves and inventory via one
+cross-contract call with attached deposits. The curve closes forever;
+the launchpad remains the project's home (votes, socials, trust, team
+escrow).
+
+**LaunchDEX (new contract, `contracts/dex/`).** Minimal permanent AMM:
+one XEL-quote pool per asset, constant product, fees extracted to
+per-pool pending pots (100% admin), and **no remove_liquidity exists**
+— liquidity can only grow (X2, the anti-rug core). The launchpad pin
+freezes at the first pool (X4); the DEX pin on the launchpad freezes at
+the first migration (D19); the two cross-called chunk ids are CI-asserted
+on both sides. Trust follows the tokens: `sync_trust_to_dex` (a
+permissionless keeper entry) mirrors the Untrusted status to the pool's
+buys-pause — sells are never pausable on either venue (D17).
+
+**Privacy (D18).** Native XELIS confidentiality for every launched
+token: wallet balances and transfers are encrypted at the base layer.
+Team claims pay via confidential transfers and the TeamClaimed event
+carries no amount. Public by chain design: deposits attached to contract
+invocations.
+
+**Accounting (D20, I1/I2/I10 + IX1..IX6).** `total_curve_xel` is now the
+EXACT sum of live curve reserves (seeds included) — the committed side
+of I2 also includes pending fees, locked refunds and earmarked asset
+budgets. Per-asset: `launchpad asset balance == curve inventory + unpaid
+team allocation` (I1), degenerating to the team escrow after migration
+(I10). The DEX keeps its own solvency (reserves + pending pots ==
+balances, IX1/IX2), verified by the fuzz suite after every action.
+
+See docs/LAUNCHPAD.md (§1a/§1b) and docs/DEX.md for the full
+specifications.

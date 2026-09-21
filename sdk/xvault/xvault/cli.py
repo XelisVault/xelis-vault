@@ -30,12 +30,16 @@ from pathlib import Path
 from typing import Optional
 
 from . import crypto
+from . import dex as dexmod
+from .dex import (DexReader, spot_price as dex_math_spot_price,
+                  tokens_to_xel_out, xel_to_tokens_out)
 from .launchpad import (DEFAULTS, LaunchpadReader, buy_quote, current_price,
-                         fmt_token, market_cap, propose_deposits,
+                         fmt_token, market_cap, pid_params, propose_deposits,
                          propose_params, sell_quote, team_alloc_of)
 from .mixer import (MixerReader, Note, deposit_deposits, deposit_params,
                     prepare_deposit, release_many_params, release_params)
 from .protocol import (DaemonClient, MIXER_ENTRY_IDS, MIXER_ENTRY_IDS_ALT,
+                       LAUNCHDEX_ENTRY_IDS, LAUNCHDEX_ENTRY_IDS_ALT,
                        LAUNCHPAD_ENTRY_IDS, LAUNCHPAD_ENTRY_IDS_ALT,
                        NETWORKS, WALLET_AUTH, WALLET_URL, WalletClient,
                        val_addr, val_str, val_u64)
@@ -365,22 +369,30 @@ def cmd_launchpad_status(args) -> None:
     print(f"  paused          : {'YES — new proposals & buys frozen' if st['paused'] else 'no'}")
     print(f"  curve XEL       : {crypto.fmt_xel(st['total_curve_xel'])}")
     print(f"  refundable XEL  : {crypto.fmt_xel(st['locked_refunds'])}")
+    print(f"  budget escrow   : {crypto.fmt_xel(st['total_budgets'])} "
+          f"(earmarked asset creation costs, D13)")
     print(f"  contract bal.   : {crypto.fmt_xel(balance)}")
     solvent = balance >= (st['total_curve_xel'] + st['locked_refunds']
-                          + st['pending_fees'])
+                          + st['pending_fees'] + st['total_budgets'])
     print(f"  solvent         : {'YES' if solvent else 'NO — balance below commitments!'}")
     print(f"  pending fees    : {crypto.fmt_xel(st['pending_fees'])} "
           f"(lifetime {crypto.fmt_xel(st['fees_collected_lifetime'])})")
+    print(f"  migrated        : {st['migrated_count']} project(s) on LaunchDEX "
+          f"(pin {'FROZEN' if st['migrated_count'] else 'still settable'})")
+    dex = st.get('dex_address')
+    print(f"  dex pin         : {dex or 'NOT SET — set before the first migration (chunk 48)'}")
     print(f"  total volume    : {crypto.fmt_xel(st['total_volume'])} "
           f"(buy {crypto.fmt_xel(st['total_buy_volume'])} / "
           f"sell {crypto.fmt_xel(st['total_sell_volume'])}, "
-          f"{st['total_trades']} trades)")
+          f"{st['total_trades']} trades — curve era; pool era on LaunchDEX)")
     print("  parameters      :")
     print(f"    submission fee        : {crypto.fmt_xel(cfg['submission_fee'])}")
+    print(f"    asset budget          : {crypto.fmt_xel(cfg['asset_budget'])} "
+          f"(unused part refunded at creation)")
     print(f"    min liquidity         : {crypto.fmt_xel(cfg['min_liquidity'])}")
     print(f"    trading fee           : {cfg['trading_fee_bps'] / 100:.2f}% (bonding)")
     print(f"    graduated fee         : {cfg['graduated_fee_bps'] / 100:.2f}% "
-          f"(post-graduation, always <= trading fee)")
+          f"(curve trades until migration)")
     print(f"    migration fee         : {cfg['migration_fee_bps'] / 100:.2f}% "
           f"of reserves, once at graduation")
     print(f"    direct listing        : >= {crypto.fmt_xel(cfg['direct_listing_threshold'])} "
@@ -442,9 +454,25 @@ def cmd_launchpad_project(args) -> None:
           f"(buy {crypto.fmt_xel(p['buy_volume'])} / "
           f"sell {crypto.fmt_xel(p['sell_volume'])}, "
           f"{p['trades']} trades, last at topo {p['last_trade_topo']})")
+    a = reader.asset_info(args.id)
+    if a['created']:
+        print(f"  asset      : {a['asset']} (native confidential asset, "
+              "Fixed supply — real tokens in real wallets)")
+    else:
+        print("  asset      : not created yet (born at validation success, D13)")
+    m = reader.migration_info(args.id)
+    if m['migrated']:
+        print(f"  migrated   : YES at topo {m['migrated_at']} — "
+              f"{crypto.fmt_xel(m['xel_sent'])} + "
+              f"{fmt_token(m['tokens_sent'])} tokens seeded the permanent "
+              f"LaunchDEX pool (curve closed; sells on the DEX)")
+    elif p['graduated']:
+        print("  migrated   : pending — anyone may call migrate() "
+              f"(chunk {LAUNCHPAD_ENTRY_IDS['migrate']}, needs the "
+              "contract-call permission)")
     if args.owner:
-        bal = reader.token_balance(args.id, args.owner)
-        print(f"  balance    : {fmt_token(bal)} tokens ({args.owner})")
+        print(f"  note       : token balances live in wallets now (v4) — "
+              f"check {args.owner} in any XELIS wallet/daemon")
 
 
 def cmd_launchpad_team(args) -> None:
@@ -546,7 +574,7 @@ def cmd_launchpad_propose(args) -> None:
                         ("--discord", args.discord)):
         if len(link) > 256:
             sys.exit(f"error: {label} longer than 256 characters")
-    deposit = cfg["submission_fee"] + liquidity
+    deposit = cfg["submission_fee"] + cfg["asset_budget"] + liquidity
     team = team_alloc_of(total_supply, args.team_bps)
 
     print(f"propose() — chunk {LAUNCHPAD_ENTRY_IDS['propose']}")
@@ -556,6 +584,7 @@ def cmd_launchpad_propose(args) -> None:
           f"claimable at graduation or via vesting)")
     print(f"  deposit     : {crypto.fmt_xel(deposit)} total = "
           f"{crypto.fmt_xel(cfg['submission_fee'])} fee + "
+          f"{crypto.fmt_xel(cfg['asset_budget'])} asset budget + "
           f"{crypto.fmt_xel(liquidity)} seed liquidity")
     if liquidity >= cfg["direct_listing_threshold"]:
         print(f"  path        : DIRECT LISTING — liquidity >= threshold "
@@ -585,7 +614,8 @@ def cmd_launchpad_propose(args) -> None:
                             args.website, args.logo, args.twitter,
                             args.telegram, args.discord, total_supply,
                             args.team_bps, args.vesting)
-    deposits = propose_deposits(cfg["submission_fee"], liquidity,
+    deposits = propose_deposits(cfg["submission_fee"], cfg["asset_budget"],
+                                liquidity,
                                 NETWORKS[args.network]["xelis_asset"])
     before = w.nonce()
     tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["propose"], params,
@@ -602,6 +632,155 @@ def cmd_launchpad_entries(args) -> None:
         print(f"  {eid:>3}  {name}")
     print("\nlegacy entries-only numbering (kept for probe only):")
     for name, eid in sorted(LAUNCHPAD_ENTRY_IDS_ALT.items(), key=lambda kv: kv[1]):
+        print(f"  {eid:>3}  {name}")
+
+
+def cmd_launchpad_migrate(args) -> None:
+    """Prepare the permissionless migration to LaunchDEX (D15) — atomic:
+    curve reserves + inventory -> permanent pool. Needs the wallet's
+    contract-call permission on the transaction."""
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    if args.id >= reader.count():
+        sys.exit(f"error: project {args.id} does not exist")
+    p = reader.project(args.id)
+    m = reader.migration_info(args.id)
+    if not p['graduated']:
+        sys.exit("error: project has not graduated yet")
+    if m['migrated']:
+        sys.exit("error: already migrated "
+                 f"(at topo {m['migrated_at']})")
+    if not m['dex_address']:
+        sys.exit("error: the admin must pin the DEX address first "
+                 "(set_dex_address, chunk 48)")
+    xel_out = p['reserves'] or 0
+    tok_out = p['curve'] or 0
+    print(f"migrate() — chunk {LAUNCHPAD_ENTRY_IDS['migrate']} "
+          f"(permissionless, atomic)")
+    print(f"  pool seed  : {crypto.fmt_xel(xel_out)} + "
+          f"{fmt_token(tok_out)} tokens (team escrow stays on the "
+          "launchpad)")
+    print(f"  dex        : {m['dex_address']}")
+    print("  permission : the transaction MUST carry the contract-call "
+          "permission (XSWD 'all' or LaunchDEX allowlist)")
+    if p['status_label'] == 'untrusted':
+        print("  note       : project is Untrusted — the pool's buys will be "
+              "paused in the same transaction (D17)")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["migrate"],
+                  pid_params(args.id), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — the curve is closed, trading continues on LaunchDEX")
+
+
+def cmd_launchpad_sync(args) -> None:
+    """Prepare the trust sync to the DEX pool (D17): Untrusted -> pool
+    buys paused; recovered -> pool buys unpaused. Permissionless keeper."""
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    if args.id >= reader.count():
+        sys.exit(f"error: project {args.id} does not exist")
+    p = reader.project(args.id)
+    m = reader.migration_info(args.id)
+    if not m['migrated']:
+        sys.exit("error: project has not migrated to the DEX yet")
+    flag = p['status_label'] == 'untrusted'
+    if bool(p['dex_synced']) == flag:
+        sys.exit("note: the pool already mirrors the trust status "
+                 "(nothing to sync)")
+    print(f"sync_trust_to_dex() — chunk {LAUNCHPAD_ENTRY_IDS['sync_trust_to_dex']}")
+    print(f"  action     : {'PAUSE pool buys (project Untrusted)' if flag else 'UNPAUSE pool buys (trust recovered)'}")
+    print("  permission : the transaction MUST carry the contract-call permission")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["sync_trust_to_dex"],
+                  pid_params(args.id), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — the pool mirrors the launchpad trust status")
+
+
+# dex status / pool / quote / swap / add-liquidity / entries
+# ---------------------------------------------------------------------------
+
+def cmd_dex_status(args) -> None:
+    contract = _require_contract(args)
+    reader = DexReader(_daemon(args.network), contract)
+    cfg = reader.config()
+    print(f"LaunchDEX — {contract[:16]}… ({args.network})")
+    print(f"  pools           : {reader.pools_count()}")
+    print(f"  emergency       : {'YES — everything frozen' if cfg['emergency'] else 'no'}")
+    print(f"  swap fee        : {cfg['swap_fee_bps'] / 100:.2f}% on inputs "
+          f"(cap 10%, 100% admin)")
+    print(f"  launchpad pin   : {cfg['launchpad'] or 'NOT SET'} "
+          f"({'FROZEN — first pool exists' if cfg['launchpad_pinned'] else 'still settable'})")
+    print(f"  trade bounds    : swaps "
+          f"{crypto.fmt_xel(cfg['min_swap_xel'])}.."
+          f"{crypto.fmt_xel(cfg['max_swap_xel'])} XEL, "
+          f"{fmt_token(cfg['min_swap_tokens'])}.."
+          f"{fmt_token(cfg['max_swap_tokens'])} tokens")
+    print("  liquidity       : PERMANENT (no remove_liquidity exists — "
+          "the anti-rug core, X2)")
+
+
+def cmd_dex_pool(args) -> None:
+    contract = _require_contract(args)
+    reader = DexReader(_daemon(args.network), contract)
+    q = reader.pool(args.asset.lower())
+    if q['xel_reserve'] is None:
+        sys.exit("error: no pool for this asset")
+    print(f"pool {args.asset}")
+    print(f"  reserves   : {crypto.fmt_xel(q['xel_reserve'] or 0)} XEL / "
+          f"{fmt_token(q['token_reserve'] or 0)} tokens")
+    print(f"  price      : {(q['price'] or 0) / 1e8:.8f} XEL/token")
+    print(f"  status     : {q['status_label']}")
+    print(f"  volume     : buy {crypto.fmt_xel(q['buy_volume'] or 0)} / "
+          f"sell {crypto.fmt_xel(q['sell_volume'] or 0)} "
+          f"({q['trades'] or 0} trades, last at topo {q['last_trade_topo'] or 0})")
+    print(f"  fees       : {crypto.fmt_xel(q['xel_fees'] or 0)} XEL + "
+          f"{fmt_token(q['token_fees'] or 0)} tokens pending "
+          f"(lifetime {crypto.fmt_xel(q['lifetime_fees'] or 0)} XEL)")
+    print(f"  lp gifts   : {q['lp_deposits'] or 0} permanent liquidity "
+          "donations (add_liquidity)")
+
+
+def cmd_dex_quote(args) -> None:
+    """Offline pool calculator — mirrors the LaunchDEX math exactly."""
+    x = int(round(args.x_reserve * 1e8))
+    y = int(round(args.y_reserve * 1e8))
+    if x <= 0 or y <= 0:
+        sys.exit("error: --x-reserve and --y-reserve must be positive")
+    price = dex_math_spot_price(x, y)
+    print(f"pool: {crypto.fmt_xel(x)} XEL / {fmt_token(y)} tokens "
+          f"-> price {price / 1e8:.8f} XEL/token")
+    if args.buy is not None:
+        xel_in = int(round(args.buy * 1e8))
+        out = xel_to_tokens_out(x, y, xel_in, args.fee_bps)
+        print(f"buy  {crypto.fmt_xel(xel_in)} (fee {args.fee_bps / 100:.2f}%) "
+              f"-> {fmt_token(out)} tokens")
+    if args.sell is not None:
+        tokens = int(round(args.sell * 1e8))
+        out = tokens_to_xel_out(x, y, tokens, args.fee_bps)
+        print(f"sell {fmt_token(tokens)} tokens "
+              f"-> {crypto.fmt_xel(out)} out (fee {args.fee_bps / 100:.2f}%)")
+
+
+def cmd_dex_entries(args) -> None:
+    print("LaunchDEX chunk ids — compiler numbering "
+          "(CI-verified; 6/7 are what VaultLaunch cross-calls — D19):")
+    for name, eid in sorted(LAUNCHDEX_ENTRY_IDS.items(), key=lambda kv: kv[1]):
+        pin = "  <- pinned (launchpad cross-call)" if eid in (6, 7) else ""
+        print(f"  {eid:>3}  {name}{pin}")
+    print("\nentries-only numbering (probe only):")
+    for name, eid in sorted(LAUNCHDEX_ENTRY_IDS_ALT.items(), key=lambda kv: kv[1]):
         print(f"  {eid:>3}  {name}")
 
 
@@ -742,6 +921,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = ls.add_parser("entries")
     sp.set_defaults(func=cmd_launchpad_entries, need_contract=False)
+
+    sp = ls.add_parser("migrate"); common(sp)
+    sp.add_argument("--id", type=int, required=True, help="project id")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send via local wallet (default: prepare only)")
+    sp.set_defaults(func=cmd_launchpad_migrate)
+
+    sp = ls.add_parser("sync"); common(sp)
+    sp.add_argument("--id", type=int, required=True, help="project id")
+    sp.add_argument("--broadcast", action="store_true")
+    sp.set_defaults(func=cmd_launchpad_sync)
+
+    dx = sub.add_parser("dex", help="LaunchDEX operations")
+    ds = dx.add_subparsers(dest="dex_cmd", required=True)
+
+    sp = ds.add_parser("status"); common(sp)
+    sp.set_defaults(func=cmd_dex_status)
+
+    sp = ds.add_parser("pool"); common(sp)
+    sp.add_argument("--asset", required=True,
+                    help="asset hash (64 hex) of the pool's token")
+    sp.set_defaults(func=cmd_dex_pool)
+
+    sp = ds.add_parser("quote")
+    sp.add_argument("--x-reserve", type=float, required=True,
+                    help="pool XEL reserves")
+    sp.add_argument("--y-reserve", type=float, required=True,
+                    help="pool token reserves")
+    sp.add_argument("--buy", type=float, help="XEL amount to quote a buy")
+    sp.add_argument("--sell", type=float, help="token amount to quote a sell")
+    sp.add_argument("--fee-bps", type=int,
+                    default=dexmod.DEFAULTS["swap_fee_bps"],
+                    help="swap fee in bps (default: %(default)s)")
+    sp.set_defaults(func=cmd_dex_quote, need_contract=False)
+
+    sp = ds.add_parser("entries")
+    sp.set_defaults(func=cmd_dex_entries, need_contract=False)
 
     return p
 

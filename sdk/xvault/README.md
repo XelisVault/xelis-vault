@@ -13,7 +13,14 @@ pip install ./sdk/xvault      # or: pip install -e ./sdk/xvault[dev]
 
 Requires Python ≥ 3.10. Dependencies: `requests`, `blake3`.
 
-## Launchpad workflow (VaultLaunch)
+## Launchpad workflow (VaultLaunch v4 — real assets)
+
+The launched tokens are REAL XELIS confidential assets now: buyers hold
+them in their own wallets (query the daemon for the asset hash like any
+balance — there is no internal ledger). Graduation migrates the curve
+into a permanent LaunchDEX pool; trading continues there.
+
+```bash
 
 ```bash
 # protocol health, parameters, fee pot, solvency
@@ -30,7 +37,9 @@ xvault launchpad team --contract <hash> --id 0
 # offline curve calculator (mirrors the contract math exactly)
 xvault launchpad quote --reserves 500 --curve 90000000 --buy 100 --sell 1000000
 
-# prepare / send a proposal (deposit = submission fee + seed liquidity)
+# prepare / send a proposal (deposit = submission fee + ASSET BUDGET
+# + seed liquidity — the budget covers the chain's Asset::create cost,
+# unused part refunded at validation success)
 # --vesting N declares the team vesting plan the community votes on
 # (0 = claim at graduation); socials ride along and are updatable later
 xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
@@ -42,6 +51,33 @@ xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
 # entry-point chunk ids for every invoke
 xvault launchpad entries
 ```
+
+## Migration & the pool era (v4)
+
+```bash
+# the atomic, permissionless move: curve reserves + token inventory ->
+# a PERMANENT LaunchDEX pool (no remove_liquidity exists — anti-rug)
+xvault launchpad migrate --contract <launchpad> --id 0 [--broadcast]
+# the transaction MUST carry the contract-call permission (XSWD "all")
+
+# mirror the community trust to the pool: Untrusted -> pool buys paused
+# (sells NEVER blocked, on either venue)
+xvault launchpad sync   --contract <launchpad> --id 0 [--broadcast]
+
+# the pool era: reserves, price, volume scoreboard, permanent liquidity
+xvault dex status       --contract <dex>
+xvault dex pool         --contract <dex> --asset <asset-hash-64hex>
+xvault dex quote        --x-reserve 2000 --y-reserve 900000000 --buy 100
+xvault dex entries      # chunk ids (6/7 are the pinned cross-calls)
+```
+
+Python: `from xvault import dex` — the math mirror (`xel_to_tokens_out`,
+`tokens_to_xel_out`, `spot_price`), the `DexReader` (pools, quotes,
+scoreboard) and the invoke builders (`swap_xel_params`,
+`swap_token_params`, `add_liquidity_deposits`...). The launchpad module
+gained `sell_deposits` (whole-deposit token sales), `set_dex_address_params`,
+`finalize_topup_deposits`, `dex_pool_market_cap` (the pool-era cap
+composition) and the migration fields in `LaunchpadReader.project()`.
 
 Other entries (support/report/finalize/buy/sell/claim_refund/
 request_revalidation/start_team_vesting/claim_team_allocation + admin

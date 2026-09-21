@@ -155,19 +155,47 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
     ("VaultLaunch", "sell"): (
         "exit path, public by design and NEVER blockable (not by pause, not "
         "by Untrusted status, not by a voting window): the payout goes ONLY "
-        "to the caller and is bounded by the caller's OWN internal token "
-        "balance, which the entry debits — the balance debit IS the "
-        "authorization (holders must always be able to exit)"
+        "to the caller and is bounded by the caller's OWN attached token "
+        "deposit, which the entry consumes in full (whole-deposit semantics, "
+        "v4) — the deposit IS the authorization (holders must always be "
+        "able to exit)"
     ),
     ("VaultLaunch", "finalize_validation"): (
         "permissionless deadline executor: once a voting window has ended, "
         "anyone can trigger the outcome that the public tallies already "
-        "determine (pass -> Bonding or direct-listing Graduated, fail -> "
-        "Rejected/Untrusted); it moves no user funds (the v2 migration fee "
-        "is taken from the project's own curve by graduate(), accounted in "
-        "pending_fees), mints nothing to the caller, and cannot act before "
-        "the deadline — the founder and the community both have natural "
-        "incentives to call it"
+        "determine (pass -> Asset::create + Bonding or direct-listing "
+        "Graduated, fail -> Rejected/Untrusted); it moves no user funds (the "
+        "v2 migration fee is taken from the project's own curve by "
+        "graduate(), accounted in pending_fees; the asset creation fee is "
+        "paid from the project's own earmarked budget with the unused part "
+        "refunded to the creator), mints nothing to the caller, and cannot "
+        "act before the deadline — the founder and the community both have "
+        "natural incentives to call it"
+    ),
+    ("VaultLaunch", "migrate"): (
+        "permissionless migration executor, public by design: the outcome "
+        "is fully determined by the project's state — it can only send the "
+        "project's OWN curve reserves and token inventory to the PINNED "
+        "LaunchDEX contract (frozen after the first migration, D19) as a "
+        "pool seed, with no destination, amount or caller choice anywhere; "
+        "a 'malicious' migrator can only perform the migration the "
+        "community is waiting for (anti-rug: the pool has no "
+        "remove_liquidity at all)"
+    ),
+    ("VaultLaunch", "sync_trust_to_dex"): (
+        "permissionless community keeper: it only mirrors the PUBLIC trust "
+        "status (Untrusted flag) to the migrated pool's buys-pause on the "
+        "pinned DEX — a strictly safety-increasing write on the buy side "
+        "only (sells are never pausable, D4/D17); kept OUT of report/"
+        "support on purpose so voters never need the contract-call "
+        "permission (D17)"
+    ),
+    ("LaunchDEX", "add_liquidity"): (
+        "public donation entry by design: the caller attaches BOTH assets "
+        "and receives nothing back but a deeper pool — there is no "
+        "remove_liquidity in the entire contract (permanent protocol-owned "
+        "liquidity, X2), so the entry can only ever ADD value to the "
+        "market; the attached deposits bound exactly what it can take"
     ),
 }
 

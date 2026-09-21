@@ -1,0 +1,909 @@
+// ============================================================================
+// LaunchDEX — XelisVault Protocol
+// ============================================================================
+// The permanent AMM for graduated tokens. One XEL-quote pool per asset,
+// constant-product pricing, and liquidity that can only ever GROW:
+// there is NO remove_liquidity entry, by design — the pools are
+// protocol-owned forever, which is exactly the anti-rug guarantee a
+// serious launchpad owes its buyers (a migrated project's liquidity is
+// permanent, not a promise).
+//
+// Why a new contract instead of VaultSwapV2: the legacy AMM charges its
+// treasury fee from the contract's raw balance without reserve accounting
+// (insolvency grows with every swap), never implemented LP accounting, and
+// carries oracle/PSM/guardian baggage with dead routes. LaunchDEX is a
+// clean-room minimal design with exactly one job: price migrated tokens
+// against XEL, forever, solvently.
+//
+// ZERO external dependencies (no oracle, no PSM). ONE file.
+//
+// ----------------------------------------------------------------------------
+// DESIGN DECISIONS (and why — read before changing anything)
+// ----------------------------------------------------------------------------
+// X1. ONE POOL PER ASSET, XEL ON ONE SIDE. Every pool is (XEL, asset).
+//     Launchpad-born tokens migrate here exactly once, so the bijection
+//     asset -> pool is natural; it also keeps per-asset solvency accounting
+//     trivial (one pool, one pending-fee pot, one balance to reconcile).
+//
+// X2. PERMANENT LIQUIDITY — no remove_liquidity entry exists. This is the
+//     anti-rug core: nobody — not the admin, not the launchpad, not the
+//     founder — can ever drain a pool. Liquidity enters at pool creation
+//     (the launchpad migration) and via add_liquidity (ANYONE may deepen a
+//     pool; a donation to the market that can never be clawed back). The
+//     trade-off is honest and documented: LPs get no shares in v1; a
+//     share-based upgrade can be deployed later without touching this
+//     contract's pools (new pools only).
+//
+// X3. FEES ARE EXTRACTED, NOT POOLED. On every swap, fee_bps of the INPUT
+//     is diverted to a per-pool pending pot (XEL-side or token-side) and
+//     only the NET input joins the reserves. 100% of the revenue goes to
+//     the admin via withdraw_fees (nothing burned, nothing hidden in k).
+//     Solvency is by construction: reserves + pending pots always equal
+//     exactly what the contract holds, because the deposit arrives whole
+//     and is split bookkeeping-wise on the spot.
+//
+// X4. MIGRATION ENTRY IS LAUNCHPAD-ONLY. create_pool reads the deposits
+//     attached to a cross-contract call and is callable ONLY by the pinned
+//     launchpad contract address (get_caller check). The launchpad address
+//     is set once by the admin and FREEZES the moment the first pool
+//     exists — a swapped launchpad could otherwise orphan every live pool.
+//
+// X5. TRUST HOOK — per-pool buys-pause. The launchpad's community trust
+//     system (Untrusted) must keep meaning after migration: buys on the
+//     pool can be paused, sells NEVER (holders always exit — mirrors the
+//     launchpad's D4). set_pool_buys_paused is launchpad-only (called by
+//     the launchpad's permissionless sync entry), so the flag always
+//     mirrors the launchpad's status, never an admin whim. The global
+//     admin emergency pause (both directions) exists ONLY for genuine
+//     emergencies (a bug in the wild) — it cannot rug anything since
+//     nothing can leave the reserves anyway.
+//
+// X6. OWN SCOREBOARD. Each pool tracks buy/sell volume (XEL side),
+//     trade count, last trade topoheight and the spot price implied by
+//     its reserves — the launchpad's D12 scoreboard keeps the curve era,
+//     LaunchDEX keeps the pool era. The SDK aggregates both for the
+//     frontend; no indexer required on either side.
+//
+// X7. TRADE GUARDS mirror the launchpad: dust floors and whale caps on
+//     both directions, min_out slippage protection on every swap, u128
+//     intermediates with contract-favouring floors everywhere. A pool's
+//     reserves can never reach zero from swaps (floors always leave
+//     both sides non-zero), so no swap can ever divide by zero.
+//
+// X8. NO REENTRANCY SURFACE: LaunchDEX calls no other contract, ever.
+//     Cross-contract calls arrive INBOUND only (create_pool,
+//     set_pool_buys_paused), and those two entries touch no external
+//     contract themselves. Effects are ordered state-first, transfer-last.
+//
+// ----------------------------------------------------------------------------
+// SWAP MATH (constant product, integer, contract-favouring floors)
+// ----------------------------------------------------------------------------
+// State per pool: x = XEL reserves, y = token reserves. Price = x / y.
+//
+//   buy  with D XEL attached:   fee  = D * fee_bps / 10000
+//                               net  = D - fee          (net joins x)
+//                               out   = y * net / (x + net)   (leaves y)
+//   sell with T tokens attached: fee = T * fee_bps / 10000
+//                               net  = T - fee          (net joins y)
+//                               out   = x * net / (y + net) (leaves x)
+//
+// Both directions floor (integer division) in favour of the pool: reserves
+// can never go insolvent from rounding. All intermediates in u128 (products
+// up to 1e31; u64 would overflow).
+//
+// ----------------------------------------------------------------------------
+// SECURITY MODEL (honest threat documentation)
+// ----------------------------------------------------------------------------
+//   * The admin is a hot role: it sets the swap fee (capped at 10%), the
+//     trade guards, the launchpad address (before the first pool only) and
+//     can trigger the global emergency pause. It can NEVER move pool
+//     reserves — withdraw_fees is capped by the pending pots, which are
+//     the only value the admin can ever extract, by design.
+//   * The launchpad pin (X4) is a one-way door: set before the first pool,
+//     frozen after. A frozen pin can never be repointed at a fake launchpad.
+//   * add_liquidity is a donation (X2): the caller sends both assets and
+//     receives nothing back but a deeper pool. There is no ratio
+//     enforcement — the donor chooses the mix; an imbalanced donation
+//     moves the price, but the donor paid full value for it (their loss
+//     or their gift, the market's gain either way).
+//   * No reentrancy (X8). No oracles. No pausable exits: the emergency
+//     pause blocks BOTH directions and is admin-only, documented as the
+//     last resort — sells are never selectively blocked (X5's per-pool
+//     flag blocks buys only).
+//   * Front-running is possible (no mempool privacy) — same as every
+//     public AMM on XELIS; use the quotes (get_amount_out_*) + min_out.
+//
+// ----------------------------------------------------------------------------
+// INVARIANTS
+// ----------------------------------------------------------------------------
+//   IX1. SOLVENCY (XEL): sum over pools of (x_reserves + x_fees_pending)
+//        <= contract XEL balance, before and after every entry. Equality
+//        holds at creation and is only ever widened by direct donations.
+//   IX2. SOLVENCY (per asset): for every pool's asset,
+//        y_reserves + y_fees_pending <= contract balance of that asset.
+//   IX3. RESERVES NEVER SHRINK EXCEPT BY SWAPS: reserves only grow
+//        (create_pool, add_liquidity) or move sideways (swap: one side
+//        in, other side out, floors favouring the pool). No entry moves
+//        reserves to anyone's wallet.
+//   IX4. ONE POOL PER ASSET, FOREVER: the pool map is write-once per
+//        asset; the launchpad pin freezes at the first pool.
+//   IX5. PRICE SANITY: reserves of a live pool are always > 0 on both
+//        sides (min seeds at creation, floors on every swap), so
+//        price = x / y is always well-defined and finite.
+//   IX6. Buys-pause NEVER blocks sells: the per-pool flag is checked on
+//        the buy path only; the global emergency pause is the only other
+//        gate, and it blocks everything (X5).
+//
+// ----------------------------------------------------------------------------
+// STORAGE MAP (string keys, flat KV — house style)
+// ----------------------------------------------------------------------------
+//   Global  : adm pc sfe lpx mnx lnt mnt tsw mst mxs xpa lpp xa
+//             (see constants below)
+//   Pool    : q:{asset_hex}:xr xel reserves      q:{asset_hex}:yr tok reserves
+//             q:{asset_hex}:xf xel fees pending  q:{asset_hex}:yf tok fees pending
+//             q:{asset_hex}:bp buys paused       q:{asset_hex}:ct created topo
+//             q:{asset_hex}:bv buy volume (XEL)  q:{asset_hex}:sv sell volume (XEL)
+//             q:{asset_hex}:tc trade count       q:{asset_hex}:lt last trade topo
+//             q:{asset_hex}:fl lifetime fees     q:{asset_hex}:lp lp deposits count
+//             q:{asset_hex}:ah asset hash (echo, so listings recover the Hash)
+//   Index   : i:{index} -> asset Hash (listing enumeration)
+//
+// ----------------------------------------------------------------------------
+// EVENTS (V6 contract events: id + array of string fields)
+// ----------------------------------------------------------------------------
+//    1 PoolCreated       [asset, xel_seed, token_seed, launchpad]
+//    2 SwapXelForToken   [asset, xel_in, tokens_out, fee]
+//    3 SwapTokenForXel   [asset, tokens_in, xel_out, fee]
+//    4 LiquidityAdded    [asset, xel_added, tokens_added]
+//    5 FeesWithdrawn     [asset, xel_amount, token_amount]
+//    6 ParamSet          [param, value]
+//    7 BuysPaused        [asset]      8 BuysUnpaused [asset]
+//    9 EmergencyPaused   ["admin"]   10 EmergencyUnpaused ["admin"]
+//   11 AdminSet          [new_admin] 12 LaunchpadSet [launchpad]
+//
+// ----------------------------------------------------------------------------
+// CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
+//    0  constructor                1  only_admin              2  require_pool
+//    3  pool_key                   4  fee_take                5  checked_add
+//    6  create_pool                7  set_pool_buys_paused    8  swap_xel_for_token
+//    9  swap_token_for_xel        10  add_liquidity          11  set_swap_fee
+//   12  set_trade_bounds          13  set_launchpad          14  set_admin
+//   15  set_paused                16  withdraw_fees          17  get_pool
+//   18  get_pool_state            19  get_amount_out_xel     20  get_amount_out_token
+//   21  get_spot_price            22  get_pool_volume        23  get_pools_count
+//   24  get_pool_by_index         25  get_config             26  get_status_label
+//   27  get_version
+//
+//   PINNED FOR CROSS-CONTRACT CALLS (see VaultLaunch constants):
+//     chunk 6  = create_pool          (launchpad migrate)
+//     chunk 7  = set_pool_buys_paused (launchpad sync_trust_to_dex)
+//   tests/test_dex_reference.py asserts this table against the source AND
+//   asserts VaultLaunch's pinned constants against it — renumbering either
+//   side without the other fails CI.
+// ============================================================================
+
+const VERSION: string = "LaunchDEX v1.0.0"
+
+// ---------------------------------------------------------------------------
+// Global capacity (storage growth bound; also the static loop bound of the
+// listing views — R8-clean)
+// ---------------------------------------------------------------------------
+const MAX_POOLS: u64 = 8192
+
+// ---------------------------------------------------------------------------
+// Defaults (atomic units, 8 decimals — 1 XEL = 100000000)
+// ---------------------------------------------------------------------------
+const DEFAULT_SWAP_FEE_BPS: u64 = 30
+const DEFAULT_MIN_SEED_XEL: u64 = 100000000
+const DEFAULT_MIN_SEED_TOKENS: u64 = 1000000
+const DEFAULT_MIN_SWAP_XEL: u64 = 1000000
+const DEFAULT_MAX_SWAP_XEL: u64 = 10000000000000
+const DEFAULT_MIN_SWAP_TOKENS: u64 = 1
+const DEFAULT_MAX_SWAP_TOKENS: u64 = 10000000000000000
+
+// ---------------------------------------------------------------------------
+// Hard caps for admin parameters (a compromised admin can hurt the fee
+// model, never the funds)
+// ---------------------------------------------------------------------------
+const MAX_SWAP_FEE_BPS: u64 = 1000
+const MIN_SEED_FLOOR_XEL: u64 = 1000000
+const MAX_SEED_XEL: u64 = 1000000000000000
+const MIN_SEED_FLOOR_TOKENS: u64 = 1
+const MAX_SEED_TOKENS: u64 = 10000000000000000
+const MIN_SWAP_FLOOR_XEL: u64 = 1
+const MAX_SWAP_CAP_XEL: u64 = 100000000000000
+const MIN_SWAP_FLOOR_TOKENS: u64 = 1
+const MAX_SWAP_CAP_TOKENS: u64 = 10000000000000000
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+const BPS_DENOM: u64 = 10000
+const PRICE_SCALE: u64 = 100000000
+const U64_MAX: u64 = 18446744073709551615
+const U64_MAX_128: u128 = 18446744073709551615u128
+
+// ---------------------------------------------------------------------------
+// Global storage keys
+// ---------------------------------------------------------------------------
+const ADMIN_KEY: string = "adm"
+const POOLS_COUNT_KEY: string = "pc"
+const SWAP_FEE_KEY: string = "sfe"
+const LAUNCHPAD_KEY: string = "lpx"
+const MIN_SEED_XEL_KEY: string = "mnx"
+const MIN_SEED_TOKENS_KEY: string = "lnt"
+const MIN_SWAP_XEL_KEY: string = "mnt"
+const MAX_SWAP_XEL_KEY: string = "tsw"
+const MIN_SWAP_TOKENS_KEY: string = "mst"
+const MAX_SWAP_TOKENS_KEY: string = "mxs"
+const EMERGENCY_KEY: string = "xpa"
+const LAUNCHPAD_PINNED_KEY: string = "lpp"
+const XEL_ASSET_KEY: string = "xa"
+
+// ---------------------------------------------------------------------------
+// Pool field keys (q:{asset_hex}:{field})
+// ---------------------------------------------------------------------------
+const F_XEL_RESERVE: string = "xr"
+const F_TOK_RESERVE: string = "yr"
+const F_XEL_FEES: string = "xf"
+const F_TOK_FEES: string = "yf"
+const F_BUYS_PAUSED: string = "bp"
+const F_CREATED: string = "ct"
+const F_BUY_VOL: string = "bv"
+const F_SELL_VOL: string = "sv"
+const F_TRADES: string = "tc"
+const F_LAST_TRADE: string = "lt"
+const F_LIFETIME_FEES: string = "fl"
+const F_LP_COUNT: string = "lp"
+const F_ASSET: string = "ah"
+
+const POOL_PREFIX: string = "q:"
+const ASSET_INDEX_PREFIX: string = "i:"
+
+// ---------------------------------------------------------------------------
+// Event IDs
+// ---------------------------------------------------------------------------
+const EV_POOL_CREATED: u64 = 1
+const EV_SWAP_XEL: u64 = 2
+const EV_SWAP_TOKEN: u64 = 3
+const EV_LIQUIDITY_ADDED: u64 = 4
+const EV_FEES_WITHDRAWN: u64 = 5
+const EV_PARAM_SET: u64 = 6
+const EV_BUYS_PAUSED: u64 = 7
+const EV_BUYS_UNPAUSED: u64 = 8
+const EV_EMERGENCY_PAUSED: u64 = 9
+const EV_EMERGENCY_UNPAUSED: u64 = 10
+const EV_ADMIN_SET: u64 = 11
+const EV_LAUNCHPAD_SET: u64 = 12
+
+// ============================================================================
+// 0. CONSTRUCTOR
+// ============================================================================
+// Admin = deployer (signer of the deployment transaction). The launchpad
+// address starts UNSET — the admin pins it (set_launchpad) before the
+// launchpad's first migration; it freezes at the first pool (X4).
+// ============================================================================
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+
+    let deployer: Address = Transaction::current().unwrap().source()
+    s.store(ADMIN_KEY, deployer)
+
+    s.store(POOLS_COUNT_KEY, 0u64)
+    s.store(SWAP_FEE_KEY, DEFAULT_SWAP_FEE_BPS)
+    s.store(MIN_SEED_XEL_KEY, DEFAULT_MIN_SEED_XEL)
+    s.store(MIN_SEED_TOKENS_KEY, DEFAULT_MIN_SEED_TOKENS)
+    s.store(MIN_SWAP_XEL_KEY, DEFAULT_MIN_SWAP_XEL)
+    s.store(MAX_SWAP_XEL_KEY, DEFAULT_MAX_SWAP_XEL)
+    s.store(MIN_SWAP_TOKENS_KEY, DEFAULT_MIN_SWAP_TOKENS)
+    s.store(MAX_SWAP_TOKENS_KEY, DEFAULT_MAX_SWAP_TOKENS)
+    s.store(EMERGENCY_KEY, false)
+    s.store(LAUNCHPAD_PINNED_KEY, false)
+
+    s.store(XEL_ASSET_KEY, get_xelis_asset())
+
+    return 0
+}
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+// 1. Access control — every admin entry funnels through this.
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let admin: Address = admin_opt.expect("guarded")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == admin, "notauth")
+}
+
+// 2. Pool existence — every pool-scoped entry and view starts here. The
+//    xel-reserve slot is the pool's existence marker (write-once, IX4).
+fn require_pool(asset: Hash) {
+    let s: Storage = Storage::new()
+    require(s.load(pool_key(asset, F_XEL_RESERVE)).is_some(), "nopool")
+}
+
+// 3. Storage key of a pool field: "q:{asset_hex}:{field}".
+fn pool_key(asset: Hash, field: string) -> string {
+    return POOL_PREFIX + asset.to_hex() + ":" + field
+}
+
+// 4. Fee split — floor, in favour of the pool.
+fn fee_take(amount: u64, bps: u64) -> u64 {
+    let wide: u128 = (amount as u128) * (bps as u128) / (BPS_DENOM as u128)
+    return wide as u64
+}
+
+// 5. CHECKED ADD — u64 + u64 with an explicit overflow refusal. The volume
+//    and fee accumulators are the only counters that grow without bound by
+//    design, so every addition on them goes through this (same rationale
+//    and wording as VaultLaunch's checked_add).
+fn checked_add(a: u64, b: u64) -> u64 {
+    let wide: u128 = (a as u128) + (b as u128)
+    require(wide <= U64_MAX_128, "ovf")
+    return wide as u64
+}
+
+// ============================================================================
+// 6. CREATE POOL — the migration endpoint (launchpad-only, cross-called).
+// ============================================================================
+// @caller: the PINNED launchpad contract (a cross-contract call carrying the
+//          seed liquidity as attached deposits: XEL + the asset itself).
+// @params: asset — the token being listed (one pool per asset, IX4).
+// @attached: XEL >= min_seed_xel AND asset tokens >= min_seed_tokens, both
+//            read from the deposits of THIS invocation — what the launchpad
+//            sent is what seeds the pool (no params to desync from funds).
+// @rules:  writes the pool under its asset-keyed slots, indexes it for the
+//          listing views, freezes the launchpad pin if this is the first
+//          pool (X4). Emits PoolCreated. Returns the pool index.
+// @security: caller == pinned launchpad (the inline require(caller == lpx)
+//            IS the access guard); emergency pause blocks pool creation;
+//            one pool per asset (write-once); seed floors keep IX5 (price
+//            well-defined from birth).
+// ============================================================================
+entry create_pool(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+
+    let lpx_opt: optional<Address> = s.load(LAUNCHPAD_KEY)
+    require(lpx_opt.is_some(), "nolpx")
+    let lpx: Address = lpx_opt.expect("guarded")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "nocal")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == lpx, "notlpx")
+
+    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
+
+    // One pool per asset, forever (IX4).
+    let xr_key: string = pool_key(asset, F_XEL_RESERVE)
+    require(s.load(xr_key).is_none(), "exists")
+
+    // Capacity.
+    let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
+    require(count < MAX_POOLS, "full")
+
+    // The seed arrives as deposits of this invocation.
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let xel_seed: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    let tok_seed: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+
+    let min_x: u64 = s.load(MIN_SEED_XEL_KEY).unwrap_or(DEFAULT_MIN_SEED_XEL)
+    let min_t: u64 = s.load(MIN_SEED_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SEED_TOKENS)
+    require(xel_seed >= min_x, "seedx")
+    require(tok_seed >= min_t, "seedt")
+    require(xel_seed <= MAX_SEED_XEL, "toobig")
+    require(tok_seed <= MAX_SEED_TOKENS, "toobig")
+
+    // Pool state (IX5: both reserves strictly positive from birth).
+    s.store(xr_key, xel_seed)
+    s.store(pool_key(asset, F_TOK_RESERVE), tok_seed)
+    s.store(pool_key(asset, F_XEL_FEES), 0u64)
+    s.store(pool_key(asset, F_TOK_FEES), 0u64)
+    s.store(pool_key(asset, F_BUYS_PAUSED), false)
+    s.store(pool_key(asset, F_CREATED), get_current_topoheight())
+    s.store(pool_key(asset, F_BUY_VOL), 0u64)
+    s.store(pool_key(asset, F_SELL_VOL), 0u64)
+    s.store(pool_key(asset, F_TRADES), 0u64)
+    s.store(pool_key(asset, F_LAST_TRADE), 0u64)
+    s.store(pool_key(asset, F_LIFETIME_FEES), 0u64)
+    s.store(pool_key(asset, F_LP_COUNT), 0u64)
+    s.store(pool_key(asset, F_ASSET), asset)
+
+    // Listing index: i:{index} -> asset hash (for the listing views).
+    s.store(ASSET_INDEX_PREFIX + count.to_string(10u32), asset)
+    s.store(POOLS_COUNT_KEY, count + 1)
+
+    // X4: the first pool freezes the launchpad pin FOREVER.
+    if count == 0 {
+        s.store(LAUNCHPAD_PINNED_KEY, true)
+    }
+
+    emit_event(EV_POOL_CREATED, [asset.to_hex(), xel_seed.to_string(10u32), tok_seed.to_string(10u32), lpx.to_string()])
+    return count
+}
+
+// ============================================================================
+// 7. SET POOL BUYS PAUSED — the trust hook (launchpad-only, cross-called).
+// ============================================================================
+// @caller: the pinned launchpad contract (invoked by its permissionless
+//          sync_trust_to_dex entry — anyone's wallet, launchpad's address).
+// @params: asset — the pool's asset; flag — true pauses BUYS only.
+// @rules:  sells are never touched (X5/IX6): a paused pool lets every
+//          holder exit at market price, it only refuses new XEL in.
+// ============================================================================
+entry set_pool_buys_paused(asset: Hash, flag: bool) -> u64 {
+    let s: Storage = Storage::new()
+
+    let lpx_opt: optional<Address> = s.load(LAUNCHPAD_KEY)
+    require(lpx_opt.is_some(), "nolpx")
+    let lpx: Address = lpx_opt.expect("guarded")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "nocal")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == lpx, "notlpx")
+
+    require_pool(asset)
+
+    s.store(pool_key(asset, F_BUYS_PAUSED), flag)
+    if flag {
+        emit_event(EV_BUYS_PAUSED, [asset.to_hex()])
+    } else {
+        emit_event(EV_BUYS_UNPAUSED, [asset.to_hex()])
+    }
+    return 0
+}
+
+// ============================================================================
+// 8. SWAP XEL FOR TOKEN — the buy path.
+// ============================================================================
+// @caller: anyone (a wallet). Blocked while the emergency pause is on or
+//          while the pool's buys are paused (the trust hook, X5) — the ONLY
+//          two ways buys stop. Sells (9) are never selectively blocked.
+// @attached: XEL in [min_swap_xel, max_swap_xel] — the WHOLE deposit swaps.
+// @params:  min_tokens_out — slippage protection; the trade reverts
+//           ("slip") if the pool would return fewer tokens.
+// @returns: tokens received (atomic units), transferred to the caller's
+//           wallet as a native confidential transfer.
+// ============================================================================
+entry swap_xel_for_token(asset: Hash, min_tokens_out: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
+    require_pool(asset)
+    require(s.load(pool_key(asset, F_BUYS_PAUSED)).unwrap_or(false) == false, "buyspaused")
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    let min_x: u64 = s.load(MIN_SWAP_XEL_KEY).unwrap_or(DEFAULT_MIN_SWAP_XEL)
+    let max_x: u64 = s.load(MAX_SWAP_XEL_KEY).unwrap_or(DEFAULT_MAX_SWAP_XEL)
+    require(dep >= min_x, "tiny")
+    require(dep <= max_x, "toobig")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let bps: u64 = s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS)
+    let fee: u64 = fee_take(dep, bps)
+    let net: u64 = dep - fee
+
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    require(x > 0 && y > 0, "empty")
+
+    // out = y * net / (x + net), floored — the pool keeps the rounding.
+    let wide: u128 = (y as u128) * (net as u128) / ((x as u128) + (net as u128))
+    require(wide >= 1u128, "tinyout")
+    require(wide < (y as u128), "poolerr")
+    let out: u64 = wide as u64
+    require(out >= min_tokens_out, "slip")
+
+    // State first (X8), transfer last.
+    s.store(pool_key(asset, F_XEL_RESERVE), x + net)
+    s.store(pool_key(asset, F_TOK_RESERVE), y - out)
+    if fee > 0 {
+        let xf: u64 = s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0)
+        s.store(pool_key(asset, F_XEL_FEES), checked_add(xf, fee))
+        let fl: u64 = s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
+        s.store(pool_key(asset, F_LIFETIME_FEES), checked_add(fl, fee))
+    }
+
+    // Scoreboard (X6): buy volume counts the ATTACHED XEL (fee included —
+    // an exchange's quote-side convention).
+    let bv: u64 = s.load(pool_key(asset, F_BUY_VOL)).unwrap_or(0)
+    s.store(pool_key(asset, F_BUY_VOL), checked_add(bv, dep))
+    let tc: u64 = s.load(pool_key(asset, F_TRADES)).unwrap_or(0)
+    s.store(pool_key(asset, F_TRADES), checked_add(tc, 1))
+    s.store(pool_key(asset, F_LAST_TRADE), get_current_topoheight())
+
+    let ok: bool = transfer(caller, out, asset)
+    require(ok, "txfail")
+
+    emit_event(EV_SWAP_XEL, [asset.to_hex(), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
+    return out
+}
+
+// ============================================================================
+// 9. SWAP TOKEN FOR XEL — the sell path. Never selectively blocked (IX6).
+// ============================================================================
+// @caller: anyone (a wallet). Works even when the pool's buys are paused
+//          (holders always exit — X5); blocked only by the global emergency
+//          pause.
+// @attached: pool tokens in [min_swap_tokens, max_swap_tokens] — the WHOLE
+//            attached deposit is sold (nothing can be stranded).
+// @params:  min_xel_out — slippage protection ("slip").
+// @returns: XEL received, transferred to the caller's wallet.
+// ============================================================================
+entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
+    require_pool(asset)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+    let min_t: u64 = s.load(MIN_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SWAP_TOKENS)
+    let max_t: u64 = s.load(MAX_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MAX_SWAP_TOKENS)
+    require(dep >= min_t, "tiny")
+    require(dep <= max_t, "toobig")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let bps: u64 = s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS)
+    let fee: u64 = fee_take(dep, bps)
+    let net: u64 = dep - fee
+
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    require(x > 0 && y > 0, "empty")
+
+    // out = x * net / (y + net), floored — the pool keeps the rounding.
+    let wide: u128 = (x as u128) * (net as u128) / ((y as u128) + (net as u128))
+    require(wide >= 1u128, "tinyout")
+    require(wide < (x as u128), "poolerr")
+    let out: u64 = wide as u64
+    require(out >= min_xel_out, "slip")
+
+    // State first (X8), transfer last.
+    s.store(pool_key(asset, F_TOK_RESERVE), y + net)
+    s.store(pool_key(asset, F_XEL_RESERVE), x - out)
+    if fee > 0 {
+        let yf: u64 = s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0)
+        s.store(pool_key(asset, F_TOK_FEES), checked_add(yf, fee))
+        let fl: u64 = s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
+        s.store(pool_key(asset, F_LIFETIME_FEES), checked_add(fl, fee))
+    }
+
+    // Scoreboard (X6): sell volume counts the XEL that actually left the
+    // reserves (the token-side fee never touches XEL, so this IS the
+    // gross — same convention as the launchpad's sell_volume).
+    let sv: u64 = s.load(pool_key(asset, F_SELL_VOL)).unwrap_or(0)
+    s.store(pool_key(asset, F_SELL_VOL), checked_add(sv, out))
+    let tc: u64 = s.load(pool_key(asset, F_TRADES)).unwrap_or(0)
+    s.store(pool_key(asset, F_TRADES), checked_add(tc, 1))
+    s.store(pool_key(asset, F_LAST_TRADE), get_current_topoheight())
+
+    let ok: bool = transfer(caller, out, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_SWAP_TOKEN, [asset.to_hex(), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
+    return out
+}
+
+// ============================================================================
+// 10. ADD LIQUIDITY — the permanent deepening (anyone, donation semantics).
+// ============================================================================
+// @caller: ANYONE (a wallet) — the project, its community, the protocol.
+// @attached: XEL AND pool tokens (both must be > 0). No ratio enforcement:
+//            the donor chooses the mix; an imbalanced donation moves the
+//            price, but the donor paid full value for it. What arrives
+//            joins the reserves FOREVER (X2 — there is no remove entry):
+//            add_liquidity is a gift to the market.
+// ============================================================================
+entry add_liquidity(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
+    require_pool(asset)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let xel_in: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    let tok_in: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+    require(xel_in >= 1, "noXEL")
+    require(tok_in >= 1, "notok")
+    require(xel_in <= MAX_SEED_XEL, "toobig")
+    require(tok_in <= MAX_SEED_TOKENS, "toobig")
+
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    require(x > 0 && y > 0, "empty")
+
+    // Reserves only grow (IX3). No LP shares in v1 (X2, documented).
+    s.store(pool_key(asset, F_XEL_RESERVE), x + xel_in)
+    s.store(pool_key(asset, F_TOK_RESERVE), y + tok_in)
+    let lp: u64 = s.load(pool_key(asset, F_LP_COUNT)).unwrap_or(0)
+    s.store(pool_key(asset, F_LP_COUNT), checked_add(lp, 1))
+
+    emit_event(EV_LIQUIDITY_ADDED, [asset.to_hex(), xel_in.to_string(10u32), tok_in.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// ADMIN — parameter setters (all range-checked) + fee withdrawal.
+// ============================================================================
+
+// 11. Swap fee in basis points, on the input of every swap. Hard cap: 10%.
+entry set_swap_fee(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps <= MAX_SWAP_FEE_BPS, "toohigh")
+    s.store(SWAP_FEE_KEY, bps)
+    emit_event(EV_PARAM_SET, ["swap_fee_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 12. Trade guards: seed floors/caps and swap floors/caps (dust & whale
+//     containment, mirrored from the launchpad's house rules).
+entry set_trade_bounds(min_seed_xel: u64, min_seed_tokens: u64, min_swap_xel: u64, max_swap_xel: u64, min_swap_tokens: u64, max_swap_tokens: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(min_seed_xel >= MIN_SEED_FLOOR_XEL, "toolow")
+    require(min_seed_xel <= MAX_SEED_XEL, "toohigh")
+    require(min_seed_tokens >= MIN_SEED_FLOOR_TOKENS, "toolow")
+    require(min_seed_tokens <= MAX_SEED_TOKENS, "toohigh")
+    require(min_swap_xel >= MIN_SWAP_FLOOR_XEL, "toolow")
+    require(max_swap_xel <= MAX_SWAP_CAP_XEL, "toohigh")
+    require(min_swap_xel < max_swap_xel, "croserr")
+    require(min_swap_tokens >= MIN_SWAP_FLOOR_TOKENS, "toolow")
+    require(max_swap_tokens <= MAX_SWAP_CAP_TOKENS, "toohigh")
+    require(min_swap_tokens < max_swap_tokens, "croserr")
+    s.store(MIN_SEED_XEL_KEY, min_seed_xel)
+    s.store(MIN_SEED_TOKENS_KEY, min_seed_tokens)
+    s.store(MIN_SWAP_XEL_KEY, min_swap_xel)
+    s.store(MAX_SWAP_XEL_KEY, max_swap_xel)
+    s.store(MIN_SWAP_TOKENS_KEY, min_swap_tokens)
+    s.store(MAX_SWAP_TOKENS_KEY, max_swap_tokens)
+    emit_event(EV_PARAM_SET, ["trade_bounds", min_swap_xel.to_string(10u32) + ":" + max_swap_xel.to_string(10u32)])
+    return 0
+}
+
+// 13. Launchpad pin (X4): the ONLY address allowed to create pools and set
+//     the buys-pause flag. Settable while no pool exists; FROZEN FOREVER
+//     at the first pool (a repinned launchpad could orphan live pools).
+entry set_launchpad(addr: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(s.load(LAUNCHPAD_PINNED_KEY).unwrap_or(false) == false, "pinned")
+    s.store(LAUNCHPAD_KEY, addr)
+    emit_event(EV_LAUNCHPAD_SET, [addr.to_string()])
+    return 0
+}
+
+// 14. Transfer the admin role (single-step — use a cold wallet).
+entry set_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    emit_event(EV_ADMIN_SET, [new_admin.to_string()])
+    return 0
+}
+
+// 15. EMERGENCY pause — blocks EVERYTHING (swaps both ways, pool creation,
+//     liquidity adds). Admin-only, last resort (a bug in the wild). It can
+//     never rug anything: nothing can leave the reserves (IX3), and it is
+//     the ONLY gate that ever touches the sell path (X5).
+entry set_paused(flag: bool) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(EMERGENCY_KEY, flag)
+    if flag {
+        emit_event(EV_EMERGENCY_PAUSED, ["admin"])
+    } else {
+        emit_event(EV_EMERGENCY_UNPAUSED, ["admin"])
+    }
+    return 0
+}
+
+// 16. WITHDRAW FEES — the protocol's DEX revenue stream.
+// ============================================================================
+// Admin-only. Withdraws the asset's PENDING POTS (XEL side and token side,
+// both extracted from swap inputs). Double-capped by what is pending and by
+// the contract's uncommitted balance — the admin can never make a pool
+// insolvent (IX1/IX2).
+// ============================================================================
+entry withdraw_fees(asset: Hash, xel_amount: u64, token_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    only_admin()
+    require_pool(asset)
+
+    let xf: u64 = s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0)
+    let yf: u64 = s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0)
+    require(xel_amount <= xf, "badamt")
+    require(token_amount <= yf, "badamt")
+    require(xel_amount > 0 || token_amount > 0, "badamt")
+
+    // Solvency caps (IX1/IX2): what we hand out must be sitting OUTSIDE the
+    // pool's reserves. The pending pots are exactly that by construction —
+    // the belt-and-braces check keeps even a direct-donation scenario from
+    // ever confusing the two.
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    if xel_amount > 0 {
+        let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+        let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+        require((x as u128) + (xel_amount as u128) <= (balance as u128), "notavail")
+    }
+    if token_amount > 0 {
+        let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+        let balance: u64 = get_balance_for_asset(asset).unwrap_or(0)
+        require((y as u128) + (token_amount as u128) <= (balance as u128), "notavail")
+    }
+
+    s.store(pool_key(asset, F_XEL_FEES), xf - xel_amount)
+    s.store(pool_key(asset, F_TOK_FEES), yf - token_amount)
+
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let admin: Address = admin_opt.expect("guarded")
+
+    if xel_amount > 0 {
+        let ok: bool = transfer(admin, xel_amount, xel)
+        require(ok, "txfail")
+    }
+    if token_amount > 0 {
+        let ok: bool = transfer(admin, token_amount, asset)
+        require(ok, "txfail")
+    }
+
+    emit_event(EV_FEES_WITHDRAWN, [asset.to_hex(), xel_amount.to_string(10u32), token_amount.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// VIEWS (pub fn — read-only, no storage writes; the frontend's API)
+// ============================================================================
+
+// 17. Pool identity: (asset, created_topo, buys_paused, lp_deposit_count).
+pub fn get_pool(asset: Hash) -> (Hash, u64, bool, u64) {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    return (
+        s.load(pool_key(asset, F_ASSET)).unwrap_or(asset),
+        s.load(pool_key(asset, F_CREATED)).unwrap_or(0),
+        s.load(pool_key(asset, F_BUYS_PAUSED)).unwrap_or(false),
+        s.load(pool_key(asset, F_LP_COUNT)).unwrap_or(0)
+    )
+}
+
+// 18. Live pool state: (xel_reserves, token_reserves, xel_fees_pending,
+//     token_fees_pending, lifetime_fees_value). All atomic units. The
+//     lifetime counter tracks the XEL-side fees extracted over the pool's
+//     whole life (X6 scoreboard input).
+pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    return (
+        s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0),
+        s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0),
+        s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0),
+        s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0),
+        s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
+    )
+}
+
+// 19. Buy quote: tokens out for an attached XEL amount (fee included — the
+//     same math swap_xel_for_token executes; a quote can never disagree
+//     with the trade it previews).
+pub fn get_amount_out_xel(asset: Hash, xel_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    let bps: u64 = s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS)
+    let net: u64 = xel_amount - fee_take(xel_amount, bps)
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    if x == 0 || y == 0 {
+        return 0
+    }
+    let wide: u128 = (y as u128) * (net as u128) / ((x as u128) + (net as u128))
+    return wide as u64
+}
+
+// 20. Sell quote: XEL out (net of fee) for a token amount.
+pub fn get_amount_out_token(asset: Hash, token_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    let bps: u64 = s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS)
+    let net: u64 = token_amount - fee_take(token_amount, bps)
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    if x == 0 || y == 0 {
+        return 0
+    }
+    let wide: u128 = (x as u128) * (net as u128) / ((y as u128) + (net as u128))
+    return wide as u64
+}
+
+// 21. Spot price: XEL (scaled by 1e8) per 1 whole token = x * 1e8 / y.
+//     Saturates at u64 max. The pool-era price the SDK pairs with the
+//     launchpad's curve-era price.
+pub fn get_spot_price(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    let x: u64 = s.load(pool_key(asset, F_XEL_RESERVE)).unwrap_or(0)
+    let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
+    if y == 0 {
+        return 0
+    }
+    let scaled: u128 = (x as u128) * (PRICE_SCALE as u128) / (y as u128)
+    if scaled > U64_MAX_128 {
+        return U64_MAX
+    }
+    return scaled as u64
+}
+
+// 22. Pool-era scoreboard: (buy_volume_xel, sell_volume_xel, trades,
+//     last_trade_topo) — X6, the counterpart of the launchpad's D12.
+pub fn get_pool_volume(asset: Hash) -> (u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    return (
+        s.load(pool_key(asset, F_BUY_VOL)).unwrap_or(0),
+        s.load(pool_key(asset, F_SELL_VOL)).unwrap_or(0),
+        s.load(pool_key(asset, F_TRADES)).unwrap_or(0),
+        s.load(pool_key(asset, F_LAST_TRADE)).unwrap_or(0)
+    )
+}
+
+// 23. Number of pools (listing pagination bound).
+pub fn get_pools_count() -> u64 {
+    let s: Storage = Storage::new()
+    return s.load(POOLS_COUNT_KEY).unwrap_or(0)
+}
+
+// 24. Asset hash of the pool at an index (listing enumeration).
+pub fn get_pool_by_index(index: u64) -> Hash {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
+    require(index < count, "noidx")
+    let asset: Hash = s.load(ASSET_INDEX_PREFIX + index.to_string(10u32)).unwrap_or(get_xelis_asset())
+    return asset
+}
+
+// 25. Config snapshot: (swap_fee_bps, min_seed_xel, min_seed_tokens,
+//     min_swap_xel, max_swap_xel, min_swap_tokens, max_swap_tokens,
+//     emergency, launchpad_pinned).
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS),
+        s.load(MIN_SEED_XEL_KEY).unwrap_or(DEFAULT_MIN_SEED_XEL),
+        s.load(MIN_SEED_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SEED_TOKENS),
+        s.load(MIN_SWAP_XEL_KEY).unwrap_or(DEFAULT_MIN_SWAP_XEL),
+        s.load(MAX_SWAP_XEL_KEY).unwrap_or(DEFAULT_MAX_SWAP_XEL),
+        s.load(MIN_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SWAP_TOKENS),
+        s.load(MAX_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MAX_SWAP_TOKENS),
+        s.load(EMERGENCY_KEY).unwrap_or(false),
+        s.load(LAUNCHPAD_PINNED_KEY).unwrap_or(false)
+    )
+}
+
+// 26. Human status label of a pool (frontend helper).
+pub fn get_status_label(asset: Hash) -> string {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    if s.load(EMERGENCY_KEY).unwrap_or(false) {
+        return "emergency"
+    }
+    if s.load(pool_key(asset, F_BUYS_PAUSED)).unwrap_or(false) {
+        return "buys-paused"
+    }
+    return "live"
+}
+
+// 27. Contract version (house style).
+pub fn get_version() -> string {
+    return VERSION
+}

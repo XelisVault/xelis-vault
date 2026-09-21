@@ -96,3 +96,25 @@ jobs:
           python-version: "3.12"
       - name: Run check_structure.py
         run: python scripts/check_structure.py
+
+  audits:
+    name: "Formal audits (spec traceability, security, SDK parity, doc parity)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK (reader imports)
+        run: python -m pip install --disable-pip-version-check ./sdk/xvault
+      - name: AUDIT 1 - founder-requirement traceability (30 checks)
+        run: python scripts/audit_v4_spec.py
+      - name: AUDIT 2 - mechanical security pass
+        run: python scripts/audit_v4_security.py
+      - name: AUDIT 4 - SDK parity (both contracts)
+        run: python scripts/audit_v4_sdk.py
+      - name: AUDIT 5 - doc parity (contract <-> docs <-> SDK)
+        run: python scripts/audit_doc_parity.py

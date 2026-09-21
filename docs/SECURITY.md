@@ -143,3 +143,53 @@ Local equivalents: `python3 scripts/lint_silex.py`,
 
 Recommended community timeline: renounce 30–90 days after a stable mainnet
 launch, after exercising the escape hatch once on testnet.
+
+
+---
+
+## v18 — the real-asset attack surface (VaultLaunch v4 + LaunchDEX)
+
+**New surface: the cross-contract calls (bounded, pinned, prechecked).**
+Exactly two outbound calls exist in VaultLaunch: LaunchDEX `create_pool`
+(chunk 6, from `migrate`) and `set_pool_buys_paused` (chunk 7, from
+`sync_trust_to_dex` and the untrusted-at-migration path). Both are
+inbound-guarded on the DEX (pinned launchpad address, frozen at the
+first pool — X4) and outbound-guarded on the launchpad (DEX pin frozen
+at the first migration — D19, plus the `is_contract_callable` precheck
+with the clear `"txperm"` refusal). The pinned chunk ids are asserted
+against the real chunk tables by CI (`tests/test_dex_reference.py`):
+renumbering either contract without the other fails the build. A
+malicious migrator gains nothing — `migrate()` has no destination, no
+amount and no caller choice: it can only perform the migration the
+community is waiting for, into a pool nobody can drain.
+
+**Asset creation (D13).** Fixed-mode creation is balance-verified: if
+the whole supply does not land in the contract, finalize reverts
+(`"assetbal"`). The chain's creation fee is measured by balance-delta
+and paid from the project's earmarked budget (+ optional finalize
+top-up, unused part refunded) — the solvency invariant I2 now includes
+the earmarked budgets (D20), so a fee hike can never be paid out of
+other projects' reserves.
+
+**Whole-deposit semantics (D14).** `sell(pid)` sells the ENTIRE attached
+token deposit and `buy(pid)` the entire attached XEL deposit: nothing
+can be stranded in the contract by a partial amount, and the per-asset
+identity `balance == curve inventory + team escrow` (I1) holds at every
+block. Post-migration the identity degenerates to the team escrow (I10)
+— the migration sends exactly the inventory, never the escrow.
+
+**The DEX's own threat model.** The DEX admin can set the swap fee
+(cap 10%), the trade bounds, the launchpad pin (before the first pool
+only) and trigger the global emergency pause. It can NEVER move pool
+reserves: `withdraw_fees` is capped by the pending pots AND the
+uncommitted balance (IX1/IX2). No remove_liquidity exists anywhere —
+permanent liquidity is the feature. Sells are never selectively
+blockable (IX6): the per-pool flag pauses buys only, and the emergency
+pause blocks everything (documented last resort).
+
+**Permissions note for integrators.** Transactions that cross-call
+(`migrate`, `sync_trust_to_dex`, and the DEX's launchpad-only entries)
+must carry the wallet's contract-call permission (XSWD "all" or an
+allowlist). The contracts refuse early with `"txperm"` instead of
+failing opaquely. Voters and traders NEVER need the permission:
+report/support/swap entries make no cross-calls (D17).

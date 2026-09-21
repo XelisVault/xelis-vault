@@ -50,10 +50,10 @@ def check_contracts_layout(repo: Path) -> List[str]:
         if p.suffix != ".slx":
             problems.append(f"contracts/ must contain only .slx files — found {p.relative_to(repo)}")
 
-    # Active contract families, one directory each (v15: mixer + launchpad).
+    # Active contract families, one directory each (v18: mixer + launchpad + dex).
     # Adding a family is a deliberate layout decision: extend this tuple,
     # the CI workflow comment and docs/ARCHITECTURE.md in the same commit.
-    active_families = ("mixer", "launchpad")
+    active_families = ("mixer", "launchpad", "dex")
     for p in slx_files:
         parts = p.relative_to(contracts).parts
         # active contract: contracts/<family>/<Name>.slx (exactly one level)
@@ -176,7 +176,7 @@ def main(argv=None) -> int:
     print("=" * 78)
 
     sections = [
-        ("contracts/ layout (only .slx under contracts/mixer|launchpad/)", check_contracts_layout),
+        ("contracts/ layout (only .slx under contracts/mixer|launchpad|dex/)", check_contracts_layout),
         ("no legacy/ imports in active scripts", check_no_legacy_imports),
         ("no secrets in active files", check_no_secrets),
         ("no binary blobs outside legacy/", check_no_blobs),

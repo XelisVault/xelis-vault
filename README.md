@@ -1,12 +1,12 @@
 # XelisVault Protocol
 
 [![CI](https://github.com/XelisVault/xelis-vault/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
-![Silex](https://img.shields.io/badge/contracts-PrivacyMixer%20V5%20%2B%20VaultLaunch-8b5cf6)
+![Silex](https://img.shields.io/badge/contracts-PrivacyMixer%20V5%20%2B%20VaultLaunch%20v4%20%2B%20LaunchDEX-8b5cf6)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v17** — audited contracts live beat
-fifty contracts on paper.
+[Silex](https://docs.xelis.io/). **v18** — real confidential assets,
+real migration, permanent liquidity.
 
 ## What ships today
 
@@ -38,6 +38,24 @@ to the admin (no burn):
   count, last trade, spot market cap, all-time-high market cap and the
   market cap at graduation — all computed AND stored on-chain
   (`get_trading_stats`, `get_market_cap_history`, `get_volume_stats`)
+- **REAL confidential assets (v18)**: the token of every validated
+  project is a true XELIS asset — `Asset::create` with
+  `MaxSupplyMode::Fixed` at validation success: the ENTIRE supply exists
+  from birth, whole supply held by the contract, and NOTHING can ever be
+  minted past the cap (enforced by the XELIS protocol itself). Buyers
+  hold real tokens in their own wallets from the first second — fully
+  confidential balances, transferable anywhere on XELIS
+- **real migration (v18)**: graduation moves the curve's XEL reserves
+  and token inventory ATOMICALLY into a permanent
+  [LaunchDEX](contracts/dex/LaunchDEX.slx) pool (one cross-contract call
+  with attached deposits; permissionless `migrate()`); the curve keeps
+  trading at the graduated fee until the pool exists
+- **LaunchDEX (v18)**: the permanent AMM for graduated tokens — no
+  remove_liquidity exists anywhere (the anti-rug guarantee), anyone can
+  deepen a pool forever (`add_liquidity`), fees 0.30% default extracted
+  to pending pots (100% admin), per-pool scoreboard; the community trust
+  system follows the tokens there (`sync_trust_to_dex` pauses pool buys,
+  never sells)
 - team allocation (≤ 20%): claim in full at migration OR lock it in a
   linear vesting (public commitment signal); a project that never
   graduates releases the allocation after ~6 months of bonding —
