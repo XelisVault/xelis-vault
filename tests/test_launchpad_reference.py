@@ -55,8 +55,10 @@ def test_defaults_match_the_specification():
     assert lp.DEFAULTS["min_participants"] == 20
     assert lp.DEFAULTS["min_approval_ratio_bps"] == 8000
     assert lp.DEFAULTS["team_unlock_delay"] == 3_153_600    # D3
+    assert lp.DEFAULTS["vote_deposit"] == XEL // 2         # D21: 0.5 XEL (v4.2)
     assert dx.DEFAULTS["swap_fee_bps"] == 30                # X3
     assert dx.DEFAULTS["max_swap_xel"] == 100_000 * XEL
+    assert dx.DEFAULTS["lp_share_bps"] == 5_000             # X10/D23: 50/50
 
 
 def test_fee_take_floors_in_favour_of_the_contract():
@@ -218,7 +220,9 @@ def test_storage_keys_match_the_contract_layout():
 # ===========================================================================
 
 class DexSim:
-    """Faithful replay of LaunchDEX: pools, swaps, fees, trust hook."""
+    """Faithful replay of LaunchDEX: pools, swaps, fees, trust hook,
+    and since v1.2 the X10/D23 LP fee share (accrual-per-unit, pull
+    claims, hard-bounded split dial)."""
 
     def __init__(self, cfg=None):
         self.cfg = dict(dx.DEFAULTS, **(cfg or {}))
@@ -231,6 +235,9 @@ class DexSim:
         self.emergency = False
         self.wallets = defaultdict(lambda: {"xel": 0,
                                             "assets": defaultdict(int)})
+        # X10/D23: l:{asset}:{wallet}:{x,sx,sy,cx,cy}
+        self.lp = defaultdict(lambda: {"x": 0, "sx": 0, "sy": 0,
+                                       "cx": 0, "cy": 0})
         self.topo = 0
 
     def set_launchpad(self, addr):
@@ -248,7 +255,8 @@ class DexSim:
         self.asset_balances[asset] += tok_seed
         self.pools[asset] = {"x": xel_seed, "y": tok_seed, "xf": 0, "yf": 0,
                              "bp": False, "ct": self.topo, "bv": 0, "sv": 0,
-                             "tc": 0, "lt": 0, "fl": 0, "lp": 0}
+                             "tc": 0, "lt": 0, "fl": 0, "lp": 0,
+                             "lx": 0, "ly": 0, "tl": 0, "ax": 0, "ay": 0}
         self.index.append(asset)
         if not self.pinned:
             self.pinned = True
@@ -258,6 +266,23 @@ class DexSim:
         assert caller == self.launchpad, "notlpx"
         assert asset in self.pools, "nopool"
         self.pools[asset]["bp"] = flag
+
+    def _split_fee(self, asset, fee, side):
+        """X10/D23: split a swap fee between the admin pot and the LP
+        distribution (redirecting to the admin while the pool has no
+        provider — no fee is ever stranded). Mirrors both swap entries."""
+        p = self.pools[asset]
+        lp_part = fee * self.cfg["lp_share_bps"] // 10_000
+        adm_part = fee - lp_part
+        if lp_part > 0 and p["tl"] > 0:
+            p["l" + side] += lp_part                    # lx or ly
+            acc = lp_part * dx.ACC_SCALE // p["tl"]
+            p["a" + side] += acc                        # ax or ay
+        else:
+            adm_part += lp_part
+        if adm_part > 0:
+            p[side + "f"] += adm_part                  # xf or yf
+        p["fl"] += fee
 
     def swap_xel(self, wallet, asset, xel_in, min_out=0):
         p = self.pools[asset]
@@ -274,8 +299,7 @@ class DexSim:
         self.xel_balance += xel_in
         p["x"] += net
         p["y"] -= out
-        p["xf"] += fee
-        p["fl"] += fee
+        self._split_fee(asset, fee, "x")
         p["bv"] += xel_in
         p["tc"] += 1
         p["lt"] = self.topo
@@ -300,7 +324,7 @@ class DexSim:
         self.asset_balances[asset] += tokens_in
         p["y"] += net
         p["x"] -= out
-        p["yf"] += fee
+        self._split_fee(asset, fee, "y")
         p["sv"] += out          # XEL that actually left the reserves
         p["tc"] += 1
         p["lt"] = self.topo
@@ -308,11 +332,32 @@ class DexSim:
         w["xel"] += out
         return out
 
+    def _lp_pos(self, asset, wallet):
+        return self.lp[(asset, wallet)]
+
+    def _crystallise(self, asset, wallet):
+        """X10/D23: crystallise the provider's accrued fees (both sides)
+        — called BEFORE new parts join (add) and at claim time. The
+        snapshots advance in EVERY case (fuzz-found): a FIRST deposit
+        (parts == 0) must also start its accrual clock at the CURRENT
+        counter, or it would retroactively earn fees from before it
+        existed (IX8 violation)."""
+        p = self.pools[asset]
+        pos = self._lp_pos(asset, wallet)
+        if pos["x"] > 0:
+            pos["cx"] += dx.lp_earnings(p["ax"], pos["sx"], pos["x"])
+            pos["cy"] += dx.lp_earnings(p["ay"], pos["sy"], pos["x"])
+        pos["sx"] = p["ax"]
+        pos["sy"] = p["ay"]
+
     def add_liquidity(self, wallet, asset, xel_in, tok_in):
         """X7 (founder risk review, point 1): the pool's CURRENT ratio is
         enforced — only the largest proportional pair joins the reserves,
         the excess side is refunded to the donor in the same transaction.
-        A donation can deepen a pool but NEVER move its price."""
+        A donation can deepen a pool but NEVER move its price. Since v1.2
+        the donor becomes a PROVIDER (X10/D23): parts join AFTER its
+        accrued fees are crystallised, and the effective XEL side must
+        clear the hard 1 XEL LP-entry floor."""
         p = self.pools[asset]
         assert not self.emergency
         assert xel_in >= 1 and tok_in >= 1
@@ -327,9 +372,13 @@ class DexSim:
             assert xel_in >= need_xel, "ratio"
             xel_eff, tok_eff = need_xel, tok_in
         assert xel_eff >= 1 and tok_eff >= 1, "dust"
+        assert xel_eff >= dx.MIN_LP_ADD_XEL, "minlp"
         # IX7: the reserve product drifts by at most one floor unit
         x1, y1 = x + xel_eff, y + tok_eff
         assert abs(x1 * y - x * y1) < max(x, y), "IX7 broken"
+        # X10/D23: crystallise FIRST, then the new parts join (a deposit
+        # never earns from before it existed)
+        self._crystallise(asset, wallet)
         # funds: the donor deposits everything, gets the excess back
         w["xel"] -= xel_in
         w["assets"][asset] -= tok_in
@@ -342,18 +391,62 @@ class DexSim:
         p["x"] = x1
         p["y"] = y1
         p["lp"] += 1
+        pos = self._lp_pos(asset, wallet)
+        pos["x"] += xel_eff
+        p["tl"] += xel_eff
         return xel_eff, tok_eff
 
+    def claim_lp_fees(self, wallet, asset):
+        """X10/D23: pull payout of the provider's OWN accrued fees (both
+        sides). Crystallises, bounds against the pots (IX8), pays."""
+        assert asset in self.pools, "nopool"
+        self._crystallise(asset, wallet)
+        p = self.pools[asset]
+        pos = self._lp_pos(asset, wallet)
+        payout_x, payout_y = pos["cx"], pos["cy"]
+        assert payout_x > 0 or payout_y > 0, "nofees"
+        assert payout_x <= p["lx"], "lperr"
+        assert payout_y <= p["ly"], "lperr"
+        pos["cx"] = 0
+        pos["cy"] = 0
+        p["lx"] -= payout_x
+        p["ly"] -= payout_y
+        self.xel_balance -= payout_x
+        self.wallets[wallet]["xel"] += payout_x
+        self.asset_balances[asset] -= payout_y
+        self.wallets[wallet]["assets"][asset] += payout_y
+        return payout_x, payout_y
+
+    def set_fee_split(self, bps):
+        """X10/D23: the admin/providers revenue dial, hard-bounded
+        [MIN_LP_SHARE_BPS, MAX_LP_SHARE_BPS] — the bounds are structural
+        trust guarantees."""
+        assert dx.MIN_LP_SHARE_BPS <= bps <= dx.MAX_LP_SHARE_BPS
+        self.cfg["lp_share_bps"] = bps
+
     def check_invariants(self):
-        # IX1/IX2: reserves + pending pots <= balances (equality by
-        # construction minus the refunded liquidity excesses)
-        assert sum(p["x"] + p["xf"] for p in self.pools.values()) <= self.xel_balance
+        # IX1/IX2 (extended by IX8): reserves + ADMIN pots + LP pots
+        # <= balances (equality by construction minus the refunded
+        # liquidity excesses)
+        assert sum(p["x"] + p["xf"] + p["lx"] for p in self.pools.values()) \
+            <= self.xel_balance
         for asset, p in self.pools.items():
-            assert p["y"] + p["yf"] <= self.asset_balances[asset]
+            assert p["y"] + p["yf"] + p["ly"] <= self.asset_balances[asset]
             # IX5: both sides strictly positive
             assert p["x"] >= 1 and p["y"] >= 1
             # IX6 (absolute): the sell path carries no gate at all —
             # structural (swap_tokens checks neither bp nor emergency)
+            # IX8: every provider's claimable + accrued earnings, summed,
+            # is <= the LP pots (floor dust stays in the pots forever)
+            due_x = sum(pos["cx"] + dx.lp_earnings(p["ax"], pos["sx"], pos["x"])
+                        for (a, _w), pos in self.lp.items() if a == asset)
+            due_y = sum(pos["cy"] + dx.lp_earnings(p["ay"], pos["sy"], pos["x"])
+                        for (a, _w), pos in self.lp.items() if a == asset)
+            assert due_x <= p["lx"], "IX8 broken (XEL side)"
+            assert due_y <= p["ly"], "IX8 broken (token side)"
+            # the accrual counter can never outgrow lifetime fees (the
+            # IX8 bound: total_depth >= ACC_SCALE, so increments <= fees)
+            assert p["ax"] <= p["fl"] and p["ay"] <= p["fl"]
 
 
 LAUNCHPAD_ADDR = "xvault:launchpad"   # the simulated launchpad's address
@@ -564,11 +657,12 @@ class Sim:
         self.check_invariants()
         return pid
 
-    def vote(self, pid, voter, support, deposit=0):
-        """D21: with the dial raised (cfg["vote_deposit"] > 0) the voter
-        attaches >= the deposit; exactly the configured amount is locked
-        (the excess is refunded immediately — modelled as: the wallet only
-        ever parts with the locked part), the slot records the amount."""
+    def vote(self, pid, voter, support, deposit=None):
+        """D21: with the dial raised the voter attaches >= the deposit
+        (deposit defaults to the CURRENT dial — the honest-voter default
+        since v4.2); exactly the configured amount is locked (the excess
+        is refunded immediately — modelled as: the wallet only ever
+        parts with the locked part), the slot records the amount."""
         status = self.s[self._pk(pid, "st")]
         assert status != lp.ST_REJECTED, "dead"
         if status in (lp.ST_VALIDATION, lp.ST_RECOVERY):
@@ -577,6 +671,8 @@ class Sim:
         vkey = lp.vote_key(pid, round_no, voter)
         assert vkey not in self.s, "voted"
         vdep = self.cfg.get("vote_deposit", 0)
+        if deposit is None:
+            deposit = vdep
         assert deposit >= vdep, "votedep"
         if vdep > 0:
             w = self.wallets[voter]
@@ -926,13 +1022,24 @@ class Sim:
 # ===========================================================================
 
 def _validated(sim, pid, yes=3, no=0):
-    """Push a validation window through with a passing vote."""
+    """Push a validation window through with a passing vote (voters are
+    minted the current dial — since v4.2 the default is 0.5 XEL)."""
     for i in range(yes):
+        sim.mint(f"voter{i}", sim.cfg.get("vote_deposit", 0))
         sim.vote(pid, f"voter{i}", True)
     for i in range(no):
+        sim.mint(f"no{i}", sim.cfg.get("vote_deposit", 0))
         sim.vote(pid, f"no{i}", False)
     sim.warp(sim.cfg["validation_duration"] + 1)
     return sim.finalize(pid)
+
+
+def _cast(sim, pid, n, support=True, prefix="v"):
+    """Cast n votes at the current dial, minting each voter exactly what
+    the dial locks (the tests' honest-voter default)."""
+    for i in range(n):
+        sim.mint(f"{prefix}{i}", sim.cfg.get("vote_deposit", 0))
+        sim.vote(pid, f"{prefix}{i}", support)
 
 
 def _fuzz_cfg():
@@ -1020,8 +1127,7 @@ def test_asset_budget_refund_and_topup_d13():
     sim = Sim(_fuzz_cfg(), asset_fee=50 * XEL)   # chain fee 50 XEL > budget 10
     sim.mint("founder", 700 * XEL)
     pid = sim.propose("founder", 500 * XEL)
-    for i in range(3):
-        sim.vote(pid, f"v{i}", True)
+    _cast(sim, pid, 3)
     sim.warp(3001)
     with pytest.raises(AssertionError):
         sim.finalize(pid)                # "budget" — the whole TX reverts
@@ -1036,8 +1142,7 @@ def test_asset_budget_refund_and_topup_d13():
     sim2 = Sim(_fuzz_cfg(), asset_fee=0)
     sim2.mint("founder", 600 * XEL)
     pid2 = sim2.propose("founder", 500 * XEL)
-    for i in range(3):
-        sim2.vote(pid2, f"v{i}", True)
+    _cast(sim2, pid2, 3)
     sim2.warp(3001)
     assert sim2.finalize(pid2) == 1
     # zero chain fee: the whole budget is refunded; only the liquidity
@@ -1060,8 +1165,7 @@ def test_rejected_project_refunds_liquidity_and_budget():
     sim = Sim(_fuzz_cfg())
     sim.mint("founder", 600 * XEL)
     pid = sim.propose("founder", 500 * XEL)
-    for i in range(3):
-        sim.vote(pid, f"v{i}", False)     # 100% reports -> rejection
+    _cast(sim, pid, 3, support=False)     # 100% reports -> rejection
     sim.warp(3001)
     assert sim.finalize(pid) == 0
     assert sim.s[sim._pk(pid, "st")] == lp.ST_REJECTED
@@ -1084,16 +1188,14 @@ def test_untrusted_blocks_buys_never_sells_and_recovers():
     asset = sim.asset_of(pid)
     # community flips it Untrusted (6 reports vs 3 lifetime supports
     # = 66% >= 60%)
-    for i in range(6):
-        sim.vote(pid, f"r{i}", False)
+    _cast(sim, pid, 6, support=False, prefix="r")
     assert sim.s[sim._pk(pid, "st")] == lp.ST_UNTRUSTED
     with pytest.raises(AssertionError):
         sim.buy(pid, "alice", 10 * XEL)
     sim.sell(pid, "alice", sim.wallets["alice"]["assets"][asset] // 2)  # works
     # recovery: creator pays the fee, stricter bar, back to Bonding
     sim.request_revalidation(pid, "founder", fee_paid=False)  # not graduated
-    for i in range(3):
-        sim.vote(pid, f"s{i}", True)
+    _cast(sim, pid, 3, prefix="s")
     sim.warp(3001)
     sim.finalize(pid)
     assert sim.s[sim._pk(pid, "st")] == lp.ST_BONDING
@@ -1109,8 +1211,7 @@ def test_untrusted_at_migration_pauses_pool_buys_same_tx_d17():
     while sim.s[sim._pk(pid, "st")] == lp.ST_BONDING:
         sim.buy(pid, "alice", 100 * XEL)
     # flip Untrusted BEFORE the migration (6 reports vs 3 supports)
-    for i in range(6):
-        sim.vote(pid, f"r{i}", False)
+    _cast(sim, pid, 6, support=False, prefix="r")
     assert sim.s[sim._pk(pid, "st")] == lp.ST_UNTRUSTED
     sim.set_dex_address("dex")
     sim.migrate(pid)
@@ -1126,8 +1227,7 @@ def test_untrusted_at_migration_pauses_pool_buys_same_tx_d17():
     assert out > 0
     # recovery -> keeper syncs -> pool buys resume
     sim.request_revalidation(pid, "founder", fee_paid=True)
-    for i in range(4):
-        sim.vote(pid, f"s{i}", True)
+    _cast(sim, pid, 4, prefix="s")
     sim.warp(3001)
     sim.finalize(pid)
     assert sim.s[sim._pk(pid, "st")] == lp.ST_TRUSTED
@@ -1214,6 +1314,7 @@ def test_one_vote_per_address_per_round():
     sim = Sim(_fuzz_cfg())
     sim.mint("founder", 600 * XEL)
     pid = sim.propose("founder", 500 * XEL)
+    sim.mint("voter", sim.cfg.get("vote_deposit", 0))
     sim.vote(pid, "voter", True)
     with pytest.raises(AssertionError):
         sim.vote(pid, "voter", True)
@@ -1302,6 +1403,7 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
                               tb=rng.choice([0, 500, 1000, 2000]),
                               plan=rng.choice([0, 100, 500, 2000]))
             for v in range(3):
+                sim.mint(f"warm{v}", sim.cfg.get("vote_deposit", 0))
                 sim.vote(pid, f"warm{v}", True)
             sim.warp(3001)
             assert sim.finalize(pid) == 1
@@ -1337,6 +1439,7 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
                             pass
             elif action < 0.62 and live:
                 p = rng.choice(live)
+                sim.mint(f"r{step}", sim.cfg.get("vote_deposit", 0))
                 sim.vote(p, f"r{step}", rng.random() < 0.35)
             elif action < 0.72 and pids:
                 p = rng.choice(pids)
@@ -1361,7 +1464,29 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
                             sim.dex.swap_tokens(who, asset, rng.randrange(1, held + 1))
                         except AssertionError:
                             pass
-            elif action < 0.92:
+            elif action < 0.92 and migrated:
+                # X10/D23: providers deepen a migrated pool and claim
+                # their pro-rata fees (proportional adds so the fit never
+                # refuses; claims may legitimately fail "nofees")
+                p = rng.choice(migrated)
+                asset = sim.asset_of(p)
+                pool = sim.dex.pools[asset]
+                who = rng.choice(["a1", "a2", "a3", "k1"])
+                if rng.random() < 0.6:
+                    xel_add = rng.randrange(1, 20) * XEL
+                    held = sim.dex.wallets[who]["assets"][asset]
+                    need_tok = pool["y"] * xel_add // pool["x"]
+                    if held >= need_tok and need_tok >= 1:
+                        try:
+                            sim.dex.add_liquidity(who, asset, xel_add, need_tok)
+                        except AssertionError:
+                            pass
+                else:
+                    try:
+                        sim.dex.claim_lp_fees(who, asset)
+                    except AssertionError:
+                        pass  # "nofees" — nothing accrued yet
+            elif action < 0.96:
                 p = rng.choice(pids)
                 creator = sim.s[sim._pk(p, "cr")]
                 try:
@@ -1524,9 +1649,9 @@ def test_contract_is_substantial_and_documents_its_chunk_table():
     assert len(src.splitlines()) > 2500
     assert "CHUNK TABLE (entry-point IDs" in src
     assert "VAULTLAUNCH" not in src or True
-    assert 'const VERSION: string = "VaultLaunch v4.1.0"' in src
+    assert 'const VERSION: string = "VaultLaunch v4.2.0"' in src
     dex_src = DEX_CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.1.0"' in dex_src
+    assert 'const VERSION: string = "LaunchDEX v1.2.0"' in dex_src
     assert "CHUNK TABLE (entry-point IDs" in dex_src
 
 
@@ -1568,24 +1693,31 @@ def test_d21_vote_deposits_full_lifecycle():
         sim.claim_vote_deposit(pid, 0, "poor")
 
 
-def test_d21_free_by_default_and_admin_cannot_confiscate():
-    """Default dial = 0: voting stays free and the pots stay empty; a raise
-    never touches already-locked deposits (they refund at their own amount)."""
+def test_d21_default_is_a_refundable_half_xel_and_admin_cannot_confiscate():
+    """Since v4.2 the default dial is 0.5 XEL (founder risk review, point
+    2): voting costs a refundable half-XEL from day one — 20 farmed
+    wallets deciding a validation park 10 XEL of capital while they do
+    it. The admin can zero it (free voting), raise it, and NEVER touches
+    already-locked deposits (they refund at their own amount)."""
     sim = Sim(cfg=_fuzz_cfg())
-    assert sim.cfg.get("vote_deposit", 0) == 0
+    assert sim.cfg.get("vote_deposit", 0) == XEL // 2   # the v4.2 default
     sim.mint("founder", 1000 * XEL)
     pid = sim.propose("founder", 500 * XEL)
     sim.mint("v0", 1 * XEL)
-    sim.vote(pid, "v0", True, deposit=0)               # free vote
-    assert sim.vote_pots == 0
+    sim.vote(pid, "v0", True)                          # attaches the dial
+    assert sim.vote_pots == XEL // 2
     sim.cfg["vote_deposit"] = 2 * XEL                  # the admin raises
     sim.mint("v1", 10 * XEL)
-    sim.vote(pid, "v1", True, deposit=2 * XEL)         # new votes pay
-    assert sim.vote_pots == 2 * XEL
+    sim.vote(pid, "v1", True, deposit=2 * XEL)         # new votes pay more
+    assert sim.vote_pots == XEL // 2 + 2 * XEL
     sim.warp(sim.cfg["validation_duration"] + 1)
     sim.finalize(pid)
-    sim.claim_vote_deposit(pid, 0, "v1")               # refund at own amount
+    sim.claim_vote_deposit(pid, 0, "v0")               # refund at OWN amount
+    sim.claim_vote_deposit(pid, 0, "v1")
     assert sim.vote_pots == 0
+    # and the admin can still make voting free again
+    sim.cfg["vote_deposit"] = 0
+    assert sim.cfg.get("vote_deposit") == 0
 
 
 def test_d21_withdraw_fees_cannot_touch_vote_pots():
@@ -1632,7 +1764,9 @@ def test_d22_migrated_index_and_reverse_lookup():
 def test_x7_dex_one_sided_donation_cannot_move_the_price():
     """Point 1: an imbalanced add_liquidity only deepens at the CURRENT
     ratio; the excess side is refunded — the price is unchanged (within one
-    floor unit), and a lone-sided deposit is refused outright."""
+    floor unit), a lone-sided deposit is refused outright, and since v1.2
+    a deposit too small to clear the 1 XEL LP floor is refused too
+    ("minlp" — the accrual's precision guarantee, X10)."""
     dex = DexSim()
     dex.set_launchpad("lpx")
     dex.create_pool("lpx", "aa" * 32, 1000 * XEL, 10**9)
@@ -1641,12 +1775,14 @@ def test_x7_dex_one_sided_donation_cannot_move_the_price():
     price0 = x0 * 10**8 // y0
     dex.wallets["donor"]["xel"] = 500 * XEL
     dex.wallets["donor"]["assets"]["aa" * 32] = 10**9
-    # malicious XEL-heavy donation: 500 XEL but only 1 token — the token
-    # side binds: only (ratio) 1 token + its XEL equivalent join, the rest
-    # of the XEL goes straight back. The price CANNOT move.
-    xel_eff, tok_eff = dex.add_liquidity("donor", "aa" * 32, 500 * XEL, 1)
-    assert tok_eff == 1
-    assert xel_eff == x0 * 1 // y0
+    # malicious XEL-heavy donation: 500 XEL but only 10^6 tokens — the
+    # token side binds: only (ratio) 10^6 tokens + their 1 XEL equivalent
+    # join, the rest of the XEL goes straight back. The price CANNOT
+    # move. (10^6 tokens is the minimum that clears the 1 XEL LP floor
+    # on this pool: x0/y0 = 100 — anything less is refused "minlp".)
+    xel_eff, tok_eff = dex.add_liquidity("donor", "aa" * 32, 500 * XEL, 10**6)
+    assert tok_eff == 10**6
+    assert xel_eff == x0 * 10**6 // y0
     price1 = p["x"] * 10**8 // p["y"]
     assert abs(price1 - price0) <= 1, "price moved — X7 broken"
     assert dex.wallets["donor"]["xel"] == 500 * XEL - xel_eff
@@ -1664,6 +1800,14 @@ def test_x7_dex_one_sided_donation_cannot_move_the_price():
     # dust refusal: an XEL side too small to price a single token unit
     with pytest.raises(AssertionError, match="dust"):
         dex.add_liquidity("donor", "aa" * 32, 1, 10**6)
+    # LP-floor refusal (X10/D23): a token side so thin its proportional
+    # XEL value is under 1 XEL — the deposit is refused, nothing joins
+    # (the donor attaches the XEL regardless — stock it first)
+    x0, y0 = p["x"], p["y"]
+    dex.wallets["donor"]["xel"] += 500 * XEL
+    with pytest.raises(AssertionError, match="minlp"):
+        dex.add_liquidity("donor", "aa" * 32, 500 * XEL, 100)
+    assert p["x"] == x0 and p["y"] == y0, "a refused add must change nothing"
     # balanced donation with token excess: the XEL side binds, the token
     # excess is refunded
     x0, y0 = p["x"], p["y"]
@@ -1691,3 +1835,132 @@ def test_x5_dex_sells_work_under_emergency_pause():
         dex.swap_xel("h", "bb" * 32, 10 * XEL)   # buys: gated by emergency
     out = dex.swap_tokens("h", "bb" * 32, 10**7)  # sells: NO gate at all
     assert out >= 1
+
+
+def test_d23_providers_earn_pro_rata_and_claims_pay_x10():
+    """X10/D23: fees split 50/50 admin/providers; providers earn pro-rata
+    of their share of the LP depth; claims pay out of the LP pots only;
+    before the first provider the LP share reverts to the admin."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    a = "cc" * 32
+    dex.create_pool("lpx", a, 1000 * XEL, 10**9)
+    p = dex.pools[a]
+    # fees BEFORE any provider: the LP share reverts to the admin
+    dex.wallets["t"]["xel"] = 200 * XEL
+    dex.swap_xel("t", a, 10 * XEL)
+    fee1 = dx.fee_take(10 * XEL, dex.cfg["swap_fee_bps"])
+    assert p["lx"] == 0 and p["ly"] == 0 and p["ax"] == 0
+    assert p["xf"] == fee1                    # everything went to the admin
+    # two providers: 100 XEL and 300 XEL of depth (25% / 75%)
+    for w in ("p1", "p2"):
+        dex.wallets[w]["xel"] = 400 * XEL
+        dex.wallets[w]["assets"][a] = 10**10
+    dex.add_liquidity("p1", a, 100 * XEL, p["y"] * 100 * XEL // p["x"])
+    dex.add_liquidity("p2", a, 300 * XEL, p["y"] * 300 * XEL // p["x"])
+    assert p["tl"] == 400 * XEL
+    assert dex.lp[(a, "p1")]["x"] == 100 * XEL
+    assert dex.lp[(a, "p2")]["x"] == 300 * XEL
+    # a buy accrues fees on the XEL side; the split is 50/50
+    out = dex.swap_xel("t", a, 50 * XEL)
+    fee_buy = dx.fee_take(50 * XEL, dex.cfg["swap_fee_bps"])
+    lp_part = dx.fee_split(fee_buy, dex.cfg["lp_share_bps"])[1]
+    adm_part = fee_buy - lp_part
+    assert p["xf"] == fee1 + adm_part
+    assert p["lx"] == lp_part
+    assert p["ax"] == dx.accrual_increment(lp_part, 400 * XEL)
+    # the sell side accrues on the token side (same denominator: tl)
+    dex.swap_tokens("t", a, out)
+    fee_sell = dx.fee_take(out, dex.cfg["swap_fee_bps"])
+    lp_y = fee_sell * dex.cfg["lp_share_bps"] // 10_000
+    assert p["ly"] == lp_y
+    # providers' live earnings: exactly their pro-rata of each lp_part
+    pos1, pos2 = dex.lp[(a, "p1")], dex.lp[(a, "p2")]
+    earn1_x = dx.lp_earnings(p["ax"], pos1["sx"], pos1["x"])
+    earn2_x = dx.lp_earnings(p["ax"], pos2["sx"], pos2["x"])
+    assert earn1_x + earn2_x <= p["lx"], "IX8: dues can never exceed the pot"
+    assert earn2_x == earn1_x * 3              # 75% vs 25% of the depth
+    # claims pay out of the pots and leave the invariant intact
+    before1 = dex.wallets["p1"]["xel"]
+    paid1_x, paid1_y = dex.claim_lp_fees("p1", a)
+    assert dex.wallets["p1"]["xel"] == before1 + paid1_x
+    assert paid1_x == earn1_x
+    assert dex.lp[(a, "p1")]["cx"] == 0
+    paid2_x, _ = dex.claim_lp_fees("p2", a)
+    assert paid2_x == earn2_x
+    # after both claims, at most dust remains in the pots (IX8 floors)
+    assert p["lx"] <= 2  # sub-unit dust per provider per fee
+    dex.check_invariants()
+    # a second claim with nothing accrued: "nofees"
+    with pytest.raises(AssertionError, match="nofees"):
+        dex.claim_lp_fees("p1", a)
+
+
+def test_d23_first_deposit_never_earns_fees_from_before_it_existed():
+    """Fuzz-found regression (IX8, seed 0): a provider's FIRST deposit must
+    snapshot the current accrual counters — or it would retroactively earn
+    every fee from before it entered, more than the pot ever held."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    a = "dd" * 32
+    dex.create_pool("lpx", a, 1000 * XEL, 10**9)
+    p = dex.pools[a]
+    # p1 enters first
+    dex.wallets["p1"]["xel"] = 100 * XEL
+    dex.wallets["p1"]["assets"][a] = 10**10
+    dex.add_liquidity("p1", a, 10 * XEL, p["y"] * 10 * XEL // p["x"])
+    # fees accrue (lp_part -> pot + accrual counter)
+    dex.wallets["t"]["xel"] = 100 * XEL
+    dex.swap_xel("t", a, 50 * XEL)
+    assert p["ax"] > 0 and p["lx"] > 0
+    ax_at_entry = p["ax"]
+    ay_at_entry = p["ay"]
+    # NOW p2 enters: its accrual clock must start HERE, not at zero
+    dex.wallets["p2"]["xel"] = 100 * XEL
+    dex.wallets["p2"]["assets"][a] = 10**10
+    dex.add_liquidity("p2", a, 10 * XEL, p["y"] * 10 * XEL // p["x"])
+    pos2 = dex.lp[(a, "p2")]
+    assert pos2["sx"] == ax_at_entry and pos2["sy"] == ay_at_entry
+    # p2 has earned exactly NOTHING so far
+    due2 = pos2["cx"] + dx.lp_earnings(p["ax"], pos2["sx"], pos2["x"])
+    assert due2 == 0
+    with pytest.raises(AssertionError, match="nofees"):
+        dex.claim_lp_fees("p2", a)
+    # a new fee arrives: p2 earns only its share of THAT fee
+    lx_before = p["lx"]
+    dex.swap_xel("t", a, 50 * XEL)
+    new_lp_part = p["lx"] - lx_before
+    due2 = pos2["cx"] + dx.lp_earnings(p["ax"], pos2["sx"], pos2["x"])
+    tl = p["tl"]
+    assert due2 == dx.lp_earnings(
+        dx.accrual_increment(new_lp_part, tl), 0, pos2["x"])
+    assert due2 <= new_lp_part
+    dex.check_invariants()
+
+
+def test_d23_fee_split_dial_is_bounded_and_prospective():
+    """set_fee_split: hard bounds [25%, 75%]; a change only affects FUTURE
+    fees (already-accrued claimables keep their recorded amounts)."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    a = "ee" * 32
+    dex.create_pool("lpx", a, 1000 * XEL, 10**9)
+    p = dex.pools[a]
+    dex.wallets["p"]["xel"] = 100 * XEL
+    dex.wallets["p"]["assets"][a] = 10**10
+    dex.add_liquidity("p", a, 10 * XEL, p["y"] * 10 * XEL // p["x"])
+    dex.wallets["t"]["xel"] = 100 * XEL
+    dex.swap_xel("t", a, 50 * XEL)                 # at 50%
+    lp_at_50 = p["lx"]
+    assert lp_at_50 > 0
+    with pytest.raises(AssertionError):
+        dex.set_fee_split(2499)                    # cannot cut LPs below 25%
+    with pytest.raises(AssertionError):
+        dex.set_fee_split(7501)                    # cannot starve the treasury
+    dex.set_fee_split(7500)                        # max LP share: ok
+    lx_before = p["lx"]
+    dex.swap_xel("t", a, 50 * XEL)
+    lp_new = p["lx"] - lx_before
+    fee_buy = dx.fee_take(50 * XEL, dex.cfg["swap_fee_bps"])
+    assert lp_new == fee_buy * 7500 // 10_000      # the new dial applied
+    dex.check_invariants()

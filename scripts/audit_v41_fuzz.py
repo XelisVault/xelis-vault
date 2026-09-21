@@ -115,8 +115,11 @@ def fuzz_x7(seed: int) -> None:
         try:
             xel_eff, tok_eff = dex.add_liquidity("donor", asset, xel_in, tok_in)
         except AssertionError as e:
-            assert "dust" in str(e) or "ratio" in str(e), \
+            assert "dust" in str(e) or "ratio" in str(e) or "minlp" in str(e), \
                 f"seed {seed}: unexpected refusal {e}"
+            # a refused add must change NOTHING (X7 + the v1.2 LP floor)
+            assert p["x"] == x and p["y"] == y, \
+                f"seed {seed}: refused add mutated the reserves"
             continue
         # IX7: one floor unit of drift on the binding side
         x1, y1 = p["x"], p["y"]
@@ -153,15 +156,63 @@ def fuzz_ix6(seed: int) -> None:
         assert "buyspaused" in str(e) or "paused" in str(e)
 
 
+def fuzz_d23(seed: int) -> None:
+    """X10/D23: random multi-provider pools — adds, buys, sells, dial
+    changes and claims, with IX8 (dues <= pots, reserves+pots <=
+    balances) asserted after EVERY action."""
+    rng = random.Random(3000 + seed)
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    asset = "ee" * 32
+    dex.create_pool("lpx", asset, rng.randrange(50, 5000) * XEL,
+                    rng.randrange(10**6, 10**12))
+    providers = [f"p{i}" for i in range(rng.randrange(1, 6))]
+    for w in providers + ["t"]:
+        dex.wallets[w]["xel"] = 10**6 * XEL
+        dex.wallets[w]["assets"][asset] = 10**14
+    for _ in range(60):
+        x, y = dex.pools[asset]["x"], dex.pools[asset]["y"]
+        roll = rng.random()
+        try:
+            if roll < 0.25:
+                w = rng.choice(providers)
+                xel_add = rng.randrange(1, 50) * XEL
+                need_tok = y * xel_add // x
+                if dex.wallets[w]["assets"][asset] >= need_tok >= 1:
+                    dex.add_liquidity(w, asset, xel_add, need_tok)
+            elif roll < 0.55:
+                dex.swap_xel("t", asset, rng.randrange(1, 100) * XEL)
+            elif roll < 0.75:
+                held = dex.wallets["t"]["assets"][asset]
+                if held > 0:
+                    dex.swap_tokens("t", asset, rng.randrange(1, held + 1))
+            elif roll < 0.85:
+                # the dial moves inside its hard bounds (prospective only)
+                dex.set_fee_split(rng.randrange(2500, 7501))
+            else:
+                dex.claim_lp_fees(rng.choice(providers), asset)
+        except AssertionError as e:
+            # the only legitimate refusals: fit guards and empty claims
+            ok = any(k in str(e) for k in
+                     ("dust", "ratio", "minlp", "nofees", "buyspaused"))
+            assert ok, f"seed {seed}: unexpected refusal {e}"
+        dex.check_invariants()
+        # the accrual bound (IX8): counters never outgrow lifetime fees
+        p = dex.pools[asset]
+        assert p["ax"] <= p["fl"] and p["ay"] <= p["fl"]
+
+
 def main() -> int:
     for seed in range(SEEDS):
         fuzz_d21(seed)
         fuzz_x7(seed)
         fuzz_ix6(seed)
-    print(f"AUDIT 3 (v4.1 FUZZ): PASS — {SEEDS} seeds x (D21 deposits, "
-          "X7 price-neutral adds, IX6 ungated sells); I2 pots identity, "
-          "no double refunds, one-floor-unit price bound, refunds within "
-          "deposits — all held on every action.")
+        fuzz_d23(seed)
+    print(f"AUDIT 3 (v4.1+v1.2 FUZZ): PASS — {SEEDS} seeds x (D21 deposits, "
+          "X7 price-neutral adds, IX6 ungated sells, D23 LP fee share); "
+          "I2 pots identity, no double refunds, one-floor-unit price "
+          "bound, refunds within deposits, IX8 dues-within-pots and "
+          "accrual-within-lifetime — all held on every action.")
     return 0
 
 

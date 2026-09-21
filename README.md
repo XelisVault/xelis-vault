@@ -5,10 +5,11 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v18.1** — real confidential assets,
-real migration, permanent liquidity, hardened by the founder risk
-review (price-neutral DEX liquidity, ungated sells, sybil dial,
-stateless-site data bridges).
+[Silex](https://docs.xelis.io/). **v18.2** — real confidential assets,
+real migration, permanent liquidity that EARNS (LP fee share, 50/50
+default), hardened by two founder risk reviews (price-neutral DEX
+liquidity, ungated sells, sybil dial ON by default, stateless-site data
+bridges).
 
 ## What ships today
 
@@ -56,20 +57,29 @@ to the admin (no burn):
   remove_liquidity exists anywhere (the anti-rug guarantee), anyone can
   deepen a pool forever (`add_liquidity`, PRICE-NEUTRAL since v1.1: the
   pool's ratio is enforced and the excess is refunded — only swaps move
-  a price), fees 0.30% default extracted
-  to pending pots (100% admin), per-pool scoreboard; the community trust
+  a price), fees 0.30% default split between the admin pot and the
+  POOL'S PROVIDERS (v1.2: pro-rata of LP depth, 50/50 default, dial
+  hard-bounded 25–75%, `claim_lp_fees` pull), per-pool scoreboard; the
+  community trust
   system follows the tokens there (`sync_trust_to_dex` pauses pool buys,
   never sells — and the emergency pause itself can never block a sell)
 - **founder risk review, closed (v18.1)**: (1) one-sided liquidity
   gifts can't skew markets (X7); (2) sells are ungated on BOTH venues;
   (3) the upgrade runbook assumes the frozen pins (side-by-side
-  generations, `get_launchpad`); (4) cross-call chunk ids pinned +
-  CI-asserted on both sides; (5) the REFUNDABLE vote-deposit dial
-  (D21, default off, `claim_vote_deposit`) raises sybil cost; (6) the
-  privacy model documented in plain words (public deposits, private
-  balances). The stateless site (Vercel) reads EVERYTHING from views —
-  including the new asset→project reverse bridge and the migrated
+  generations — now a FULL runbook, `docs/UPGRADES.md`); (4) cross-call
+  chunk ids pinned + CI-asserted on both sides; (5) the REFUNDABLE
+  vote-deposit dial (D21, `claim_vote_deposit`) raises sybil cost;
+  (6) the privacy model documented in plain words (public deposits,
+  private balances). The stateless site (Vercel) reads EVERYTHING from
+  views — including the asset→project reverse bridge and the migrated
   index (D22)
+- **founder risk review 2, closed (v18.2)**: (1) liquidity provision
+  now EARNS — the LP fee share above; (2) the sybil dial ships ON by
+  default (0.5 XEL refundable — 20 farmed wallets park 10 XEL to
+  decide a validation); (3) front-running documented as an assumed
+  ceiling (public mempool; `min_out` everywhere; no MEV protection
+  claimed); (4) the generation runbook written out step by step
+  (`docs/UPGRADES.md`)
 - team allocation (≤ 20%): claim in full at migration OR lock it in a
   linear vesting (public commitment signal); a project that never
   graduates releases the allocation after ~6 months of bonding —
@@ -153,19 +163,31 @@ Every push and PR runs strict checks (`.github/workflows/ci.yml`):
 
 Run locally: `python3 scripts/lint_silex.py && python3 scripts/verify_chunk_ids.py && python3 -m pytest tests/`
 
-## Audit status
+## Audit status — read this before saying "audited"
 
-v12 was fully audited and retired (1316 blocker/error findings across 51
-contracts — the corpus now powers the linter). PrivacyMixer V4 was
-superseded before deployment (recipient leak in deposit params +
-recipient-gas problem — see docs/SECURITY.md §V4 disclosure). v13/v14
-rebuilt the tree around the mixer; v15 added VaultLaunch; v16 made
-graduation pay (two-path graduation, lower graduated fee, one-time
-migration fee, flexible team allocation); **v17 puts everything on the
-table**: the vesting plan declared at propose and bound at graduation,
-mutable social links, and the on-chain volume/market-cap scoreboard —
-same bar: lint clean, chunk table verified, reference tests green
-(incl. a 30-seed invariant fuzz), threat model written.
+**v12 (51 legacy contracts) was formally audited and retired** (1316
+blocker/error findings; the corpus now powers the linter). PrivacyMixer
+V4 was superseded before deployment (recipient leak in deposit params +
+recipient-gas problem — see docs/SECURITY.md §V4 disclosure). **Those
+audits cover NONE of the current production contracts.**
+
+**VaultLaunch v4+ and LaunchDEX v1+ have NO external, independent
+audit.** What they have is internal, CI-enforced verification on every
+push: the audit-derived Silex linter, the full reference test suite
+(Python mirrors replaying the contracts' exact math), five formal audit
+scripts (spec traceability, security heuristics, SDK parity, doc
+parity, randomized fuzz with invariants after every action) and the
+chunk-id/structure/secret gates. The honest phrasing: *internally
+audited, machine-checked in CI, no external audit yet.* Budget an
+external review before any mainnet deployment carrying real value.
+
+History: v13/v14 rebuilt the tree around the mixer; v15 added
+VaultLaunch; v16 made graduation pay; v17 put everything on-chain
+(vesting plans, socials, scoreboard); v18 shipped real assets + atomic
+migration to LaunchDEX; v18.1 closed the first founder risk review
+(X7, ungated sells, D21/D22); v18.2 closed the second (LP fee share,
+sybil dial on by default, front-running documented, the generation
+runbook).
 Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## License

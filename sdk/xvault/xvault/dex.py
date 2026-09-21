@@ -10,8 +10,11 @@ per asset, constant-product pricing, and liquidity that can only ever
 GROW (no remove_liquidity exists — the anti-rug core, X2). Pools are
 seeded by VaultLaunch's atomic migration (cross-contract call with
 attached deposits) and deepened by anyone via add_liquidity (a permanent
-donation). Fees are extracted from swap inputs to per-pool pending pots,
-100% to the admin.
+deepening). Since v1.2 every swap fee is SPLIT between the admin pot and
+the pool's liquidity providers (X10/D23): each provider earns pro-rata
+of their share of the pool's LP depth, claimable at any time via
+claim_lp_fees (pull). The principal can never be clawed back — only
+fees ever flow out.
 
 Units: XEL and token amounts are atomic integers with 8 decimals
 (1 XEL = 1 token = 100_000_000).
@@ -34,7 +37,14 @@ DEFAULTS = {
     "max_swap_xel": 10_000_000_000_000,        # 100 000 XEL whale cap
     "min_swap_tokens": 1,
     "max_swap_tokens": 10_000_000_000_000_000, # 1e8 whole tokens
+    "lp_share_bps": 5_000,                     # X10/D23: 50/50 admin/LP
 }
+
+# X10/D23 bounds (must match the contract constants exactly)
+MIN_LP_SHARE_BPS = 2_500
+MAX_LP_SHARE_BPS = 7_500
+MIN_LP_ADD_XEL = 100_000_000                  # hard LP-entry floor (1 XEL)
+ACC_SCALE = 100_000_000                       # accrual scale == floor
 
 # ---------------------------------------------------------------------------
 # Swap math — the contract's exact integer formulas (u128-safe)
@@ -76,8 +86,8 @@ def liquidity_fit(xel_reserve: int, token_reserve: int,
     largest (xel_eff, tok_eff) pair at the pool's CURRENT ratio that fits
     inside the attached deposit. Returns (xel_eff, tok_eff, xel_back,
     tok_back): the effective liquidity and the refunded excess. Raises
-    ValueError ("dust"/"ratio") exactly where the entry refuses. A
-    donation can deepen a pool but NEVER move its price (founder risk
+    ValueError ("dust"/"ratio"/"minlp") exactly where the entry refuses.
+    A donation can deepen a pool but NEVER move its price (founder risk
     review, point 1)."""
     x, y = xel_reserve, token_reserve
     if x <= 0 or y <= 0:
@@ -92,7 +102,36 @@ def liquidity_fit(xel_reserve: int, token_reserve: int,
         xel_eff, tok_eff = need_xel, tok_in
     if xel_eff < 1 or tok_eff < 1:
         raise ValueError("dust")
+    if xel_eff < MIN_LP_ADD_XEL:
+        raise ValueError("minlp")
     return xel_eff, tok_eff, xel_in - xel_eff, tok_in - tok_eff
+
+
+def fee_split(fee: int, lp_bps: int) -> tuple:
+    """X10/D23: split a swap fee between admin and providers.
+    Returns (admin_part, lp_part), floored on the LP side in favour of
+    the admin pot — exactly what both swap entries compute."""
+    lp_part = fee * lp_bps // 10_000
+    return fee - lp_part, lp_part
+
+
+def lp_earnings(accrued: int, snapshot: int, parts: int) -> int:
+    """X10/D23: a provider's fees earned since their last touch =
+    (accrued - snapshot) * parts / ACC_SCALE, floored (the pot keeps the
+    dust — by-construction over-collateralisation, IX8)."""
+    if parts <= 0 or accrued <= snapshot:
+        return 0
+    return (accrued - snapshot) * parts // ACC_SCALE
+
+
+def accrual_increment(lp_part: int, total_depth: int) -> int:
+    """X10/D23: how much the per-unit accrual counter grows when lp_part
+    reaches the pot: lp_part * ACC_SCALE / total_depth, floored. Result
+    is always <= lp_part while total_depth >= ACC_SCALE (the 1 XEL LP
+    floor) — IX8's bound."""
+    if total_depth <= 0:
+        return 0
+    return lp_part * ACC_SCALE // total_depth
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +153,21 @@ F_XEL_FEES, F_TOK_FEES = "xf", "yf"
 F_BUYS_PAUSED, F_CREATED = "bp", "ct"
 F_BUY_VOL, F_SELL_VOL, F_TRADES, F_LAST_TRADE = "bv", "sv", "tc", "lt"
 F_LIFETIME_FEES, F_LP_COUNT, F_ASSET = "fl", "lp", "ah"
+F_LP_POT_XEL, F_LP_POT_TOK = "lx", "ly"
+F_LP_TOTAL, F_LP_ACC_XEL, F_LP_ACC_TOK = "tl", "ax", "ay"
+
+# X10/D23 provider slots: l:{asset_hex}:{wallet}:{field}
+LP_PREFIX = "l:"
+LPF_XEL, LPF_SNAP_XEL, LPF_SNAP_TOK = "x", "sx", "sy"
+LPF_CLAIM_XEL, LPF_CLAIM_TOK = "cx", "cy"
+
+
+def lp_key(asset_hex: str, wallet: str, field: str) -> str:
+    """l:{asset_hex}:{wallet}:{field} — a provider's slot in one pool.
+    `wallet` is the address string exactly as Address::to_string()
+    renders it on-chain (same format as the launchpad's v:{pid}:{round}
+    vote keys)."""
+    return f"l:{asset_hex}:{wallet}:{field}"
 
 GLOBAL_KEYS = {
     "admin": "adm", "pools_count": "pc", "swap_fee_bps": "sfe",
@@ -121,6 +175,7 @@ GLOBAL_KEYS = {
     "min_swap_xel": "mnt", "max_swap_xel": "tsw",
     "min_swap_tokens": "mst", "max_swap_tokens": "mxs",
     "emergency": "xpa", "launchpad_pinned": "lpp",
+    "fee_split_bps": "fsl",
 }
 
 # ---------------------------------------------------------------------------
@@ -193,6 +248,18 @@ def withdraw_fees_params(asset_hex: str, xel_amount: int,
     return [val_hash(asset_hex), val_u64(xel_amount), val_u64(token_amount)]
 
 
+def set_fee_split_params(lp_bps: int) -> list:
+    """set_fee_split (admin): the admin/providers revenue dial, in bps of
+    every fee. Hard-bounded [2500, 7500] on-chain (MIN/MAX_LP_SHARE_BPS)."""
+    return [val_u64(lp_bps)]
+
+
+def claim_lp_fees_params(asset_hex: str) -> list:
+    """claim_lp_fees (public, pull): pays the caller's OWN accrued
+    provider fees on both sides (X10/D23). No deposits needed."""
+    return [val_hash(asset_hex)]
+
+
 # ---------------------------------------------------------------------------
 # RPC reader (public nodes are fine — read-only)
 # ---------------------------------------------------------------------------
@@ -217,6 +284,8 @@ class DexReader:
         out["launchpad"] = self._key(GLOBAL_KEYS["launchpad"])
         out["emergency"] = bool(self._key(GLOBAL_KEYS["emergency"], False))
         out["launchpad_pinned"] = bool(self._key(GLOBAL_KEYS["launchpad_pinned"], False))
+        out["lp_share_bps"] = self._key(GLOBAL_KEYS["fee_split_bps"],
+                                         DEFAULTS["lp_share_bps"])
         return out
 
     def pool_by_index(self, index: int) -> str:
@@ -238,7 +307,10 @@ class DexReader:
                             ("trades", F_TRADES),
                             ("last_trade_topo", F_LAST_TRADE),
                             ("lifetime_fees", F_LIFETIME_FEES),
-                            ("lp_deposits", F_LP_COUNT)):
+                            ("lp_deposits", F_LP_COUNT),
+                            ("lp_pot_xel", F_LP_POT_XEL),
+                            ("lp_pot_tokens", F_LP_POT_TOK),
+                            ("lp_total_depth", F_LP_TOTAL)):
             out[attr] = self._key(pool_key(asset_hex, field))
         x, y = out["xel_reserve"] or 0, out["token_reserve"] or 0
         out["price"] = spot_price(x, y)
@@ -269,3 +341,25 @@ class DexReader:
         out["xel_out"] = (tokens_to_xel_out(x, y, token_amount, bps)
                           if token_amount else 0)
         return out
+
+    def lp_info(self, asset_hex: str, wallet: str) -> Dict[str, int]:
+        """X10/D23 provider position (mirrors get_lp_info): parts (XEL
+        depth provided), crystallised claimables, and the LIVE available
+        payout on both sides = claimables + everything accrued since the
+        provider's last touch (computed here exactly like the contract's
+        view — a pure read, nothing is claimed)."""
+        a = asset_hex.lower()
+        parts = self._key(lp_key(a, wallet, LPF_XEL), 0) or 0
+        cx = self._key(lp_key(a, wallet, LPF_CLAIM_XEL), 0) or 0
+        cy = self._key(lp_key(a, wallet, LPF_CLAIM_TOK), 0) or 0
+        avail_x, avail_y = cx, cy
+        if parts and parts > 0:
+            ax = self._key(pool_key(a, F_LP_ACC_XEL), 0) or 0
+            sx = self._key(lp_key(a, wallet, LPF_SNAP_XEL), 0) or 0
+            avail_x += lp_earnings(ax, sx, parts)
+            ay = self._key(pool_key(a, F_LP_ACC_TOK), 0) or 0
+            sy = self._key(lp_key(a, wallet, LPF_SNAP_TOK), 0) or 0
+            avail_y += lp_earnings(ay, sy, parts)
+        return {"parts": parts, "claimable_xel": cx,
+                "claimable_tokens": cy, "available_xel": avail_x,
+                "available_tokens": avail_y}

@@ -107,6 +107,45 @@ check("need_tok" in DEX_SRC and '"fiterr"' in DEX_SRC,
 check("pub fn get_launchpad() -> (string, bool)" in DEX_SRC,
       "DEX get_launchpad view missing (v4.1)")
 
+# 10. the v1.2 surface (X10/D23): builders, math mirrors, reader, defaults
+for piece in ("def set_fee_split_params", "def claim_lp_fees_params",
+              "def fee_split", "def lp_earnings", "def accrual_increment",
+              "def lp_key", "def lp_info"):
+    check(piece in dex_src, f"xvault.dex missing {piece} (v1.2/X10)")
+# the split math mirrors the contract exactly (floor on the LP side)
+check("lp_part = fee * lp_bps // 10_000" in dex_src and
+      "return fee - lp_part, lp_part" in dex_src,
+      "SDK fee_split formula drifted from the contract (X10)")
+# the accrual mirror: lp_part * ACC_SCALE / total_depth, floored
+check("lp_part * ACC_SCALE // total_depth" in dex_src,
+      "SDK accrual_increment drifted from the contract (X10)")
+check("(accrued - snapshot) * parts // ACC_SCALE" in dex_src,
+      "SDK lp_earnings drifted from the contract (X10)")
+# DEFAULTS + bounds parity: SDK == contract constants
+check(f"const DEFAULT_LP_SHARE_BPS: u64 = {dx.DEFAULTS['lp_share_bps']}" in DEX_SRC,
+      "DEX default LP share drifted")
+check(f"const MIN_LP_SHARE_BPS: u64 = {dx.MIN_LP_SHARE_BPS}" in DEX_SRC,
+      "DEX min LP share bound drifted")
+check(f"const MAX_LP_SHARE_BPS: u64 = {dx.MAX_LP_SHARE_BPS}" in DEX_SRC,
+      "DEX max LP share bound drifted")
+check(f"const MIN_LP_ADD_XEL: u64 = {dx.MIN_LP_ADD_XEL}" in DEX_SRC,
+      "DEX LP-entry floor drifted")
+check(f"const ACC_SCALE: u64 = {dx.ACC_SCALE}" in DEX_SRC,
+      "DEX accrual scale drifted")
+# the v4.2 default: the D21 dial is 0.5 XEL refundable
+check(f"const DEFAULT_VOTE_DEPOSIT: u64 = {lp.DEFAULTS['vote_deposit']}" in LP_SRC,
+      "VaultLaunch default vote deposit drifted (v4.2)")
+# the reader carries the LP pots/depth + the provider position
+for piece in ('"lp_pot_xel", F_LP_POT_XEL', '"lp_pot_tokens", F_LP_POT_TOK',
+              '"lp_total_depth", F_LP_TOTAL', '"fee_split_bps": "fsl"'):
+    check(piece in dex_src, f"DexReader missing the X10 field {piece}")
+# CLI surfaces the new entries
+cli_src = open(ROOT / "sdk" / "xvault" / "xvault" / "cli.py").read()
+for piece in ("claim-lp-fees", "set-fee-split", "def cmd_dex_lp",
+              "LAUNCHDEX_ENTRY_IDS[\"claim_lp_fees\"]",
+              "LAUNCHDEX_ENTRY_IDS[\"set_fee_split\"]"):
+    check(piece in cli_src, f"CLI missing {piece} (v1.2/X10)")
+
 if fails:
     print("AUDIT 4 (SDK PARITY) FAILED:")
     for f in fails:
@@ -115,4 +154,5 @@ if fails:
 print("AUDIT 4 (SDK PARITY): PASS — signatures (incl. whole-deposit sell), "
       "entry-ids on BOTH contracts, pinned cross-call chunks, defaults, "
       "budget deposits, the v4 reader surface, the dex math mirror and the "
-      "v4.1 hardening surface (D21/D22/X7) all agree with the contracts.")
+      "v4.1 hardening surface (D21/D22/X7) and the v1.2 LP revenue\n"
+      "surface (X10/D23: split, accrual, claims, bounds) all agree with the contracts.")

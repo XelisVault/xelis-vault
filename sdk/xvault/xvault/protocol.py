@@ -184,6 +184,8 @@ LAUNCHDEX_ENTRY_IDS = {
     "set_admin": 14,
     "set_paused": 15,
     "withdraw_fees": 16,
+    "set_fee_split": 29,
+    "claim_lp_fees": 30,
 }
 
 LAUNCHDEX_ENTRY_IDS_ALT = {
@@ -198,6 +200,8 @@ LAUNCHDEX_ENTRY_IDS_ALT = {
     "set_admin": 8,
     "set_paused": 9,
     "withdraw_fees": 10,
+    "set_fee_split": 11,
+    "claim_lp_fees": 12,
 }
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v17
+# Security Policy — XelisVault Protocol v18.2
 
 ## Reporting
 
@@ -6,6 +6,31 @@ Report vulnerabilities privately to the repository owner (GitHub security
 advisory: *Security → Report a vulnerability*). Please include a minimal
 reproduction, affected entry points and impact. Coordinated disclosure with
 credit; no bounties yet (community project).
+
+## What is audited — and what is NOT (read this first)
+
+Honest words, because "audited" gets people hurt:
+
+- **v12 (51 legacy contracts) was formally audited and retired** — 1316
+  blocker/error findings; the corpus now powers the CI linter.
+- **VaultLaunch v4+ and LaunchDEX v1+ have NO external, independent
+  audit.** What they have is an INTERNAL, CI-enforced battery, run on
+  every push: the strict Silex linter (audit-derived rules), the full
+  reference test suite (Python mirrors replaying the contracts' exact
+  math), five formal audit scripts (spec traceability founder-requirement
+  by founder-requirement, security heuristics, SDK parity, doc parity,
+  randomized fuzz with invariants asserted after every action) and the
+  chunk-id/structure/secret gates.
+- Internal audits find classes of bugs (accounting, bounds, rounding,
+  access control) with high reliability — the v1.2 LP accrual design
+  shipped with a snapshot bug the fuzz caught on seed 0 and a regression
+  test now pins. They do NOT substitute for an independent review of
+  novel mechanism design.
+- **Do not describe VaultLaunch v4, LaunchDEX v1 or anything later as
+  "audited"** in communications, listings or conversations. The honest
+  phrasing: "internally audited, machine-checked in CI, no external
+  audit yet". Budget an external review before any mainnet deployment
+  that carries real value.
 
 ## State of the codebase
 
@@ -192,22 +217,76 @@ NEVER trap holders. And since v1.1 `add_liquidity` is price-neutral
 (X7/IX7): a malicious one-sided donation cannot skew a market — only
 swaps move a pool's price.
 
-**The founder risk review, closed (v4.1).** The six pre-launch risks
-and their resolutions: (1) one-sided liquidity → X7 ratio fit with
-same-transaction refund of the excess; (2) emergency pause trapping
-holders → sells carry no gate on either venue; (3) frozen upgrade
-pins → assumed and documented as the side-by-side runbook
-(LAUNCHPAD.md §5b, `get_launchpad()` exposes the pin); (4) hardcoded
-cross-call chunk ids → pinned constants asserted against BOTH real
-tables by CI on every push (append-only rule for the DEX); (5) sybil
-voting → the D21 refundable-deposit dial (default off, cap 10 XEL,
+**The founder risk review, closed (v4.1, updated v4.2).** The six
+pre-launch risks and their resolutions: (1) one-sided liquidity → X7
+ratio fit with same-transaction refund of the excess; (2) emergency
+pause trapping holders → sells carry no gate on either venue; (3)
+frozen upgrade pins → assumed and documented as the side-by-side
+runbook (**docs/UPGRADES.md** — the full procedure, not a note;
+LAUNCHPAD.md §5b keeps the summary, `get_launchpad()` exposes the pin);
+(4) hardcoded cross-call chunk ids → pinned constants asserted against
+BOTH real tables by CI on every push (append-only rule for the DEX);
+(5) sybil voting → the D21 refundable-deposit dial (**default 0.5 XEL
+since v4.2** — ON from day one, not an opt-in; cap 10 XEL,
 `claim_vote_deposit` refunds, pots committed in I2), honest that it
 mitigates and does not cure; (6) public deposits → the privacy model
 is documented in plain words (LAUNCHPAD.md §5a) — balances are
 confidential, attached amounts are public, never promise total
 privacy.
 
-**Permissions note for integrators.** Transactions that cross-call
+## v18.2 — providers earn (LaunchDEX v1.2, X10/D23)
+
+**New surface: the provider accounting.** Every swap fee now splits
+between the admin pot and the pool's providers (pro-rata of the LP
+depth, XEL side). The design keeps the anti-rug core intact: no
+`remove_liquidity` exists — only FEES ever flow out, the principal is
+permanent. Threat notes, plainly:
+
+- The **split dial is hard-bounded [2500, 7500]**: a compromised
+  admin can neither zero the providers' revenue nor dump the whole
+  fee stream out of the treasury — and it can never touch the
+  provider pots themselves (`withdraw_fees` reads the ADMIN pots
+  only; `claim_lp_fees` pays the CALLER's own accrued fees, keys
+  embed the caller's address, payouts bounded by the pots with
+  belt-and-braces `"lperr"` reverts).
+- **IX8 (LP solvency) holds by construction**: each accrual increment
+  is `lp_part * ACC_SCALE / tl` with `tl ≥ ACC_SCALE` (the hard 1 XEL
+  LP-entry floor — a precision guarantee, not a dust rule), so the
+  accrual counter can never outgrow the pool's lifetime fees, and
+  payouts are floor-rounded shares — the sum of all dues never
+  exceeds the pot. The fuzz asserts this after every action.
+- **Fuzz-found, fixed, pinned**: the first deposit of a wallet must
+  snapshot the current accrual counters, or it would retroactively
+  earn fees from before it existed (more than the pot ever held).
+  The 30-seed fuzz caught exactly this (seed 0); the contract, the
+  Sim and a dedicated regression test now pin the boundary.
+- A deposit **crystallises before its parts join** — new money never
+  earns from before it existed, old parts never lose a unit earned.
+- While a pool has no provider, the LP share reverts to the admin —
+  no fee is ever stranded in a beneficiary-less pot.
+
+## Front-running — an assumed ceiling, documented (not a bug)
+
+The XELIS mempool is public, like every blockchain mempool: a pending
+swap can be observed and front-run (sandwich). This is NOT a VaultLaunch
+or LaunchDEX defect — it is the platform's transparency model, and these
+contracts accept it as a ceiling rather than pretend to solve it. What
+the design does about it, honestly:
+
+- **`min_out` slippage protection on EVERY swap** (both venues): a
+  sandwiched trade reverts (`"slip"`) instead of silently filling at
+  the manipulated price. The CLI quotes (`quote`, `get_amount_out_*`)
+  exist to compute a sane `min_out` before you sign.
+- **No commit-reveal, no private mempool, no MEV protection of any
+  kind** is implemented or claimed.
+- Mitigations users can take: set a tight `min_out`, split large
+  orders, avoid trading right after visible migrations.
+- If XELIS ever ships mempool privacy or batch ordering, the swap
+  entries need no change to benefit from it.
+
+## Permissions note for integrators
+
+Transactions that cross-call
 (`migrate`, `sync_trust_to_dex`, and the DEX's launchpad-only entries)
 must carry the wallet's contract-call permission (XSWD "all" or an
 allowlist). The contracts refuse early with `"txperm"` instead of

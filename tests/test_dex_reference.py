@@ -127,6 +127,8 @@ def test_add_liquidity_enforces_the_pool_ratio_x7():
             xel_eff, tok_eff = need_xel, tok_in
         if tok_eff < 1 or xel_eff < 1:
             continue  # refused with "dust"
+        if xel_eff < dx.MIN_LP_ADD_XEL:
+            continue  # refused with "minlp" (X10/D23 — the 1 XEL LP floor)
         x1, y1 = x + xel_eff, y + tok_eff
         drift = x1 * y - x * y1
         assert abs(drift) < max(x, y), "price moved — X7 broken"
@@ -181,4 +183,102 @@ def test_fees_are_extracted_not_pooled_x3():
 
 
 def test_version_string():
-    assert 'const VERSION: string = "LaunchDEX v1.1.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.2.0"' in DEX_CONTRACT.read_text()
+
+
+# ===========================================================================
+# X10/D23 — LP FEE SHARE (v1.2): providers earn, structure + math
+# ===========================================================================
+
+def test_d23_fee_split_math_is_exactly_the_contract():
+    # dx.fee_split mirrors both swap entries: lp_part floored, admin gets
+    # the rest; while the pool has no provider the LP part reverts to the
+    # admin (no stranded fees)
+    for fee, bps in ((10**8, 5000), (3, 5000), (999, 2500), (12345, 7500)):
+        adm, lp = dx.fee_split(fee, bps)
+        assert adm + lp == fee
+        assert lp == fee * bps // 10_000
+    # the accrual increment is <= lp_part while depth >= ACC_SCALE (the
+    # IX8 bound: the accrual counter can never outgrow lifetime fees)
+    import random
+    rng = random.Random(23)
+    for _ in range(500):
+        lp_part = rng.randrange(1, 10**12)
+        depth = rng.randrange(dx.ACC_SCALE, 10**16)
+        assert dx.accrual_increment(lp_part, depth) <= lp_part
+    # and a provider's earnings are bounded by what the increment
+    # distributed: sum over providers <= lp_part (floors leave dust IN
+    # the pot — IX8)
+    for _ in range(500):
+        lp_part = rng.randrange(1, 10**12)
+        depth = rng.randrange(dx.ACC_SCALE, 10**16)
+        inc = dx.accrual_increment(lp_part, depth)
+        parts = []
+        rest = depth
+        while rest >= dx.MIN_LP_ADD_XEL and len(parts) < 20:
+            take = rng.randrange(dx.MIN_LP_ADD_XEL, rest + 1)
+            parts.append(take)
+            rest -= take
+        if not parts:
+            continue
+        parts[-1] += rest          # exact conservation of the depth
+        assert sum(parts) == depth
+        dues = sum(dx.lp_earnings(inc, 0, p) for p in parts)
+        assert dues <= lp_part, "IX8 broken: providers earn more than the fee"
+
+
+def test_d23_claim_lp_fees_structure():
+    """The pull payout: public, own-key-only, bounded by the pots, and
+    the transfers come after every state write."""
+    src = DEX_CONTRACT.read_text()
+    m = re.search(r"entry claim_lp_fees\(.*?\n\}", src, re.S)
+    assert m, "claim_lp_fees not found"
+    body = m.group(0)
+    # the caller's own slots only (the key embeds the caller's address)
+    assert 'LP_PREFIX + asset.to_hex() + ":" + caller.to_string()' in body
+    # bounded by the pots (IX8 belt-and-braces) and zeroed on payout
+    assert '"lperr"' in body and '"nofees"' in body
+    assert 's.store(lkey + LPF_CLAIM_XEL, 0u64)' in body
+    # transfers LAST, after every store (X9)
+    first_store = body.index("s.store")
+    first_transfer = body.index("transfer(")
+    assert first_store < first_transfer
+
+
+def test_d23_add_liquidity_snapshots_on_first_deposit_too():
+    """Fuzz-found regression (seed 0, IX8): a FIRST deposit must snapshot
+    the accrual counters even when parts == 0 — the snapshot stores sit
+    OUTSIDE the `if parts > 0` block in the contract."""
+    src = DEX_CONTRACT.read_text()
+    m = re.search(r"entry add_liquidity\(.*?\n\}", src, re.S)
+    assert m
+    body = m.group(0)
+    # the snapshot stores exist unconditionally (after the crystallise if)
+    assert 's.store(lkey + LPF_SNAP_XEL, s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0))' in body
+    assert 's.store(lkey + LPF_SNAP_TOK, s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0))' in body
+    # the 1 XEL floor is enforced
+    assert 'require(xel_eff >= MIN_LP_ADD_XEL, "minlp")' in body
+
+
+def test_d23_fee_split_dial_is_hard_bounded():
+    src = DEX_CONTRACT.read_text()
+    m = re.search(r"entry set_fee_split\(.*?\n\}", src, re.S)
+    assert m
+    body = m.group(0)
+    assert 'require(lp_bps >= MIN_LP_SHARE_BPS, "toolow")' in body
+    assert 'require(lp_bps <= MAX_LP_SHARE_BPS, "toohigh")' in body
+    # the bounds: 25% / 75% — providers can never be cut to zero, the
+    # treasury can never be starved (structural trust guarantees)
+    assert "const MIN_LP_SHARE_BPS: u64 = 2500" in src
+    assert "const MAX_LP_SHARE_BPS: u64 = 7500" in src
+    assert "const DEFAULT_LP_SHARE_BPS: u64 = 5000" in src
+
+
+def test_d23_lp_views_exist():
+    src = DEX_CONTRACT.read_text()
+    assert "pub fn get_lp_info(asset: Hash, wallet: Address) -> (u64, u64, u64)" in src
+    # get_pool_state extended to 8 fields (pots + depth), get_config to 10
+    assert "pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64, u64, u64, u64)" in src
+    assert "pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool, u64)" in src
+    # IX8 is documented in the header's invariants
+    assert "IX8. LP SOLVENCY" in src

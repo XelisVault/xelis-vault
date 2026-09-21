@@ -251,14 +251,16 @@
 //     (20 wallets decide a validation). XELIS confidentiality rules out
 //     balance- or age-weighted voting (nobody can read anyone's balance),
 //     so the honest lever is CAPITAL: set_vote_deposit (admin, capped at
-//     10 XEL, DEFAULT 0 = voting stays free) makes every support()/report()
-//     attach that amount; it is LOCKED for the round's duration and fully
-//     REFUNDED by claim_vote_deposit(pid, round) once the round has closed
+//     10 XEL, DEFAULT 0.5 XEL since v4.2 — a refundable participation
+//     cost from day one, founder risk review point 2) makes every
+//     support()/report() attach that amount; it is LOCKED for the round's
+//     duration and fully REFUNDED by claim_vote_deposit(pid, round) once
+//     the round has closed
 //     (per-voter pull — no unbounded loops; the vote slot itself records
 //     the locked amount). An honest voter only ever lends gas-locked
 //     capital; a sybil farmer must lock 20x the deposit across wallets and
-//     rounds. The dial is a circuit-breaker to raise under attack, not a
-//     default tax — and it is documented as a mitigation, not a cure
+//     rounds. The dial is a circuit-breaker to raise under attack — and it
+//     is documented as a mitigation, not a cure
 //     (small communities stay the weak link; min_participants remains the
 //     product-side defense).
 //
@@ -600,7 +602,7 @@
 //   function invalidates the table — regenerate it, never hand-edit around.
 // ============================================================================
 
-const VERSION: string = "VaultLaunch v4.1.0"
+const VERSION: string = "VaultLaunch v4.2.0"
 
 // ---------------------------------------------------------------------------
 // Status codes (see LIFECYCLE)
@@ -651,7 +653,7 @@ const DEFAULT_RECOVERY_RATIO_BPS: u64 = 9000
 const DEFAULT_TEAM_DELAY: u64 = 3153600
 const DEFAULT_VESTING_MIN: u64 = 518400
 const DEFAULT_VESTING_MAX: u64 = 6307200
-const DEFAULT_VOTE_DEPOSIT: u64 = 0
+const DEFAULT_VOTE_DEPOSIT: u64 = 50000000
 
 // ---------------------------------------------------------------------------
 // Hard caps for admin parameters (a compromised admin can hurt the fee
@@ -2477,10 +2479,13 @@ entry set_asset_budget(amount: u64) -> u64 {
 
 // 47b. VOTE DEPOSIT (D21): the sybil dial. When > 0, every support()/
 //      report() must attach exactly this XEL amount (locked for the
-//      round, refunded by claim_vote_deposit). Default 0 — voting free.
-//      A raise only affects FUTURE votes (already-locked deposits are
-//      refunded at their own recorded amount). Cap: 10 XEL — a sybil
-//      cost, never a participation toll.
+//      round, refunded by claim_vote_deposit). Default 0.5 XEL since
+//      v4.2 (founder risk review, point 2): 20 farmed wallets deciding
+//      a validation must at least park 10 XEL of refundable capital
+//      while they do it. The admin can still zero it (0 = free voting)
+//      or raise it under attack. A raise only affects FUTURE votes
+//      (already-locked deposits are refunded at their own recorded
+//      amount). Cap: 10 XEL — a sybil cost, never a participation toll.
 entry set_vote_deposit(amount: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2928,10 +2933,11 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 }
 
 // 71b. Vote-deposit parameter set (D21): (vote_deposit, locked_vote_pots).
-//     vote_deposit is the CURRENT dial (0 = voting is free); pots is the
-//     total XEL currently locked as refundable voter deposits — part of
-//     the committed side of I2, shown here so the solvency dashboard and
-//     the site can display both without extra reads.
+//     vote_deposit is the CURRENT dial (0.5 XEL by default since v4.2;
+//     0 = voting is free); pots is the total XEL currently locked as
+//     refundable voter deposits — part of the committed side of I2,
+//     shown here so the solvency dashboard and the site can display
+//     both without extra reads.
 pub fn get_vote_config() -> (u64, u64) {
     let s: Storage = Storage::new()
     return (

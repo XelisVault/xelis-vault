@@ -31,18 +31,20 @@
 //     admin, not the launchpad, not the
 //     founder — can ever drain a pool. Liquidity enters at pool creation
 //     (the launchpad migration) and via add_liquidity (ANYONE may deepen a
-//     pool; a donation to the market that can never be clawed back). The
-//     trade-off is honest and documented: LPs get no shares in v1; a
-//     share-based upgrade can be deployed later without touching this
-//     contract's pools (new pools only).
+//     pool; a donation to the market that can never be clawed back). Since
+//     v1.2 the trade-off has a revenue side (X10): providers earn their
+//     pro-rata share of every swap fee, claimable at any time — the
+//     anti-rug core stays untouched (no remove_liquidity, ever: the
+//     principal is permanent, only the FEES flow out).
 //
 // X3. FEES ARE EXTRACTED, NOT POOLED. On every swap, fee_bps of the INPUT
 //     is diverted to a per-pool pending pot (XEL-side or token-side) and
-//     only the NET input joins the reserves. 100% of the revenue goes to
-//     the admin via withdraw_fees (nothing burned, nothing hidden in k).
-//     Solvency is by construction: reserves + pending pots always equal
-//     exactly what the contract holds, because the deposit arrives whole
-//     and is split bookkeeping-wise on the spot.
+//     only the NET input joins the reserves. The revenue is split between
+//     the admin pot (withdraw_fees) and the provider pots (claim_lp_fees,
+//     X10) — nothing burned, nothing hidden in k. Solvency is by
+//     construction: reserves + admin pots + LP pots always equal exactly
+//     what the contract holds, because the deposit arrives whole and is
+//     split bookkeeping-wise on the spot.
 //
 // X4. MIGRATION ENTRY IS LAUNCHPAD-ONLY. create_pool reads the deposits
 //     attached to a cross-contract call and is callable ONLY by the pinned
@@ -89,6 +91,33 @@
 //     (the add_liquidity refunds are transfers to the CALLER of deposits
 //     that just arrived — they can never touch the reserves).
 //
+// X10. LP FEE SHARE (D23, founder risk review v18.2 point 1): providers
+//     earn. Every swap fee is split between the admin (pending pot, as
+//     before) and the LIQUIDITY PROVIDERS of that pool, pro-rata of each
+//     provider's share of the pool's total LP depth (measured on the XEL
+//     side, which the fit rule keeps proportional to the token side).
+//     Default split: 50/50. The dial (set_fee_split) is admin-settable but
+//     HARD-BOUNDED in both directions [25%, 75%]: a compromised or hostile
+//     admin can neither zero the providers' revenue nor starve the
+//     treasury — and it can still never touch the principal (X2).
+//     Distribution is the standard accrual-per-unit pattern (MasterChef
+//     lineage) adapted to a pool with NO withdrawals:
+//       * the pool keeps an accrued-per-unit counter per side (ax, ay);
+//       * each fee event adds lp_part * ACC_SCALE / total_depth to it;
+//       * each provider keeps a snapshot (sx, sy) from their last touch;
+//       * the delta * their parts / ACC_SCALE is their earned fees, paid
+//         by claim_lp_fees (pull, public, own-key-only).
+//     A deposit CRYSTALLISES the caller's accrued fees BEFORE its new
+//     parts join — new money never earns from before it existed, and old
+//     parts never lose a unit of what they earned. While a pool has no
+//     provider yet, the LP share of every fee reverts to the admin (no
+//     fee is ever stranded in a beneficiary-less pot). Floor rounding
+//     everywhere leaves at most sub-unit dust in the pots forever —
+//     by-construction over-collateralisation of IX8.
+//     The 1 XEL LP-entry floor (MIN_LP_ADD_XEL = ACC_SCALE) is not a dust
+//     rule: it is the precision guarantee that keeps the accrual counter
+//     inside u64 for the pool's whole life (see IX8's bound proof).
+//
 // ----------------------------------------------------------------------------
 // SWAP MATH (constant product, integer, contract-favouring floors)
 // ----------------------------------------------------------------------------
@@ -109,16 +138,25 @@
 // SECURITY MODEL (honest threat documentation)
 // ----------------------------------------------------------------------------
 //   * The admin is a hot role: it sets the swap fee (capped at 10%), the
-//     trade guards, the launchpad address (before the first pool only) and
-//     can trigger the global emergency pause. It can NEVER move pool
-//     reserves — withdraw_fees is capped by the pending pots, which are
-//     the only value the admin can ever extract, by design.
+//     trade guards, the LP fee split (hard-bounded [25%, 75%], X10), the
+//     launchpad address (before the first pool only) and can trigger the
+//     global emergency pause. It can NEVER move pool reserves and can
+//     NEVER touch the provider pots — withdraw_fees is capped by the
+//     ADMIN pending pots, which (with the bounded fee dial) are the only
+//     value the admin can ever extract, by design.
 //   * The launchpad pin (X4) is a one-way door: set before the first pool,
 //     frozen after. A frozen pin can never be repointed at a fake launchpad.
-//   * add_liquidity is a donation (X2/X7): the caller sends both assets
-//     and receives nothing back but a deeper pool AT THE SAME PRICE — the
-//     effective liquidity is the largest proportional pair that fits the
-//     deposit, and the excess side is refunded in the same transaction.
+//   * LP parts live in PUBLIC contract storage (per-wallet, per-pool:
+//     parts, snapshots, claimables — all readable by anyone). This adds
+//     ZERO new exposure: the attached deposit of every add_liquidity is
+//     public by chain design anyway (amounts attached to invocations are
+//     visible; only wallet BALANCES are confidential on XELIS). Say it
+//     plainly on the frontend (LAUNCHPAD.md §5a's public/private table).
+//   * add_liquidity is a permanent deepening (X2/X7): the caller sends
+//     both assets and receives back a deeper pool AT THE SAME PRICE plus,
+//     since v1.2, a perpetual pro-rata claim on the LP share of every
+//     future fee (X10) — the principal itself can never be clawed back
+//     (no remove_liquidity exists; that is the anti-rug core).
 //     A malicious one-sided donation cannot skew the market: the price
 //     of a pool can ONLY move by swaps (founder risk review, point 1).
 //   * No reentrancy (X9). No oracles. NO PAUSABLE EXITS: the sell path
@@ -156,12 +194,24 @@
 //        product within one floor unit: after every add,
 //        |x1*y0 - x0*y1| < max(x0, y0) — a relative drift below
 //        1/min(x0, y0). Only swaps move the price.
+//   IX8. LP SOLVENCY (X10): for every pool and both sides, at all times:
+//        the sum of every provider's crystallised claimable + accrued
+//        earnings is <= the pool's LP pot, and reserves + admin pot + LP
+//        pot <= contract balance of that asset (per-side extension of
+//        IX1/IX2). Bound proof: every accrual increment is
+//        lp_part * ACC_SCALE / total_depth with total_depth >= ACC_SCALE
+//        (MIN_LP_ADD_XEL floor), so the increment is <= lp_part — the
+//        accrual counter can never outgrow the pool's lifetime fees
+//        (itself u64-checked); and each provider's payout is the
+//        floor-rounded delta of that counter times their parts, so the
+//        sum of all payouts is <= the sum of lp_parts that fed the pot.
+//        Floors only ever leave dust IN the pot.
 //
 // ----------------------------------------------------------------------------
 // STORAGE MAP (string keys, flat KV — house style)
 // ----------------------------------------------------------------------------
-//   Global  : adm pc sfe lpx mnx lnt mnt tsw mst mxs xpa lpp xa
-//             (see constants below)
+//   Global  : adm pc sfe lpx mnx lnt mnt tsw mst mxs xpa lpp xa fsl
+//             (see constants below; fsl = LP fee share bps, X10)
 //   Pool    : q:{asset_hex}:xr xel reserves      q:{asset_hex}:yr tok reserves
 //             q:{asset_hex}:xf xel fees pending  q:{asset_hex}:yf tok fees pending
 //             q:{asset_hex}:bp buys paused       q:{asset_hex}:ct created topo
@@ -169,6 +219,14 @@
 //             q:{asset_hex}:tc trade count       q:{asset_hex}:lt last trade topo
 //             q:{asset_hex}:fl lifetime fees     q:{asset_hex}:lp lp deposits count
 //             q:{asset_hex}:ah asset hash (echo, so listings recover the Hash)
+//             q:{asset_hex}:lx lp pot (XEL)      q:{asset_hex}:ly lp pot (tokens)
+//             q:{asset_hex}:tl lp total depth    q:{asset_hex}:ax accrual (XEL/u)
+//             q:{asset_hex}:ay accrual (tok/u)
+//   LP      : l:{asset_hex}:{wallet}:x  parts (XEL depth provided)
+//             l:{asset_hex}:{wallet}:sx accrual snapshot XEL side
+//             l:{asset_hex}:{wallet}:sy accrual snapshot token side
+//             l:{asset_hex}:{wallet}:cx crystallised claimable XEL
+//             l:{asset_hex}:{wallet}:cy crystallised claimable tokens
 //   Index   : i:{index} -> asset Hash (listing enumeration)
 //
 // ----------------------------------------------------------------------------
@@ -184,6 +242,7 @@
 //    7 BuysPaused        [asset]      8 BuysUnpaused [asset]
 //    9 EmergencyPaused   ["admin"]   10 EmergencyUnpaused ["admin"]
 //   11 AdminSet          [new_admin] 12 LaunchpadSet [launchpad]
+//   13 LpFeesClaimed     [asset, xel_amount, token_amount]
 //
 // ----------------------------------------------------------------------------
 // CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
@@ -196,7 +255,8 @@
 //    18  get_pool_state        19  get_amount_out_xel    20  get_amount_out_token
 //    21  get_spot_price        22  get_pool_volume       23  get_pools_count
 //    24  get_pool_by_index     25  get_config            26  get_status_label
-//    27  get_launchpad         28  get_version
+//    27  get_launchpad         28  get_version           29  set_fee_split
+//    30  claim_lp_fees         31  get_lp_info
 //
 //   PINNED FOR CROSS-CONTRACT CALLS (see VaultLaunch constants):
 //     chunk 6  = create_pool          (launchpad migrate)
@@ -204,10 +264,11 @@
 //   tests/test_dex_reference.py asserts this table against the source AND
 //   asserts VaultLaunch's pinned constants against it — renumbering either
 //   side without the other fails CI. Appending new functions at the END
-//   keeps every pinned id stable (the v1.1 additions did exactly that).
+//   keeps every pinned id stable (the v1.1 and v1.2 additions did exactly
+//   that).
 // ============================================================================
 
-const VERSION: string = "LaunchDEX v1.1.0"
+const VERSION: string = "LaunchDEX v1.2.0"
 
 // ---------------------------------------------------------------------------
 // Global capacity (storage growth bound; also the static loop bound of the
@@ -225,6 +286,18 @@ const DEFAULT_MIN_SWAP_XEL: u64 = 1000000
 const DEFAULT_MAX_SWAP_XEL: u64 = 10000000000000
 const DEFAULT_MIN_SWAP_TOKENS: u64 = 1
 const DEFAULT_MAX_SWAP_TOKENS: u64 = 10000000000000000
+
+// ---------------------------------------------------------------------------
+// LP fee share (X10/D23) — defaults, hard bounds, and the accrual scale.
+// ACC_SCALE doubles as the LP-entry floor: every add_liquidity must bring
+// >= 1 XEL of effective XEL depth, which bounds the accrual counter for
+// the pool's whole life (see IX8's bound proof in the header).
+// ---------------------------------------------------------------------------
+const DEFAULT_LP_SHARE_BPS: u64 = 5000
+const MIN_LP_SHARE_BPS: u64 = 2500
+const MAX_LP_SHARE_BPS: u64 = 7500
+const MIN_LP_ADD_XEL: u64 = 100000000
+const ACC_SCALE: u64 = 100000000
 
 // ---------------------------------------------------------------------------
 // Hard caps for admin parameters (a compromised admin can hurt the fee
@@ -264,6 +337,7 @@ const MAX_SWAP_TOKENS_KEY: string = "mxs"
 const EMERGENCY_KEY: string = "xpa"
 const LAUNCHPAD_PINNED_KEY: string = "lpp"
 const XEL_ASSET_KEY: string = "xa"
+const FEE_SPLIT_KEY: string = "fsl"
 
 // ---------------------------------------------------------------------------
 // Pool field keys (q:{asset_hex}:{field})
@@ -281,9 +355,20 @@ const F_LAST_TRADE: string = "lt"
 const F_LIFETIME_FEES: string = "fl"
 const F_LP_COUNT: string = "lp"
 const F_ASSET: string = "ah"
+const F_LP_POT_XEL: string = "lx"
+const F_LP_POT_TOK: string = "ly"
+const F_LP_TOTAL: string = "tl"
+const F_LP_ACC_XEL: string = "ax"
+const F_LP_ACC_TOK: string = "ay"
 
 const POOL_PREFIX: string = "q:"
 const ASSET_INDEX_PREFIX: string = "i:"
+const LP_PREFIX: string = "l:"
+const LPF_XEL: string = "x"
+const LPF_SNAP_XEL: string = "sx"
+const LPF_SNAP_TOK: string = "sy"
+const LPF_CLAIM_XEL: string = "cx"
+const LPF_CLAIM_TOK: string = "cy"
 
 // ---------------------------------------------------------------------------
 // Event IDs
@@ -300,6 +385,7 @@ const EV_EMERGENCY_PAUSED: u64 = 9
 const EV_EMERGENCY_UNPAUSED: u64 = 10
 const EV_ADMIN_SET: u64 = 11
 const EV_LAUNCHPAD_SET: u64 = 12
+const EV_LP_FEES_CLAIMED: u64 = 13
 
 // ============================================================================
 // 0. CONSTRUCTOR
@@ -324,6 +410,7 @@ hook constructor() -> u64 {
     s.store(MAX_SWAP_TOKENS_KEY, DEFAULT_MAX_SWAP_TOKENS)
     s.store(EMERGENCY_KEY, false)
     s.store(LAUNCHPAD_PINNED_KEY, false)
+    s.store(FEE_SPLIT_KEY, DEFAULT_LP_SHARE_BPS)
 
     s.store(XEL_ASSET_KEY, get_xelis_asset())
 
@@ -429,6 +516,11 @@ entry create_pool(asset: Hash) -> u64 {
     s.store(pool_key(asset, F_TOK_RESERVE), tok_seed)
     s.store(pool_key(asset, F_XEL_FEES), 0u64)
     s.store(pool_key(asset, F_TOK_FEES), 0u64)
+    s.store(pool_key(asset, F_LP_POT_XEL), 0u64)
+    s.store(pool_key(asset, F_LP_POT_TOK), 0u64)
+    s.store(pool_key(asset, F_LP_TOTAL), 0u64)
+    s.store(pool_key(asset, F_LP_ACC_XEL), 0u64)
+    s.store(pool_key(asset, F_LP_ACC_TOK), 0u64)
     s.store(pool_key(asset, F_BUYS_PAUSED), false)
     s.store(pool_key(asset, F_CREATED), get_current_topoheight())
     s.store(pool_key(asset, F_BUY_VOL), 0u64)
@@ -531,8 +623,32 @@ entry swap_xel_for_token(asset: Hash, min_tokens_out: u64) -> u64 {
     s.store(pool_key(asset, F_XEL_RESERVE), x + net)
     s.store(pool_key(asset, F_TOK_RESERVE), y - out)
     if fee > 0 {
-        let xf: u64 = s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0)
-        s.store(pool_key(asset, F_XEL_FEES), checked_add(xf, fee))
+        // X10/D23 — split the fee: admin part to the pending pot, LP part
+        // to the provider distribution. While the pool has no provider
+        // yet, the LP part reverts to the admin (no fee is ever stranded
+        // in a beneficiary-less pot). Lifetime fees keep counting the
+        // TOTAL fee (scoreboard convention, unchanged).
+        let lp_bps: u64 = s.load(FEE_SPLIT_KEY).unwrap_or(DEFAULT_LP_SHARE_BPS)
+        let lp_part: u64 = fee_take(fee, lp_bps)
+        let adm_part: u64 = fee - lp_part
+        let tl: u64 = s.load(pool_key(asset, F_LP_TOTAL)).unwrap_or(0)
+        if lp_part > 0 && tl > 0 {
+            let lx: u64 = s.load(pool_key(asset, F_LP_POT_XEL)).unwrap_or(0)
+            s.store(pool_key(asset, F_LP_POT_XEL), checked_add(lx, lp_part))
+            // Accrual per unit of LP depth. u128 intermediate; the result
+            // is <= lp_part because tl >= MIN_LP_ADD_XEL = ACC_SCALE (the
+            // LP-entry floor), so the accrual counter can never outgrow
+            // the pool's lifetime fees — IX8's bound.
+            let ax: u64 = s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0)
+            let acc: u128 = (lp_part as u128) * (ACC_SCALE as u128) / (tl as u128)
+            s.store(pool_key(asset, F_LP_ACC_XEL), checked_add(ax, acc as u64))
+        } else {
+            adm_part = adm_part + lp_part
+        }
+        if adm_part > 0 {
+            let xf: u64 = s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0)
+            s.store(pool_key(asset, F_XEL_FEES), checked_add(xf, adm_part))
+        }
         let fl: u64 = s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
         s.store(pool_key(asset, F_LIFETIME_FEES), checked_add(fl, fee))
     }
@@ -600,8 +716,27 @@ entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {
     s.store(pool_key(asset, F_TOK_RESERVE), y + net)
     s.store(pool_key(asset, F_XEL_RESERVE), x - out)
     if fee > 0 {
-        let yf: u64 = s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0)
-        s.store(pool_key(asset, F_TOK_FEES), checked_add(yf, fee))
+        // X10/D23 — same split on the token side: the token-denominated
+        // LP share feeds the token-side pot and accrual. Shares are
+        // measured on the XEL depth (the fit rule keeps both sides
+        // proportional), so tl is the same denominator on both sides.
+        let lp_bps: u64 = s.load(FEE_SPLIT_KEY).unwrap_or(DEFAULT_LP_SHARE_BPS)
+        let lp_part: u64 = fee_take(fee, lp_bps)
+        let adm_part: u64 = fee - lp_part
+        let tl: u64 = s.load(pool_key(asset, F_LP_TOTAL)).unwrap_or(0)
+        if lp_part > 0 && tl > 0 {
+            let ly: u64 = s.load(pool_key(asset, F_LP_POT_TOK)).unwrap_or(0)
+            s.store(pool_key(asset, F_LP_POT_TOK), checked_add(ly, lp_part))
+            let ay: u64 = s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0)
+            let acc: u128 = (lp_part as u128) * (ACC_SCALE as u128) / (tl as u128)
+            s.store(pool_key(asset, F_LP_ACC_TOK), checked_add(ay, acc as u64))
+        } else {
+            adm_part = adm_part + lp_part
+        }
+        if adm_part > 0 {
+            let yf: u64 = s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0)
+            s.store(pool_key(asset, F_TOK_FEES), checked_add(yf, adm_part))
+        }
         let fl: u64 = s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
         s.store(pool_key(asset, F_LIFETIME_FEES), checked_add(fl, fee))
     }
@@ -678,6 +813,13 @@ entry add_liquidity(asset: Hash) -> u64 {
         tok_eff = tok_in
     }
     require(xel_eff >= 1 && tok_eff >= 1, "dust")
+    // X10/D23: LP entries have a hard 1 XEL floor. Not a dust rule — it
+    // is the PRECISION GUARANTEE of the per-unit accrual: the pool's
+    // total depth is always >= ACC_SCALE, so accrual increments
+    // (lp_part * ACC_SCALE / tl) can never outgrow the fees they
+    // distribute, keeping the accrual counter inside u64 for the pool's
+    // whole life (IX8's bound proof).
+    require(xel_eff >= MIN_LP_ADD_XEL, "minlp")
 
     // Belt-and-braces (provably true by the branch logic above; kept so
     // the fit invariant is LOCAL and machine-checkable — the refunds can
@@ -687,17 +829,55 @@ entry add_liquidity(asset: Hash) -> u64 {
     let xel_back: u64 = xel_in - xel_eff
     let tok_back: u64 = tok_in - tok_eff
 
-    // Reserves only grow, at the SAME ratio (IX3/IX7).
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    // X10/D23 — crystallise the caller's accrued-but-unclaimed fees BEFORE
+    // the new parts join: a deposit must never earn from before it
+    // existed, and old parts must never lose a unit of what they earned.
+    // The snapshots are written in EVERY branch (fuzz-found, seed 0): a
+    // FIRST deposit (parts == 0) must also start its accrual clock at
+    // the CURRENT accrued counter, or it would retroactively earn fees
+    // from before it existed — breaking IX8 (the pot only ever holds
+    // lp_parts of the fees that happened AFTER each provider entered).
+    // The u128 product is safe: (acc - snap) <= lifetime fees < 2^64 and
+    // parts <= 2^64, so the product is < 2^128 — structurally overflow-
+    // free, no runtime guard needed.
+    let lkey: string = LP_PREFIX + asset.to_hex() + ":" + caller.to_string() + ":"
+    let parts: u64 = s.load(lkey + LPF_XEL).unwrap_or(0)
+    if parts > 0 {
+        let ax: u64 = s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0)
+        let sx: u64 = s.load(lkey + LPF_SNAP_XEL).unwrap_or(0)
+        if ax > sx {
+            let wide: u128 = ((ax - sx) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            let cx: u64 = s.load(lkey + LPF_CLAIM_XEL).unwrap_or(0)
+            s.store(lkey + LPF_CLAIM_XEL, checked_add(cx, wide as u64))
+        }
+        let ay: u64 = s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0)
+        let sy: u64 = s.load(lkey + LPF_SNAP_TOK).unwrap_or(0)
+        if ay > sy {
+            let wide: u128 = ((ay - sy) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            let cy: u64 = s.load(lkey + LPF_CLAIM_TOK).unwrap_or(0)
+            s.store(lkey + LPF_CLAIM_TOK, checked_add(cy, wide as u64))
+        }
+    }
+    // new money starts accruing NOW — in every case (first add included)
+    s.store(lkey + LPF_SNAP_XEL, s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0))
+    s.store(lkey + LPF_SNAP_TOK, s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0))
+
+    // Reserves only grow, at the SAME ratio (IX3/IX7); the caller's LP
+    // parts and the pool's total depth grow by the effective XEL side.
     s.store(pool_key(asset, F_XEL_RESERVE), x + xel_eff)
     s.store(pool_key(asset, F_TOK_RESERVE), y + tok_eff)
     let lp: u64 = s.load(pool_key(asset, F_LP_COUNT)).unwrap_or(0)
     s.store(pool_key(asset, F_LP_COUNT), checked_add(lp, 1))
+    s.store(lkey + LPF_XEL, checked_add(parts, xel_eff))
+    let tl: u64 = s.load(pool_key(asset, F_LP_TOTAL)).unwrap_or(0)
+    s.store(pool_key(asset, F_LP_TOTAL), checked_add(tl, xel_eff))
 
     // Refunds of the donor's own fresh deposit (never the reserves), and
     // only after every state write (X9: state first, transfers last).
-    let caller_opt: optional<Address> = get_caller()
-    require(caller_opt.is_some(), "walletonly")
-    let caller: Address = caller_opt.expect("guarded")
     if xel_back > 0 {
         let ok: bool = transfer(caller, xel_back, xel)
         require(ok, "txfail")
@@ -860,10 +1040,13 @@ pub fn get_pool(asset: Hash) -> (Hash, u64, bool, u64) {
 }
 
 // 18. Live pool state: (xel_reserves, token_reserves, xel_fees_pending,
-//     token_fees_pending, lifetime_fees_value). All atomic units. The
-//     lifetime counter tracks the XEL-side fees extracted over the pool's
-//     whole life (X6 scoreboard input).
-pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64) {
+//     token_fees_pending, lifetime_fees_value, lp_pot_xel, lp_pot_tokens,
+//     lp_total_depth). All atomic units. The lifetime counter tracks the
+//     TOTAL fees extracted over the pool's whole life (X6 scoreboard
+//     input, both sides, before the admin/LP split); the LP pots and depth
+//     are the X10/D23 provider accounting (pot = claimable by providers,
+//     depth = the pro-rata denominator).
+pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     require_pool(asset)
     return (
@@ -871,7 +1054,10 @@ pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64) {
         s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0),
         s.load(pool_key(asset, F_XEL_FEES)).unwrap_or(0),
         s.load(pool_key(asset, F_TOK_FEES)).unwrap_or(0),
-        s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0)
+        s.load(pool_key(asset, F_LIFETIME_FEES)).unwrap_or(0),
+        s.load(pool_key(asset, F_LP_POT_XEL)).unwrap_or(0),
+        s.load(pool_key(asset, F_LP_POT_TOK)).unwrap_or(0),
+        s.load(pool_key(asset, F_LP_TOTAL)).unwrap_or(0)
     )
 }
 
@@ -955,8 +1141,10 @@ pub fn get_pool_by_index(index: u64) -> Hash {
 
 // 25. Config snapshot: (swap_fee_bps, min_seed_xel, min_seed_tokens,
 //     min_swap_xel, max_swap_xel, min_swap_tokens, max_swap_tokens,
-//     emergency, launchpad_pinned).
-pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool) {
+//     emergency, launchpad_pinned, lp_share_bps). The last field is the
+//     X10/D23 revenue split dial (share of every fee that goes to the
+//     providers; bounded [2500, 7500]).
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool, u64) {
     let s: Storage = Storage::new()
     return (
         s.load(SWAP_FEE_KEY).unwrap_or(DEFAULT_SWAP_FEE_BPS),
@@ -967,7 +1155,8 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool) {
         s.load(MIN_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SWAP_TOKENS),
         s.load(MAX_SWAP_TOKENS_KEY).unwrap_or(DEFAULT_MAX_SWAP_TOKENS),
         s.load(EMERGENCY_KEY).unwrap_or(false),
-        s.load(LAUNCHPAD_PINNED_KEY).unwrap_or(false)
+        s.load(LAUNCHPAD_PINNED_KEY).unwrap_or(false),
+        s.load(FEE_SPLIT_KEY).unwrap_or(DEFAULT_LP_SHARE_BPS)
     )
 }
 
@@ -1008,4 +1197,140 @@ pub fn get_launchpad() -> (string, bool) {
 // 28. Contract version (house style).
 pub fn get_version() -> string {
     return VERSION
+}
+
+// ============================================================================
+// v1.2 ADDITIONS (X10/D23 — LP FEE SHARE). Appended at the END of the file
+// so every existing chunk id (and both cross-contract pins, 6 and 7) stays
+// stable — the house rule since v1.1.
+// ============================================================================
+
+// 29. SET FEE SPLIT — the admin/providers revenue dial (admin, bounded).
+// ============================================================================
+// The share of every swap fee that goes to the liquidity providers, in
+// basis points of the fee. Default 5000 (50/50, founder risk review v18.2
+// point 1). The bounds are structural trust guarantees, not just input
+// validation: the admin can NEITHER cut the providers to nothing (>= 25%)
+// NOR dump the whole revenue out of the treasury (<= 75%). A change only
+// affects FUTURE fees — already-accrued claimables keep their recorded
+// amounts, and the principal is untouchable either way (X2: there is no
+// remove_liquidity; only fees ever flow out).
+// ============================================================================
+entry set_fee_split(lp_bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(lp_bps >= MIN_LP_SHARE_BPS, "toolow")
+    require(lp_bps <= MAX_LP_SHARE_BPS, "toohigh")
+    s.store(FEE_SPLIT_KEY, lp_bps)
+    emit_event(EV_PARAM_SET, ["lp_share_bps", lp_bps.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 30. CLAIM LP FEES — the provider's pull payout (public, own funds only).
+// ============================================================================
+// @caller: any wallet holding LP parts in the pool. Crystallises the
+//          caller's accrued-but-unclaimed fees (both sides) into the
+//          claimable slots, pays them out of the LP pots, zeroes the
+//          claimables. The storage keys embed the CALLER's address, so no
+//          provider can ever touch another provider's payout; the payout
+//          is bounded by the caller's own crystallised claimables, which
+//          are bounded by the LP pot by construction (IX8) — the
+//          belt-and-braces requires keep even a hypothetical accounting
+//          bug from ever touching the reserves (the entry would revert
+//          and the funds would stay in the pot).
+// @note:   works under the emergency pause (it pays out OWN accrued fees,
+//          exactly like the sell path pays out OWN deposits — never a
+//          gate on what is already owed).
+// ============================================================================
+entry claim_lp_fees(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let lkey: string = LP_PREFIX + asset.to_hex() + ":" + caller.to_string() + ":"
+    let parts: u64 = s.load(lkey + LPF_XEL).unwrap_or(0)
+    let payout_x: u64 = s.load(lkey + LPF_CLAIM_XEL).unwrap_or(0)
+    let payout_y: u64 = s.load(lkey + LPF_CLAIM_TOK).unwrap_or(0)
+
+    // Crystallise everything accrued since the caller's last touch (both
+    // sides). The u128 product is structurally < 2^128 (same bound proof
+    // as add_liquidity).
+    if parts > 0 {
+        let ax: u64 = s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0)
+        let sx: u64 = s.load(lkey + LPF_SNAP_XEL).unwrap_or(0)
+        if ax > sx {
+            let wide: u128 = ((ax - sx) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            payout_x = checked_add(payout_x, wide as u64)
+        }
+        s.store(lkey + LPF_SNAP_XEL, ax)
+        let ay: u64 = s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0)
+        let sy: u64 = s.load(lkey + LPF_SNAP_TOK).unwrap_or(0)
+        if ay > sy {
+            let wide: u128 = ((ay - sy) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            payout_y = checked_add(payout_y, wide as u64)
+        }
+        s.store(lkey + LPF_SNAP_TOK, ay)
+    }
+    require(payout_x > 0 || payout_y > 0, "nofees")
+
+    // Payout bounds (IX8): crystallised claimables are, by the accrual
+    // construction, always <= the LP pot. A violation would mean an
+    // accounting bug — revert (the funds stay in the pot) rather than
+    // ever reaching into the reserves.
+    let lx: u64 = s.load(pool_key(asset, F_LP_POT_XEL)).unwrap_or(0)
+    let ly: u64 = s.load(pool_key(asset, F_LP_POT_TOK)).unwrap_or(0)
+    require(payout_x <= lx, "lperr")
+    require(payout_y <= ly, "lperr")
+
+    s.store(lkey + LPF_CLAIM_XEL, 0u64)
+    s.store(lkey + LPF_CLAIM_TOK, 0u64)
+    s.store(pool_key(asset, F_LP_POT_XEL), lx - payout_x)
+    s.store(pool_key(asset, F_LP_POT_TOK), ly - payout_y)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    if payout_x > 0 {
+        let ok: bool = transfer(caller, payout_x, xel)
+        require(ok, "txfail")
+    }
+    if payout_y > 0 {
+        let ok: bool = transfer(caller, payout_y, asset)
+        require(ok, "txfail")
+    }
+
+    emit_event(EV_LP_FEES_CLAIMED, [asset.to_hex(), payout_x.to_string(10u32), payout_y.to_string(10u32)])
+    return 0
+}
+
+// 31. Provider position: (lp_xel_parts, xel_available, tokens_available).
+//     available = crystallised claimables + everything accrued since the
+//     last touch (computed, not stored — a pure read). The LP dashboard
+//     view: the site can show live provider earnings with one call per
+//     provider, and quote the pro-rata share of future fees from the
+//     pool's lp_total_depth (get_pool_state's 8th field).
+pub fn get_lp_info(asset: Hash, wallet: Address) -> (u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_pool(asset)
+    let lkey: string = LP_PREFIX + asset.to_hex() + ":" + wallet.to_string() + ":"
+    let parts: u64 = s.load(lkey + LPF_XEL).unwrap_or(0)
+    let avail_x: u64 = s.load(lkey + LPF_CLAIM_XEL).unwrap_or(0)
+    let avail_y: u64 = s.load(lkey + LPF_CLAIM_TOK).unwrap_or(0)
+    if parts > 0 {
+        let ax: u64 = s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0)
+        let sx: u64 = s.load(lkey + LPF_SNAP_XEL).unwrap_or(0)
+        if ax > sx {
+            let wide: u128 = ((ax - sx) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            avail_x = checked_add(avail_x, wide as u64)
+        }
+        let ay: u64 = s.load(pool_key(asset, F_LP_ACC_TOK)).unwrap_or(0)
+        let sy: u64 = s.load(lkey + LPF_SNAP_TOK).unwrap_or(0)
+        if ay > sy {
+            let wide: u128 = ((ay - sy) as u128) * (parts as u128) / (ACC_SCALE as u128)
+            avail_y = checked_add(avail_y, wide as u64)
+        }
+    }
+    return (parts, avail_x, avail_y)
 }

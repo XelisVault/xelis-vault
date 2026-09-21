@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""audit_doc_parity.py — one-shot audit pass: docs/LAUNCHPAD.md and the SDK
-must agree with contracts/launchpad/VaultLaunch.slx on every storage key,
-default value and event id they mention. Exit 1 on any drift."""
+"""audit_doc_parity.py — one-shot audit pass: docs/LAUNCHPAD.md,
+docs/DEX.md and the SDK must agree with the contracts on every storage
+key, default value, event id and version they mention. Exit 1 on drift."""
 import re
 import sys
 from pathlib import Path
@@ -9,6 +9,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 CONTRACT = (REPO / "contracts" / "launchpad" / "VaultLaunch.slx").read_text()
 DOC = (REPO / "docs" / "LAUNCHPAD.md").read_text()
+DEX_CONTRACT = (REPO / "contracts" / "dex" / "LaunchDEX.slx").read_text()
+DEX_DOC = (REPO / "docs" / "DEX.md").read_text()
 
 fails = []
 
@@ -115,10 +117,14 @@ for name, eid in [("EV_PROJECT_CREATED", 1), ("EV_SUPPORTED", 2),
         fails.append(f"contract: event {name} = {eid} missing")
 
 # 6. version strings agree
-if 'const VERSION: string = "VaultLaunch v4.1.0"' not in CONTRACT:
-    fails.append("contract: VERSION is not v4.1.0")
-if "v4.1.0" not in DOC:
-    fails.append("doc: LAUNCHPAD.md does not say v4.1.0")
+if 'const VERSION: string = "VaultLaunch v4.2.0"' not in CONTRACT:
+    fails.append("contract: VERSION is not v4.2.0")
+if "v4.2.0" not in DOC:
+    fails.append("doc: LAUNCHPAD.md does not say v4.2.0")
+if 'const VERSION: string = "LaunchDEX v1.2.0"' not in DEX_CONTRACT:
+    fails.append("dex contract: VERSION is not v1.2.0")
+if "v1.2.0" not in DEX_DOC:
+    fails.append("doc: DEX.md does not say v1.2.0")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
@@ -138,6 +144,41 @@ for concept in ["vote_deposit", "claim_vote_deposit", "get_project_by_asset",
     if concept not in DOC:
         fails.append(f"doc: v4.1 concept {concept} not documented")
 
+# v4.2 sanity: the dial default and the provider era are documented
+for concept in ["0.5 XEL", "get_lp_info", "claim_lp_fees", "lp_share_bps",
+                "UPGRADES.md"]:
+    if concept not in DOC:
+        fails.append(f"doc: v4.2 concept {concept} not documented")
+if "const DEFAULT_VOTE_DEPOSIT: u64 = 50000000" not in CONTRACT:
+    fails.append("contract: DEFAULT_VOTE_DEPOSIT is not 0.5 XEL (v4.2)")
+
+# v1.2 DEX sanity: the provider surface is documented in DEX.md and the
+# keys/views/entries exist in the contract
+for concept in ["X10", "IX8", "claim_lp_fees", "set_fee_split",
+                "get_lp_info", "lp_share_bps", "MIN_LP_ADD_XEL"]:
+    if concept not in DEX_DOC:
+        fails.append(f"doc: DEX.md v1.2 concept {concept} not documented")
+for const, key in [("F_LP_POT_XEL", "lx"), ("F_LP_POT_TOK", "ly"),
+                   ("F_LP_TOTAL", "tl"), ("F_LP_ACC_XEL", "ax"),
+                   ("F_LP_ACC_TOK", "ay")]:
+    if f'const {const}: string = "{key}"' not in DEX_CONTRACT:
+        fails.append(f"dex contract: pool key {key} ({const}) missing")
+if 'const FEE_SPLIT_KEY: string = "fsl"' not in DEX_CONTRACT:
+    fails.append("dex contract: global key fsl (FEE_SPLIT_KEY) missing")
+for fn in ("entry claim_lp_fees", "entry set_fee_split",
+           "pub fn get_lp_info"):
+    if fn not in DEX_CONTRACT:
+        fails.append(f"dex contract: {fn} missing")
+if "const EV_LP_FEES_CLAIMED: u64 = 13" not in DEX_CONTRACT:
+    fails.append("dex contract: event 13 (LpFeesClaimed) missing")
+
+# the upgrade runbook exists and the honest audit status is written
+for path, needle in (("docs/UPGRADES.md", "generation"),
+                     ("docs/SECURITY.md", "NO external, independent"),
+                     ("docs/SECURITY.md", "Front-running")):
+    if not (REPO / path).exists() or needle not in (REPO / path).read_text():
+        fails.append(f"doc: {path} missing the {needle!r} section")
+
 # 7. the doc's fee schedule quotes the real default pair
 if "0.25%" not in DOC or "0.50%" not in DOC or "0.5%" not in DOC:
     fails.append("doc: fee schedule defaults not documented")
@@ -147,5 +188,6 @@ if fails:
     for f in fails:
         print("  -", f)
     sys.exit(1)
-print("doc-parity audit: OK — contract, docs and SDK agree on keys, "
-      "defaults, events, views and version")
+print("doc-parity audit: OK — contracts, docs (LAUNCHPAD/DEX/SECURITY/"
+      "UPGRADES) and SDK agree on keys, defaults, events, views, "
+      "versions and the v4.2/v1.2 provider surface")

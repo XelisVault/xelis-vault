@@ -69,12 +69,22 @@ xvault dex status       --contract <dex>
 xvault dex pool         --contract <dex> --asset <asset-hash-64hex>
 xvault dex quote        --x-reserve 2000 --y-reserve 900000000 --buy 100
 xvault dex entries      # chunk ids (6/7 are the pinned cross-calls)
+
+# the provider era (v1.2, X10): liquidity EARNS its pro-rata fee share
+xvault dex lp            --contract <dex> --asset <hash> --wallet <addr>
+                                                        # parts + live earnings
+xvault dex claim-lp-fees --contract <dex> --asset <hash> [--broadcast]
+                                                        # pull YOUR fees (both sides)
+xvault dex set-fee-split --contract <dex> --percent 50 [--broadcast]
+                                                        # admin: the split dial (25-75)
 ```
 
 Python: `from xvault import dex` — the math mirror (`xel_to_tokens_out`,
-`tokens_to_xel_out`, `spot_price`), the `DexReader` (pools, quotes,
-scoreboard) and the invoke builders (`swap_xel_params`,
-`swap_token_params`, `add_liquidity_deposits`...). The launchpad module
+`tokens_to_xel_out`, `spot_price`, `liquidity_fit`, `fee_split`,
+`lp_earnings`, `accrual_increment`), the `DexReader` (pools, quotes,
+scoreboard, `lp_info` — the provider position) and the invoke builders
+(`swap_xel_params`, `swap_token_params`, `add_liquidity_deposits`,
+`claim_lp_fees_params`, `set_fee_split_params`...). The launchpad module
 gained `sell_deposits` (whole-deposit token sales), `set_dex_address_params`,
 `finalize_topup_deposits`, `dex_pool_market_cap` (the pool-era cap
 composition) and the migration fields in `LaunchpadReader.project()`.

@@ -1,15 +1,17 @@
 # VaultLaunch — Design Specification
 
 > contracts/launchpad/VaultLaunch.slx + contracts/dex/LaunchDEX.slx ·
-> VaultLaunch v4.1.0 / LaunchDEX v1.1.0 · mainnet-ready (testnet first)
+> VaultLaunch v4.2.0 / LaunchDEX v1.2.0 · mainnet-ready (testnet first)
 
 A serious launchpad for XEL: real projects are filtered by a community
 validation vote, priced by a constant-product bonding curve, and held to a
 long-term community trust standard (Trusted / Untrusted). Every fee is
-configurable by the admin and 100% of the revenue goes to the admin —
-nothing is burned. This is NOT a memecoin casino: the vote window is the
-quality filter, the trust system keeps founders accountable forever, and
-the curve math is integer-exact and solvent by construction.
+configurable by the admin; the launchpad's revenue goes 100% to the admin
+and the DEX's swap fees are SPLIT between the admin and the liquidity
+providers (default 50/50, dial hard-bounded [25%, 75%]) — nothing is
+burned. This is NOT a memecoin casino: the vote window is the quality
+filter, the trust system keeps founders accountable forever, and the
+curve math is integer-exact and solvent by construction.
 
 **v2 — graduation is worth reaching.** Two paths lead to graduation:
 a founder who locks serious liquidity (≥ the direct-listing threshold)
@@ -70,6 +72,20 @@ site (statically hosted, stateless): **D22** adds the asset→project
 reverse bridge (`get_project_by_asset`) and the migrated index
 (`get_migrated_count` / `get_migrated_by_rank`) — every listing, stat
 and link the frontend shows is enumerable from views alone.
+
+**v4.2 — PROVIDERS EARN, VOTERS PAY (A LITTLE).** The founder risk
+review's first two points, closed in code. (1) **LaunchDEX v1.2 — LP
+fee share (X10/D23)**: adding liquidity to a migrated pool now EARNED
+its keep — every swap fee splits between the admin pot and the pool's
+liquidity providers, pro-rata of each provider's share of the pool's LP
+depth. Default 50/50, admin-settable but hard-bounded [25%, 75%]; the
+principal stays permanent (still no remove_liquidity anywhere — only
+fees ever flow out). The full design, the accrual math and the IX8
+solvency proof live in `docs/DEX.md`. (2) **The sybil dial ships ON by
+default**: `vote_deposit` now defaults to **0.5 XEL refundable** — 20
+farmed wallets deciding a validation park 10 XEL of capital while they
+do it; the admin can still zero it or raise it (cap 10 XEL), and a raise
+never touches already-locked deposits.
 
 Two contracts, one architecture. Zero other dependencies.
 
@@ -497,33 +513,34 @@ corrupted counter is worse than a refused trade).
 | vesting bounds             | 518400..6307200 topos (~1..12 mo) | [~1d, ~2y], min < max |
 | recovery_fee               | 250 XEL     | ≤ 1000 XEL                      |
 | recovery thresholds        | 40 voters / 90% | stricter than validation    |
-| vote_deposit (D21, v4.1)   | 0 (free)    | ≤ 10 XEL — the REFUNDABLE sybil dial |
+| vote_deposit (D21, v4.1)   | 0.5 XEL since v4.2 | ≤ 10 XEL — the REFUNDABLE sybil dial |
 
 LaunchDEX parameters (set on the DEX contract — see `docs/DEX.md`):
 `swap_fee_bps` 30 (≤ 1000), trade bounds, the launchpad pin (frozen at
-the first pool).
+the first pool), and **`lp_share_bps` 5000 — the admin/providers split
+of every swap fee, hard-bounded [2500, 7500] (X10, v1.2)**.
 
 **The sybil dial (D21)** deserves its own paragraph because it changes
-UX when raised. While `vote_deposit` reads 0 (the default), voting is
-free — one transaction, one vote, nothing locked. When the admin raises
-the dial with `set_vote_deposit` (say 5 XEL), every `support()` and
-`report()` must ATTACH that amount; it is locked for the round's
-duration and refunded in full by
+UX. Since v4.2 the default is **0.5 XEL refundable** (founder risk
+review, point 2): every `support()` and `report()` attaches it, it is
+locked for the round's duration and refunded in full by
 `claim_vote_deposit(pid, round)` once the round has closed (a newer
 round exists, or the deadline passed). Honest voters only ever lend
-capital; sybil farmers must lock N × deposit across wallets and rounds.
-A raise only affects future votes — already-locked deposits refund at
-their own recorded amount. Read the dial and the locked total with
-`get_vote_config()`; the locked pots are part of the committed side of
-the solvency invariant (I2) — the admin can NEVER withdraw them as
-fees. Default 0 means the launch experience is unchanged until an
-attack is observed; the cap (10 XEL) keeps the dial a sybil cost, never
-a participation toll. One honest nuance: the hard lock applies to
-VALIDATION and RECOVERY windows (the gates a sybil actually attacks);
-ongoing trust votes in Bonding/Graduated use a round whose deadline is
-already past, so their deposit is only flash-locked (vote transaction,
-then claim transaction) — the tallies still count each address exactly
-once per round either way.
+capital — and half an XEL of it by default; sybil farmers must lock
+N × deposit across wallets and rounds (20 farmed wallets deciding a
+validation park 10 XEL while they do it). A raise only affects future
+votes — already-locked deposits refund at their own recorded amount.
+The admin can zero the dial at any time (0 = free voting) or move it
+with `set_vote_deposit` (say 5 XEL under attack). Read the
+dial and the locked total with `get_vote_config()`; the locked pots are
+part of the committed side of the solvency invariant (I2) — the admin
+can NEVER withdraw them as fees. The cap (10 XEL) keeps the dial a
+sybil cost, never a participation toll. One honest nuance: the hard
+lock applies to VALIDATION and RECOVERY windows (the gates a sybil
+actually attacks); ongoing trust votes in Bonding/Graduated use a round
+whose deadline is already past, so their deposit is only flash-locked
+(vote transaction, then claim transaction) — the tallies still count
+each address exactly once per round either way.
 
 **Cross-checked pairs** (the two invariants the setters enforce between
 each other): `graduated_fee_bps ≤ trading_fee_bps` (the graduation
@@ -598,13 +615,18 @@ Say it plainly on the site; never promise total privacy.
 | Deposits ATTACHED to contract calls         | PUBLIC  | the contract must read the amount       |
 | Curve buys (XEL in) / sells (tokens in)     | PUBLIC  | they are attached deposits              |
 | DEX swaps' input side                       | PUBLIC  | attached deposits                       |
+| Vote deposits (the D21 amount attached)     | PUBLIC  | attached deposit — refunded later, but the amount was visible |
+| LP parts & live provider earnings (v1.2)    | PUBLIC  | contract storage is public (l:{asset}:{wallet}:*) |
 | Vote participation (which address voted)    | PUBLIC  | the vote event carries the voter        |
 | Everything the views return (reserves, volumes, market caps) | PUBLIC | on-chain scoreboard by design |
 
 The honest summary for users: **your balances and your wallet-to-wallet
 transfers are confidential; your participation in the launchpad's
-markets (what you attach to a buy/sell/swap/vote) is public by chain
-design** — exactly like every contract interaction on XELIS.
+markets (what you attach to a buy/sell/swap/vote/liquidity add) is
+public by chain design** — exactly like every contract interaction on
+XELIS. If you do not want an amount to be public, do not attach it to a
+contract call: there is no in-between, and any product that claims
+total transactional privacy on XELIS contracts is lying.
 
 ### 5b. Upgrade runbook — the two frozen pins (D19, v4.1)
 
@@ -612,8 +634,11 @@ Both pins are one-way doors, on purpose: `set_dex_address` freezes at
 the launchpad's first migration, and LaunchDEX's launchpad pin freezes
 at its first pool. A frozen pin can never be repointed — not even by
 the admin — which is what makes live pools un-orphanable. The
-operational consequence is assumed and documented: **a new VaultLaunch
-generation requires a NEW LaunchDEX deployment**, side by side:
+operational consequence is assumed: **a new VaultLaunch generation
+requires a NEW LaunchDEX deployment**, side by side. **The full,
+step-by-step runbook lives in `docs/UPGRADES.md`** (phase 0 gates →
+testnet rehearsal → mainnet cut → site registry, plus the worst-case
+playbook for a critical bug on a live generation); the summary:
 
 1. Deploy the new LaunchDEX, pin the NEW launchpad on it
    (`set_launchpad`) BEFORE its first pool.
@@ -769,6 +794,14 @@ each launchpad keeps its own reverse index, written at asset creation.
 **Project page** = the 8-point card layout above + `get_vote_config()`
 when the D21 dial is raised (show "5 XEL refundable deposit to vote").
 
+**Provider dashboard (X10, v1.2)**: for a connected wallet with LP
+parts in a pool, one `get_lp_info(asset, wallet)` per pool returns
+(parts, available XEL, available tokens) — enough for a live "your
+position / your earnings / claim" panel, `claim_lp_fees` being the
+claim itself. The pool card adds the LP context from `get_pool_state`
+(provider pots + total depth): the site can quote a prospective
+provider's pro-rata share of the LP fee stream before they deposit.
+
 **Protocol dashboard**: `get_protocol_stats` (now 12 fields — includes
 `vote_pots`) + `get_volume_stats` + the DEX's own `get_pools_count`.
 
@@ -802,8 +835,15 @@ xvault launchpad migrate  --contract <hash> --id 0 [--broadcast]
 xvault launchpad sync     --contract <hash> --id 0 [--broadcast]
                                                         # trust -> pool buys-pause
 xvault launchpad entries                                # chunk-id tables
-xvault dex status        --contract <hash>              # pools, fee, pin state
+xvault dex status        --contract <hash>              # pools, fee + split, pin state
 xvault dex pool          --contract <hash> --asset <hash64>
+                                                        # + provider pots & depth
+xvault dex lp            --contract <hash> --asset <hash64> --wallet <addr>
+                                                        # YOUR parts & live earnings
+xvault dex claim-lp-fees --contract <hash> --asset <hash64> [--broadcast]
+                                                        # pull YOUR provider fees
+xvault dex set-fee-split --contract <hash> --percent 50 [--broadcast]
+                                                        # admin: the split dial (25–75)
 xvault dex quote         --x-reserve 2000 --y-reserve 900000000 \
     [--buy 100] [--sell 1000] [--fee-bps 30]
 xvault dex entries                                     # + the pinned chunks 6/7
@@ -819,7 +859,10 @@ socials row, the buy/sell volume split with trade count, the market-cap
 series (now / ATH / at graduation), **the asset hash (real confidential
 asset) and the migration state**. `migrate` prepares/sends the atomic
 migration (reminding about the contract-call permission); `sync` mirrors
-the trust status to the pool. `dex` subcommands read the pool era.
+the trust status to the pool. `dex` subcommands read the pool era — and
+since v1.2 also the PROVIDER era: `lp` shows a wallet's parts and live
+earnings, `claim-lp-fees` pulls them (both sides), `set-fee-split` is
+the admin's revenue dial.
 
 ---
 

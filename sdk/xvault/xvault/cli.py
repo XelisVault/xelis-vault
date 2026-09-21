@@ -31,7 +31,8 @@ from typing import Optional
 
 from . import crypto
 from . import dex as dexmod
-from .dex import (DexReader, spot_price as dex_math_spot_price,
+from .dex import (DexReader, claim_lp_fees_params, set_fee_split_params,
+                  spot_price as dex_math_spot_price,
                   tokens_to_xel_out, xel_to_tokens_out)
 from .launchpad import (DEFAULTS, LaunchpadReader, buy_quote, claim_vote_deposit_params,
                          current_price, fmt_token, market_cap, pid_params,
@@ -772,7 +773,9 @@ def cmd_dex_status(args) -> None:
     print(f"  pools           : {reader.pools_count()}")
     print(f"  emergency       : {'YES — buys frozen, SELLS STAY OPEN (IX6)' if cfg['emergency'] else 'no'}")
     print(f"  swap fee        : {cfg['swap_fee_bps'] / 100:.2f}% on inputs "
-          f"(cap 10%, 100% admin)")
+          f"(cap 10%) — split {100 - cfg['lp_share_bps'] / 100:.2f}% admin / "
+          f"{cfg['lp_share_bps'] / 100:.2f}% providers (X10, dial bounded "
+          f"25–75%)")
     print(f"  launchpad pin   : {cfg['launchpad'] or 'NOT SET'} "
           f"({'FROZEN — first pool exists' if cfg['launchpad_pinned'] else 'still settable'})")
     print(f"  trade bounds    : swaps "
@@ -781,8 +784,9 @@ def cmd_dex_status(args) -> None:
           f"{fmt_token(cfg['min_swap_tokens'])}.."
           f"{fmt_token(cfg['max_swap_tokens'])} tokens")
     print("  liquidity       : PERMANENT (no remove_liquidity exists — "
-          "the anti-rug core, X2) and PRICE-NEUTRAL to add (X7 — only "
-          "swaps move a pool's price)")
+          "the anti-rug core, X2), PRICE-NEUTRAL to add (X7), and it EARNS: "
+          "providers get their pro-rata share of every fee, claimable "
+          "anytime (claim_lp_fees, X10)")
 
 
 def cmd_dex_pool(args) -> None:
@@ -799,11 +803,17 @@ def cmd_dex_pool(args) -> None:
     print(f"  volume     : buy {crypto.fmt_xel(q['buy_volume'] or 0)} / "
           f"sell {crypto.fmt_xel(q['sell_volume'] or 0)} "
           f"({q['trades'] or 0} trades, last at topo {q['last_trade_topo'] or 0})")
-    print(f"  fees       : {crypto.fmt_xel(q['xel_fees'] or 0)} XEL + "
-          f"{fmt_token(q['token_fees'] or 0)} tokens pending "
-          f"(lifetime {crypto.fmt_xel(q['lifetime_fees'] or 0)} XEL)")
-    print(f"  lp gifts   : {q['lp_deposits'] or 0} permanent liquidity "
-          "donations (add_liquidity)")
+    print(f"  fees       : admin pot {crypto.fmt_xel(q['xel_fees'] or 0)} XEL + "
+          f"{fmt_token(q['token_fees'] or 0)} tokens; provider pot "
+          f"{crypto.fmt_xel(q['lp_pot_xel'] or 0)} XEL + "
+          f"{fmt_token(q['lp_pot_tokens'] or 0)} tokens "
+          f"(lifetime fees {crypto.fmt_xel(q['lifetime_fees'] or 0)})")
+    depth = q['lp_total_depth'] or 0
+    share = (q['xel_reserve'] and depth * 100 // q['xel_reserve']) or 0
+    print(f"  providers : {q['lp_deposits'] or 0} entries, "
+          f"{crypto.fmt_xel(depth)} total depth "
+          f"({share}% of the pool's XEL side) — each earns pro-rata of the "
+          "LP fee share (X10); principal permanent (X2)")
 
 
 def cmd_dex_quote(args) -> None:
@@ -836,6 +846,78 @@ def cmd_dex_entries(args) -> None:
     print("\nentries-only numbering (probe only):")
     for name, eid in sorted(LAUNCHDEX_ENTRY_IDS_ALT.items(), key=lambda kv: kv[1]):
         print(f"  {eid:>3}  {name}")
+
+
+def cmd_dex_lp(args) -> None:
+    """X10/D23: YOUR provider position in a pool (parts + live earnings)."""
+    contract = _require_contract(args)
+    reader = DexReader(_daemon(args.network), contract)
+    pos = reader.lp_info(args.asset.lower(), args.wallet)
+    if not pos["parts"]:
+        sys.exit("error: this wallet has no LP parts in this pool "
+                 "(add_liquidity to become a provider)")
+    print(f"provider position — pool {args.asset[:16]}…")
+    print(f"  parts        : {crypto.fmt_xel(pos['parts'])} of the pool's "
+          "LP depth (pro-rata of the LP fee share, X10)")
+    print(f"  available    : {crypto.fmt_xel(pos['available_xel'])} XEL + "
+          f"{fmt_token(pos['available_tokens'])} tokens "
+          "(claimable now — claim_lp_fees)")
+    print(f"  crystallised : {crypto.fmt_xel(pos['claimable_xel'])} XEL + "
+          f"{fmt_token(pos['claimable_tokens'])} tokens "
+          "(rest = accrued since your last touch)")
+
+
+def cmd_dex_claim_lp_fees(args) -> None:
+    """X10/D23: claim YOUR accrued provider fees (pull, both sides)."""
+    contract = _require_contract(args)
+    asset = args.asset.lower()
+    reader = DexReader(_daemon(args.network), contract)
+    print(f"claim_lp_fees({asset[:16]}…) — chunk "
+          f"{LAUNCHDEX_ENTRY_IDS['claim_lp_fees']}")
+    print("  rules     : pays YOUR own accrued fees only (keys embed your "
+          "address); principal untouchable (no remove_liquidity)")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    pos = reader.lp_info(asset, w.address())
+    if not pos["parts"]:
+        sys.exit("error: this wallet has no LP parts in this pool")
+    print(f"  available : {crypto.fmt_xel(pos['available_xel'])} XEL + "
+          f"{fmt_token(pos['available_tokens'])} tokens")
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHDEX_ENTRY_IDS["claim_lp_fees"],
+                  claim_lp_fees_params(asset), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — provider fees paid out")
+
+
+def cmd_dex_set_fee_split(args) -> None:
+    """Admin: set the admin/providers fee split (X10, bounded 25–75%)."""
+    contract = _require_contract(args)
+    lp_bps = int(round(args.percent * 100))
+    if not (dexmod.MIN_LP_SHARE_BPS <= lp_bps <= dexmod.MAX_LP_SHARE_BPS):
+        sys.exit(f"error: the LP share is hard-bounded "
+                 f"{dexmod.MIN_LP_SHARE_BPS / 100:.0f}%–"
+                 f"{dexmod.MAX_LP_SHARE_BPS / 100:.0f}% "
+                 "(providers can never be cut to zero, treasury can never "
+                 "be starved)")
+    print(f"set_fee_split({lp_bps}) — chunk "
+          f"{LAUNCHDEX_ENTRY_IDS['set_fee_split']}")
+    print(f"  effect    : every FUTURE fee splits "
+          f"{100 - args.percent}% admin / {args.percent}% providers")
+    print("  note      : accrued claimables keep their recorded amounts")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHDEX_ENTRY_IDS["set_fee_split"],
+                  set_fee_split_params(lp_bps), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — split updated")
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1111,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = ds.add_parser("entries")
     sp.set_defaults(func=cmd_dex_entries, need_contract=False)
+
+    sp = ds.add_parser("lp"); common(sp)
+    sp.add_argument("--asset", required=True,
+                    help="asset hash (64 hex) of the pool's token")
+    sp.add_argument("--wallet", required=True,
+                    help="the PROVIDER's address (read-only view)")
+    sp.set_defaults(func=cmd_dex_lp)
+
+    sp = ds.add_parser("claim-lp-fees"); common(sp)
+    sp.add_argument("--asset", required=True,
+                    help="asset hash (64 hex) of the pool's token")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send the transaction (default: dry-run)")
+    sp.set_defaults(func=cmd_dex_claim_lp_fees)
+
+    sp = ds.add_parser("set-fee-split"); common(sp)
+    sp.add_argument("--percent", type=float, required=True,
+                    help="LP share of every fee, in %% (25–75)")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send the transaction (default: dry-run)")
+    sp.set_defaults(func=cmd_dex_set_fee_split)
 
     return p
 

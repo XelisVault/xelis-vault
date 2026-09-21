@@ -168,3 +168,35 @@ DEX pools back to launchpad pages, and the migrated index
 (`get_migrated_count`/`get_migrated_by_rank`) enumerates every project
 that ever moved to a pool — across DEX generations. The full
 stateless-site recipe is LAUNCHPAD.md §7a.
+
+## v18.2 — the second founder risk review, closed (providers earn, honest limits)
+
+Four points raised; all closed. The architecture is unchanged (append-only
+DEX additions, chunks 6/7 untouched, no storage migration):
+
+1. **Liquidity provision earned nothing** — LaunchDEX v1.2 (X10/D23):
+   every swap fee now splits between the admin pot and the pool's
+   liquidity providers, pro-rata of each provider's share of the LP
+   depth (XEL side, the fit rule keeps both sides proportional).
+   Default 50/50; the dial (`set_fee_split`) is hard-bounded
+   [2500, 7500] — a hostile admin can neither zero the providers nor
+   starve the treasury. Distribution is accrual-per-unit with per-
+   provider snapshots; `claim_lp_fees` is a public pull (own-key-only,
+   bounded by the pots, works under the emergency pause). New invariant
+   IX8 (LP solvency) holds by construction; the 1 XEL LP-entry floor is
+   the precision bound that keeps the accrual counter inside u64 for
+   the pool's whole life. The anti-rug core is untouched: still no
+   remove_liquidity anywhere — only fees ever flow out.
+2. **Sybil voting still free by default** — the D21 dial now ships at
+   0.5 XEL refundable (VaultLaunch v4.2): twenty farmed wallets deciding
+   a validation park 10 XEL of capital while they do it. Still
+   admin-settable [0, 10 XEL], refunds untouched.
+3. **Frozen pins = no in-place upgrade** — the runbook is now a real
+   document (`docs/UPGRADES.md`): the generation model, the exact
+   procedure (gates → testnet rehearsal → mainnet cut → site registry),
+   and the worst-case playbook for a critical bug on a live generation.
+4. **Honesty about limits** — the security policy now states plainly
+   what is audited and what is NOT (v4/v1.2: internal CI verification
+   only, no external audit — never say "audited"), and front-running is
+   documented as an assumed ceiling (public mempool, `min_out`
+   everywhere, no MEV protection claimed).

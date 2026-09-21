@@ -22,6 +22,17 @@ PUBLIC_BY_DESIGN = {
     ("VaultLaunch", "report"): "public voting by design — same bound as support",
     ("VaultLaunch", "sell"): "exit path, never blockable — bounded by the caller's OWN token deposit (whole-deposit)",
     ("VaultLaunch", "claim_vote_deposit"): "pull-refund of the caller's OWN locked deposit (D21) — the storage key embeds the caller's address (v:{pid}:{round}:{caller}), so no voter can ever touch another voter's funds; the slot's recorded amount bounds the payout, and require(locked > 0) makes double claims impossible",
+    ("LaunchDEX", "claim_lp_fees"): (
+        "pull-payout of the caller's OWN accrued provider fees (X10/D23) — "
+        "the storage keys embed the caller's address "
+        "(l:{asset}:{caller}:*), so no provider can ever touch another "
+        "provider's payout; the payout is bounded by the caller's own "
+        "crystallised claimables, themselves bounded by the LP pot by "
+        "construction (IX8 accrual bound), and the belt-and-braces "
+        "requires (payout <= pot) keep even a hypothetical accounting bug "
+        "from ever reaching the reserves — the entry reverts, the funds "
+        "stay in the pot; double claims are impossible (claimables zeroed)"
+    ),
     ("VaultLaunch", "finalize_validation"): "permissionless deadline executor — outcome fully determined by public tallies",
     ("VaultLaunch", "migrate"): "permissionless migration executor — no destination/amount/caller choice, pinned DEX only",
     ("VaultLaunch", "sync_trust_to_dex"): "permissionless keeper — mirrors the public trust status to the pool's buys-pause",
@@ -97,6 +108,11 @@ for path in FILES:
                 # (hard-capped) => fee < x, always
                 (b == "fee" and f"fee_take({a}," in ctx) or
                  (b == "fee_take" and f"{a} - fee_take({a}" in raw) or
+                 # X10/D23 fee split: lp_part = fee_take(fee, lp_bps) with
+                 # lp_bps hard-bounded to [2500, 7500] in set_fee_split
+                 # (<= 7500 < 10000) => lp_part < fee, always
+                 (b == "lp_part" and "fee_take(fee," in ctx and
+                  "MIN_LP_SHARE_BPS" in src) or
                  # team allocation: team_bps <= 2000 (required in propose)
                  # => team_alloc_of(ts, tb) <= ts/5 < ts
                  (b == "team_alloc_of" and "require(team_bps <= MAX_TEAM_BPS" in ctx) or

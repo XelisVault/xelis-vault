@@ -104,6 +104,19 @@ REQS = [
     ("R30", "solvent by construction (exact-sum curve accounting, D20/D21)",
      "let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128) + (pots as u128)",
      "test_solvency_after_graduation_and_withdrawal_pressure"),
+    # -- v18.2 founder risk review, points 1-2 (X10/D23 + D21 default) --
+    ("R31", "providers earn: every swap fee splits admin/LP pro-rata of depth (point 1)",
+     "if lp_part > 0 && tl > 0 {",
+     "test_d23_providers_earn_pro_rata_and_claims_pay_x10"),
+    ("R32", "the split dial is hard-bounded [25%, 75%] — LPs never cut to zero, treasury never starved",
+     'require(lp_bps >= MIN_LP_SHARE_BPS, "toolow")',
+     "test_d23_fee_split_dial_is_bounded_and_prospective"),
+    ("R33", "vote deposit default 0.5 XEL refundable from day one (point 2: 20 farmed wallets park capital)",
+     "const DEFAULT_VOTE_DEPOSIT: u64 = 50000000",
+     "test_d21_default_is_a_refundable_half_xel_and_admin_cannot_confiscate"),
+    ("R34", "a first deposit never earns fees from before it existed (fuzz-found IX8 fix)",
+     "s.store(lkey + LPF_SNAP_XEL, s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0))",
+     "test_d23_first_deposit_never_earns_fees_from_before_it_existed"),
 ]
 
 fails = []
@@ -115,12 +128,12 @@ for rid, req, marker, test in REQS:
         fails.append(f"{rid}: no test grounds {req!r} (expected {test})")
 
 # cross-cutting sanity: the requirement count matches the founder brief
-assert len(REQS) == 30
+assert len(REQS) == 34
 
 if fails:
     print("AUDIT 1 (SPEC TRACEABILITY) FAILED:")
     for f in fails:
         print("  -", f)
     sys.exit(1)
-print(f"AUDIT 1 (SPEC TRACEABILITY): PASS — {len(REQS)}/30 founder requirements "
+print(f"AUDIT 1 (SPEC TRACEABILITY): PASS — {len(REQS)}/34 founder requirements "
       "grounded in the contract source AND covered by a test.")

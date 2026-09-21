@@ -73,7 +73,7 @@ DEFAULTS = {
     "team_unlock_delay": 3_153_600,           # ~6 months of bonding (D3)
     "vesting_min": 518_400,                   # ~1 month
     "vesting_max": 6_307_200,                 # ~1 year
-    "vote_deposit": 0,                        # D21 sybil dial (0 = free voting)
+    "vote_deposit": 50_000_000,               # D21 sybil dial (0.5 XEL refundable, v4.2)
 }
 
 # ---------------------------------------------------------------------------

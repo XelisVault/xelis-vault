@@ -208,6 +208,18 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "entry can only ever ADD value to the market at the market's own "
         "price; the attached deposits bound exactly what it can take"
     ),
+    ("LaunchDEX", "claim_lp_fees"): (
+        "pull-payout of the caller's OWN accrued provider fees (X10/D23): "
+        "the storage keys are l:{asset}:{caller}:{...} — they embed the "
+        "caller's address, so no provider can ever touch another "
+        "provider's payout; the payout is bounded by the caller's own "
+        "crystallised claimables, which are bounded by the LP pot by "
+        "construction (IX8 accrual bound), and the belt-and-braces "
+        "requires keep even a hypothetical accounting bug from ever "
+        "reaching the reserves (the entry would revert, funds stay in "
+        "the pot); double claims are impossible (claimables zeroed on "
+        "payout) and the principal is untouchable (no remove_liquidity)"
+    ),
 }
 
 
