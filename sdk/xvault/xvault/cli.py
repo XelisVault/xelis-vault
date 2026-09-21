@@ -783,10 +783,13 @@ def cmd_dex_status(args) -> None:
           f"{crypto.fmt_xel(cfg['max_swap_xel'])} XEL, "
           f"{fmt_token(cfg['min_swap_tokens'])}.."
           f"{fmt_token(cfg['max_swap_tokens'])} tokens")
-    print("  liquidity       : PERMANENT (no remove_liquidity exists — "
-          "the anti-rug core, X2), PRICE-NEUTRAL to add (X7), and it EARNS: "
-          "providers get their pro-rata share of every fee, claimable "
-          "anytime (claim_lp_fees, X10)")
+    print("  liquidity       : SEED PERMANENT (the migration's parts are\n"
+          "                    protocol-locked FOREVER, X11 — the anti-rug\n"
+          "                    floor), PRICE-NEUTRAL to add (X7), providers may\n"
+          "                    EXIT pro-rata ANYTIME (remove_liquidity, X12), and\n"
+          "                    it EARNS: every part gets its pro-rata share of\n"
+          "                    every fee (claim_lp_fees, X10) — the seed included\n"
+          "                    (it accrues to the protocol's own position)")
 
 
 def cmd_dex_pool(args) -> None:
@@ -809,11 +812,16 @@ def cmd_dex_pool(args) -> None:
           f"{fmt_token(q['lp_pot_tokens'] or 0)} tokens "
           f"(lifetime fees {crypto.fmt_xel(q['lifetime_fees'] or 0)})")
     depth = q['lp_total_depth'] or 0
+    locked = q['lp_locked_depth'] or 0
     share = (q['xel_reserve'] and depth * 100 // q['xel_reserve']) or 0
     print(f"  providers : {q['lp_deposits'] or 0} entries, "
           f"{crypto.fmt_xel(depth)} total depth "
           f"({share}% of the pool's XEL side) — each earns pro-rata of the "
-          "LP fee share (X10); principal permanent (X2)")
+          "LP fee share (X10) and may exit pro-rata anytime (X12)")
+    floor_pct = (depth and locked * 100 // depth) or 0
+    print(f"  seed floor: {crypto.fmt_xel(locked)} of the depth "
+          f"({floor_pct}%) is the migration itself — PROTOCOL-LOCKED "
+          "FOREVER, never withdrawable by anyone (X11)")
 
 
 def cmd_dex_quote(args) -> None:
@@ -859,9 +867,24 @@ def cmd_dex_lp(args) -> None:
     print(f"provider position — pool {args.asset[:16]}…")
     print(f"  parts        : {crypto.fmt_xel(pos['parts'])} of the pool's "
           "LP depth (pro-rata of the LP fee share, X10)")
+    w = pos.get('withdrawable') or 0
+    if w:
+        out_x, out_y = dexmod.remove_outs(
+            reader._key(dexmod.pool_key(args.asset.lower(),
+                                        dexmod.F_XEL_RESERVE), 0) or 0,
+            reader._key(dexmod.pool_key(args.asset.lower(),
+                                        dexmod.F_TOK_RESERVE), 0) or 0,
+            w, reader._key(dexmod.pool_key(args.asset.lower(),
+                                           dexmod.F_LP_TOTAL), 0) or 0)
+        print(f"  withdrawable : {crypto.fmt_xel(w)} parts — the exit quote "
+              f"is {crypto.fmt_xel(out_x)} XEL + {fmt_token(out_y)} tokens "
+              "(remove-liquidity, X12)")
+    else:
+        print("  withdrawable : 0 parts (the protocol's seed position is "
+              "fees-only, forever — X11)")
     print(f"  available    : {crypto.fmt_xel(pos['available_xel'])} XEL + "
           f"{fmt_token(pos['available_tokens'])} tokens "
-          "(claimable now — claim_lp_fees)")
+          "(claimable now — claim-lp-fees)")
     print(f"  crystallised : {crypto.fmt_xel(pos['claimable_xel'])} XEL + "
           f"{fmt_token(pos['claimable_tokens'])} tokens "
           "(rest = accrued since your last touch)")
@@ -891,6 +914,54 @@ def cmd_dex_claim_lp_fees(args) -> None:
     print(f"broadcast: {tx}")
     w.wait_nonce_advance(before)
     print("confirmed — provider fees paid out")
+
+
+def cmd_dex_remove_liquidity(args) -> None:
+    """X12 (v1.3): burn YOUR withdrawable parts for their exact pro-rata
+    share of both reserves at the current ratio."""
+    contract = _require_contract(args)
+    asset = args.asset.lower()
+    reader = DexReader(_daemon(args.network), contract)
+    print(f"remove_liquidity({asset[:16]}…, {args.parts}) — chunk "
+          f"{LAUNCHDEX_ENTRY_IDS['remove_liquidity']}")
+    print("  rules     : burns YOUR OWN withdrawable parts only (the "
+          "migration's seed is protocol-locked FOREVER, X11); payout = "
+          "exact floored pro-rata of BOTH reserves at the current ratio; "
+          "NO gate — works under any pause (X12)")
+    wallet_addr = args.wallet or (_wallet(args).address() if args.broadcast else None)
+    if wallet_addr:
+        pos = reader.lp_info(asset, wallet_addr)
+        w = pos.get('withdrawable') or 0
+        if not w:
+            sys.exit("error: this wallet has no WITHDRAWABLE parts in this "
+                     "pool (the seed position is fees-only — X11)")
+        if args.parts > w:
+            sys.exit(f"error: you only hold {w} withdrawable parts "
+                     f"(asked {args.parts}) — the rest is locked forever")
+        x = reader._key(dexmod.pool_key(asset, dexmod.F_XEL_RESERVE), 0) or 0
+        y = reader._key(dexmod.pool_key(asset, dexmod.F_TOK_RESERVE), 0) or 0
+        tl = reader._key(dexmod.pool_key(asset, dexmod.F_LP_TOTAL), 0) or 0
+        out_x, out_y = dexmod.remove_outs(x, y, args.parts, tl)
+        print(f"  quote     : burn {args.parts} parts -> "
+              f"{crypto.fmt_xel(out_x)} XEL + {fmt_token(out_y)} tokens")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    if not args.wallet:
+        pos = reader.lp_info(asset, w.address())
+        if args.parts > (pos.get('withdrawable') or 0):
+            sys.exit("error: not enough withdrawable parts (\"locked\")")
+    min_x = int(round(args.min_xel_out * 1e8)) if args.min_xel_out is not None else 0
+    min_t = int(round(args.min_tokens_out * 1e8)) if args.min_tokens_out is not None else 0
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHDEX_ENTRY_IDS["remove_liquidity"],
+                  dexmod.remove_liquidity_params(asset, args.parts, min_x, min_t),
+                  deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — pro-rata payout sent; accrued fees preserved "
+          "(claim them with claim-lp-fees)")
 
 
 def cmd_dex_set_fee_split(args) -> None:
@@ -1125,6 +1196,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--broadcast", action="store_true",
                     help="send the transaction (default: dry-run)")
     sp.set_defaults(func=cmd_dex_claim_lp_fees)
+
+    sp = ds.add_parser("remove-liquidity"); common(sp)
+    sp.add_argument("--asset", required=True,
+                    help="asset hash (64 hex) of the pool's token")
+    sp.add_argument("--parts", type=int, required=True,
+                    help="atomic parts to burn (see: dex lp)")
+    sp.add_argument("--wallet", help="quote THIS wallet's position "
+                    "(default: the local wallet)")
+    sp.add_argument("--min-xel-out", type=float,
+                    help="slippage floor on the XEL side (XEL)")
+    sp.add_argument("--min-tokens-out", type=float,
+                    help="slippage floor on the token side (whole tokens)")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send the transaction (default: dry-run)")
+    sp.set_defaults(func=cmd_dex_remove_liquidity)
 
     sp = ds.add_parser("set-fee-split"); common(sp)
     sp.add_argument("--percent", type=float, required=True,

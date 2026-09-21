@@ -5,16 +5,18 @@ Python mirror of contracts/dex/LaunchDEX.slx. Every formula here MUST stay
 byte-identical to the contract (CI cross-checks the math + the pinned
 cross-call chunk ids in tests/test_dex_reference.py).
 
-LaunchDEX is the permanent AMM for graduated tokens: one XEL-quote pool
-per asset, constant-product pricing, and liquidity that can only ever
-GROW (no remove_liquidity exists — the anti-rug core, X2). Pools are
-seeded by VaultLaunch's atomic migration (cross-contract call with
-attached deposits) and deepened by anyone via add_liquidity (a permanent
-deepening). Since v1.2 every swap fee is SPLIT between the admin pot and
-the pool's liquidity providers (X10/D23): each provider earns pro-rata
-of their share of the pool's LP depth, claimable at any time via
-claim_lp_fees (pull). The principal can never be clawed back — only
-fees ever flow out.
+LaunchDEX is the AMM for graduated tokens with a PERMANENT FLOOR (v1.3):
+one XEL-quote pool per asset, constant-product pricing, and a two-tier
+liquidity model — the migration's SEED is protocol-locked forever (X11:
+its LP parts are minted to the admin with NO withdrawable balance, so
+the pool's depth can never fall below the migration = the anti-rug
+floor), while every part added afterwards by a provider is withdrawable
+pro-rata at any time (X12: remove_liquidity, price-neutral, fees
+crystallised first). Since v1.2 every swap fee is SPLIT between the
+admin pot and the pool's liquidity providers (X10/D23), pro-rata of the
+LP depth; the seed position makes the protocol itself the first
+provider (it earns the provider share of every fee until real providers
+deepen the pool — claimable by the admin via the same public pull).
 
 Units: XEL and token amounts are atomic integers with 8 decimals
 (1 XEL = 1 token = 100_000_000).
@@ -134,6 +136,27 @@ def accrual_increment(lp_part: int, total_depth: int) -> int:
     return lp_part * ACC_SCALE // total_depth
 
 
+def remove_outs(xel_reserve: int, token_reserve: int,
+                parts: int, total_depth: int) -> tuple:
+    """X12 (v1.3): the pro-rata exit quote remove_liquidity pays —
+    (out_xel, out_tok) = parts * reserve / tl, floored on BOTH sides
+    (the pool keeps the rounding). Price-neutral by construction (IX7).
+    Raises ValueError ("dust"/"poolerr") exactly where the entry refuses:
+    a remove can never zero a side (parts < tl always — the seed's parts
+    are never withdrawable, X11)."""
+    if total_depth <= 0 or parts <= 0:
+        raise ValueError("empty")
+    if parts >= total_depth:
+        raise ValueError("poolerr")
+    out_x = parts * xel_reserve // total_depth
+    out_y = parts * token_reserve // total_depth
+    if out_x < 1 or out_y < 1:
+        raise ValueError("dust")
+    if out_x >= xel_reserve or out_y >= token_reserve:
+        raise ValueError("poolerr")
+    return out_x, out_y
+
+
 # ---------------------------------------------------------------------------
 # Storage keys — must match the contract's key builders exactly
 # ---------------------------------------------------------------------------
@@ -155,11 +178,13 @@ F_BUY_VOL, F_SELL_VOL, F_TRADES, F_LAST_TRADE = "bv", "sv", "tc", "lt"
 F_LIFETIME_FEES, F_LP_COUNT, F_ASSET = "fl", "lp", "ah"
 F_LP_POT_XEL, F_LP_POT_TOK = "lx", "ly"
 F_LP_TOTAL, F_LP_ACC_XEL, F_LP_ACC_TOK = "tl", "ax", "ay"
+F_LP_LOCKED = "pl"                             # X11: the seed floor
 
 # X10/D23 provider slots: l:{asset_hex}:{wallet}:{field}
 LP_PREFIX = "l:"
 LPF_XEL, LPF_SNAP_XEL, LPF_SNAP_TOK = "x", "sx", "sy"
 LPF_CLAIM_XEL, LPF_CLAIM_TOK = "cx", "cy"
+LPF_W = "w"                                     # X12: withdrawable parts
 
 
 def lp_key(asset_hex: str, wallet: str, field: str) -> str:
@@ -205,14 +230,28 @@ def swap_token_deposits(token_amount: int, asset_hex: str) -> dict:
 def add_liquidity_deposits(xel_amount: int, token_amount: int,
                            xel_asset: str = "0" * 64,
                            asset_hex: str = "") -> dict:
-    """add_liquidity: attach BOTH assets (both must be > 0). A PERMANENT
-    donation — there is no remove_liquidity (X2). `asset_hex` is the
+    """add_liquidity: attach BOTH assets (both must be > 0). A
+    price-neutral deepening (X7) that mints LP parts AND withdrawable
+    parts (X10/X12 — exit pro-rata anytime via remove_liquidity; the
+    migration's seed is never withdrawable, X11). `asset_hex` is the
     non-XEL side."""
     return {xel_asset: xel_amount, asset_hex: token_amount}
 
 
 def add_liquidity_params(asset_hex: str) -> list:
     return [val_hash(asset_hex)]
+
+
+def remove_liquidity_params(asset_hex: str, parts: int,
+                            min_xel_out: int, min_tokens_out: int) -> list:
+    """remove_liquidity (X12, public pull): burn `parts` of YOUR
+    withdrawable parts for their exact pro-rata share of BOTH reserves
+    at the current ratio. min_out on both sides = slippage protection
+    (the payout moves with the market until execution). The seed's
+    parts are never withdrawable ("locked", X11) — quote first with
+    remove_outs()."""
+    return [val_hash(asset_hex), val_u64(parts), val_u64(min_xel_out),
+            val_u64(min_tokens_out)]
 
 
 def set_pool_buys_paused_params(asset_hex: str, flag: bool) -> list:
@@ -310,7 +349,8 @@ class DexReader:
                             ("lp_deposits", F_LP_COUNT),
                             ("lp_pot_xel", F_LP_POT_XEL),
                             ("lp_pot_tokens", F_LP_POT_TOK),
-                            ("lp_total_depth", F_LP_TOTAL)):
+                            ("lp_total_depth", F_LP_TOTAL),
+                            ("lp_locked_depth", F_LP_LOCKED)):
             out[attr] = self._key(pool_key(asset_hex, field))
         x, y = out["xel_reserve"] or 0, out["token_reserve"] or 0
         out["price"] = spot_price(x, y)
@@ -343,11 +383,14 @@ class DexReader:
         return out
 
     def lp_info(self, asset_hex: str, wallet: str) -> Dict[str, int]:
-        """X10/D23 provider position (mirrors get_lp_info): parts (XEL
-        depth provided), crystallised claimables, and the LIVE available
+        """X10/D23+X12 provider position (mirrors get_lp_info): parts
+        (XEL depth provided), crystallised claimables, the LIVE available
         payout on both sides = claimables + everything accrued since the
         provider's last touch (computed here exactly like the contract's
-        view — a pure read, nothing is claimed)."""
+        view — a pure read, nothing is claimed), and the WITHDRAWABLE
+        parts remove_liquidity may burn (X12) — 0 for the protocol's
+        seed position (X11: the admin's seed parts are fees-only,
+        forever)."""
         a = asset_hex.lower()
         parts = self._key(lp_key(a, wallet, LPF_XEL), 0) or 0
         cx = self._key(lp_key(a, wallet, LPF_CLAIM_XEL), 0) or 0
@@ -360,6 +403,7 @@ class DexReader:
             ay = self._key(pool_key(a, F_LP_ACC_TOK), 0) or 0
             sy = self._key(lp_key(a, wallet, LPF_SNAP_TOK), 0) or 0
             avail_y += lp_earnings(ay, sy, parts)
+        w = self._key(lp_key(a, wallet, LPF_W), 0) or 0
         return {"parts": parts, "claimable_xel": cx,
                 "claimable_tokens": cy, "available_xel": avail_x,
-                "available_tokens": avail_y}
+                "available_tokens": avail_y, "withdrawable": w}

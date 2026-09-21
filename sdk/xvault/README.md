@@ -56,7 +56,8 @@ xvault launchpad entries
 
 ```bash
 # the atomic, permissionless move: curve reserves + token inventory ->
-# a PERMANENT LaunchDEX pool (no remove_liquidity exists — anti-rug)
+# a LaunchDEX pool whose SEED is protocol-locked FOREVER (X11 — the
+# migration can never be drained; the depth floor is absolute)
 xvault launchpad migrate --contract <launchpad> --id 0 [--broadcast]
 # the transaction MUST carry the contract-call permission (XSWD "all")
 
@@ -64,7 +65,7 @@ xvault launchpad migrate --contract <launchpad> --id 0 [--broadcast]
 # (sells NEVER blocked, on either venue)
 xvault launchpad sync   --contract <launchpad> --id 0 [--broadcast]
 
-# the pool era: reserves, price, volume scoreboard, permanent liquidity
+# the pool era: reserves, price, volume scoreboard, the seed floor
 xvault dex status       --contract <dex>
 xvault dex pool         --contract <dex> --asset <asset-hash-64hex>
 xvault dex quote        --x-reserve 2000 --y-reserve 900000000 --buy 100
@@ -77,14 +78,22 @@ xvault dex claim-lp-fees --contract <dex> --asset <hash> [--broadcast]
                                                         # pull YOUR fees (both sides)
 xvault dex set-fee-split --contract <dex> --percent 50 [--broadcast]
                                                         # admin: the split dial (25-75)
+
+# the exit era (v1.3, X12): providers are FREE, the seed is not
+xvault dex remove-liquidity --contract <dex> --asset <hash> \
+        --parts 100000000 [--min-xel-out 1.5] [--min-tokens-out 200] \
+        [--broadcast]        # burn withdrawable parts for the exact
+                             # pro-rata exit; refuses the seed ("locked")
 ```
 
 Python: `from xvault import dex` — the math mirror (`xel_to_tokens_out`,
 `tokens_to_xel_out`, `spot_price`, `liquidity_fit`, `fee_split`,
-`lp_earnings`, `accrual_increment`), the `DexReader` (pools, quotes,
-scoreboard, `lp_info` — the provider position) and the invoke builders
-(`swap_xel_params`, `swap_token_params`, `add_liquidity_deposits`,
-`claim_lp_fees_params`, `set_fee_split_params`...). The launchpad module
+`lp_earnings`, `accrual_increment`, `remove_outs`), the `DexReader`
+(pools, quotes, scoreboard, `lp_info` — the provider position incl.
+the withdrawable balance and the pool's seed floor) and the invoke
+builders (`swap_xel_params`, `swap_token_params`,
+`add_liquidity_deposits`, `claim_lp_fees_params`,
+`remove_liquidity_params`, `set_fee_split_params`...). The launchpad module
 gained `sell_deposits` (whole-deposit token sales), `set_dex_address_params`,
 `finalize_topup_deposits`, `dex_pool_market_cap` (the pool-era cap
 composition) and the migration fields in `LaunchpadReader.project()`.

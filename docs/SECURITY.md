@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v18.2
+# Security Policy — XelisVault Protocol v18.3
 
 ## Reporting
 
@@ -203,19 +203,29 @@ identity `balance == curve inventory + team escrow` (I1) holds at every
 block. Post-migration the identity degenerates to the team escrow (I10)
 — the migration sends exactly the inventory, never the escrow.
 
-**The DEX's own threat model (v1.1, founder risk review).** The DEX
-admin can set the swap fee (cap 10%), the trade bounds, the launchpad
-pin (before the first pool only) and trigger the global emergency
-pause. It can NEVER move pool reserves: `withdraw_fees` is capped by
-the pending pots AND the uncommitted balance (IX1/IX2). No
-remove_liquidity exists anywhere — permanent liquidity is the feature.
-**Sells are ungated, absolutely (IX6)**: the per-pool flag pauses buys
-only, and since v1.1 the emergency pause gates buys, pool creation and
-liquidity adds ONLY — the sell path carries NO gate at all. A
-compromised admin can tax sellers (fee hard-capped at 10%) but can
-NEVER trap holders. And since v1.1 `add_liquidity` is price-neutral
-(X7/IX7): a malicious one-sided donation cannot skew a market — only
-swaps move a pool's price.
+**The DEX's own threat model (v1.1, founder risk review; updated v1.3).**
+The DEX admin can set the swap fee (cap 10%), the trade bounds, the
+launchpad pin (before the first pool only), the fee split (bounded
+[25%, 75%]) and trigger the global emergency pause. It can NEVER move
+pool reserves: `withdraw_fees` is capped by the pending pots AND the
+uncommitted balance (IX1/IX2). Since v1.3 the liquidity is two-tier:
+**the migrated seed is protocol-locked FOREVER** (its LP parts are
+minted to the protocol's position with NO withdrawable balance — even
+a fully compromised admin cannot withdraw it), while providers' added
+liquidity is withdrawable pro-rata by its owners only
+(`remove_liquidity` burns the caller's OWN withdrawable parts,
+"locked"; the seed floor is re-asserted belt-and-braces, "seederr").
+**Every exit is ungated, absolutely (IX6 + X12)**: the per-pool flag
+pauses buys only, and the emergency pause gates buys, pool creation
+and liquidity adds ONLY — sells, provider fee claims AND provider
+liquidity removes carry NO gate at all. A compromised admin can tax
+sellers (fee hard-capped at 10%) but can NEVER trap ANYONE — holders
+or providers. `add_liquidity` stays price-neutral (X7/IX7) and so is
+`remove_liquidity` (v1.3, IX7 both sides): neither can steer a price —
+only swaps move a pool's price. The honest trade-off, documented: the
+depth ABOVE the seed floor depends on providers' goodwill and can
+shrink back to the floor at any time (a market risk, not a rug — the
+floor itself is immutable).
 
 **The founder risk review, closed (v4.1, updated v4.2).** The six
 pre-launch risks and their resolutions: (1) one-sided liquidity → X7
@@ -234,13 +244,14 @@ is documented in plain words (LAUNCHPAD.md §5a) — balances are
 confidential, attached amounts are public, never promise total
 privacy.
 
-## v18.2 — providers earn (LaunchDEX v1.2, X10/D23)
+## v18.2/v18.3 — providers earn, the seed is locked (LaunchDEX v1.2/v1.3, X10-X12)
 
 **New surface: the provider accounting.** Every swap fee now splits
 between the admin pot and the pool's providers (pro-rata of the LP
-depth, XEL side). The design keeps the anti-rug core intact: no
-`remove_liquidity` exists — only FEES ever flow out, the principal is
-permanent. Threat notes, plainly:
+depth, XEL side). Since v1.3 the anti-rug core is TWO-TIER: the seed
+mints LP parts to the protocol (X11 — fees-only, forever) and
+providers mint WITHDRAWABLE parts they may burn pro-rata at any time
+(X12). Threat notes, plainly:
 
 - The **split dial is hard-bounded [2500, 7500]**: a compromised
   admin can neither zero the providers' revenue nor dump the whole
@@ -249,12 +260,14 @@ permanent. Threat notes, plainly:
   only; `claim_lp_fees` pays the CALLER's own accrued fees, keys
   embed the caller's address, payouts bounded by the pots with
   belt-and-braces `"lperr"` reverts).
-- **IX8 (LP solvency) holds by construction**: each accrual increment
-  is `lp_part * ACC_SCALE / tl` with `tl ≥ ACC_SCALE` (the hard 1 XEL
-  LP-entry floor — a precision guarantee, not a dust rule), so the
-  accrual counter can never outgrow the pool's lifetime fees, and
-  payouts are floor-rounded shares — the sum of all dues never
-  exceeds the pot. The fuzz asserts this after every action.
+- **IX8 (LP solvency) holds by construction, removes included**: each
+  accrual increment is `lp_part * ACC_SCALE / tl` with `tl ≥ pl ≥
+  ACC_SCALE` (the seed floor guarantees it through removes since
+  v1.3 — IX9; before that, the 1 XEL LP-entry floor alone carried
+  the bound), so the accrual counter can never outgrow the pool's
+  lifetime fees, and payouts are floor-rounded shares — the sum of
+  all dues never exceeds the pot. The fuzz asserts this after every
+  action, removes included.
 - **Fuzz-found, fixed, pinned**: the first deposit of a wallet must
   snapshot the current accrual counters, or it would retroactively
   earn fees from before it existed (more than the pot ever held).
@@ -262,8 +275,12 @@ permanent. Threat notes, plainly:
   Sim and a dedicated regression test now pin the boundary.
 - A deposit **crystallises before its parts join** — new money never
   earns from before it existed, old parts never lose a unit earned.
-- While a pool has no provider, the LP share reverts to the admin —
-  no fee is ever stranded in a beneficiary-less pot.
+  Since v1.3 a REMOVE crystallises before its parts leave — an exit
+  never forfeits a unit of what the burned parts already earned (the
+  claimables survive and `claim_lp_fees` pays them later).
+- Since v1.3 the pool always has a provider from birth (the seed), so
+  no fee is ever stranded in a beneficiary-less pot; the pre-v1.3
+  no-provider redirect to the admin pot remains as defense-in-depth.
 
 ## Front-running — an assumed ceiling, documented (not a bug)
 

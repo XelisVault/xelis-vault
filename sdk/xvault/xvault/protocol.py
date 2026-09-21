@@ -186,6 +186,7 @@ LAUNCHDEX_ENTRY_IDS = {
     "withdraw_fees": 16,
     "set_fee_split": 29,
     "claim_lp_fees": 30,
+    "remove_liquidity": 32,
 }
 
 LAUNCHDEX_ENTRY_IDS_ALT = {
@@ -202,6 +203,7 @@ LAUNCHDEX_ENTRY_IDS_ALT = {
     "withdraw_fees": 10,
     "set_fee_split": 11,
     "claim_lp_fees": 12,
+    "remove_liquidity": 13,
 }
 
 # ---------------------------------------------------------------------------

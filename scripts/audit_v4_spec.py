@@ -52,9 +52,9 @@ REQS = [
     ("R13", "the pool is a real AMM (constant product on the DEX)",
      "let wide: u128 = (y as u128) * (net as u128) / ((x as u128) + (net as u128))",
      "test_dex_swap_math_hand_vectors"),
-    ("R14", "anti-rug: NO remove_liquidity anywhere on the DEX",
-     "PERMANENT LIQUIDITY — no remove_liquidity entry exists",
-     "test_no_remove_liquidity_can_exist"),
+    ("R14", "anti-rug: the migrated seed is protocol-locked FOREVER (v1.3: removes exist for providers, never for the seed)",
+     "X2. THE SEED IS PERMANENT, PROVIDERS ARE FREE",
+     "test_the_seed_is_protocol_locked_x11_x12"),
     ("R15", "team escrow NEVER migrates (claims keep working after)",
      "let team_rem: u64 = team_remaining(pid)",
      "test_full_lifecycle_curve_path"),
@@ -117,6 +117,13 @@ REQS = [
     ("R34", "a first deposit never earns fees from before it existed (fuzz-found IX8 fix)",
      "s.store(lkey + LPF_SNAP_XEL, s.load(pool_key(asset, F_LP_ACC_XEL)).unwrap_or(0))",
      "test_d23_first_deposit_never_earns_fees_from_before_it_existed"),
+    # -- v18.3 founder risk review 3, points 1-2 (X11 seed shares + X12 removes) --
+    ("R35", "the seed mints LP parts to the protocol — the first add cannot capture a migrated pool (point 1: 1 XEL on 4000 XEL = 1/4001, not 100%)",
+     "s.store(pool_key(asset, F_LP_LOCKED), xel_seed)",
+     "test_x11_the_first_add_cannot_capture_a_seeded_pool"),
+    ("R36", "providers exit pro-rata anytime and the seed NEVER leaves — burns bounded by own withdrawable parts, floor re-asserted (point 2)",
+     'require(parts <= w, "locked")',
+     "test_x12_remove_liquidity_full_lifecycle"),
 ]
 
 fails = []
@@ -128,12 +135,12 @@ for rid, req, marker, test in REQS:
         fails.append(f"{rid}: no test grounds {req!r} (expected {test})")
 
 # cross-cutting sanity: the requirement count matches the founder brief
-assert len(REQS) == 34
+assert len(REQS) == 36
 
 if fails:
     print("AUDIT 1 (SPEC TRACEABILITY) FAILED:")
     for f in fails:
         print("  -", f)
     sys.exit(1)
-print(f"AUDIT 1 (SPEC TRACEABILITY): PASS — {len(REQS)}/34 founder requirements "
+print(f"AUDIT 1 (SPEC TRACEABILITY): PASS — {len(REQS)}/36 founder requirements "
       "grounded in the contract source AND covered by a test.")

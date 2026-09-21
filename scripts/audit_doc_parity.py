@@ -121,10 +121,10 @@ if 'const VERSION: string = "VaultLaunch v4.2.0"' not in CONTRACT:
     fails.append("contract: VERSION is not v4.2.0")
 if "v4.2.0" not in DOC:
     fails.append("doc: LAUNCHPAD.md does not say v4.2.0")
-if 'const VERSION: string = "LaunchDEX v1.2.0"' not in DEX_CONTRACT:
-    fails.append("dex contract: VERSION is not v1.2.0")
-if "v1.2.0" not in DEX_DOC:
-    fails.append("doc: DEX.md does not say v1.2.0")
+if 'const VERSION: string = "LaunchDEX v1.3.0"' not in DEX_CONTRACT:
+    fails.append("dex contract: VERSION is not v1.3.0")
+if "v1.3.0" not in DEX_DOC:
+    fails.append("doc: DEX.md does not say v1.3.0")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
@@ -171,6 +171,30 @@ for fn in ("entry claim_lp_fees", "entry set_fee_split",
         fails.append(f"dex contract: {fn} missing")
 if "const EV_LP_FEES_CLAIMED: u64 = 13" not in DEX_CONTRACT:
     fails.append("dex contract: event 13 (LpFeesClaimed) missing")
+
+# v1.3 DEX sanity: the two-tier liquidity model (seed shares + provider
+# removes) is documented in DEX.md and the keys/entries exist in the
+# contract
+for concept in ["X11", "X12", "IX9", "remove_liquidity", "seed floor",
+                "PROVIDERS CAN LEAVE"]:
+    if concept not in DEX_DOC:
+        fails.append(f"doc: DEX.md v1.3 concept {concept} not documented")
+for const, key in [("F_LP_LOCKED", "pl"), ("LPF_W", "w")]:
+    if f'const {const}: string = "{key}"' not in DEX_CONTRACT:
+        fails.append(f"dex contract: v1.3 key {key} ({const}) missing")
+for fn in ("entry remove_liquidity",):
+    if fn not in DEX_CONTRACT:
+        fails.append(f"dex contract: {fn} missing")
+if "const EV_LIQUIDITY_REMOVED: u64 = 14" not in DEX_CONTRACT:
+    fails.append("dex contract: event 14 (LiquidityRemoved) missing")
+for guard in ('require(parts <= w, "locked")', '"seederr"', '"parterr"',
+              '"seedlp"'):
+    if guard not in DEX_CONTRACT:
+        fails.append(f"dex contract: v1.3 guard {guard} missing")
+# LAUNCHPAD.md must say the new anti-rug model LOUDLY
+for concept in ("seed is protocol-locked", "remove_liquidity"):
+    if concept not in DOC:
+        fails.append(f"doc: LAUNCHPAD.md v1.3 concept {concept} missing")
 
 # the upgrade runbook exists and the honest audit status is written
 for path, needle in (("docs/UPGRADES.md", "generation"),

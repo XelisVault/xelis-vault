@@ -1,4 +1,4 @@
-# Architecture — XelisVault Protocol v17
+# Architecture — XelisVault Protocol v18
 
 ## Why a rewrite of the layout
 
@@ -98,16 +98,21 @@ the whole attached token deposit. The internal ledger of v1-v3 is gone.
 
 **Graduation is now a real migration (D15).** Between graduation and
 migration the curve keeps trading at the graduated fee (admin-lag
-tolerant); then `migrate()` — permissionless, atomic — seeds a permanent
+tolerant); then `migrate()` — permissionless, atomic — seeds a
 LaunchDEX pool with the curve's whole reserves and inventory via one
-cross-contract call with attached deposits. The curve closes forever;
-the launchpad remains the project's home (votes, socials, trust, team
-escrow).
+cross-contract call with attached deposits, and that seed is
+protocol-locked FOREVER (X11 — the pool's depth can never fall below
+the migration). The curve closes forever; the launchpad remains the
+project's home (votes, socials, trust, team escrow).
 
-**LaunchDEX (new contract, `contracts/dex/`).** Minimal permanent AMM:
+**LaunchDEX (contracts/dex/).** Minimal AMM with a PERMANENT FLOOR:
 one XEL-quote pool per asset, constant product, fees extracted to
-per-pool pending pots (100% admin), and **no remove_liquidity exists**
-— liquidity can only grow (X2, the anti-rug core). The launchpad pin
+per-pool pending pots and split admin/providers. The liquidity is
+two-tier (v1.3): the migrated seed is protocol-locked forever (its
+parts carry no withdrawable balance — the anti-rug floor), while
+providers' `add_liquidity` parts are withdrawable pro-rata at any
+time (`remove_liquidity` — price-neutral, ungated, never the seed).
+The launchpad pin
 freezes at the first pool (X4); the DEX pin on the launchpad freezes at
 the first migration (D19); the two cross-called chunk ids are CI-asserted
 on both sides. Trust follows the tokens: `sync_trust_to_dex` (a
@@ -185,8 +190,7 @@ DEX additions, chunks 6/7 untouched, no storage migration):
    bounded by the pots, works under the emergency pause). New invariant
    IX8 (LP solvency) holds by construction; the 1 XEL LP-entry floor is
    the precision bound that keeps the accrual counter inside u64 for
-   the pool's whole life. The anti-rug core is untouched: still no
-   remove_liquidity anywhere — only fees ever flow out.
+   the pool's whole life.
 2. **Sybil voting still free by default** — the D21 dial now ships at
    0.5 XEL refundable (VaultLaunch v4.2): twenty farmed wallets deciding
    a validation park 10 XEL of capital while they do it. Still
@@ -196,7 +200,38 @@ DEX additions, chunks 6/7 untouched, no storage migration):
    procedure (gates → testnet rehearsal → mainnet cut → site registry),
    and the worst-case playbook for a critical bug on a live generation.
 4. **Honesty about limits** — the security policy now states plainly
-   what is audited and what is NOT (v4/v1.2: internal CI verification
+   what is audited and what is NOT (v4/v1.x: internal CI verification
    only, no external audit — never say "audited"), and front-running is
    documented as an assumed ceiling (public mempool, `min_out`
    everywhere, no MEV protection claimed).
+
+## v18.3 — the third founder risk review, closed (seed shares, free providers)
+
+Two points; both closed by LaunchDEX v1.3 (append-only, chunk 32, pins
+6/7 untouched, no storage migration, VaultLaunch v4.2 unchanged):
+
+1. **The migrated liquidity had no LP parts** — the economics bug:
+   `create_pool` planted the reserves but left `tl = 0`, so the FIRST
+   1 XEL add on a 4000 XEL pool captured 100% of the provider fee
+   share. Fixed by X11 (seed shares): create_pool now mints LP parts
+   equal to the XEL seed to the admin (the protocol LP position,
+   snapshots posited at the zero accrual counters) and records them as
+   the pool's protocol-locked parts (`pl`). The first external add
+   mints its marginal depth (1/4001), and the protocol itself earns
+   the provider share of every fee pro-rata on its position —
+   fees-only forever (no withdrawable balance is ever minted for the
+   seed, so not even a compromised admin can turn it into principal).
+   The seed floor also carries the IX8 precision bound through
+   removes (IX9: `tl >= pl >= ACC_SCALE` forever).
+2. **Providers were locked in forever** — X12 (`remove_liquidity`,
+   chunk 32): any provider burns withdrawable parts for their exact
+   floored pro-rata share of BOTH reserves at the current ratio.
+   Price-neutral (IX7 holds on removes), min_out on both sides, fees
+   crystallised BEFORE the burn (an exit never forfeits earnings),
+   UNGATED (no pause check — the IX6 principle extended to provider
+   exits), and the seed floor is unreachable ("locked" +
+   "seederr" belt-and-braces). The pool can never be emptied
+   ("poolerr"/"parterr"). New view surface: `get_pool_state` exposes
+   the seed floor (9th field), `get_lp_info` the withdrawable balance
+   (4th field) — the frontend shows "depth X, of which the migration's
+   Y is permanent" and the live exit quote.

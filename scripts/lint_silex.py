@@ -200,13 +200,14 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "locked while the window is still open"
     ),
     ("LaunchDEX", "add_liquidity"): (
-        "public donation entry by design: the caller attaches BOTH assets "
+        "public deepening entry by design: the caller attaches BOTH assets "
         "and receives back at most its OWN excess side (X7 — the pool's "
         "ratio is enforced, the excess is refunded, so the price can never "
-        "be moved by a donation) — there is no remove_liquidity in the "
-        "entire contract (permanent protocol-owned liquidity, X2), so the "
-        "entry can only ever ADD value to the market at the market's own "
-        "price; the attached deposits bound exactly what it can take"
+        "be moved by a donation); what joins the reserves mints LP parts "
+        "AND withdrawable parts (X12 — the caller may exit pro-rata at any "
+        "time via remove_liquidity), while the migration's seed parts are "
+        "never withdrawable by anyone (X11/IX9 — the anti-rug floor); the "
+        "attached deposits bound exactly what the entry can ever touch"
     ),
     ("LaunchDEX", "claim_lp_fees"): (
         "pull-payout of the caller's OWN accrued provider fees (X10/D23): "
@@ -218,7 +219,25 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "requires keep even a hypothetical accounting bug from ever "
         "reaching the reserves (the entry would revert, funds stay in "
         "the pot); double claims are impossible (claimables zeroed on "
-        "payout) and the principal is untouchable (no remove_liquidity)"
+        "payout) and the principal is untouchable (remove_liquidity "
+        "burns withdrawable parts only, never the seed — X11/X12)"
+    ),
+    ("LaunchDEX", "remove_liquidity"): (
+        "exit path, public by design and NEVER blockable (no emergency "
+        "gate, no buys-pause gate — X12, the IX6 principle extended to "
+        "providers): the burn is bounded by the caller's OWN withdrawable "
+        "parts (l:{asset}:{caller}:w — every part minted by add_liquidity "
+        "and nothing else), so no provider can ever touch another "
+        "provider's liquidity NOR the protocol seed (the migration's parts "
+        "carry no withdrawable balance at all, X11/IX9 — the "
+        "belt-and-braces \"locked\"/\"parterr\"/\"seederr\" requires keep even "
+        "a hypothetical storage bug from crossing the seed floor); the "
+        "payout is the exact floored pro-rata of both reserves at the "
+        "current ratio (price-neutral, IX7) with min_out slippage guards "
+        "on both sides; accrued dues are crystallised BEFORE the burn so "
+        "nothing is forfeited; and the pool can never be emptied "
+        "(\"poolerr\" — the seed's parts are unburnable, so parts < tl "
+        "strictly and both outs stay strictly below the reserves, IX5)"
     ),
 }
 

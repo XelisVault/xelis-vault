@@ -13,6 +13,13 @@ invariant asserted after every action:
      branch behavior of the fit.
   C. IX6 ungated sells — sells succeed under BOTH the buys-pause and
      the emergency pause; buys are refused.
+  D. X10/D23 LP fee share — random multi-provider pools: adds, buys,
+     sells, dial moves, claims; IX8 (dues <= pots, counters <= lifetime
+     fees) after every action.
+  E. X12 provider removes (v1.3) — random adds/removes/swaps/claims
+     around the SEED FLOOR: tl >= pl forever, w never crosses the seed,
+     exact pro-rata payouts, IX7 holds on removes, fees crystallised
+     before burns survive them, and the pool can never be emptied.
 
 Exit 0 = PASS (all seeds), 1 = any failure.
 """
@@ -27,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sdk" / "xvault"))
 
 from test_launchpad_reference import DexSim, Sim, _fuzz_cfg  # noqa: E402
 from xvault import launchpad as lp  # noqa: E402
+from xvault import dex as dx  # noqa: E402
 
 XEL = 100_000_000
 SEEDS = 40
@@ -202,17 +210,94 @@ def fuzz_d23(seed: int) -> None:
         assert p["ax"] <= p["fl"] and p["ay"] <= p["fl"]
 
 
+def fuzz_x12(seed: int) -> None:
+    """X12 (v1.3): providers come and go around the SEED FLOOR — random
+    adds, removes (partial and full), buys and sells, with IX9 (tl >= pl
+    >= ACC_SCALE, w <= tl - pl), IX7 on removes, IX8 on fees, and the
+    never-emptied pool asserted after EVERY action."""
+    rng = random.Random(4000 + seed)
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    asset = "cd" * 32
+    seed_xel = rng.randrange(50, 5000) * XEL
+    dex.create_pool("lpx", asset, seed_xel, rng.randrange(10**6, 10**12))
+    p = dex.pools[asset]
+    pl0 = p["pl"]
+    assert pl0 == seed_xel and p["tl"] == seed_xel
+    providers = [f"p{i}" for i in range(rng.randrange(1, 6))]
+    for w in providers + ["t"]:
+        dex.wallets[w]["xel"] = 10**6 * XEL
+        dex.wallets[w]["assets"][asset] = 10**14
+    fees_owed = {w: 0 for w in providers}    # crystallised + accrued, tracked
+    for _ in range(80):
+        x, y, tl = p["x"], p["y"], p["tl"]
+        roll = rng.random()
+        w = rng.choice(providers)
+        pos = dex.lp[(asset, w)]
+        try:
+            if roll < 0.30:
+                # an add (proportional, like a real provider)
+                xel_add = rng.randrange(1, 50) * XEL
+                need_tok = y * xel_add // x
+                if dex.wallets[w]["assets"][asset] >= need_tok >= 1:
+                    fees_owed[w] = pos["cx"] + dx.lp_earnings(
+                        p["ax"], pos["sx"], pos["x"])
+                    dex.add_liquidity(w, asset, xel_add, need_tok)
+            elif roll < 0.55:
+                # a remove: partial or full exit of the withdrawable parts
+                if pos["w"] > 0:
+                    burn = (pos["w"] if rng.random() < 0.3
+                            else rng.randrange(1, pos["w"] + 1))
+                    fees_owed[w] = pos["cx"] + dx.lp_earnings(
+                        p["ax"], pos["sx"], pos["x"])
+                    out_x, out_y = dex.remove_liquidity(w, asset, burn)
+                    assert out_x == burn * x // tl, f"seed {seed}: bad pro-rata"
+                    assert out_y == burn * y // tl
+                    # the fees crystallised by the remove survive it
+                    pos_after = dex.lp[(asset, w)]
+                    assert pos_after["cx"] >= fees_owed[w] - 1, \
+                        f"seed {seed}: a remove forfeited accrued fees"
+                    # a remove can never empty the pool nor cross the seed
+                    assert p["x"] >= 1 and p["y"] >= 1
+                    assert p["tl"] >= p["pl"] >= dx.ACC_SCALE
+            elif roll < 0.75:
+                dex.swap_xel("t", asset, rng.randrange(1, 100) * XEL)
+            elif roll < 0.90:
+                held = dex.wallets["t"]["assets"][asset]
+                if held > 0:
+                    dex.swap_tokens("t", asset, rng.randrange(1, held + 1))
+            else:
+                dex.claim_lp_fees(w, asset)
+        except AssertionError as e:
+            ok = any(k in str(e) for k in
+                     ("dust", "ratio", "minlp", "nofees", "locked",
+                      "buyspaused", "poolerr", "seederr", "badamt"))
+            assert ok, f"seed {seed}: unexpected refusal {e}"
+        dex.check_invariants()
+        # the seed never moves, the depth never crosses it
+        assert p["pl"] == pl0, f"seed {seed}: the seed floor moved!"
+        assert p["tl"] >= p["pl"]
+        # the accrual bound (IX8) holds through removes
+        assert p["ax"] <= p["fl"] and p["ay"] <= p["fl"]
+    # the admin's seed position is STILL fees-only after everything
+    seed_pos = dex.lp[(asset, dex.admin)]
+    assert seed_pos["x"] == pl0 and seed_pos["w"] == 0
+
+
 def main() -> int:
     for seed in range(SEEDS):
         fuzz_d21(seed)
         fuzz_x7(seed)
         fuzz_ix6(seed)
         fuzz_d23(seed)
-    print(f"AUDIT 3 (v4.1+v1.2 FUZZ): PASS — {SEEDS} seeds x (D21 deposits, "
-          "X7 price-neutral adds, IX6 ungated sells, D23 LP fee share); "
-          "I2 pots identity, no double refunds, one-floor-unit price "
-          "bound, refunds within deposits, IX8 dues-within-pots and "
-          "accrual-within-lifetime — all held on every action.")
+        fuzz_x12(seed)
+    print(f"AUDIT 3 (v4.1+v1.2+v1.3 FUZZ): PASS — {SEEDS} seeds x (D21 "
+          "deposits, X7 price-neutral adds, IX6 ungated sells, D23 LP fee "
+          "share, X12 seed-floor removes); I2 pots identity, no double "
+          "refunds, one-floor-unit price bound (adds AND removes), refunds "
+          "within deposits, IX8 dues-within-pots and accrual-within-"
+          "lifetime, IX9 tl>=pl>=scale with the seed floor IMMOVABLE and "
+          "fees surviving burns — all held on every action.")
     return 0
 
 

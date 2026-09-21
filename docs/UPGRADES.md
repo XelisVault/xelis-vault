@@ -132,6 +132,8 @@ or a silent retarget of live value (pins are one-way doors).
 ```
 [ ] all CI gates green on the commit being deployed
 [ ] pinned chunks (6/7) unchanged OR both sides updated + tests green
+[ ] before ANY admin rotation: claim_lp_fees on the seed position of
+    every live pool (the parts stay with their owner at creation, X11)
 [ ] testnet lifecycle: full pass, provider fees claimed, pins frozen
 [ ] versions consistent (contract / VERSION / docs / SDK / doc-parity)
 [ ] CHANGELOG + announcement draft ready

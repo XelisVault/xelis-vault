@@ -5,11 +5,12 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v18.2** — real confidential assets,
-real migration, permanent liquidity that EARNS (LP fee share, 50/50
-default), hardened by two founder risk reviews (price-neutral DEX
-liquidity, ungated sells, sybil dial ON by default, stateless-site data
-bridges).
+[Silex](https://docs.xelis.io/). **v18.3** — real confidential assets,
+real migration, two-tier liquidity with a PERMANENT SEED FLOOR (the
+migration is protocol-locked forever; providers earn their pro-rata and
+can exit pro-rata anytime), hardened by three founder risk reviews
+(price-neutral DEX liquidity, ungated sells AND provider exits, sybil
+dial ON by default, stateless-site data bridges).
 
 ## What ships today
 
@@ -49,20 +50,27 @@ to the admin (no burn):
   hold real tokens in their own wallets from the first second — fully
   confidential balances, transferable anywhere on XELIS
 - **real migration (v18)**: graduation moves the curve's XEL reserves
-  and token inventory ATOMICALLY into a permanent
+  and token inventory ATOMICALLY into a
   [LaunchDEX](contracts/dex/LaunchDEX.slx) pool (one cross-contract call
   with attached deposits; permissionless `migrate()`); the curve keeps
   trading at the graduated fee until the pool exists
-- **LaunchDEX (v18)**: the permanent AMM for graduated tokens — no
-  remove_liquidity exists anywhere (the anti-rug guarantee), anyone can
-  deepen a pool forever (`add_liquidity`, PRICE-NEUTRAL since v1.1: the
-  pool's ratio is enforced and the excess is refunded — only swaps move
-  a price), fees 0.30% default split between the admin pot and the
-  POOL'S PROVIDERS (v1.2: pro-rata of LP depth, 50/50 default, dial
-  hard-bounded 25–75%, `claim_lp_fees` pull), per-pool scoreboard; the
-  community trust
+- **LaunchDEX (v18.2+v18.3)**: the AMM for graduated tokens with a
+  PERMANENT FLOOR — the migrated seed is protocol-locked FOREVER (its
+  LP parts carry no withdrawable balance; nobody can ever drain a pool
+  below its migration), while providers who deepen a pool
+  (`add_liquidity`, PRICE-NEUTRAL since v1.1: the pool's ratio is
+  enforced and the excess is refunded) hold withdrawable parts and may
+  exit pro-rata at any time (`remove_liquidity` v1.3: exact floored
+  payout, min_out both sides, NO gate — never the seed); fees 0.30%
+  default split between the admin pot and the POOL'S PROVIDERS (v1.2:
+  pro-rata of LP depth, 50/50 default, dial hard-bounded 25–75%,
+  `claim_lp_fees` pull), and since v1.3 the seed itself mints the
+  protocol's LP position (X11: the first external add mints 1/4001 of
+  a 4000 XEL pool, not 100% — and the protocol earns the provider
+  share on its position); per-pool scoreboard; the community trust
   system follows the tokens there (`sync_trust_to_dex` pauses pool buys,
-  never sells — and the emergency pause itself can never block a sell)
+  never sells — and the emergency pause itself can never block a sell,
+  a claim or a remove)
 - **founder risk review, closed (v18.1)**: (1) one-sided liquidity
   gifts can't skew markets (X7); (2) sells are ungated on BOTH venues;
   (3) the upgrade runbook assumes the frozen pins (side-by-side
@@ -80,6 +88,14 @@ to the admin (no burn):
   ceiling (public mempool; `min_out` everywhere; no MEV protection
   claimed); (4) the generation runbook written out step by step
   (`docs/UPGRADES.md`)
+- **founder risk review 3, closed (v18.3)**: (1) the seed's LP parts
+  mint to the protocol — the first-add fee-capture bug is dead (1 XEL
+  on a 4000 XEL pool = 1/4001 of the provider share, not 100%) and the
+  protocol earns the provider share on its position; (2) providers are
+  free — `remove_liquidity` pays the exact pro-rata exit under any
+  state (fees crystallised first, nothing forfeited), while the seed
+  floor is absolute ("locked"/"seederr" — not even the admin can
+  withdraw the migration)
 - team allocation (≤ 20%): claim in full at migration OR lock it in a
   linear vesting (public commitment signal); a project that never
   graduates releases the allocation after ~6 months of bonding —

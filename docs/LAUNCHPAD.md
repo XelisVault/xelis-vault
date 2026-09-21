@@ -40,10 +40,14 @@ every wallet and service. The bonding curve trades real deposits (buy:
 attach XEL, receive tokens in your wallet; sell: attach tokens, receive
 XEL — the whole deposit, nothing stranded). And graduation now really
 means **migration**: the curve's XEL reserves and its token inventory
-move ATOMICALLY into a permanent **LaunchDEX** pool (one cross-contract
-call with attached deposits; no remove_liquidity exists anywhere — the
-anti-rug guarantee). The launchpad keeps the project's home (votes,
-socials, trust, team escrow); the pool owns the market.
+move ATOMICALLY into a **LaunchDEX** pool (one cross-contract call with
+attached deposits) whose SEED is protocol-locked FOREVER — the seed's
+LP parts carry no withdrawable balance, so the migration can never be
+drained by anyone: that is the anti-rug floor. Providers who deepen
+the pool afterwards can exit pro-rata at any time
+(`remove_liquidity`); the floor cannot (DEX.md X11/X12). The launchpad
+keeps the project's home (votes, socials, trust, team escrow); the
+pool owns the market.
 
 **v4.1 — HARDENED BY THE FOUNDER RISK REVIEW (D21/D22).** Six risks were
 raised before going live; six are now closed in code and docs. (1) DEX
@@ -78,14 +82,19 @@ review's first two points, closed in code. (1) **LaunchDEX v1.2 — LP
 fee share (X10/D23)**: adding liquidity to a migrated pool now EARNED
 its keep — every swap fee splits between the admin pot and the pool's
 liquidity providers, pro-rata of each provider's share of the pool's LP
-depth. Default 50/50, admin-settable but hard-bounded [25%, 75%]; the
-principal stays permanent (still no remove_liquidity anywhere — only
-fees ever flow out). The full design, the accrual math and the IX8
-solvency proof live in `docs/DEX.md`. (2) **The sybil dial ships ON by
-default**: `vote_deposit` now defaults to **0.5 XEL refundable** — 20
-farmed wallets deciding a validation park 10 XEL of capital while they
-do it; the admin can still zero it or raise it (cap 10 XEL), and a raise
-never touches already-locked deposits.
+depth. Default 50/50, admin-settable but hard-bounded [25%, 75%].
+(v1.3, the third founder review) **the seed mints LP parts to the
+protocol (X11)** — the first external add mints its marginal depth
+(1 XEL on a 4000 XEL pool = 1/4001 of the fees, not 100%), and the
+protocol earns the provider share on its position (fees-only, forever);
+**providers can exit pro-rata at any time (X12, `remove_liquidity`)**
+while the seed never leaves (no withdrawable balance is ever minted
+for it — the anti-rug floor is absolute). The full design, the accrual
+math and the IX8/IX9 proofs live in `docs/DEX.md`. (2) **The sybil
+dial ships ON by default**: `vote_deposit` now defaults to **0.5 XEL
+refundable** — 20 farmed wallets deciding a validation park 10 XEL of
+capital while they do it; the admin can still zero it or raise it
+(cap 10 XEL), and a raise never touches already-locked deposits.
 
 Two contracts, one architecture. Zero other dependencies.
 
@@ -234,11 +243,12 @@ strands a hot project).
 
 **`migrate(pid)` — permissionless, atomic.** One transaction, callable by
 anyone: the curve's whole XEL reserves and its whole token inventory
-(team escrow excepted) seed a permanent LaunchDEX pool via a single
-cross-contract call with **attached deposits** (the funds and the pool
-creation are one atomic operation — a failure anywhere reverts
-everything). After it: the curve is closed forever (`"migrated"`), the
-pool owns the market, and the launchpad keeps the project's home —
+(team escrow excepted) seed a LaunchDEX pool whose seed is
+protocol-locked forever, via a single cross-contract call with
+**attached deposits** (the funds and the pool creation are one atomic
+operation — a failure anywhere reverts everything). After it: the curve
+is closed forever (`"migrated"`), the pool owns the market, and the
+launchpad keeps the project's home —
 votes, socials, trust system, team escrow claims.
 
 **The DEX pin (D19).** `set_dex_address` (admin) is possible only while
@@ -257,11 +267,16 @@ project is Untrusted AT migration time, `migrate()` pauses the pool's
 buys in the SAME transaction (no unprotected window). Sells on the pool
 are never pausable (D4).
 
-**The anti-rug core (D16 / LaunchDEX X2).** There is NO
-`remove_liquidity` on LaunchDEX: migrated liquidity is permanent,
-protocol-owned, and can only grow (`add_liquidity` is an open, permanent
-donation). Nobody — not the admin, not the founder, not the launchpad —
-can ever drain a pool.
+**The anti-rug core (D16 / LaunchDEX X11+X12).** The seed is protocol-locked
+FOREVER: the migrated liquidity's LP parts are minted to the protocol's
+own position with NO withdrawable balance, so nobody — not the admin,
+not the founder, not the launchpad — can ever drain a pool below its
+migration. Providers who deepen the pool with
+`add_liquidity` hold withdrawable parts and may exit pro-rata at any
+time (`remove_liquidity`, price-neutral, fees crystallised first) — a
+provider is never trapped; the floor never moves. Say it loudly on the
+frontend: **PROVIDERS CAN LEAVE AT ANY TIME, THE MIGRATED SEED NEVER
+LEAVES.**
 
 See `docs/DEX.md` for the LaunchDEX specification.
 
@@ -572,8 +587,9 @@ parameters), `get_recovery_config()`, `get_team_config()`.
 - The migration is permissionless and its outcome fully determined:
   `migrate()` can only send the project's OWN reserves and inventory to
   the PINNED DEX contract — no destination, no amount, no caller
-  choice. The pool it seeds has NO remove_liquidity (nobody can ever
-  drain it — D16).
+  choice. The pool it seeds has a PROTOCOL-LOCKED floor (the seed's
+  parts are never withdrawable by anyone — D16/X11), and the protocol
+  earns the provider share of every fee on its seed position (X11).
 - The cross-contract surface is exactly two outbound calls
   (`create_pool`, `set_pool_buys_paused`), both inbound-guarded on the
   DEX side (pinned launchpad) and outbound-guarded here (frozen dex
@@ -644,8 +660,9 @@ playbook for a critical bug on a live generation); the summary:
    (`set_launchpad`) BEFORE its first pool.
 2. Deploy/point the new VaultLaunch, `set_dex_address` to the new DEX
    BEFORE its first migration.
-3. Old venues keep serving their pools and curves FOREVER (permanent
-   liquidity, no remove_liquidity) — nothing migrates, nothing breaks.
+3. Old venues keep serving their pools and curves FOREVER (the seed
+   floor is protocol-locked in every generation) — nothing migrates,
+   nothing breaks.
 4. The site aggregates generations: each launchpad instance enumerates
    its own projects; each DEX instance exposes `get_launchpad()` so the
    frontend can verify which generation owns which pools, and every
@@ -894,9 +911,12 @@ the admin's revenue dial.
    wallet, contract-call permission) → `MigratedToDex`; curve closed
    (buy/sell now revert "migrated"); the LaunchDEX pool holds exactly
    `mx`/`mt`; swap both ways on the DEX (`swap_xel_for_token` /
-   `swap_token_for_xel`) with real wallet balances; `add_liquidity` (a
-   permanent donation) deepens the pool; `withdraw_fees` on the DEX
-   pays the pending pots to the DEX admin.
+   `swap_token_for_xel`) with real wallet balances; `add_liquidity`
+   deepens the pool and mints withdrawable parts; `remove_liquidity`
+   pays the exact pro-rata exit (and MUST refuse the seed — "locked");
+   `claim_lp_fees` pays provider fees (the admin's seed position
+   included); `withdraw_fees` on the DEX pays the pending pots to the
+   DEX admin.
 7. **Trust drill across venues (D17)**: report a project to 80% → buys
    blocked on the curve; migrate or `sync_trust_to_dex` → pool buys
    paused, pool sells still open; `request_revalidation` (250 XEL when

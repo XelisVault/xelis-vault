@@ -146,6 +146,36 @@ for piece in ("claim-lp-fees", "set-fee-split", "def cmd_dex_lp",
               "LAUNCHDEX_ENTRY_IDS[\"set_fee_split\"]"):
     check(piece in cli_src, f"CLI missing {piece} (v1.2/X10)")
 
+# 11. the v1.3 surface (X11/X12): seed shares, removes, the floor views
+for piece in ("def remove_liquidity_params", "def remove_outs",
+              "LPF_W", "F_LP_LOCKED"):
+    check(piece in dex_src, f"xvault.dex missing {piece} (v1.3/X11-X12)")
+check("remove_liquidity_params" in dir(dx), "SDK remove builder not importable")
+# the remove math mirrors the contract exactly (floored pro-rata, both sides)
+check("parts * xel_reserve // total_depth" in dex_src and
+      "parts * token_reserve // total_depth" in dex_src,
+      "SDK remove_outs formula drifted from the contract (X12)")
+# the contract's guards and the SDK's refusals agree
+check('require(parts <= w, "locked")' in DEX_SRC and
+      '"poolerr"' in DEX_SRC and '"seederr"' in DEX_SRC,
+      "contract remove_liquidity no longer carries the X12 guards")
+check('ValueError("poolerr")' in dex_src and
+      'ValueError("dust")' in dex_src,
+      "SDK remove_outs refusals drifted from the contract (X12)")
+# the seed mint + the fees-only guarantee in the contract
+check("s.store(pool_key(asset, F_LP_LOCKED), xel_seed)" in DEX_SRC,
+      "contract create_pool no longer mints the seed floor (X11)")
+check("s.store(seed_lkey + LPF_XEL, xel_seed)" in DEX_SRC and
+      "s.store(seed_lkey + LPF_W" not in DEX_SRC,
+      "the seed position must mint parts but NEVER withdrawable parts (X11)")
+# the reader carries the seed floor + the withdrawable balance
+for piece in ('"lp_locked_depth", F_LP_LOCKED', '"withdrawable": w'):
+    check(piece in dex_src, f"DexReader missing the v1.3 field {piece}")
+# CLI surfaces the remove
+for piece in ("remove-liquidity", "def cmd_dex_remove_liquidity",
+              "LAUNCHDEX_ENTRY_IDS[\"remove_liquidity\"]"):
+    check(piece in cli_src, f"CLI missing {piece} (v1.3/X12)")
+
 if fails:
     print("AUDIT 4 (SDK PARITY) FAILED:")
     for f in fails:
@@ -153,6 +183,8 @@ if fails:
     sys.exit(1)
 print("AUDIT 4 (SDK PARITY): PASS — signatures (incl. whole-deposit sell), "
       "entry-ids on BOTH contracts, pinned cross-call chunks, defaults, "
-      "budget deposits, the v4 reader surface, the dex math mirror and the "
-      "v4.1 hardening surface (D21/D22/X7) and the v1.2 LP revenue\n"
-      "surface (X10/D23: split, accrual, claims, bounds) all agree with the contracts.")
+      "budget deposits, the v4 reader surface, the dex math mirror, the "
+      "v4.1 hardening surface (D21/D22/X7), the v1.2 LP revenue\n"
+      "surface (X10/D23: split, accrual, claims, bounds) and the v1.3\n"
+      "two-tier surface (X11 seed shares, X12 removes, the floor views)\n"
+      "all agree with the contracts.")

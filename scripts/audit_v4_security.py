@@ -38,7 +38,21 @@ PUBLIC_BY_DESIGN = {
     ("VaultLaunch", "sync_trust_to_dex"): "permissionless keeper — mirrors the public trust status to the pool's buys-pause",
     ("LaunchDEX", "swap_xel_for_token"): "payable-style — bounded by the caller's OWN XEL deposit",
     ("LaunchDEX", "swap_token_for_xel"): "payable-style — bounded by the caller's OWN token deposit (whole-deposit)",
-    ("LaunchDEX", "add_liquidity"): "public permanent donation — bounded by BOTH attached deposits; only the caller's OWN excess side can come back (X7 ratio fit)",
+    ("LaunchDEX", "add_liquidity"): "public deepening — bounded by BOTH attached deposits; only the caller's OWN excess side can come back (X7 ratio fit); mints withdrawable parts the caller may burn later (X12)",
+    ("LaunchDEX", "remove_liquidity"): (
+        "exit path, never blockable (X12 — no pause gate, the IX6 "
+        "principle extended to providers): the burn is bounded by the "
+        "caller's OWN withdrawable parts (l:{asset}:{caller}:w — minted "
+        "only by add_liquidity, never by the seed), so no provider can "
+        "touch another provider's liquidity NOR the protocol seed (X11: "
+        "the migration's parts carry no withdrawable balance; the "
+        "\"locked\"/\"parterr\"/\"seederr\" belt-and-braces keeps even a "
+        "hypothetical storage bug from crossing the seed floor); the "
+        "payout is the exact floored pro-rata of both reserves (IX7 "
+        "price-neutral, min_out both sides, \"poolerr\" — the pool can "
+        "never be emptied) and accrued dues are crystallised BEFORE the "
+        "burn so nothing is forfeited"
+    ),
 }
 
 fails = []
@@ -118,7 +132,14 @@ for path in FILES:
                  (b == "team_alloc_of" and "require(team_bps <= MAX_TEAM_BPS" in ctx) or
                  # DEX swap floors: require(wide < (y as u128)) with
                  # out = wide as u64, checked right above the store
-                 (b == "out" and re.search(r"require\(wide < \(" + a + r" as u128\)", ctx)))
+                 (b == "out" and re.search(r"require\(wide < \(" + a + r" as u128\)", ctx)) or
+                 # X12 removes (v1.3): the reserve subtractions are guarded
+                 # by the split "poolerr" pair (x > out_xel / y > out_tok),
+                 # and tl - parts by the seed-floor require (the u128 cast
+                 # form: (tl - parts) >= pl, "seederr") plus parts <= w
+                 # ("locked") with sum(w) <= tl - pl by construction
+                 (b.startswith("out_") and f"{a} > {b}" in ctx) or
+                 (a == "tl" and b == "parts" and '"seederr"' in ctx))
             if not guarded:
                 fails.append(f"{stem}:{n} unguarded `{frag}` in `{fn[0]}`: {stripped[:70]}")
 

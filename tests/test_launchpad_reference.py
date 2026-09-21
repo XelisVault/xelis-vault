@@ -220,12 +220,15 @@ def test_storage_keys_match_the_contract_layout():
 # ===========================================================================
 
 class DexSim:
-    """Faithful replay of LaunchDEX: pools, swaps, fees, trust hook,
-    and since v1.2 the X10/D23 LP fee share (accrual-per-unit, pull
-    claims, hard-bounded split dial)."""
+    """Faithful replay of LaunchDEX: pools, swaps, fees, trust hook, the
+    X10/D23 LP fee share (accrual-per-unit, pull claims, hard-bounded
+    split dial) and since v1.3 the two-tier liquidity model: X11 seed
+    shares (the protocol LP position, fees-only forever) and X12
+    remove_liquidity (providers exit pro-rata, never the seed)."""
 
     def __init__(self, cfg=None):
         self.cfg = dict(dx.DEFAULTS, **(cfg or {}))
+        self.admin = "admin"           # X11: the protocol LP address
         self.pools = {}             # asset -> dict(x, y, xf, yf, bp, ...)
         self.index = []             # listing order
         self.xel_balance = 0        # contract XEL balance
@@ -235,9 +238,9 @@ class DexSim:
         self.emergency = False
         self.wallets = defaultdict(lambda: {"xel": 0,
                                             "assets": defaultdict(int)})
-        # X10/D23: l:{asset}:{wallet}:{x,sx,sy,cx,cy}
+        # X10/D23 + X12: l:{asset}:{wallet}:{x,sx,sy,cx,cy,w}
         self.lp = defaultdict(lambda: {"x": 0, "sx": 0, "sy": 0,
-                                       "cx": 0, "cy": 0})
+                                       "cx": 0, "cy": 0, "w": 0})
         self.topo = 0
 
     def set_launchpad(self, addr):
@@ -251,12 +254,21 @@ class DexSim:
         assert asset not in self.pools, "exists"
         assert xel_seed >= self.cfg["min_seed_xel"]
         assert tok_seed >= self.cfg["min_seed_tokens"]
+        # X11: the seed IS the pool's permanent LP floor (IX9's half of
+        # the IX8 bound: pl >= ACC_SCALE, removes can never cross pl)
+        assert xel_seed >= dx.MIN_LP_ADD_XEL, "seedlp"
         self.xel_balance += xel_seed
         self.asset_balances[asset] += tok_seed
         self.pools[asset] = {"x": xel_seed, "y": tok_seed, "xf": 0, "yf": 0,
                              "bp": False, "ct": self.topo, "bv": 0, "sv": 0,
                              "tc": 0, "lt": 0, "fl": 0, "lp": 0,
-                             "lx": 0, "ly": 0, "tl": 0, "ax": 0, "ay": 0}
+                             "lx": 0, "ly": 0, "tl": xel_seed, "ax": 0,
+                             "ay": 0, "pl": xel_seed}
+        # X11: mint the seed's LP parts to the admin (fees-only: no w)
+        seed = self.lp[(asset, self.admin)]
+        seed["x"] = xel_seed
+        seed["sx"] = 0
+        seed["sy"] = 0
         self.index.append(asset)
         if not self.pinned:
             self.pinned = True
@@ -269,8 +281,9 @@ class DexSim:
 
     def _split_fee(self, asset, fee, side):
         """X10/D23: split a swap fee between the admin pot and the LP
-        distribution (redirecting to the admin while the pool has no
-        provider — no fee is ever stranded). Mirrors both swap entries."""
+        distribution (the no-provider redirect is defense-in-depth since
+        X11 — the seed mints parts at creation, so tl > 0 from birth).
+        Mirrors both swap entries."""
         p = self.pools[asset]
         lp_part = fee * self.cfg["lp_share_bps"] // 10_000
         adm_part = fee - lp_part
@@ -357,7 +370,8 @@ class DexSim:
         A donation can deepen a pool but NEVER move its price. Since v1.2
         the donor becomes a PROVIDER (X10/D23): parts join AFTER its
         accrued fees are crystallised, and the effective XEL side must
-        clear the hard 1 XEL LP-entry floor."""
+        clear the hard 1 XEL LP-entry floor. Since v1.3 the minted parts
+        are WITHDRAWABLE (X12): pos["w"] grows with pos["x"]."""
         p = self.pools[asset]
         assert not self.emergency
         assert xel_in >= 1 and tok_in >= 1
@@ -393,8 +407,50 @@ class DexSim:
         p["lp"] += 1
         pos = self._lp_pos(asset, wallet)
         pos["x"] += xel_eff
+        pos["w"] += xel_eff            # X12: withdrawable
         p["tl"] += xel_eff
         return xel_eff, tok_eff
+
+    def remove_liquidity(self, wallet, asset, parts, min_xel_out=0, min_tokens_out=0):
+        """X12 (v1.3): burn WITHDRAWABLE parts for their exact pro-rata
+        share of BOTH reserves at the current ratio. NEVER the seed
+        ("locked"), never more than the caller's own parts ("parterr"),
+        never across the seed floor ("seederr"), never the last unit of
+        a side ("poolerr"), min_out on both sides ("slip"), and the
+        caller's accrued dues are crystallised FIRST so nothing is
+        forfeited. UNGATED (X12): works under the emergency pause."""
+        assert asset in self.pools, "nopool"
+        assert parts >= 1, "badamt"
+        pos = self._lp_pos(asset, wallet)
+        assert parts <= pos["w"], "locked"
+        assert parts <= pos["x"], "parterr"
+        p = self.pools[asset]
+        x, y, tl, pl = p["x"], p["y"], p["tl"], p["pl"]
+        assert x > 0 and y > 0 and tl > 0, "empty"
+        assert tl - parts >= pl, "seederr"
+        # X10: crystallise the dues BEFORE the parts shrink (nothing is
+        # forfeited — the claimables survive the burn)
+        self._crystallise(asset, wallet)
+        out_x = parts * x // tl
+        out_y = parts * y // tl
+        assert out_x >= 1 and out_y >= 1, "dust"
+        assert out_x >= min_xel_out and out_y >= min_tokens_out, "slip"
+        assert out_x < x and out_y < y, "poolerr"
+        # IX7 (X12): the remove keeps the reserve product within one
+        # floor unit — price-neutral, like the add
+        x1, y1 = x - out_x, y - out_y
+        assert abs(x1 * y - x * y1) < max(x, y), "IX7 broken (remove)"
+        # state first, funds after (X9)
+        p["x"] = x1
+        p["y"] = y1
+        pos["x"] -= parts
+        pos["w"] -= parts
+        p["tl"] = tl - parts
+        self.xel_balance -= out_x
+        self.wallets[wallet]["xel"] += out_x
+        self.asset_balances[asset] -= out_y
+        self.wallets[wallet]["assets"][asset] += out_y
+        return out_x, out_y
 
     def claim_lp_fees(self, wallet, asset):
         """X10/D23: pull payout of the provider's OWN accrued fees (both
@@ -447,6 +503,16 @@ class DexSim:
             # the accrual counter can never outgrow lifetime fees (the
             # IX8 bound: total_depth >= ACC_SCALE, so increments <= fees)
             assert p["ax"] <= p["fl"] and p["ay"] <= p["fl"]
+            # IX9 (X11/X12): the seed never leaves — tl >= pl >= ACC_SCALE
+            # forever, and the withdrawable balance can never cross it
+            assert p["pl"] >= dx.ACC_SCALE, "IX9 broken: seed below scale"
+            assert p["tl"] >= p["pl"], "IX9 broken: depth below the seed"
+            sum_w = sum(pos["w"] for (a, _w), pos in self.lp.items()
+                        if a == asset)
+            assert sum_w <= p["tl"] - p["pl"], "IX9 broken: w crosses the seed"
+            for (a, _w), pos in self.lp.items():
+                if a == asset:
+                    assert pos["w"] <= pos["x"], "IX9 broken: w > parts"
 
 
 LAUNCHPAD_ADDR = "xvault:launchpad"   # the simulated launchpad's address
@@ -1612,14 +1678,23 @@ def test_cross_calls_are_exactly_the_pinned_pair_d19():
 
 def test_dex_contract_structure():
     src = DEX_CONTRACT.read_text()
-    # the anti-rug core: NO remove_liquidity entry exists (comments may
-    # mention its absence; the ENTRY is what matters)
-    assert not re.search(r"^(?:entry|pub fn|fn) remove_liquidity", src, re.M)
+    # the anti-rug core, v1.3 (X11/X12): remove_liquidity EXISTS but the
+    # seed can NEVER leave — the burn is bounded by the caller's own
+    # withdrawable balance (never minted for the seed) and the seed floor
+    # is re-asserted belt-and-braces. No whole-pool drain entry exists.
+    assert re.search(r"^(?:entry|pub fn|fn) remove_liquidity", src, re.M)
+    assert 'require(parts <= w, "locked")' in src
+    assert '"seederr"' in src and '"parterr"' in src
+    assert 's.store(pool_key(asset, F_LP_LOCKED), xel_seed)' in src
+    # the seed parts mint NO withdrawable balance (fees-only, X11)
+    m = re.search(r"entry create_pool\(.*?\n\}", src, re.S)
+    assert m, "create_pool not found"
+    assert 's.store(seed_lkey + LPF_W' not in m.group(0)
     assert not re.search(r"^(?:entry|pub fn|fn) withdraw_pool", src, re.M)
     for entry in ("create_pool", "set_pool_buys_paused", "swap_xel_for_token",
                   "swap_token_for_xel", "add_liquidity", "set_swap_fee",
                   "set_trade_bounds", "set_launchpad", "set_admin",
-                  "set_paused", "withdraw_fees"):
+                  "set_paused", "withdraw_fees", "remove_liquidity"):
         assert re.search(rf"^entry {entry}\(", src, re.M), entry
     # X4: the launchpad pin freezes at the first pool
     assert 's.store(LAUNCHPAD_PINNED_KEY, true)' in src
@@ -1651,7 +1726,7 @@ def test_contract_is_substantial_and_documents_its_chunk_table():
     assert "VAULTLAUNCH" not in src or True
     assert 'const VERSION: string = "VaultLaunch v4.2.0"' in src
     dex_src = DEX_CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.2.0"' in dex_src
+    assert 'const VERSION: string = "LaunchDEX v1.3.0"' in dex_src
     assert "CHUNK TABLE (entry-point IDs" in dex_src
 
 
@@ -1838,27 +1913,40 @@ def test_x5_dex_sells_work_under_emergency_pause():
 
 
 def test_d23_providers_earn_pro_rata_and_claims_pay_x10():
-    """X10/D23: fees split 50/50 admin/providers; providers earn pro-rata
-    of their share of the LP depth; claims pay out of the LP pots only;
-    before the first provider the LP share reverts to the admin."""
+    """X10/D23 + X11: fees split 50/50 admin/providers; providers earn
+    pro-rata of their share of the LP depth; claims pay out of the LP pots
+    only; and since v1.3 the SEED is the first provider — the protocol LP
+    position accrues the provider share from the pool's very first fee
+    (founder risk review v18.3: "part of the fees comes back to the
+    protocol" — and the first external add can no longer capture the
+    whole fee stream)."""
     dex = DexSim()
     dex.set_launchpad("lpx")
     a = "cc" * 32
     dex.create_pool("lpx", a, 1000 * XEL, 10**9)
     p = dex.pools[a]
-    # fees BEFORE any provider: the LP share reverts to the admin
+    # X11: the seed minted the protocol LP position at creation — tl = pl
+    # = the XEL seed, admin parts fees-only (no withdrawable balance)
+    assert p["tl"] == 1000 * XEL and p["pl"] == 1000 * XEL
+    seed_pos = dex.lp[(a, dex.admin)]
+    assert seed_pos["x"] == 1000 * XEL and seed_pos["w"] == 0
+    # fees BEFORE any external provider: the LP share accrues to the SEED
+    # (nothing reverts to the admin pot anymore — the pot has a provider
+    # from birth; the admin collects via claim_lp_fees on its position)
     dex.wallets["t"]["xel"] = 200 * XEL
     dex.swap_xel("t", a, 10 * XEL)
     fee1 = dx.fee_take(10 * XEL, dex.cfg["swap_fee_bps"])
-    assert p["lx"] == 0 and p["ly"] == 0 and p["ax"] == 0
-    assert p["xf"] == fee1                    # everything went to the admin
-    # two providers: 100 XEL and 300 XEL of depth (25% / 75%)
+    lp1 = dx.fee_split(fee1, dex.cfg["lp_share_bps"])[1]
+    assert p["xf"] == fee1 - lp1
+    assert p["lx"] == lp1
+    assert p["ax"] == dx.accrual_increment(lp1, 1000 * XEL)
+    # two providers: 100 XEL and 300 XEL of depth (25%/75% of the adds)
     for w in ("p1", "p2"):
         dex.wallets[w]["xel"] = 400 * XEL
         dex.wallets[w]["assets"][a] = 10**10
     dex.add_liquidity("p1", a, 100 * XEL, p["y"] * 100 * XEL // p["x"])
     dex.add_liquidity("p2", a, 300 * XEL, p["y"] * 300 * XEL // p["x"])
-    assert p["tl"] == 400 * XEL
+    assert p["tl"] == 1400 * XEL           # seed + adds
     assert dex.lp[(a, "p1")]["x"] == 100 * XEL
     assert dex.lp[(a, "p2")]["x"] == 300 * XEL
     # a buy accrues fees on the XEL side; the split is 50/50
@@ -1866,9 +1954,10 @@ def test_d23_providers_earn_pro_rata_and_claims_pay_x10():
     fee_buy = dx.fee_take(50 * XEL, dex.cfg["swap_fee_bps"])
     lp_part = dx.fee_split(fee_buy, dex.cfg["lp_share_bps"])[1]
     adm_part = fee_buy - lp_part
-    assert p["xf"] == fee1 + adm_part
-    assert p["lx"] == lp_part
-    assert p["ax"] == dx.accrual_increment(lp_part, 400 * XEL)
+    assert p["xf"] == fee1 - lp1 + adm_part
+    assert p["lx"] == lp1 + lp_part
+    assert p["ax"] == dx.accrual_increment(lp1, 1000 * XEL) + \
+        dx.accrual_increment(lp_part, 1400 * XEL)
     # the sell side accrues on the token side (same denominator: tl)
     dex.swap_tokens("t", a, out)
     fee_sell = dx.fee_take(out, dex.cfg["swap_fee_bps"])
@@ -1878,8 +1967,11 @@ def test_d23_providers_earn_pro_rata_and_claims_pay_x10():
     pos1, pos2 = dex.lp[(a, "p1")], dex.lp[(a, "p2")]
     earn1_x = dx.lp_earnings(p["ax"], pos1["sx"], pos1["x"])
     earn2_x = dx.lp_earnings(p["ax"], pos2["sx"], pos2["x"])
-    assert earn1_x + earn2_x <= p["lx"], "IX8: dues can never exceed the pot"
-    assert earn2_x == earn1_x * 3              # 75% vs 25% of the depth
+    earn_seed_x = dx.lp_earnings(p["ax"], seed_pos["sx"], seed_pos["x"])
+    assert earn1_x + earn2_x + earn_seed_x <= p["lx"], \
+        "IX8: dues can never exceed the pot"
+    assert earn2_x == earn1_x * 3              # 75% vs 25% of the ADDED depth
+    assert earn_seed_x > earn1_x + earn2_x     # X11: the seed earns the most
     # claims pay out of the pots and leave the invariant intact
     before1 = dex.wallets["p1"]["xel"]
     paid1_x, paid1_y = dex.claim_lp_fees("p1", a)
@@ -1888,8 +1980,16 @@ def test_d23_providers_earn_pro_rata_and_claims_pay_x10():
     assert dex.lp[(a, "p1")]["cx"] == 0
     paid2_x, _ = dex.claim_lp_fees("p2", a)
     assert paid2_x == earn2_x
-    # after both claims, at most dust remains in the pots (IX8 floors)
-    assert p["lx"] <= 2  # sub-unit dust per provider per fee
+    # X11: the ADMIN claims the seed position's dues — the protocol's
+    # provider revenue, same public pull as everyone else
+    before_adm = dex.wallets[dex.admin]["xel"]
+    paid_seed_x, paid_seed_y = dex.claim_lp_fees(dex.admin, a)
+    assert dex.wallets[dex.admin]["xel"] == before_adm + paid_seed_x
+    assert paid_seed_x == earn_seed_x
+    # after all claims, only floor dust remains in the pots (IX8 floors:
+    # each fee event's increment floors, leaving < depth-in-whole-XEL
+    # units; here depth = 1400 XEL, two XEL-side fee events, 3 claimants)
+    assert p["lx"] <= 2803
     dex.check_invariants()
     # a second claim with nothing accrued: "nofees"
     with pytest.raises(AssertionError, match="nofees"):

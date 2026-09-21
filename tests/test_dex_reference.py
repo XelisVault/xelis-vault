@@ -1,22 +1,31 @@
-"""LaunchDEX reference tests — the permanent AMM for graduated tokens.
+"""LaunchDEX reference tests — the AMM for graduated tokens with a
+PERMANENT FLOOR.
 
 Asserts, against the REAL contract source:
   1. the chunk table (declaration order) matches the SDK's
      LAUNCHDEX_ENTRY_IDS — the ABI reference real transactions build from;
   2. the two chunks VaultLaunch cross-calls are pinned on BOTH sides
      (VaultLaunch's constants vs LaunchDEX's real positions — D19);
-  3. the anti-rug core: no remove_liquidity entry can exist;
+  3. the anti-rug core, v1.3 (X11/X12): remove_liquidity exists (providers
+     are free) but the migrated seed is protocol-locked FOREVER — its
+     parts carry no withdrawable balance and no burn can cross the floor;
   4. the launchpad pin freeze at the first pool (X4);
-  5. the swap math properties (never insolvent, fees extracted not pooled).
+  5. the swap math properties (never insolvent, fees extracted not pooled);
+  6. the v1.3 economics fix (X11): the first add on a seeded pool mints
+     1/4001 of the depth, not 100% of it (founder risk review, point 1).
 """
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sdk" / "xvault"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+
+import pytest  # noqa: E402
 
 from xvault import dex as dx  # noqa: E402
 from xvault.protocol import LAUNCHDEX_ENTRY_IDS, LAUNCHDEX_ENTRY_IDS_ALT  # noqa: E402
+from test_launchpad_reference import DexSim  # noqa: E402
 
 XEL = 100_000_000
 DEX_CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "dex" / "LaunchDEX.slx"
@@ -56,12 +65,178 @@ def test_pinned_cross_call_chunks_d19():
     assert LAUNCHDEX_ENTRY_IDS["set_pool_buys_paused"] == int(m2.group(1))
 
 
-def test_no_remove_liquidity_can_exist():
-    """The anti-rug core (X2): nothing can ever drain a pool."""
+def test_the_seed_is_protocol_locked_x11_x12():
+    """The anti-rug core, v1.3 (X11/X12): remove_liquidity EXISTS (providers
+    are free) but the migrated seed can NEVER leave — its parts carry no
+    withdrawable balance, the burn is bounded by the caller's own
+    withdrawable parts, and the seed floor is re-asserted belt-and-braces.
+    No whole-pool drain entry exists."""
     src = DEX_CONTRACT.read_text()
-    assert not re.search(r"^(?:entry|pub fn|fn) remove_liquidity", src, re.M)
+    m = re.search(r"entry remove_liquidity\(.*?\n\}", src, re.S)
+    assert m, "remove_liquidity not found"
+    body = m.group(0)
+    # the burn is bounded by the caller's OWN withdrawable balance and
+    # the seed floor is unreachable (X11/X12 + IX9)
+    assert 'require(parts <= w, "locked")' in body
+    assert '"seederr"' in body and '"parterr"' in body
+    assert '"poolerr"' in body and '"dust"' in body and '"slip"' in body
+    # NO gate on the exit (X12 — the IX6 principle extended to providers)
+    assert '"paused"' not in body
+    assert "EMERGENCY_KEY" not in body
+    assert "buyspaused" not in body
+    # create_pool mints the seed's parts to the admin WITHOUT a
+    # withdrawable balance (X11) and records the locked floor
+    cp = re.search(r"entry create_pool\(.*?\n\}", src, re.S)
+    assert cp, "create_pool not found"
+    cp_body = cp.group(0)
+    assert 's.store(pool_key(asset, F_LP_TOTAL), xel_seed)' in cp_body
+    assert 's.store(pool_key(asset, F_LP_LOCKED), xel_seed)' in cp_body
+    assert 's.store(seed_lkey + LPF_XEL, xel_seed)' in cp_body
+    assert 's.store(seed_lkey + LPF_W' not in cp_body
+    assert 'require(xel_seed >= MIN_LP_ADD_XEL, "seedlp")' in cp_body
+    # no whole-pool drain entry, ever
     assert not re.search(r"^(?:entry|pub fn|fn) withdraw_pool", src, re.M)
     assert not re.search(r"^(?:entry|pub fn|fn) drain", src, re.M)
+    # the seed position is fees-only forever: get_lp_info exposes the
+    # withdrawable balance (4th field) so frontends can SHOW the floor
+    assert "pub fn get_lp_info(asset: Hash, wallet: Address) -> (u64, u64, u64, u64)" in src
+    assert "pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64)" in src
+
+
+def test_x11_the_first_add_cannot_capture_a_seeded_pool():
+    """Founder risk review v18.3, point 1 — THE economics bug: before
+    v1.3, create_pool planted the reserves but minted NO LP parts (tl = 0),
+    so the first 1 XEL add on a 4000 XEL pool captured 100% of the
+    provider fee share. With the seed shares (X11) the same add mints
+    1/4001 of the depth. The exact scenario from the review, as a model."""
+    seed = 4000 * XEL
+    first_add = 1 * XEL
+    # v1.3: tl = seed at birth; the first add mints its marginal depth
+    tl = seed + first_add
+    provider_share = first_add / tl
+    assert abs(provider_share - 1 / 4001) < 1e-12
+    assert provider_share < 0.00025           # 0.025%, not 100%
+    # the SDK mirror of the fee math agrees end to end
+    lp_part = 1_000_000                       # any fee
+    inc = dx.accrual_increment(lp_part, tl)
+    assert inc <= lp_part                     # IX8 bound (tl >= ACC_SCALE)
+    earn = dx.lp_earnings(inc, 0, first_add)
+    assert earn <= lp_part // 4000            # a sliver of the fee, not all
+    # v1.2 (the bug): tl = 0 at birth -> the first add WAS the depth
+    tl_bug = 0 + first_add
+    assert tl_bug == first_add                # the first provider held 100%
+    # and the guard that makes the fix structural: the seed must clear
+    # the 1 XEL LP floor at creation (seed parts = the permanent floor)
+    assert "const MIN_LP_ADD_XEL: u64 = 100000000" in DEX_CONTRACT.read_text()
+
+
+def test_x12_remove_liquidity_full_lifecycle():
+    """X12: providers exit pro-rata at any time — exact payouts, fees
+    crystallised BEFORE the burn (nothing forfeited), the seed floor
+    untouchable ("locked"), and the pool can never be emptied."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    a = "ff" * 32
+    dex.create_pool("lpx", a, 1000 * XEL, 10**9)
+    p = dex.pools[a]
+    # a provider deepens the pool
+    dex.wallets["p"]["xel"] = 100 * XEL
+    dex.wallets["p"]["assets"][a] = 10**10
+    xel_add = 100 * XEL
+    dex.add_liquidity("p", a, xel_add, p["y"] * xel_add // p["x"])
+    pos = dex.lp[(a, "p")]
+    assert pos["w"] == 100 * XEL
+    # fees accrue while the provider is in
+    dex.wallets["t"]["xel"] = 200 * XEL
+    dex.swap_xel("t", a, 50 * XEL)
+    due_before = pos["cx"] + dx.lp_earnings(p["ax"], pos["sx"], pos["x"])
+    assert due_before > 0
+    # HALF exit: the payout is the exact pro-rata of both reserves
+    x, y, tl = p["x"], p["y"], p["tl"]
+    half = pos["w"] // 2
+    out_x, out_y = dex.remove_liquidity("p", a, half)
+    assert out_x == half * x // tl and out_y == half * y // tl
+    assert p["tl"] == tl - half and pos["w"] == 100 * XEL - half
+    # price-neutral: the reserve product stays within one floor unit
+    assert abs((x - out_x) * y - x * (y - out_y)) < max(x, y)
+    # the fees earned BEFORE the remove survive it (crystallised, not
+    # forfeited) — the provider claims them AFTER its exit
+    due_after = pos["cx"] + dx.lp_earnings(p["ax"], pos["sx"], pos["x"])
+    assert due_after >= due_before - 1       # floor dust at most
+    paid_x, paid_y = dex.claim_lp_fees("p", a)
+    assert paid_x >= due_before - 1
+    dex.check_invariants()
+    # FULL exit of the rest
+    rest = pos["w"]
+    out_x2, out_y2 = dex.remove_liquidity("p", a, rest)
+    assert pos["w"] == 0 and pos["x"] == 0
+    assert p["tl"] == p["pl"] == 1000 * XEL   # back to the seed floor
+    # the provider is out; the pool still lives at the same price
+    assert p["x"] >= 1 and p["y"] >= 1
+    dex.check_invariants()
+    # the SEED can never be removed — not by the provider (no parts),
+    # not by the admin (parts but no withdrawable balance)
+    with pytest.raises(AssertionError, match="locked"):
+        dex.remove_liquidity("p", a, 1)
+    with pytest.raises(AssertionError, match="locked"):
+        dex.remove_liquidity(dex.admin, a, 1)
+    # dust refusal: a remove that would pay 0 on a side
+    with pytest.raises(AssertionError, match="badamt"):
+        dex.remove_liquidity("p", a, 0)
+    dex.check_invariants()
+
+
+def test_x12_remove_is_never_blocked_by_any_pause():
+    """X12 + IX6 extended: provider exits carry NO gate — the emergency
+    pause blocks buys/creations/adds ONLY; removes (like sells and fee
+    claims) work under every pause state."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    a = "ab" * 32
+    dex.create_pool("lpx", a, 1000 * XEL, 10**9)
+    p = dex.pools[a]
+    dex.wallets["p"]["xel"] = 100 * XEL
+    dex.wallets["p"]["assets"][a] = 10**10
+    dex.add_liquidity("p", a, 100 * XEL, p["y"] * 100 * XEL // p["x"])
+    # fees accrue while it is still possible (the pause only blocks
+    # buys/creations/adds — never the exits)
+    dex.wallets["t"]["xel"] = 200 * XEL
+    dex.swap_xel("t", a, 50 * XEL)
+    dex.set_pool_buys_paused("lpx", a, True)
+    dex.emergency = True                     # worst case: both pauses on
+    out_x, out_y = dex.remove_liquidity("p", a, 50 * XEL)
+    assert out_x >= 1 and out_y >= 1         # the exit went through
+    paid_x, paid_y = dex.claim_lp_fees("p", a)
+    assert paid_x > 0                        # the fees flowed too
+    dex.check_invariants()
+    dex.emergency = False
+
+
+def test_x12_remove_outs_math_is_exactly_the_contract():
+    """The SDK remove_outs mirror: floored pro-rata on both sides, dust
+    and poolerr refusals, and the price-neutrality bound over random
+    states (IX7 extended to removes)."""
+    import random
+    rng = random.Random(31)
+    for _ in range(500):
+        tl = rng.randrange(dx.ACC_SCALE, 10**15)
+        pl = rng.randrange(dx.ACC_SCALE, tl)      # the seed floor
+        parts = rng.randrange(1, tl - pl + 1)      # a valid burn
+        x = rng.randrange(1, 10**15)
+        y = rng.randrange(1, 10**15)
+        out_x, out_y = dx.remove_outs(x, y, parts, tl)
+        assert out_x == parts * x // tl
+        assert out_y == parts * y // tl
+        assert 1 <= out_x < x and 1 <= out_y < y
+        # price-neutral: one floor unit of drift (IX7, the remove side)
+        assert abs((x - out_x) * y - x * (y - out_y)) < max(x, y)
+        # burning the whole withdrawable depth is fine; burning INTO the
+        # seed floor is refused structurally (parts < tl always)
+        try:
+            dx.remove_outs(x, y, tl, tl)
+            raise SystemExit("burning tl parts must be refused")
+        except ValueError as e:
+            assert "poolerr" in str(e)
 
 
 def test_launchpad_pin_freezes_at_first_pool_x4():
@@ -183,7 +358,7 @@ def test_fees_are_extracted_not_pooled_x3():
 
 
 def test_version_string():
-    assert 'const VERSION: string = "LaunchDEX v1.2.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.3.0"' in DEX_CONTRACT.read_text()
 
 
 # ===========================================================================
@@ -276,9 +451,13 @@ def test_d23_fee_split_dial_is_hard_bounded():
 
 def test_d23_lp_views_exist():
     src = DEX_CONTRACT.read_text()
-    assert "pub fn get_lp_info(asset: Hash, wallet: Address) -> (u64, u64, u64)" in src
-    # get_pool_state extended to 8 fields (pots + depth), get_config to 10
-    assert "pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64, u64, u64, u64)" in src
+    assert "pub fn get_lp_info(asset: Hash, wallet: Address) -> (u64, u64, u64, u64)" in src
+    # get_pool_state extended to 9 fields (pots + depth + seed floor),
+    # get_config to 10
+    assert "pub fn get_pool_state(asset: Hash) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64)" in src
     assert "pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool, u64)" in src
-    # IX8 is documented in the header's invariants
+    # IX8 is documented in the header's invariants, IX9 since v1.3
     assert "IX8. LP SOLVENCY" in src
+    assert "IX9. THE SEED NEVER LEAVES" in src
+    # the remove entry is documented as chunk 32 in the header table
+    assert "31  get_lp_info           32  remove_liquidity" in src
