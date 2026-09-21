@@ -1,6 +1,6 @@
 # VaultLaunch — Design Specification
 
-> contracts/launchpad/VaultLaunch.slx · v2.0.0 · mainnet-ready (testnet first)
+> contracts/launchpad/VaultLaunch.slx · v3.0.0 · mainnet-ready (testnet first)
 
 A serious launchpad for XEL: real projects are filtered by a community
 validation vote, priced by a constant-product bonding curve, and held to a
@@ -17,6 +17,17 @@ the bonding curve and graduate when their reserves grow ×4. Graduated
 projects trade at a LOWER fee, the team allocation unlocks (immediate
 claim or voluntary vesting), and a small one-time migration fee — taken
 from the curve, pump.fun-style but smaller — funds the protocol.
+
+**v3 — everything on the table, everything on-chain.** The vote happens
+with EVERY piece of data visible: the creator declares the **team vesting
+plan at proposition time** and the contract binds it automatically at
+graduation — the community votes on the exact unlock schedule, not a
+promise (D10). Projects carry **social links** (Twitter / Telegram /
+Discord) the team can update at any time (D11). And the contract keeps
+**the market's scoreboard itself** (D12): per-project and protocol-wide
+buy/sell volume, trade counts, last-trade topoheight, the spot market cap
+rewritten after every trade, its all-time high, and the market cap at
+graduation — all computed AND stored on-chain, no indexer required.
 
 One file. Zero inter-contract calls. Zero external dependencies.
 
@@ -192,7 +203,7 @@ plus a full admin fee drain and assert I2 throughout.
 
 ---
 
-## 3. The team allocation (v2, D3)
+## 3. The team allocation (v2 D3, v3 D10)
 
 The founder declares `team_bps` (≤ 20%) at propose time. The allocation
 is **reserved in the curve from day one** (the sellable supply excludes
@@ -200,7 +211,31 @@ it), so it can never be over-sold — and it is **paid out exactly once
 across all claim paths** (invariant I4), debited against a running
 `team_paid` counter.
 
-Three unlock paths, evaluated lazily at claim time:
+### 3a. The vesting plan — a votable commitment (v3, D10)
+
+`propose()` takes a `vesting_duration`:
+
+- `0` (default) — "team claims at graduation": the classic migration
+  reward, `claim_team_allocation()` or a voluntary `start_team_vesting`
+  afterwards (the v2 behaviour, unchanged).
+- **any value inside `[vesting_min, vesting_max]`** (default ~1 month to
+  ~1 year, admin-bounded) — a **DECLARED PLAN**. It is stored at propose
+time, shown on the voting card (`get_proposal_data` → `vesting_plan`),
+  and **bound automatically by `graduate()`**: the linear vesting starts
+  itself, with exactly that duration, the moment the project graduates —
+  whichever path gets it there. A planned project can never swap, retune
+  or duplicate its vesting (`start_team_vesting` refuses it: `"planned"`)
+  — the plan IS the vesting, and it is the schedule the community voted
+  on.
+
+The plan is validated against the bounds **snapshotted at propose time**
+(D7-consistent: the founder gets the rules they signed up with), and it
+only binds at graduation — a project that never graduates falls back to
+the late-claim path below (plan or no plan, the team is never hostage).
+
+### 3b. The three unlock paths
+
+Evaluated lazily at claim time:
 
 | situation                                  | unlocked amount               |
 |--------------------------------------------|-------------------------------|
@@ -215,6 +250,8 @@ Three unlock paths, evaluated lazily at claim time:
   window, default ~1 month..~1 year) claimed incrementally. The vesting
   is a **public commitment signal** — the frontend shows it via
   `get_team_allocation`, and a vesting founder cannot dump.
+  (Planned projects skip the choice: their vesting started itself at
+  graduation — §3a.)
 - **The vesting is irreversible** (one per project) — that is the point
   of a commitment.
 - **The late claim keeps founders motivated**: a project that never
@@ -228,6 +265,64 @@ Three unlock paths, evaluated lazily at claim time:
   total_supply`, always).
 - A **rejected** project mints nothing: the launch never happened, the
   liquidity is refunded 100%, the team gets a lesson instead.
+
+---
+
+## 3c. Social links — mutable project metadata (v3, D11)
+
+Twitter, Telegram and Discord links are part of the proposal (empty
+string = "no link") and ride along with description/website/logo in
+`propose()` and `update_project_info()`. The **team can change them at
+any time** (the only frozen state is Rejected): communities move,
+channels get rebuilt, and a launchpad that freezes social pointers
+forces teams to abandon their own project page. Read them with
+`get_social_links(pid) -> (twitter, telegram, discord)` or via the
+`p:{id}:tw / tg / dc` storage keys.
+
+Length-capped display metadata (≤ 256 chars each), same trust model as
+the website field: the frontend renders, the voters judge. Name,
+symbol, supply, team allocation and the vesting plan stay immutable
+(structural — the plan is the ballot, changing it after the vote would
+be changing the vote itself).
+
+---
+
+## 3d. The on-chain scoreboard — volume & market cap (v3, D12)
+
+The contract itself calculates and stores the market data — no indexer,
+no off-chain oracle, no trust:
+
+**Volume** (per project AND protocol-wide), maintained by `record_trade`
+on every buy/sell:
+
+- `buy_volume` — sums the **attached XEL of every buy** (fee included:
+  an exchange's quote-side convention)
+- `sell_volume` — sums the **pre-fee gross XEL out** of every sell
+- `total_volume = buy + sell` (invariant I9, exact at all times), plus
+  the trade count and the last-trade topoheight
+- read per project: `get_trading_stats` (keys `bv sv vo tc lt`);
+  protocol-wide: `get_volume_stats` (keys `tbv tsv tvl ttc`)
+
+**Market cap** = `R × circulating / C` (u128, saturating at u64 max),
+where `circulating = total_supply − curve_supply − team_remaining` — the
+tokens actually in holders' hands, excluding both the curve's sellable
+balance and the team's unclaimed allocation. Maintained by
+`update_market_cap()` after EVERY change of its inputs (buy, sell,
+graduation fee, team claim):
+
+- `mc` — the stored spot value, rewritten after every trade (it can
+  never drift from the live state: same formula as the pure
+  `get_market_cap` view)
+- `mh` — the all-time high (only ever grows)
+- `mg` — the market cap **at graduation**, snapshotted once, after the
+  migration fee (the honest post-graduation number; 0 = never graduated,
+  or a direct listing at t0 — nothing circulates before the first buy, so
+  the honest snapshot is 0 and mc/mh light up on the first trade)
+- read: `get_market_cap_history` → `(current, all_time_high,
+  at_graduation)`
+
+All accumulator additions are overflow-guarded (`checked_add` — a
+corrupted counter is worse than a refused trade).
 
 ---
 
@@ -328,12 +423,14 @@ Python reference):
 
 - global: `pc` (project count), `sub mnl tfe gfe mgf dlt mnp mab vdt
   gmu tdy vmn vmx rfe rmp rmr` (parameters), `pfe fcl tvl tcx lrf pz`
-  (accounting), `adm` (admin), `xa` (XEL asset)
+  (accounting), `tbv tsv ttc` (protocol volume scoreboard, D12), `adm`
+  (admin), `xa` (XEL asset)
 - project fields `p:{id}:{field}`: `cr` creator, `st` status, `nm sy ds
-  ws lg` metadata, `ts tb lq rv cs` tokenomics, `ct ve` window, `sp rp
-  rd` votes, `gr` graduated, `rc` refund claimed, `vo` volume, `dl`
-  direct-listing eligible, `bt` bonding start, `tp` team paid, `vs vd`
-  vesting start/duration
+  ws lg tw tg dc` metadata (socials: D11), `ts tb lq rv cs` tokenomics,
+  `ct ve` window, `sp rp rd` votes, `gr` graduated, `rc` refund claimed,
+  `vo bv sv tc lt` volume scoreboard (D12), `dl` direct-listing eligible,
+  `bt` bonding start, `tp` team paid, `vs vd vp` vesting start/duration/
+  DECLARED PLAN (D10), `mc mh mg` market cap series (D12)
 - balances `b:{id}:{addr}` (the launched token IS this ledger), votes
   `v:{id}:{round}:{addr}`
 
@@ -346,10 +443,26 @@ Card layout suggestion (per project):
 3. graduation progress: `reserves / graduation_target` (from
    `get_bonding_info`) for curve projects; "graduated" for the rest
 4. votes: `sp / rp` and the current round (`get_project_trust`)
-5. team panel (`get_team_allocation`): allocation, paid, vesting stream
-   progress, claimable now — a running vesting is a trust signal
+5. team panel (`get_team_allocation`, now 6 fields): allocation, paid,
+   vesting stream progress, claimable now, **vesting plan** — and social
+   links row (`get_social_links`): Twitter / Telegram / Discord
 6. trade panel: `get_buy_quote` / `get_sell_quote` (they already use the
    project's effective fee), token balance via `get_token_balance`
+7. market panel (D12): `get_trading_stats` (buy/sell split, trade count,
+   last trade) + `get_market_cap_history` (current, ATH, at graduation —
+   show the graduation milestone number)
+
+**The voting card** (Validation/Recovery status): ONE call gives the
+community everything it votes on — `get_proposal_data` → (liquidity,
+total_supply, team_bps, **vesting_plan**, direct_listed, created_topo,
+validation_end) — plus `get_project_info` + `get_social_links` for the
+metadata and `get_team_config` for the vesting window. The plan is on
+the table BEFORE a single vote is cast (D10): `vesting_plan == 0` →
+"team claims at graduation", any other value → "linear vesting of
+exactly that length, enforced by the contract, starting at graduation".
+
+Protocol dashboard: `get_protocol_stats` + `get_volume_stats` (the
+launchpad's own total volume, buy/sell split and trade count).
 
 Listings: `get_projects_by_status` + `get_project_by_rank` (paginated,
 count-then-rank — Silex ABIs return no arrays), `get_latest_projects`,
@@ -365,18 +478,25 @@ Events (§6) drive the live feed: watch for `ProjectCreated`,
 ## 8. CLI
 
 ```
-xvault launchpad status   --contract <hash>            # params, solvency, stats
+xvault launchpad status   --contract <hash>            # params, solvency, volume scoreboard
 xvault launchpad project  --contract <hash> --id 0 --owner xel:...
+                                                        # + socials, mcap series, plan
 xvault launchpad team     --contract <hash> --id 0 [--topo N]
 xvault launchpad quote    --reserves 500 --curve 90000000 --buy 100 [--fee-bps 50]
 xvault launchpad propose  --name "Real Project" --symbol RPR \
-    --supply 1000000 --team-bps 1000 --liquidity 500 [--broadcast]
+    --supply 1000000 --team-bps 1000 --liquidity 500 \
+    [--vesting N] [--twitter URL] [--telegram URL] [--discord URL] [--broadcast]
 xvault launchpad entries                                # chunk-id tables
 ```
 
 `propose` prints whether the liquidity qualifies for a direct listing
-(and the deposit split). `team` shows the allocation panel: paid,
-remaining, vesting progress, late-claim countdown, claimable now.
+(and the deposit split), validates the vesting plan against the live
+bounds, and shows the plan's meaning (votable, bound at graduation).
+`team` shows the allocation panel: paid, remaining, vesting progress
+(marked `declared plan` or `voluntary`), late-claim countdown, claimable
+now. `project` prints the socials row, the buy/sell volume split with
+trade count, and the market-cap series (now / ATH / at graduation).
+`status` includes the protocol-wide volume scoreboard.
 
 ---
 
@@ -384,7 +504,7 @@ remaining, vesting progress, late-claim countdown, claimable now.
 
 1. Deploy `VaultLaunch.slx` on **testnet**; the deployer becomes the
    admin (use a cold wallet — `set_admin` is single-step).
-2. Sanity: `get_version` → `VaultLaunch v2.0.0`, `get_config` → the
+2. Sanity: `get_version` → `VaultLaunch v3.0.0`, `get_config` → the
    documented defaults.
 3. Dry-run the two paths: propose a small float (bonding path) and a
    ≥ 2000 XEL float (direct listing); pass both validations (20 voters,
@@ -392,14 +512,23 @@ remaining, vesting progress, late-claim countdown, claimable now.
    + `MigrationFeeTaken` in the events.
 4. Trade both: buy → check the fee rate matches the state (50 bps
    bonding, 25 bps graduated); sell → check the payout and the never-
-   blocked exit.
+   blocked exit. After each trade, verify the scoreboard: `get_trading_stats`
+   (buy/sell split, count, last-trade topo) and `get_market_cap_history`
+   (mc follows every trade; mh only grows; mg == 0 until graduation).
 5. Team panel: `claim_team_allocation` on the graduated project (full),
    `start_team_vesting` + incremental claims on the other; verify
-   `get_team_allocation` at every step.
+   `get_team_allocation` at every step. Also propose a third project
+   WITH a declared plan (`--vesting`): verify the plan is refused outside
+   the bounds, appears in `get_proposal_data` before the vote, and binds
+   itself at graduation (claim reverts at t0, pays fractions while the
+   stream runs, saturates at the full allocation).
 6. Trust drill: report a project to 80% of all votes → buys blocked,
    sells open; `request_revalidation` (250 XEL when graduated) →
    recovery vote → Trusted.
-7. Fees: `withdraw_fees(pending)` and verify the double cap — the
+7. Metadata drill (D11): `update_project_info` with new socials mid-
+   bonding and after graduation → `get_social_links` follows; non-creator
+   refused; Rejected project refused.
+8. Fees: `withdraw_fees(pending)` and verify the double cap — the
    withdrawal can never make the contract insolvent.
-8. Tune parameters if needed (range + cross-checks enforced on-chain),
+9. Tune parameters if needed (range + cross-checks enforced on-chain),
    then announce the mainnet deployment with the config table.

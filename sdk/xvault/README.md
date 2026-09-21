@@ -1,6 +1,6 @@
 # xvault — XELIS Vault CLI & SDK
 
-Python tooling for the XelisVault protocol (v16, VaultLaunch + PrivacyMixer
+Python tooling for the XelisVault protocol (v17, VaultLaunch + PrivacyMixer
 V5). **Key-less by design**: the CLI prepares transactions and reads state;
 your local wallet (`xelis_wallet --rpc-server`, or Genesix via XSWD) signs
 and broadcasts.
@@ -19,18 +19,24 @@ Requires Python ≥ 3.10. Dependencies: `requests`, `blake3`.
 # protocol health, parameters, fee pot, solvency
 xvault launchpad status --contract <hash> --network mainnet
 
-# one project card (status, curve, price, votes, volume, balances)
+# one project card (status, curve, price, votes, volume, balances,
+# socials, market-cap series, vesting plan)
 xvault launchpad project --contract <hash> --id 0 --owner xel:...
 
-# team allocation panel: vesting stream, late-claim countdown, claimable now
+# team allocation panel: vesting stream (declared plan or voluntary),
+# late-claim countdown, claimable now
 xvault launchpad team --contract <hash> --id 0
 
 # offline curve calculator (mirrors the contract math exactly)
 xvault launchpad quote --reserves 500 --curve 90000000 --buy 100 --sell 1000000
 
 # prepare / send a proposal (deposit = submission fee + seed liquidity)
+# --vesting N declares the team vesting plan the community votes on
+# (0 = claim at graduation); socials ride along and are updatable later
 xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
-    --team-bps 1000 --liquidity 500 --contract <hash> --network mainnet
+    --team-bps 1000 --liquidity 500 [--vesting 2592000] \
+    [--twitter https://x.com/rpr] [--telegram https://t.me/rpr] \
+    [--discord https://discord.gg/rpr] --contract <hash> --network mainnet
 # add --broadcast to send via the local wallet
 
 # entry-point chunk ids for every invoke

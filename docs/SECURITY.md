@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v16
+# Security Policy — XelisVault Protocol v17
 
 ## Reporting
 
@@ -9,11 +9,13 @@ credit; no bounties yet (community project).
 
 ## State of the codebase
 
-### v16 (current, this tree)
+### v17 (current, this tree)
 
 - `contracts/launchpad/VaultLaunch.slx` — the launchpad (v2: two-path
-  graduation, graduated fee, migration fee, team vesting), built to the
-  same bar as the mixer and machine-checked on every push:
+  graduation, graduated fee, migration fee, team vesting; v3: declared
+  vesting plans, mutable social links, on-chain volume/market-cap
+  scoreboard), built to the same bar as the mixer and machine-checked on
+  every push:
   - zero `let _ = transfer` (swallowed transfer failures) — linter rule R1
   - zero unchecked transfers — R2
   - zero owner-drain entries; the admin's only XEL exit is
@@ -35,6 +37,17 @@ credit; no bounties yet (community project).
     (immediate, vesting stream, late claim) via the `team_paid` debit
     counter — invariant I4, asserted by the reference mini-VM after
     every operation
+  - the v3 scoreboard is overflow-guarded end to end: every volume
+    accumulator grows only through `record_trade` with `checked_add`
+    (u128-wide, explicit overflow refusal), the stored market cap is
+    recomputed from storage by `update_market_cap` after EVERY change of
+    its inputs (it can never drift from the pure `get_market_cap`
+    formula — invariant I9, asserted per-step by the fuzz), `mh` is
+    monotone and `mg` is written exactly once, at graduation
+  - the declared vesting plan (D10) is validated against the bounds
+    snapshotted at propose time and bound automatically at graduation;
+    `start_team_vesting` refuses planned projects ("planned") — the
+    votable commitment can never be swapped, retuned or duplicated
   - the SDK's entry-id table is CI-pinned to the contract's real chunk
     numbering (tests/test_launchpad_reference.py) — a drift would invoke
     the wrong entry, so it cannot happen silently

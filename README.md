@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v16** — audited contracts live beat
+[Silex](https://docs.xelis.io/). **v17** — audited contracts live beat
 fifty contracts on paper.
 
 ## What ships today
@@ -28,6 +28,16 @@ to the admin (no burn):
   (default 2000 XEL, admin-tunable) and the project graduates the moment
   validation passes — no bonding phase; smaller floats discover price on
   the curve and graduate at `liquidity × 4`
+- **the vote sees everything (v17)**: the team vesting plan is declared
+  at propose time and bound by the contract at graduation (the community
+  votes on the exact unlock schedule, not a promise — `get_proposal_data`
+  shows it all before a single vote is cast)
+- **social links (v17)**: Twitter / Telegram / Discord on the project
+  card, updatable by the team at any time (`get_social_links`)
+- **the contract keeps the scoreboard (v17)**: buy/sell volume, trade
+  count, last trade, spot market cap, all-time-high market cap and the
+  market cap at graduation — all computed AND stored on-chain
+  (`get_trading_stats`, `get_market_cap_history`, `get_volume_stats`)
 - team allocation (≤ 20%): claim in full at migration OR lock it in a
   linear vesting (public commitment signal); a project that never
   graduates releases the allocation after ~6 months of bonding —
@@ -117,13 +127,13 @@ v12 was fully audited and retired (1316 blocker/error findings across 51
 contracts — the corpus now powers the linter). PrivacyMixer V4 was
 superseded before deployment (recipient leak in deposit params +
 recipient-gas problem — see docs/SECURITY.md §V4 disclosure). v13/v14
-rebuilt the tree around the mixer; v15 added VaultLaunch; **v16 makes
-graduation pay**: two-path graduation (direct listing above a
-tunable liquidity cap), a lower trading fee for graduated projects, a
-one-time migration fee funding the protocol, and a flexible team
-allocation (immediate claim or vesting, late release for never-graduated
-projects) — same bar: lint clean, chunk table verified, reference tests
-green, threat model written.
+rebuilt the tree around the mixer; v15 added VaultLaunch; v16 made
+graduation pay (two-path graduation, lower graduated fee, one-time
+migration fee, flexible team allocation); **v17 puts everything on the
+table**: the vesting plan declared at propose and bound at graduation,
+mutable social links, and the on-chain volume/market-cap scoreboard —
+same bar: lint clean, chunk table verified, reference tests green
+(incl. a 30-seed invariant fuzz), threat model written.
 Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## License

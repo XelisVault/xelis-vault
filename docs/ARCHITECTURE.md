@@ -1,4 +1,4 @@
-# Architecture — XelisVault Protocol v16
+# Architecture — XelisVault Protocol v17
 
 ## Why a rewrite of the layout
 
@@ -55,7 +55,7 @@ re-scoped as small, single-purpose contracts that pass the same bar:
 
 | Module | v12 state | v13+ plan |
 |---|---|---|
-| Launchpad | no community filter, no curve, no trust system | **done — VaultLaunch v2: validation vote, two-path graduation (curve / direct listing), trust system, team vesting** |
+| Launchpad | no community filter, no curve, no trust system | **done — VaultLaunch v3: validation vote, two-path graduation (curve / direct listing), trust system, team vesting with declared plans, mutable social links, on-chain volume/market-cap scoreboard** |
 | Privacy mixer | secrets leaked in withdraw params | **done — V5 dead-drop; on hold pending VM zk primitives** |
 | Vault engine | debts erased for free, collateral math broken | rewrite as one contract, XEL-only first |
 | Oracle | slash-all deviation logic, global DoS via miner list | staked-report median with bounded slash, no global iteration |

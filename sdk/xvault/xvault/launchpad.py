@@ -198,12 +198,16 @@ def bal_key(pid: int, owner: str) -> str:
 
 F_CREATOR, F_STATUS, F_NAME, F_SYMBOL = "cr", "st", "nm", "sy"
 F_DESC, F_WEBSITE, F_LOGO = "ds", "ws", "lg"
+F_TWITTER, F_TELEGRAM, F_DISCORD = "tw", "tg", "dc"
 F_SUPPLY, F_TEAM_BPS, F_LIQUIDITY = "ts", "tb", "lq"
 F_RESERVES, F_CURVE, F_CREATED, F_DEADLINE = "rv", "cs", "ct", "ve"
 F_SUPPORTS, F_REPORTS, F_GRADUATED = "sp", "rp", "gr"
 F_REFUND, F_ROUND, F_VOLUME = "rc", "rd", "vo"
 F_DL, F_BONDING_START = "dl", "bt"
 F_TEAM_PAID, F_VESTING_START, F_VESTING_DURATION = "tp", "vs", "vd"
+F_VESTING_PLAN = "vp"
+F_BUY_VOL, F_SELL_VOL, F_TRADES, F_LAST_TRADE = "bv", "sv", "tc", "lt"
+F_MCAP, F_MCAP_HIGH, F_MCAP_GRAD = "mc", "mh", "mg"
 
 GLOBAL_KEYS = {
     "admin": "adm", "count": "pc", "submission_fee": "sub",
@@ -216,6 +220,8 @@ GLOBAL_KEYS = {
     "recovery_fee": "rfe", "recovery_min_participants": "rmp",
     "recovery_min_ratio_bps": "rmr", "pending_fees": "pfe",
     "fees_collected_lifetime": "fcl", "total_volume": "tvl",
+    "total_buy_volume": "tbv", "total_sell_volume": "tsv",
+    "total_trades": "ttc",
     "total_curve_xel": "tcx", "locked_refunds": "lrf",
     "paused": "pz",
 }
@@ -226,10 +232,15 @@ GLOBAL_KEYS = {
 # ---------------------------------------------------------------------------
 
 def propose_params(name: str, symbol: str, description: str, website: str,
-                   logo: str, total_supply: int, team_bps: int) -> list:
+                   logo: str, twitter: str, telegram: str, discord: str,
+                   total_supply: int, team_bps: int, vesting_duration: int) -> list:
+    """v3: social links (D11) + the vesting plan (D10, 0 = claim at
+    graduation, otherwise within [vesting_min, vesting_max] snapshotted at
+    propose time)."""
     return [val_str(name), val_str(symbol), val_str(description),
-            val_str(website), val_str(logo), val_u64(total_supply),
-            val_u64(team_bps)]
+            val_str(website), val_str(logo), val_str(twitter),
+            val_str(telegram), val_str(discord), val_u64(total_supply),
+            val_u64(team_bps), val_u64(vesting_duration)]
 
 
 def propose_deposits(submission_fee: int, liquidity: int,
@@ -242,8 +253,11 @@ def buy_deposits(xel_amount: int, xel_asset: str = "0" * 64) -> dict:
     return {xel_asset: xel_amount}
 
 
-def update_info_params(description: str, website: str, logo: str) -> list:
-    return [val_str(description), val_str(website), val_str(logo)]
+def update_info_params(description: str, website: str, logo: str,
+                       twitter: str, telegram: str, discord: str) -> list:
+    """v3: social links ride along (D11) — updatable at any time."""
+    return [val_str(description), val_str(website), val_str(logo),
+            val_str(twitter), val_str(telegram), val_str(discord)]
 
 
 def set_recovery_params_params(participants: int, ratio_bps: int) -> list:
@@ -295,10 +309,17 @@ class LaunchpadReader:
 
     def stats(self) -> Dict[str, Any]:
         names = ("count", "pending_fees", "fees_collected_lifetime",
-                 "total_volume", "total_curve_xel", "locked_refunds")
+                 "total_volume", "total_curve_xel", "locked_refunds",
+                 "total_buy_volume", "total_sell_volume", "total_trades")
         out: Dict[str, Any] = {n: self._key(GLOBAL_KEYS[n], 0) for n in names}
         out["paused"] = self.paused()
         return out
+
+    def volume_stats(self) -> Dict[str, int]:
+        """Protocol-wide scoreboard (D12, mirrors get_volume_stats)."""
+        names = ("total_volume", "total_buy_volume", "total_sell_volume",
+                 "total_trades")
+        return {n: self._key(GLOBAL_KEYS[n], 0) for n in names}
 
     def project(self, pid: int) -> Dict[str, Any]:
         """Everything the frontend needs for one project card."""
@@ -306,7 +327,10 @@ class LaunchpadReader:
         for attr, field in (("creator", F_CREATOR), ("status", F_STATUS),
                             ("name", F_NAME), ("symbol", F_SYMBOL),
                             ("description", F_DESC), ("website", F_WEBSITE),
-                            ("logo", F_LOGO), ("total_supply", F_SUPPLY),
+                            ("logo", F_LOGO),
+                            ("twitter", F_TWITTER), ("telegram", F_TELEGRAM),
+                            ("discord", F_DISCORD),
+                            ("total_supply", F_SUPPLY),
                             ("team_bps", F_TEAM_BPS),
                             ("liquidity", F_LIQUIDITY),
                             ("reserves", F_RESERVES), ("curve", F_CURVE),
@@ -319,11 +343,55 @@ class LaunchpadReader:
                             ("bonding_start", F_BONDING_START),
                             ("team_paid", F_TEAM_PAID),
                             ("vesting_start", F_VESTING_START),
-                            ("vesting_duration", F_VESTING_DURATION)):
+                            ("vesting_duration", F_VESTING_DURATION),
+                            ("vesting_plan", F_VESTING_PLAN),
+                            ("buy_volume", F_BUY_VOL),
+                            ("sell_volume", F_SELL_VOL),
+                            ("trades", F_TRADES),
+                            ("last_trade_topo", F_LAST_TRADE),
+                            ("market_cap", F_MCAP),
+                            ("market_cap_high", F_MCAP_HIGH),
+                            ("market_cap_grad", F_MCAP_GRAD)):
             out[attr] = self._key(proj_key(pid, field))
         status = out.get("status") or 0
         out["status_label"] = STATUS_LABELS.get(status, "unknown")
         return out
+
+    def social_links(self, pid: int) -> Dict[str, str]:
+        """(D11) — empty string means no link."""
+        p = self.project(pid)
+        return {"twitter": p["twitter"] or "",
+                "telegram": p["telegram"] or "",
+                "discord": p["discord"] or ""}
+
+    def trading_stats(self, pid: int) -> Dict[str, int]:
+        """Per-project scoreboard (D12, mirrors get_trading_stats)."""
+        p = self.project(pid)
+        return {"buy_volume": p["buy_volume"] or 0,
+                "sell_volume": p["sell_volume"] or 0,
+                "total_volume": p["volume"] or 0,
+                "trades": p["trades"] or 0,
+                "last_trade_topo": p["last_trade_topo"] or 0}
+
+    def market_cap_history(self, pid: int) -> Dict[str, int]:
+        """Stored market-cap series (D12, mirrors get_market_cap_history)."""
+        p = self.project(pid)
+        return {"current": p["market_cap"] or 0,
+                "all_time_high": p["market_cap_high"] or 0,
+                "at_graduation": p["market_cap_grad"] or 0}
+
+    def proposal_data(self, pid: int) -> Dict[str, Any]:
+        """The one-call voting card (D10/D7, mirrors get_proposal_data):
+        what is being sold, what the team takes, the vesting plan, which
+        graduation path, when the window closes."""
+        p = self.project(pid)
+        return {"liquidity": p["liquidity"] or 0,
+                "total_supply": p["total_supply"] or 0,
+                "team_bps": p["team_bps"] or 0,
+                "vesting_plan": p["vesting_plan"] or 0,
+                "direct_listed": bool(p["direct_listing"]),
+                "created_topo": p["created_topo"] or 0,
+                "validation_end": p["deadline"] or 0}
 
     def team_allocation(self, pid: int, topo: int = 0) -> Dict[str, int]:
         """Team allocation panel (D3): alloc, paid, vesting, claimable_now.
@@ -349,6 +417,7 @@ class LaunchpadReader:
             "vesting_start": p["vesting_start"] or 0,
             "vesting_duration": p["vesting_duration"] or 0,
             "claimable_now": max(unlocked - paid, 0),
+            "vesting_plan": p["vesting_plan"] or 0,
         }
 
     def token_balance(self, pid: int, owner: str) -> int:

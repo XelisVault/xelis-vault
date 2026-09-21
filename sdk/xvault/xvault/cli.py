@@ -371,7 +371,10 @@ def cmd_launchpad_status(args) -> None:
     print(f"  solvent         : {'YES' if solvent else 'NO — balance below commitments!'}")
     print(f"  pending fees    : {crypto.fmt_xel(st['pending_fees'])} "
           f"(lifetime {crypto.fmt_xel(st['fees_collected_lifetime'])})")
-    print(f"  total volume    : {crypto.fmt_xel(st['total_volume'])}")
+    print(f"  total volume    : {crypto.fmt_xel(st['total_volume'])} "
+          f"(buy {crypto.fmt_xel(st['total_buy_volume'])} / "
+          f"sell {crypto.fmt_xel(st['total_sell_volume'])}, "
+          f"{st['total_trades']} trades)")
     print("  parameters      :")
     print(f"    submission fee        : {crypto.fmt_xel(cfg['submission_fee'])}")
     print(f"    min liquidity         : {crypto.fmt_xel(cfg['min_liquidity'])}")
@@ -408,20 +411,37 @@ def cmd_launchpad_project(args) -> None:
           f"(window ends topo {p['deadline']})")
     if p['website']:
         print(f"  website    : {p['website']}")
+    socials = [x for x in (
+        ("twitter", p['twitter']), ("telegram", p['telegram']),
+        ("discord", p['discord'])) if x[1]]
+    if socials:
+        print("  socials    : " + "  ".join(
+            f"{name}={link}" for name, link in socials))
     print(f"  supply     : {fmt_token(p['total_supply'])} "
           f"({p['total_supply'] / 1e8:,.0f} tokens), "
-          f"team {p['team_bps'] / 100:.0f}%")
+          f"team {p['team_bps'] / 100:.0f}%"
+          + (f", vesting plan {p['vesting_plan']} topos (D10)"
+             if p['vesting_plan'] else ""))
     print(f"  liquidity  : {crypto.fmt_xel(p['liquidity'])} deposited"
           + (" (direct-listing eligible)" if p['direct_listing'] else ""))
     print(f"  curve      : {crypto.fmt_xel(p['reserves'])} reserves, "
           f"{fmt_token(p['curve'])} sellable")
     print(f"  price      : {q['price'] / 1e8:.8f} XEL/token  "
           f"(mc {crypto.fmt_xel(q['market_cap'])})")
+    mc = reader.market_cap_history(args.id)
+    if mc['all_time_high'] or mc['at_graduation']:
+        print(f"  mcap       : now {crypto.fmt_xel(mc['current'])} / "
+              f"ATH {crypto.fmt_xel(mc['all_time_high'])}"
+              + (f" / at graduation {crypto.fmt_xel(mc['at_graduation'])}"
+                 if mc['at_graduation'] else ""))
     print(f"  fee        : {q['fee_bps'] / 100:.2f}% "
           f"({'graduated' if q['graduated'] else 'bonding'} rate)")
     print(f"  votes      : {p['supports']} support / {p['reports']} report "
           f"(round {p['round']}, graduated: {bool(p['graduated'])})")
-    print(f"  volume     : {crypto.fmt_xel(p['volume'])}")
+    print(f"  volume     : {crypto.fmt_xel(p['volume'])} total "
+          f"(buy {crypto.fmt_xel(p['buy_volume'])} / "
+          f"sell {crypto.fmt_xel(p['sell_volume'])}, "
+          f"{p['trades']} trades, last at topo {p['last_trade_topo']})")
     if args.owner:
         bal = reader.token_balance(args.id, args.owner)
         print(f"  balance    : {fmt_token(bal)} tokens ({args.owner})")
@@ -444,12 +464,16 @@ def cmd_launchpad_team(args) -> None:
     print(f"  remaining   : {fmt_token(t['team_remaining'])}")
     if t['vesting_start'] > 0:
         done = min(max(topo - t['vesting_start'], 0), t['vesting_duration'])
+        source = "declared plan" if t['vesting_plan'] == t['vesting_duration'] and t['vesting_plan'] > 0 else "voluntary"
         print(f"  vesting     : started topo {t['vesting_start']}, "
               f"{t['vesting_duration']} topos linear "
-              f"({done / t['vesting_duration'] * 100:.1f}% elapsed)")
+              f"({done / t['vesting_duration'] * 100:.1f}% elapsed, {source})")
+    elif t['vesting_plan'] > 0:
+        print(f"  vesting     : PLAN {t['vesting_plan']} topos declared at "
+              f"propose — binds automatically at graduation (D10)")
     else:
         print("  vesting     : none started (immediate full claim available "
-              "once unlocked)")
+              "once unlocked; a plan can only be declared at propose)")
     if p['graduated']:
         print("  unlock      : GRADUATED — full allocation unlockable")
     elif p['bonding_start']:
@@ -511,6 +535,17 @@ def cmd_launchpad_propose(args) -> None:
     if liquidity < cfg["min_liquidity"]:
         sys.exit(f"error: liquidity below min_liquidity "
                  f"({crypto.fmt_xel(cfg['min_liquidity'])})")
+    # D10: the vesting plan must be 0 or inside the admin window (checked
+    # against the CURRENT bounds — the contract snapshots them at propose).
+    if not (args.vesting == 0 or
+            cfg["vesting_min"] <= args.vesting <= cfg["vesting_max"]):
+        sys.exit(f"error: --vesting must be 0 (claim at graduation) or "
+                 f"within [{cfg['vesting_min']}, {cfg['vesting_max']}] topos")
+    for label, link in (("--twitter", args.twitter),
+                        ("--telegram", args.telegram),
+                        ("--discord", args.discord)):
+        if len(link) > 256:
+            sys.exit(f"error: {label} longer than 256 characters")
     deposit = cfg["submission_fee"] + liquidity
     team = team_alloc_of(total_supply, args.team_bps)
 
@@ -529,12 +564,27 @@ def cmd_launchpad_propose(args) -> None:
     else:
         print(f"  path        : bonding curve (direct listing needs >= "
               f"{crypto.fmt_xel(cfg['direct_listing_threshold'])})")
+    if args.vesting > 0:
+        print(f"  vesting     : PLAN {args.vesting} topos — the community "
+              f"votes on this exact schedule; the contract binds it at "
+              f"graduation (D10, irreversible)")
+    else:
+        print("  vesting     : no plan — team claims at graduation (or may "
+              "start a voluntary vesting later)")
+    socials = [(n, l) for n, l in (("twitter", args.twitter),
+                                   ("telegram", args.telegram),
+                                   ("discord", args.discord)) if l]
+    if socials:
+        print("  socials     : " + "  ".join(
+            f"{name}={link}" for name, link in socials))
     if not args.broadcast:
         print("dry-run (pass --broadcast to send via the local wallet)")
         return
     w = _wallet(args)
     params = propose_params(args.name, args.symbol, args.description,
-                            args.website, args.logo, total_supply, args.team_bps)
+                            args.website, args.logo, args.twitter,
+                            args.telegram, args.discord, total_supply,
+                            args.team_bps, args.vesting)
     deposits = propose_deposits(cfg["submission_fee"], liquidity,
                                 NETWORKS[args.network]["xelis_asset"])
     before = w.nonce()
@@ -673,12 +723,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--description", default="", help="short description")
     sp.add_argument("--website", default="", help="project website")
     sp.add_argument("--logo", default="", help="logo URL")
+    sp.add_argument("--twitter", default="", help="Twitter/X link (D11, updatable anytime)")
+    sp.add_argument("--telegram", default="", help="Telegram link (D11, updatable anytime)")
+    sp.add_argument("--discord", default="", help="Discord invite (D11, updatable anytime)")
     sp.add_argument("--supply", type=float, required=True,
                     help="total supply in whole tokens (1..100M)")
     sp.add_argument("--team-bps", type=int, default=1000,
                     help="team allocation in bps, max 2000 (default: 10%%)")
     sp.add_argument("--liquidity", type=float, required=True,
                     help="seed liquidity in XEL (>= min_liquidity)")
+    sp.add_argument("--vesting", type=int, default=0,
+                    help="vesting PLAN in topos (D10): 0 = claim at "
+                         "graduation, else within [vesting_min, vesting_max] "
+                         "- the contract binds it at graduation")
     sp.add_argument("--broadcast", action="store_true",
                     help="send via local wallet (default: prepare only)")
     sp.set_defaults(func=cmd_launchpad_propose)

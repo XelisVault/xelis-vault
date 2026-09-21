@@ -22,6 +22,11 @@ for field, const in [
     ("rc", "F_REFUND"), ("rd", "F_ROUND"), ("vo", "F_VOLUME"), ("dl", "F_DL"),
     ("bt", "F_BONDING_START"), ("tp", "F_TEAM_PAID"),
     ("vs", "F_VESTING_START"), ("vd", "F_VESTING_DURATION"),
+    # v3 (D10/D11/D12)
+    ("vp", "F_VESTING_PLAN"), ("tw", "F_TWITTER"), ("tg", "F_TELEGRAM"),
+    ("dc", "F_DISCORD"), ("bv", "F_BUY_VOL"), ("sv", "F_SELL_VOL"),
+    ("tc", "F_TRADES"), ("lt", "F_LAST_TRADE"),
+    ("mc", "F_MCAP"), ("mh", "F_MCAP_HIGH"), ("mg", "F_MCAP_GRAD"),
 ]:
     if f'const {const}: string = "{field}"' not in CONTRACT:
         fails.append(f"contract: field key {field} ({const}) missing")
@@ -33,6 +38,9 @@ for key, const in [
     ("vmn", "VESTING_MIN_KEY"), ("vmx", "VESTING_MAX_KEY"),
     ("pfe", "PENDING_FEES_KEY"), ("tcx", "TOTAL_CURVE_XEL_KEY"),
     ("lrf", "LOCKED_REFUNDS_KEY"), ("sub", "SUBMISSION_FEE_KEY"),
+    # v3 (D12 protocol-wide scoreboard)
+    ("tbv", "TOTAL_BUY_VOL_KEY"), ("tsv", "TOTAL_SELL_VOL_KEY"),
+    ("ttc", "TOTAL_TRADES_KEY"),
 ]:
     if f'const {const}: string = "{key}"' not in CONTRACT:
         fails.append(f"contract: global key {key} ({const}) missing")
@@ -58,7 +66,12 @@ for view in ["get_current_price", "get_market_cap", "get_bonding_info",
              "get_trusted_projects", "get_trusted_by_rank",
              "get_status_label", "get_config", "get_recovery_config",
              "get_team_config", "get_version", "get_project",
-             "claim_team_allocation", "start_team_vesting"]:
+             "claim_team_allocation", "start_team_vesting",
+             # v3 (D10/D11/D12)
+             "get_social_links", "get_trading_stats",
+             "get_market_cap_history", "get_proposal_data",
+             "get_volume_stats", "get_protocol_stats",
+             "update_project_info"]:
     if f"fn {view}(" not in CONTRACT and f"entry {view}(" not in CONTRACT:
         fails.append(f"contract: view/entry {view} named in the doc is missing")
     if view not in DOC:
@@ -80,10 +93,15 @@ for name, eid in [("EV_PROJECT_CREATED", 1), ("EV_SUPPORTED", 2),
         fails.append(f"contract: event {name} = {eid} missing")
 
 # 6. version strings agree
-if 'const VERSION: string = "VaultLaunch v2.0.0"' not in CONTRACT:
-    fails.append("contract: VERSION is not v2.0.0")
-if "v2.0.0" not in DOC:
-    fails.append("doc: LAUNCHPAD.md does not say v2.0.0")
+if 'const VERSION: string = "VaultLaunch v3.0.0"' not in CONTRACT:
+    fails.append("contract: VERSION is not v3.0.0")
+if "v3.0.0" not in DOC:
+    fails.append("doc: LAUNCHPAD.md does not say v3.0.0")
+# v3 sanity: the D10/D11/D12 views are documented in the frontend guide
+for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
+                "get_market_cap_history", "get_trading_stats"]:
+    if concept not in DOC:
+        fails.append(f"doc: v3 concept {concept} not documented")
 
 # 7. the doc's fee schedule quotes the real default pair
 if "0.25%" not in DOC or "0.50%" not in DOC or "0.5%" not in DOC:

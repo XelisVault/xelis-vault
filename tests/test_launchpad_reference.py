@@ -1,5 +1,6 @@
 """
-Reference tests for VaultLaunch (launchpad) — v2 two-path edition.
+Reference tests for VaultLaunch (launchpad) — v3 full-proposal-data
+edition.
 
 Three layers, mirroring the mixer's test philosophy (if you change the
 contract, change the reference in the SAME commit — CI fails on drift):
@@ -14,9 +15,10 @@ contract, change the reference in the SAME commit — CI fails on drift):
   2. STATE MACHINE — a Python mini-VM replays full project lifecycles
      against the same storage keys and transition rules as the contract:
      propose -> validation -> bonding -> graduation (migration fee, team
-     claim/vesting) -> trust loss -> recovery, AND the v2 direct-listing
-     path (liquidity >= threshold graduates at validation), asserting the
-     contract's invariants I1/I2/I5 after every step.
+     claim/vesting, D10 plan binding, D12 trading data) -> trust loss ->
+     recovery, AND the v2 direct-listing path (liquidity >= threshold
+     graduates at validation), asserting the contract's invariants
+     I1/I2/I5/I9 after every step.
 
   3. SOURCE & SDK CONSISTENCY — the contract file must expose every
      function and event of the spec, carry the documented defaults, keep
@@ -252,13 +254,15 @@ def test_storage_keys_match_the_contract_layout():
 # ---------------------------------------------------------------------------
 
 class Sim:
-    """A faithful Python replay of VaultLaunch v2's state transitions.
+    """A faithful Python replay of VaultLaunch v3's state transitions.
 
     Implements propose/support/report/finalize/buy/sell/claim_refund/
-    request_revalidation/start_team_vesting/claim_team_allocation with the
-    contract's exact rules (two-path graduation, effective fees, migration
-    fee, team claim bookkeeping); invariants are asserted after every
-    operation. `self.topo` is the simulated topoheight (warp() advances it).
+    request_revalidation/update_info/start_team_vesting/claim_team_allocation
+    with the contract's exact rules (two-path graduation, effective fees,
+    migration fee, team claim bookkeeping, D10 vesting-plan binding, D11
+    social links, D12 volume + market-cap scoreboard); invariants are
+    asserted after every operation. `self.topo` is the simulated topoheight
+    (warp() advances it).
     """
 
     def __init__(self, cfg=None):
@@ -268,6 +272,10 @@ class Sim:
         self.pending_fees = 0
         self.total_curve_xel = 0
         self.locked_refunds = 0
+        self.total_buy_vol = 0    # D12 global tbv
+        self.total_sell_vol = 0   # D12 global tsv
+        self.total_volume = 0     # D12 global tvl (== tbv + tsv, I9)
+        self.total_trades = 0     # D12 global ttc
         self.balance = 0  # contract XEL balance (deposits arrive here)
         self.topo = 0     # simulated topoheight
 
@@ -288,35 +296,117 @@ class Sim:
         # I2: solvency
         assert self.balance >= self.total_curve_xel + self.pending_fees + \
             self.locked_refunds, "I2 broken"
+        # I9: volume identity + stored market-cap freshness (v3)
+        per_project_total = 0
+        for pid in range(self.count):
+            bv = self.s.get(self._pk(pid, "bv"), 0)
+            sv = self.s.get(self._pk(pid, "sv"), 0)
+            vo = self.s.get(self._pk(pid, "vo"), 0)
+            assert vo == bv + sv, f"I9 volume broken for project {pid}"
+            per_project_total += vo
+            # stored cap == recomputed cap (same formula as the contract's
+            # update_market_cap / the pure get_market_cap view)
+            expected = lp.market_cap(
+                self.s[self._pk(pid, "rv")], self.s[self._pk(pid, "cs")],
+                self.s.get(self._pk(pid, "ts"), 0),
+                self.s.get(self._pk(pid, "tb"), 0),
+                bool(self.s.get(self._pk(pid, "gr"), False)),
+                self.s.get(self._pk(pid, "tp"), 0))
+            assert self.s.get(self._pk(pid, "mc"), 0) == expected, \
+                f"I9 mcap drift for project {pid}"
+            assert self.s.get(self._pk(pid, "mh"), 0) >= expected, \
+                f"I9 ATH below current for project {pid}"
+        assert per_project_total == self.total_volume, "I9 global volume"
+        assert self.total_volume == self.total_buy_vol + self.total_sell_vol, \
+            "I9 directional split"
 
-    def propose(self, creator, liquidity, ts=1_000_000_000 * XEL, tb=1000):
+    def _update_mcap(self, pid):
+        """Mirrors update_market_cap(): recompute + store mc, raise mh."""
+        cap = lp.market_cap(
+            self.s[self._pk(pid, "rv")], self.s[self._pk(pid, "cs")],
+            self.s.get(self._pk(pid, "ts"), 0),
+            self.s.get(self._pk(pid, "tb"), 0),
+            bool(self.s.get(self._pk(pid, "gr"), False)),
+            self.s.get(self._pk(pid, "tp"), 0))
+        self.s[self._pk(pid, "mc")] = cap
+        if cap > self.s.get(self._pk(pid, "mh"), 0):
+            self.s[self._pk(pid, "mh")] = cap
+
+    def _record_trade(self, pid, buy_side, xel_amount):
+        """Mirrors record_trade(): directional + total volume, counts, lt."""
+        if buy_side:
+            self.s[self._pk(pid, "bv")] = self.s.get(self._pk(pid, "bv"), 0) + xel_amount
+            self.total_buy_vol += xel_amount
+        else:
+            self.s[self._pk(pid, "sv")] = self.s.get(self._pk(pid, "sv"), 0) + xel_amount
+            self.total_sell_vol += xel_amount
+        self.s[self._pk(pid, "vo")] = self.s.get(self._pk(pid, "vo"), 0) + xel_amount
+        self.total_volume += xel_amount
+        self.s[self._pk(pid, "tc")] = self.s.get(self._pk(pid, "tc"), 0) + 1
+        self.total_trades += 1
+        self.s[self._pk(pid, "lt")] = self.topo
+
+    def propose(self, creator, liquidity, ts=1_000_000_000 * XEL, tb=1000,
+                plan=0, twitter="", telegram="", discord=""):
         fee, min_liq = self.cfg["submission_fee"], self.cfg["min_liquidity"]
         dep = fee + liquidity
         assert dep >= fee + min_liq
+        # D10: the plan must be 0 or inside the snapshotted bounds
+        assert plan == 0 or self.cfg["vesting_min"] <= plan <= self.cfg["vesting_max"], \
+            "badplan"
         self.balance += dep
         pid = self.count
         self.count += 1
         self.s[self._pk(pid, "cr")] = creator
         self.s[self._pk(pid, "st")] = lp.ST_VALIDATION
+        self.s[self._pk(pid, "nm")] = "name"
+        self.s[self._pk(pid, "sy")] = "SYM"
         self.s[self._pk(pid, "ts")] = ts
         self.s[self._pk(pid, "tb")] = tb
         self.s[self._pk(pid, "lq")] = liquidity
         self.s[self._pk(pid, "rv")] = liquidity
         self.s[self._pk(pid, "cs")] = ts - lp.team_alloc_of(ts, tb)
+        # D11: social links
+        self.s[self._pk(pid, "tw")] = twitter
+        self.s[self._pk(pid, "tg")] = telegram
+        self.s[self._pk(pid, "dc")] = discord
         # v2: direct-listing snapshot at propose time (D7)
         self.s[self._pk(pid, "dl")] = liquidity >= self.cfg["direct_listing_threshold"]
         self.s[self._pk(pid, "tp")] = 0
         self.s[self._pk(pid, "vs")] = 0
         self.s[self._pk(pid, "vd")] = 0
+        self.s[self._pk(pid, "vp")] = plan
         self.s[self._pk(pid, "bt")] = 0
         self.s[self._pk(pid, "rd")] = 0
         self.s[self._pk(pid, "sp")] = 0
         self.s[self._pk(pid, "rp")] = 0
         self.s[self._pk(pid, "gr")] = False
         self.s[self._pk(pid, "ve")] = self.topo + self.cfg["validation_duration"]
+        # D12: scoreboard starts empty
+        self.s[self._pk(pid, "bv")] = 0
+        self.s[self._pk(pid, "sv")] = 0
+        self.s[self._pk(pid, "vo")] = 0
+        self.s[self._pk(pid, "tc")] = 0
+        self.s[self._pk(pid, "lt")] = 0
+        self.s[self._pk(pid, "mc")] = 0
+        self.s[self._pk(pid, "mh")] = 0
+        self.s[self._pk(pid, "mg")] = 0
         self.pending_fees += fee
         self.check_invariants()
         return pid
+
+    def update_info(self, pid, caller, description="d", website="w",
+                    logo="l", twitter="", telegram="", discord=""):
+        """Mirrors update_project_info (D11): metadata + socials, anytime."""
+        assert self.s[self._pk(pid, "st")] != lp.ST_REJECTED
+        assert caller == self.s[self._pk(pid, "cr")]
+        self.s[self._pk(pid, "ds")] = description
+        self.s[self._pk(pid, "ws")] = website
+        self.s[self._pk(pid, "lg")] = logo
+        self.s[self._pk(pid, "tw")] = twitter
+        self.s[self._pk(pid, "tg")] = telegram
+        self.s[self._pk(pid, "dc")] = discord
+        self.check_invariants()
 
     def vote(self, pid, voter, support):
         st = self.s[self._pk(pid, "st")]
@@ -339,7 +429,8 @@ class Sim:
         self.check_invariants()
 
     def _graduate(self, pid):
-        """graduate() + take_migration_fee() replayed exactly."""
+        """graduate() + take_migration_fee() + D10 plan binding + D12 mcap
+        snapshot, replayed exactly."""
         self.s[self._pk(pid, "st")] = lp.ST_GRADUATED
         self.s[self._pk(pid, "gr")] = True
         bps = self.cfg["migration_fee_bps"]
@@ -350,6 +441,14 @@ class Sim:
                 assert reserves >= fee
                 self.s[self._pk(pid, "rv")] = reserves - fee
                 self.pending_fees += fee
+        # D10: bind the declared plan — the vesting starts by itself.
+        plan = self.s.get(self._pk(pid, "vp"), 0) or 0
+        if plan > 0:
+            self.s[self._pk(pid, "vs")] = self.topo
+            self.s[self._pk(pid, "vd")] = plan
+        # D12: the graduation market cap, AFTER the migration fee.
+        self._update_mcap(pid)
+        self.s[self._pk(pid, "mg")] = self.s[self._pk(pid, "mc")]
         self.check_invariants()
 
     def finalize(self, pid):
@@ -405,12 +504,16 @@ class Sim:
         self.balance += xel_in
         self.pending_fees += fee
         self.total_curve_xel += net
+        # D12: scoreboard — buys record the ATTACHED amount
+        self._record_trade(pid, True, xel_in)
         # graduation (curve path): migration fee taken inside _graduate
         if st == lp.ST_BONDING:
             target = self.s[self._pk(pid, "lq")] * \
                 self.cfg["graduation_multiplier"]
             if self.s[self._pk(pid, "rv")] >= target:
                 self._graduate(pid)
+        # D12: stored market cap follows the curve state change
+        self._update_mcap(pid)
         self.check_invariants()
         return tokens
 
@@ -432,6 +535,10 @@ class Sim:
         self.balance -= out
         self.pending_fees += fee
         self.total_curve_xel -= gross
+        # D12: scoreboard — sells record the PRE-FEE gross
+        self._record_trade(pid, False, gross)
+        # D12: stored market cap follows the curve state change
+        self._update_mcap(pid)
         self.check_invariants()
         return out
 
@@ -470,6 +577,8 @@ class Sim:
 
     def start_team_vesting(self, pid, caller, duration):
         assert caller == self.s[self._pk(pid, "cr")]
+        # D10: a declared plan IS the vesting — no voluntary one on top.
+        assert (self.s.get(self._pk(pid, "vp"), 0) or 0) == 0, "planned"
         assert self.s[self._pk(pid, "vs")] == 0, "vesting already started"
         ts, tb = self.s[self._pk(pid, "ts")], self.s[self._pk(pid, "tb")]
         assert lp.team_remaining(lp.team_alloc_of(ts, tb),
@@ -489,6 +598,8 @@ class Sim:
         self.s[self._pk(pid, "tp")] = paid + pay
         ck = lp.bal_key(pid, self.s[self._pk(pid, "cr")])
         self.s[ck] = self.s.get(ck, 0) + pay
+        # D12: a claim grows circulating supply — the cap follows at once.
+        self._update_mcap(pid)
         self.check_invariants()
         return pay
 
@@ -800,14 +911,19 @@ def test_solvency_after_graduation_and_withdrawal_pressure():
 
 def test_fuzz_invariants_hold_under_random_lifecycles():
     """AUDIT PASS (solvency): random multi-project activity — votes, buys,
-    sells, graduations (both paths), trust flips, team claims, fee drains
-    — with I1/I2 asserted after EVERY action. Illegal actions (blocked
-    buys, early claims...) are expected and swallowed."""
+    sells, graduations (both paths), trust flips, team claims (planned AND
+    voluntary vesting), social updates, fee drains — with I1/I2/I5/I9
+    asserted after EVERY action. Illegal actions (blocked buys, early
+    claims...) are expected and swallowed."""
     import random
 
     for seed in range(30):
         rng = random.Random(seed)
-        # random, sometimes aggressive parameters (within the admin caps)
+        # random, sometimes aggressive parameters (within the admin caps).
+        # Quorums and windows are fuzz-sized: the mainnet defaults (20
+        # voters, 3-day windows, 40-voter recovery) can never be reached
+        # inside 220 steps, so lifecycles would stall in Validation and
+        # the storm would trade nothing at all.
         sim = Sim(cfg={
             "trading_fee_bps": rng.choice([0, 25, 50, 200, 1000]),
             "graduated_fee_bps": 0,  # will be forced <= trading fee below
@@ -815,6 +931,11 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
             "direct_listing_threshold": rng.choice([500, 800, 2000]) * XEL,
             "team_unlock_delay": rng.choice([100, 1000, 3153600]),
             "vesting_min": 100, "vesting_max": 10_000,
+            "min_participants": 3,
+            "min_approval_ratio_bps": 6000,
+            "validation_duration": 3000,
+            "recovery_min_participants": 3,
+            "recovery_min_ratio_bps": 6000,
         })
         sim.cfg["graduated_fee_bps"] = min(
             rng.choice([0, 25, 50, 1000]), sim.cfg["trading_fee_bps"])
@@ -822,36 +943,57 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
         pids = []
         for p in range(3):
             liq = rng.choice([500, 800, 2000, 3000]) * XEL
+            # D10: some projects carry a declared vesting plan
+            plan = rng.choice([0, 0, 500, 2000])
             pids.append(sim.propose(f"xel:founder{p}", liq,
                                     ts=1_000_000_000 * XEL,
-                                    tb=rng.choice([0, 500, 1000, 2000])))
+                                    tb=rng.choice([0, 500, 1000, 2000]),
+                                    plan=plan,
+                                    twitter=f"https://x.com/p{p}",
+                                    telegram=f"https://t.me/p{p}",
+                                    discord=""))
+        # deterministic warm-up: push every project through its initial
+        # validation (liq >= threshold graduates directly — both paths
+        # exercised), so the storm always starts from live, tradeable
+        # projects. The storm itself stays fully random from here on.
+        for pid in pids:
+            for i in range(sim.cfg["min_participants"]):
+                sim.vote(pid, f"xel:warm{pid}_{i}", True)
+        sim.warp(sim.cfg["validation_duration"] + 1)
+        for pid in pids:
+            assert sim.finalize(pid) is True
+            assert sim.s[sim._pk(pid, "st")] in lp.BUYABLE
         acted = 0
         for step in range(220):
             pid = rng.choice(pids)
             st = sim.s[sim._pk(pid, "st")]
             action = rng.random()
             try:
-                if action < 0.18:  # vote (support or report)
+                if action < 0.16:  # vote (support or report)
                     sim.vote(pid, f"xel:step{step}", rng.random() < 0.7)
-                elif action < 0.40 and st in lp.BUYABLE:  # buy
+                elif action < 0.38 and st in lp.BUYABLE:  # buy
                     sim.buy(pid, rng.choice(traders),
                             rng.randrange(1, 300) * XEL)
-                elif action < 0.58 and st in lp.SELLABLE:  # sell
+                elif action < 0.56 and st in lp.SELLABLE:  # sell
                     t = sim.s.get(lp.bal_key(pid, rng.choice(traders)), 0)
                     if t > 0:
                         sim.sell(pid, rng.choice(traders),
                                  rng.randrange(1, t + 1))
-                elif action < 0.66:  # warp time (windows, delays, vesting)
+                elif action < 0.62:  # warp time (windows, delays, vesting)
                     sim.warp(rng.randrange(1, 800))
-                elif action < 0.72:  # finalize a closed window
+                elif action < 0.68:  # finalize a closed window
                     sim.finalize(pid)
-                elif action < 0.80:  # team claim / vesting attempt
+                elif action < 0.76:  # team claim / vesting attempt
                     if rng.random() < 0.5:
                         sim.claim_team_allocation(pid, sim.s[sim._pk(pid, "cr")])
                     else:
                         sim.start_team_vesting(
                             pid, sim.s[sim._pk(pid, "cr")],
                             rng.randrange(100, 10_001))
+                elif action < 0.80:  # social/metadata update (D11)
+                    sim.update_info(pid, sim.s[sim._pk(pid, "cr")],
+                                    twitter=f"https://x.com/u{step}",
+                                    telegram="", discord=f"https://d.gg/{step}")
                 elif action < 0.84:  # revalidation attempt
                     sim.request_revalidation(pid, sim.s[sim._pk(pid, "cr")])
                 elif action < 0.88:  # admin drains accrued fees
@@ -869,6 +1011,258 @@ def test_fuzz_invariants_hold_under_random_lifecycles():
         # the strict accounting identity held through everything:
         # every fee the contract ever accrued came from a documented source
         assert sim.balance >= 0
+        # I9 survived the storm: directional split is exact protocol-wide
+        assert sim.total_volume == sim.total_buy_vol + sim.total_sell_vol
+        assert sim.total_trades > 0
+
+
+# ---------------------------------------------------------------------------
+# Layer 2b — v3 features: full proposal data (D10/D11/D12)
+# ---------------------------------------------------------------------------
+
+def test_proposal_data_is_complete_at_propose_time():
+    """D10/D11: everything is on the table BEFORE the vote — social links,
+    the vesting plan, the direct-listing flag, and a zeroed scoreboard."""
+    sim = Sim()
+    alice = "xel:alice"
+    pid = sim.propose(alice, 1_000 * XEL, ts=1_000_000_000 * XEL, tb=1000,
+                      plan=518_400,
+                      twitter="https://x.com/projectx",
+                      telegram="https://t.me/projectx",
+                      discord="https://discord.gg/projectx")
+    # the one-call voting card (get_proposal_data)
+    assert sim.s[sim._pk(pid, "lq")] == 1_000 * XEL
+    assert sim.s[sim._pk(pid, "ts")] == 1_000_000_000 * XEL
+    assert sim.s[sim._pk(pid, "tb")] == 1000
+    assert sim.s[sim._pk(pid, "vp")] == 518_400      # the votable plan
+    assert sim.s[sim._pk(pid, "dl")] is False        # 1000 < 2000 threshold
+    # socials stored
+    assert sim.s[sim._pk(pid, "tw")] == "https://x.com/projectx"
+    assert sim.s[sim._pk(pid, "tg")] == "https://t.me/projectx"
+    assert sim.s[sim._pk(pid, "dc")] == "https://discord.gg/projectx"
+    # the scoreboard starts at zero
+    for f in ("bv", "sv", "vo", "tc", "lt", "mc", "mh", "mg"):
+        assert sim.s[sim._pk(pid, f)] == 0
+    # no vesting running yet: the plan waits for graduation
+    assert sim.s[sim._pk(pid, "vs")] == 0
+    assert sim.s[sim._pk(pid, "vd")] == 0
+    # a plan outside the snapshotted bounds is refused
+    with pytest.raises(AssertionError):
+        sim.propose("xel:b", 500 * XEL, plan=sim.cfg["vesting_min"] - 1)
+    with pytest.raises(AssertionError):
+        sim.propose("xel:b", 500 * XEL, plan=sim.cfg["vesting_max"] + 1)
+    # plan == 0 (the default) is always allowed
+    sim.propose("xel:b", 500 * XEL, plan=0)
+
+
+def test_plan_bounds_snapshot_at_propose_d10():
+    """The bounds are read ONCE at propose: a later admin tightening never
+    invalidates a plan the community already voted on."""
+    sim = Sim()
+    pid = sim.propose("xel:a", 500 * XEL, plan=sim.cfg["vesting_max"])
+    sim.cfg["vesting_max"] = 100  # admin squeezes the window afterwards
+    assert sim.s[sim._pk(pid, "vp")] == 6_307_200  # the original default
+    # a NEW proposal must fit the NEW bounds
+    with pytest.raises(AssertionError):
+        sim.propose("xel:b", 500 * XEL, plan=6_307_200)
+
+
+def test_social_links_update_anytime_d11():
+    """Socials are metadata: the team can move channels whenever it wants,
+    until (and after) graduation; only Rejected freezes them."""
+    sim = Sim()
+    alice = "xel:alice"
+    pid = sim.propose(alice, 500 * XEL, twitter="https://x.com/old")
+    _validate(sim, pid)
+    assert sim.s[sim._pk(pid, "tw")] == "https://x.com/old"
+    # the team rebrands mid-bonding
+    sim.update_info(pid, alice, twitter="https://x.com/new",
+                    telegram="https://t.me/new", discord="https://d.gg/new")
+    assert sim.s[sim._pk(pid, "tw")] == "https://x.com/new"
+    assert sim.s[sim._pk(pid, "tg")] == "https://t.me/new"
+    assert sim.s[sim._pk(pid, "dc")] == "https://d.gg/new"
+    # ... and after graduation
+    while sim.s[sim._pk(pid, "st")] == lp.ST_BONDING:
+        sim.buy(pid, "xel:w", 200 * XEL)
+    sim.update_info(pid, alice, twitter="https://x.com/final")
+    assert sim.s[sim._pk(pid, "tw")] == "https://x.com/final"
+    # not the creator: refused
+    with pytest.raises(AssertionError):
+        sim.update_info(pid, "xel:imp", twitter="https://x.com/fake")
+    # Rejected freezes everything
+    pid2 = sim.propose("xel:b", 500 * XEL)
+    for i in range(3):
+        sim.vote(pid2, f"xel:n{i}", False)
+    sim.warp(sim.cfg["validation_duration"] + 1)
+    sim.finalize(pid2)
+    with pytest.raises(AssertionError):
+        sim.update_info(pid2, "xel:b", twitter="https://x.com/late")
+
+
+def test_vesting_plan_binds_at_graduation_curve_path_d10():
+    """The declared plan starts BY ITSELF the moment the curve graduates:
+    no claim before the stream pays, partial claims, saturation — and the
+    creator can never swap it for a voluntary vesting."""
+    sim = Sim()
+    alice = "xel:alice"
+    plan = sim.cfg["vesting_min"]  # 518_400 topos
+    pid = sim.propose(alice, 500 * XEL, ts=1_000_000_000 * XEL, tb=1000,
+                      plan=plan)
+    _validate(sim, pid)
+    while sim.s[sim._pk(pid, "st")] == lp.ST_BONDING:
+        sim.buy(pid, "xel:whale", 200 * XEL)
+    # graduated: the plan bound itself
+    grad_topo = sim.topo
+    assert sim.s[sim._pk(pid, "gr")] is True
+    assert sim.s[sim._pk(pid, "vs")] == grad_topo
+    assert sim.s[sim._pk(pid, "vd")] == plan
+    # the immediate full claim is GONE — the stream rules
+    with pytest.raises(AssertionError):
+        sim.claim_team_allocation(pid, alice)  # unlocked == 0 at t0
+    team = 100_000_000 * XEL
+    sim.warp(plan // 2)
+    assert sim.claim_team_allocation(pid, alice) == team // 2
+    sim.warp(plan)
+    assert sim.claim_team_allocation(pid, alice) == team - team // 2
+    with pytest.raises(AssertionError):
+        sim.claim_team_allocation(pid, alice)
+    # a voluntary vesting on top: refused (the plan IS the vesting)
+    with pytest.raises(AssertionError):
+        sim.start_team_vesting(pid, alice, plan)
+
+
+def test_vesting_plan_binds_at_graduation_direct_listing_d10():
+    """Direct listing applies the SAME plan rule: graduation on day one
+    starts the declared stream (the community voted the schedule, the path
+    to graduation is irrelevant to the commitment)."""
+    sim = Sim()
+    founder = "xel:whale"
+    plan = 2_000_000
+    pid = sim.propose(founder, 2_000 * XEL, ts=1_000_000_000 * XEL, tb=1000,
+                      plan=plan)
+    assert sim.s[sim._pk(pid, "dl")] is True
+    _validate(sim, pid)
+    # graduated on the spot, plan bound at the graduation topo
+    assert sim.s[sim._pk(pid, "gr")] is True
+    assert sim.s[sim._pk(pid, "vs")] == sim.topo
+    assert sim.s[sim._pk(pid, "vd")] == plan
+    # no immediate claim despite the direct listing
+    with pytest.raises(AssertionError):
+        sim.claim_team_allocation(pid, founder)
+    team = 100_000_000 * XEL
+    sim.warp(plan // 4)
+    assert sim.claim_team_allocation(pid, founder) == team // 4
+
+
+def test_plan_never_graduated_falls_back_to_late_claim_d10():
+    """The plan binds at GRADUATION only: a project that never gets there
+    uses the D3 late-claim path (full allocation after the unlock delay)."""
+    sim = Sim(cfg={"team_unlock_delay": 1_000})
+    alice = "xel:alice"
+    pid = sim.propose(alice, 500 * XEL, ts=1_000_000_000 * XEL, tb=1000,
+                      plan=sim.cfg["vesting_min"])
+    _validate(sim, pid)
+    bonding_start = sim.s[sim._pk(pid, "bt")]
+    # before the delay: nothing (the plan has not bound, no late claim yet)
+    with pytest.raises(AssertionError):
+        sim.claim_team_allocation(pid, alice)
+    sim.warp(1_000)
+    assert sim.topo == bonding_start + 1_000
+    # the late claim pays IN FULL — the plan never executed
+    assert sim.claim_team_allocation(pid, alice) == 100_000_000 * XEL
+
+
+def test_unplanned_project_keeps_voluntary_vesting_d3():
+    """plan == 0 keeps the v2 behaviour: immediate claim at graduation OR a
+    voluntary vesting started by the creator afterwards."""
+    sim = Sim()
+    alice = "xel:alice"
+    pid = sim.propose(alice, 500 * XEL, ts=1_000_000_000 * XEL, tb=1000,
+                      plan=0)
+    _validate(sim, pid)
+    while sim.s[sim._pk(pid, "st")] == lp.ST_BONDING:
+        sim.buy(pid, "xel:whale", 200 * XEL)
+    assert sim.s[sim._pk(pid, "vp")] == 0
+    # voluntary vesting still available
+    sim.start_team_vesting(pid, alice, sim.cfg["vesting_min"])
+    assert sim.s[sim._pk(pid, "vs")] == sim.topo
+
+
+def test_trading_stats_and_volume_scoreboard_d12():
+    """Every trade lands in the on-chain scoreboard: directional volumes,
+    total, trade count, last-trade topo — per project AND protocol-wide."""
+    sim = Sim()
+    pid = sim.propose("xel:a", 1_000 * XEL, ts=1_000_000_000 * XEL, tb=0)
+    _validate(sim, pid)
+    # two buys of 100 XEL
+    sim.buy(pid, "xel:b1", 100 * XEL)
+    sim.warp(10)
+    sim.buy(pid, "xel:b2", 100 * XEL)
+    # one sell
+    tokens = sim.s[lp.bal_key(pid, "xel:b1")]
+    sim.warp(5)
+    sim.sell(pid, "xel:b1", tokens)
+    sell_gross = lp.sell_xel_out(
+        sim.s[sim._pk(pid, "rv")] + 0,  # post-trade state: recompute below
+        1, 1)  # placeholder — real value asserted via identity
+    # per-project scoreboard
+    assert sim.s[sim._pk(pid, "bv")] == 200 * XEL          # attached sums
+    assert sim.s[sim._pk(pid, "sv")] > 0                   # pre-fee gross
+    assert sim.s[sim._pk(pid, "vo")] == \
+        sim.s[sim._pk(pid, "bv")] + sim.s[sim._pk(pid, "sv")]
+    assert sim.s[sim._pk(pid, "tc")] == 3
+    assert sim.s[sim._pk(pid, "lt")] == sim.topo
+    # protocol-wide scoreboard (single project: identical + trades count)
+    assert sim.total_buy_vol == 200 * XEL
+    assert sim.total_sell_vol == sim.s[sim._pk(pid, "sv")]
+    assert sim.total_volume == sim.s[sim._pk(pid, "vo")]
+    assert sim.total_trades == 3
+    # a second project keeps its OWN scoreboard
+    pid2 = sim.propose("xel:b", 500 * XEL, tb=0)
+    _validate(sim, pid2)
+    sim.buy(pid2, "xel:c", 50 * XEL)
+    assert sim.s[sim._pk(pid2, "bv")] == 50 * XEL
+    assert sim.s[sim._pk(pid2, "tc")] == 1
+    assert sim.s[sim._pk(pid, "tc")] == 3            # untouched
+    assert sim.total_trades == 4
+    assert sim.total_volume == (sim.s[sim._pk(pid, "vo")] +
+                                sim.s[sim._pk(pid2, "vo")])
+
+
+def test_market_cap_history_scoreboard_d12():
+    """mc tracks every curve change, mh only grows, mg is snapshotted once
+    at graduation (post-migration-fee); claims refresh mc too."""
+    sim = Sim()
+    alice = "xel:alice"
+    pid = sim.propose(alice, 500 * XEL, ts=1_000_000_000 * XEL, tb=1000)
+    _validate(sim, pid)
+    assert sim.s[sim._pk(pid, "mg")] == 0            # never graduated yet
+    first_cap = None
+    while sim.s[sim._pk(pid, "st")] == lp.ST_BONDING:
+        sim.buy(pid, "xel:w", 100 * XEL)
+        cap = sim.s[sim._pk(pid, "mc")]
+        if first_cap is None:
+            first_cap = cap
+        assert cap <= sim.s[sim._pk(pid, "mh")]
+    # graduated: mg written exactly once, equals the post-fee cap
+    assert sim.s[sim._pk(pid, "gr")] is True
+    assert sim.s[sim._pk(pid, "mg")] > 0
+    assert sim.s[sim._pk(pid, "mg")] == sim.s[sim._pk(pid, "mc")]
+    mg = sim.s[sim._pk(pid, "mg")]
+    # a sell DROPS mc (reserves leave) but mh stays at the peak
+    tokens = sim.s[lp.bal_key(pid, "xel:w")]
+    sim.sell(pid, "xel:w", tokens // 2)
+    assert sim.s[sim._pk(pid, "mc")] < mg
+    assert sim.s[sim._pk(pid, "mh")] >= mg
+    # a team claim GROWS circulating -> mc jumps up immediately (no lag)
+    sim.claim_team_allocation(pid, alice)
+    expected = lp.market_cap(
+        sim.s[sim._pk(pid, "rv")], sim.s[sim._pk(pid, "cs")],
+        sim.s[sim._pk(pid, "ts")], sim.s[sim._pk(pid, "tb")],
+        True, sim.s[sim._pk(pid, "tp")])
+    assert sim.s[sim._pk(pid, "mc")] == expected
+    # mg was never rewritten
+    assert sim.s[sim._pk(pid, "mg")] == mg
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1304,9 @@ def test_contract_exposes_the_full_spec_api():
         # housekeeping
         "get_project_info", "get_token_balance", "get_status_label",
         "get_version",
+        # v3 (D10/D11/D12)
+        "get_social_links", "get_trading_stats", "get_market_cap_history",
+        "get_proposal_data", "get_volume_stats",
     }
     missing = spec - names
     assert not missing, f"spec functions missing from the contract: {missing}"
@@ -943,7 +1340,7 @@ def test_contract_defaults_match_the_sdk_reference():
     assert "DEFAULT_TEAM_DELAY: u64 = 3153600" in text
     assert "DEFAULT_VESTING_MIN: u64 = 518400" in text
     assert "DEFAULT_VESTING_MAX: u64 = 6307200" in text
-    assert 'const VERSION: string = "VaultLaunch v2.0.0"' in text
+    assert 'const VERSION: string = "VaultLaunch v3.0.0"' in text
 
 
 def test_cross_checked_pairs_are_enforced_d7_d8():
