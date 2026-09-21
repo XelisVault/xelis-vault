@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v15
+# Security Policy — XelisVault Protocol v16
 
 ## Reporting
 
@@ -9,24 +9,32 @@ credit; no bounties yet (community project).
 
 ## State of the codebase
 
-### v15 (current, this tree)
+### v16 (current, this tree)
 
-- `contracts/launchpad/VaultLaunch.slx` — the launchpad, built to the same
-  bar as the mixer and machine-checked on every push:
+- `contracts/launchpad/VaultLaunch.slx` — the launchpad (v2: two-path
+  graduation, graduated fee, migration fee, team vesting), built to the
+  same bar as the mixer and machine-checked on every push:
   - zero `let _ = transfer` (swallowed transfer failures) — linter rule R1
   - zero unchecked transfers — R2
   - zero owner-drain entries; the admin's only XEL exit is
     `withdraw_fees`, double-capped (accrued fees AND uncommitted balance) —
     R3 + the I2 solvency invariant
   - every `.expect()`/`.unwrap()` guarded by a preceding `require` — R4
-  - every admin parameter range-checked against hard caps (trading fee
-    can never exceed 10%) — documented in docs/LAUNCHPAD.md §4
+  - every admin parameter range-checked against hard caps (trading and
+    graduated fees can never exceed 10%, the migration fee 5%) and the
+    fee/liquidity pairs CROSS-CHECKED (`graduated_fee ≤ trading_fee`,
+    `min_liquidity ≤ direct_listing_threshold`) — documented in
+    docs/LAUNCHPAD.md §4
   - public-by-design entries (`sell`, `finalize_validation`) carry written
     exemptions in the linter; `support`/`report` are caller-bound by the
     vote-marker key itself — R7
   - listing views use const-bounded loops (R8) and rank accessors instead
     of array returns (no compiled ABI ever returned an array — verified
     against the v12 compiler ground truth)
+  - the team allocation is paid EXACTLY once across all claim paths
+    (immediate, vesting stream, late claim) via the `team_paid` debit
+    counter — invariant I4, asserted by the reference mini-VM after
+    every operation
   - the SDK's entry-id table is CI-pinned to the contract's real chunk
     numbering (tests/test_launchpad_reference.py) — a drift would invoke
     the wrong entry, so it cannot happen silently

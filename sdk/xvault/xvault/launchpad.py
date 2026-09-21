@@ -53,7 +53,10 @@ SELLABLE = (ST_BONDING, ST_GRADUATED, ST_TRUSTED, ST_UNTRUSTED, ST_RECOVERY)
 DEFAULTS = {
     "submission_fee": 1_000_000_000,          # 10 XEL
     "min_liquidity": 50_000_000_000,          # 500 XEL
-    "trading_fee_bps": 50,                    # 0.5%
+    "trading_fee_bps": 50,                    # 0.5% while bonding
+    "graduated_fee_bps": 25,                  # 0.25% once graduated (D8)
+    "migration_fee_bps": 50,                  # 0.5% once at graduation (D9)
+    "direct_listing_threshold": 200_000_000_000,  # 2000 XEL skips bonding (D7)
     "min_participants": 20,
     "min_approval_ratio_bps": 8_000,          # 80%
     "validation_duration": 51_840,            # ~3 days at ~5s topoheights
@@ -61,6 +64,9 @@ DEFAULTS = {
     "recovery_fee": 25_000_000_000,           # 250 XEL
     "recovery_min_participants": 40,
     "recovery_min_ratio_bps": 9_000,          # 90%
+    "team_unlock_delay": 3_153_600,           # ~6 months of bonding (D3)
+    "vesting_min": 518_400,                   # ~1 month
+    "vesting_max": 6_307_200,                 # ~1 year
 }
 
 # ---------------------------------------------------------------------------
@@ -91,6 +97,51 @@ def team_alloc_of(total_supply: int, team_bps: int) -> int:
     return total_supply * team_bps // 10_000
 
 
+def current_fee_bps(graduated: bool, trading_fee_bps: int, graduated_fee_bps: int) -> int:
+    """Effective trading fee of a project (D8): the graduated rate once it
+    has graduated, clamped <= the bonding rate — exactly the contract's
+    current_fee_bps() helper (defence in depth on top of cross-checked
+    setters)."""
+    if not graduated:
+        return trading_fee_bps
+    return min(graduated_fee_bps, trading_fee_bps)
+
+
+def team_unlocked(team_alloc: int, graduated: bool,
+                  vesting_start: int, vesting_duration: int,
+                  status: int, bonding_start: int, team_unlock_delay: int,
+                  topo: int) -> int:
+    """How much of the allocation the creator may claim RIGHT NOW (D3) —
+    mirrors the contract's team_unlocked() exactly (the gross unlocked
+    amount; claimable = unlocked - team_paid, floored at 0).
+
+    vesting active -> linear stream team * elapsed / duration (floored)
+    graduated (no vesting) -> full allocation
+    bonding/Untrusted/Recovery past team_unlock_delay -> full allocation
+    otherwise -> 0
+    """
+    if team_alloc == 0:
+        return 0
+    if vesting_start > 0:
+        if vesting_duration == 0:
+            return team_alloc
+        if topo <= vesting_start:
+            return 0
+        elapsed = topo - vesting_start
+        return min(team_alloc * elapsed // vesting_duration, team_alloc)
+    if graduated:
+        return team_alloc
+    if status in (ST_BONDING, ST_UNTRUSTED, ST_RECOVERY) and bonding_start > 0:
+        if topo >= bonding_start + team_unlock_delay:
+            return team_alloc
+    return 0
+
+
+def team_remaining(team_alloc: int, team_paid: int) -> int:
+    """Allocation still owed to the creator (never negative) — the I1 term."""
+    return max(team_alloc - team_paid, 0)
+
+
 def buy_quote(reserves: int, curve_supply: int, xel_amount: int,
               fee_bps: int) -> int:
     """Tokens received for an attached XEL amount (fee included)."""
@@ -114,12 +165,16 @@ def current_price(reserves: int, curve_supply: int,
 
 
 def market_cap(reserves: int, curve_supply: int, total_supply: int,
-               team_bps: int, graduated: bool) -> int:
-    """mc = R * circulating / C in atomic XEL (saturating at u64 max)."""
+               team_bps: int, graduated: bool, team_paid: int = 0) -> int:
+    """mc = R * circulating / C in atomic XEL (saturating at u64 max).
+
+    circulating excludes the team allocation NOT YET PAID to the creator
+    (v2 unified rule — the graduated flag no longer changes the term).
+    """
     if curve_supply == 0:
         return 0
-    team = 0 if graduated else team_alloc_of(total_supply, team_bps)
-    circulating = total_supply - curve_supply - team
+    team_rem = team_remaining(team_alloc_of(total_supply, team_bps), team_paid)
+    circulating = total_supply - curve_supply - team_rem
     if circulating <= 0:
         return 0
     return min(reserves * circulating // curve_supply, 2**64 - 1)
@@ -147,12 +202,17 @@ F_SUPPLY, F_TEAM_BPS, F_LIQUIDITY = "ts", "tb", "lq"
 F_RESERVES, F_CURVE, F_CREATED, F_DEADLINE = "rv", "cs", "ct", "ve"
 F_SUPPORTS, F_REPORTS, F_GRADUATED = "sp", "rp", "gr"
 F_REFUND, F_ROUND, F_VOLUME = "rc", "rd", "vo"
+F_DL, F_BONDING_START = "dl", "bt"
+F_TEAM_PAID, F_VESTING_START, F_VESTING_DURATION = "tp", "vs", "vd"
 
 GLOBAL_KEYS = {
     "admin": "adm", "count": "pc", "submission_fee": "sub",
     "min_liquidity": "mnl", "trading_fee_bps": "tfe",
+    "graduated_fee_bps": "gfe", "migration_fee_bps": "mgf",
+    "direct_listing_threshold": "dlt",
     "min_participants": "mnp", "min_approval_ratio_bps": "mab",
     "validation_duration": "vdt", "graduation_multiplier": "gmu",
+    "team_unlock_delay": "tdy", "vesting_min": "vmn", "vesting_max": "vmx",
     "recovery_fee": "rfe", "recovery_min_participants": "rmp",
     "recovery_min_ratio_bps": "rmr", "pending_fees": "pfe",
     "fees_collected_lifetime": "fcl", "total_volume": "tvl",
@@ -188,6 +248,14 @@ def update_info_params(description: str, website: str, logo: str) -> list:
 
 def set_recovery_params_params(participants: int, ratio_bps: int) -> list:
     return [val_u64(participants), val_u64(ratio_bps)]
+
+
+def set_vesting_bounds_params(min_topos: int, max_topos: int) -> list:
+    return [val_u64(min_topos), val_u64(max_topos)]
+
+
+def start_team_vesting_params(pid: int, duration: int) -> list:
+    return [val_u64(pid), val_u64(duration)]
 
 
 def pid_params(pid: int) -> list:
@@ -246,11 +314,42 @@ class LaunchpadReader:
                             ("deadline", F_DEADLINE),
                             ("supports", F_SUPPORTS), ("reports", F_REPORTS),
                             ("graduated", F_GRADUATED), ("round", F_ROUND),
-                            ("volume", F_VOLUME)):
+                            ("volume", F_VOLUME),
+                            ("direct_listing", F_DL),
+                            ("bonding_start", F_BONDING_START),
+                            ("team_paid", F_TEAM_PAID),
+                            ("vesting_start", F_VESTING_START),
+                            ("vesting_duration", F_VESTING_DURATION)):
             out[attr] = self._key(proj_key(pid, field))
         status = out.get("status") or 0
         out["status_label"] = STATUS_LABELS.get(status, "unknown")
         return out
+
+    def team_allocation(self, pid: int, topo: int = 0) -> Dict[str, int]:
+        """Team allocation panel (D3): alloc, paid, vesting, claimable_now.
+
+        `topo` is the reference topoheight for the vesting stream (the
+        daemon's current topoheight in production; tests pass explicit
+        values). Mirrors the contract's get_team_allocation view.
+        """
+        p = self.project(pid)
+        team = team_alloc_of(p["total_supply"] or 0, p["team_bps"] or 0)
+        paid = p["team_paid"] or 0
+        unlocked = team_unlocked(
+            team, bool(p["graduated"]),
+            p["vesting_start"] or 0, p["vesting_duration"] or 0,
+            p["status"] or 0, p["bonding_start"] or 0,
+            self._key(GLOBAL_KEYS["team_unlock_delay"],
+                      DEFAULTS["team_unlock_delay"]),
+            topo)
+        return {
+            "team_alloc": team,
+            "team_paid": paid,
+            "team_remaining": team_remaining(team, paid),
+            "vesting_start": p["vesting_start"] or 0,
+            "vesting_duration": p["vesting_duration"] or 0,
+            "claimable_now": max(unlocked - paid, 0),
+        }
 
     def token_balance(self, pid: int, owner: str) -> int:
         return self._key(bal_key(pid, owner), 0) or 0
@@ -261,15 +360,22 @@ class LaunchpadReader:
     def quotes(self, pid: int, fee_bps: Optional[int] = None) -> Dict[str, int]:
         p = self.project(pid)
         reserves, curve = p["reserves"] or 0, p["curve"] or 0
+        graduated = bool(p["graduated"])
         if fee_bps is None:
-            fee_bps = self._key(GLOBAL_KEYS["trading_fee_bps"],
-                                DEFAULTS["trading_fee_bps"])
+            # the project's EFFECTIVE fee (D8), exactly like the contract
+            fee_bps = current_fee_bps(
+                graduated,
+                self._key(GLOBAL_KEYS["trading_fee_bps"],
+                          DEFAULTS["trading_fee_bps"]),
+                self._key(GLOBAL_KEYS["graduated_fee_bps"],
+                          DEFAULTS["graduated_fee_bps"]))
         return {
             "reserves": reserves,
             "curve": curve,
             "price": current_price(reserves, curve),
             "market_cap": market_cap(reserves, curve, p["total_supply"] or 0,
-                                     p["team_bps"] or 0,
-                                     bool(p["graduated"])),
+                                     p["team_bps"] or 0, graduated,
+                                     p["team_paid"] or 0),
             "fee_bps": fee_bps,
+            "graduated": graduated,
         }

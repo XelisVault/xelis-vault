@@ -1,6 +1,6 @@
 # VaultLaunch — Design Specification
 
-> contracts/launchpad/VaultLaunch.slx · v1.0.0 · mainnet-ready (testnet first)
+> contracts/launchpad/VaultLaunch.slx · v2.0.0 · mainnet-ready (testnet first)
 
 A serious launchpad for XEL: real projects are filtered by a community
 validation vote, priced by a constant-product bonding curve, and held to a
@@ -9,6 +9,14 @@ configurable by the admin and 100% of the revenue goes to the admin —
 nothing is burned. This is NOT a memecoin casino: the vote window is the
 quality filter, the trust system keeps founders accountable forever, and
 the curve math is integer-exact and solvent by construction.
+
+**v2 — graduation is worth reaching.** Two paths now lead to graduation:
+a founder who locks serious liquidity (≥ the direct-listing threshold)
+graduates the moment validation passes; smaller floats discover price on
+the bonding curve and graduate when their reserves grow ×4. Graduated
+projects trade at a LOWER fee, the team allocation unlocks (immediate
+claim or voluntary vesting), and a small one-time migration fee — taken
+from the curve, pump.fun-style but smaller — funds the protocol.
 
 One file. Zero inter-contract calls. Zero external dependencies.
 
@@ -25,22 +33,38 @@ One file. Zero inter-contract calls. Zero external dependencies.
                  ends at validation_end topo)
         pass >= 20 voters AND >= 80%      fail
         |----------------------------------|
-        v                                  v
-  2 BONDING                        1 REJECTED
-  buy / sell live                  claim_refund() -> 100% of the
-  votes continue (trust)           founder's liquidity, once
+        |                                  v
+        |                           1 REJECTED
+        |                           claim_refund() -> 100% of the
+        |                           founder's liquidity, once
+        |                           (NO team tokens — a rejected
+        |                            launch never mints)
+        |
+        +-- liquidity >= direct_listing_threshold (snapshotted at propose)
+        |            |
+        |            v  DIRECT LISTING (D7)
+        |   3 GRADUATED on the spot: migration fee taken on the seed,
+        |      graduated fee from the first trade, Trusted badge,
+        |      team unlock — the full graduation set, day one
+        |
+        v  else (smaller float)
+  2 BONDING
+  buy / sell live
+  votes continue (trust)
         |
         | reserves >= liquidity x 4 (default)
-        v
+        v  CURVE GRADUATION
   3 GRADUATED (+ Trusted)
-  team allocation minted to the creator
-  trading CONTINUES (the contract is the
-  token's permanent venue)
+  one-time migration fee taken from the grown reserves (D9)
+  team allocation claimable (D3); trading CONTINUES at the
+  graduated fee (the contract is the token's permanent venue)
         |
         | reports reach 80% of all votes
         v
   5 UNTRUSTED  <-------------------------------------.
   buys BLOCKED, sells open, votes open                |
+  (graduated projects KEEP the lower fee:             |
+   the milestone is rewarded, not punished)           |
         | request_revalidation()                      | fail
         |  - not graduated: free, normal thresholds   |
         |  - graduated: 250 XEL fee, 40 voters, 90%   |
@@ -56,194 +80,326 @@ Status codes (see `get_status_label`): `0 validation, 1 rejected,
 
 **Who triggers what.** XELIS has no timers: every transition is
 event-driven. Graduation fires inside the `buy()` that crosses the
-threshold; trust loss fires inside the vote that crosses the ratio;
-window outcomes are applied by `finalize_validation()`, callable by
-ANYONE once the deadline passed (the founder has a natural incentive to
-finalize a refund, the community to finalize a launch).
+threshold, or inside `finalize_validation()` for a direct listing; trust
+loss fires inside the vote that crosses the ratio; window outcomes are
+applied by `finalize_validation()`, callable by
+ANYONE after the deadline (the outcome is fully determined by the public
+tallies — the finalizer only executes it). The vesting stream and the
+team unlock delay are evaluated lazily, at claim time, against the
+current topoheight.
+
+**Why "graduation" at all, if trading never stops?** Graduation is a
+status milestone with real economics attached — see §2a. It is the
+launchpad's incentive spine: everyone (founder, buyers, community) is
+pushed toward the same goal.
+
+---
 
 ## 2. The bonding curve (constant product, integer-exact)
 
-State per project: `R` = real XEL reserves, `C` = curve token supply
-(the sellable balance the curve holds). Price = `R / C`.
+State per project: `R` = real XEL reserves, `C` = curve token supply (the
+sellable balance held by the curve). Spot price = `R / C`.
 
 ```
-buy  X XEL:   fee   = X * trading_fee_bps / 10000        -> admin (pending)
-              net   = X - fee                            -> joins R
-              out   = C * net / (R + net)                -> buyer (floored)
-
-sell T tokens: gross = R * T / (C + T)                   -> leaves R (floored)
-              fee   = gross * trading_fee_bps / 10000     -> admin (pending)
-              out   = gross - fee                         -> seller (checked transfer)
+buy  with X XEL attached:   fee = X * fee_bps / 10000
+                            net = X - fee                  (joins R)
+                            tokens_out = C * net / (R + net)     (floored)
+sell of T tokens:          gross = R * T / (C + T)         (leaves R)
+                            fee  = gross * fee_bps / 10000
+                            out  = gross - fee              (to caller)
 ```
 
-Both directions floor in favour of the contract, so rounding can never
-make a curve insolvent. All intermediates are computed in u128 (products
-reach 1e31; u64 would overflow). Defaults: trading fee 50 bps (0.5%),
-hard-capped at 1000 bps (10%) by the setter.
+Both directions floor (integer division) in favour of the contract, so
+the pool can never go insolvent from rounding. All intermediates are
+computed in u128 (products reach 1e31; u64 would overflow). The implied
+`k = R * C` never decreases through trades — fees stay in the reserves
+on the buy side and only the net is paid out on the sell side.
 
-**Worked example.** A founder deposits 1000 XEL with 1B supply and 10%
-team: `C = 900M` tokens, `R = 1000 XEL`, opening price ≈ 1.11 µXEL. A
-100 XEL buy at 0.5% fee nets 99.5 XEL into `R` → buyer receives ≈
-82.6M tokens. Graduation needs `R >= 4000 XEL` (liquidity × 4): net buys
-must add ~3000 XEL. At graduation the 100M team tokens are minted to the
-creator (they were excluded from `C` from block one, so they can never
-be over-sold), and trading simply continues.
+### 2a. The fee schedule — graduation pays (v2)
 
-**Solvency invariant (I2).** The contract's XEL balance always covers
-`Σ curve reserves + pending fees + refundable rejections`. `withdraw_fees`
-is double-capped (accrued fees AND uncommitted balance) — the admin can
-never touch curve funds, user balances or refunds.
+`fee_bps` is **per-project**, resolved by the `current_fee_bps()` helper:
 
-## 3. Design decisions (the important trade-offs)
+| project state        | fee applied                | default |
+|----------------------|----------------------------|---------|
+| bonding              | `trading_fee_bps`          | 0.50%   |
+| graduated (any path) | `graduated_fee_bps`        | 0.25%   |
 
-| # | Decision | Why |
-|---|----------|-----|
-| D1 | Tokens are an **internal ledger** in this contract | XELIS has no inter-contract calls today; a launched token cannot be a separate contract the launchpad drives. Balances live in `b:{id}:{addr}` keys and trade only against the curve here. Migration becomes possible the day the VM ships cross-calls. |
-| D2 | **Graduation does not stop trading** | There is no external DEX to migrate to (D1); freezing the curve would trap holders. The bonding PHASE ends, the milestone is recorded, the same math serves trades forever. |
-| D3 | **Team tokens mint at graduation** | The allocation is excluded from the curve's sellable supply from day one (no over-sale possible) but only credited to the creator on graduation. A project that never graduates pays the team nothing — and the founder's liquidity stays locked in the curve. |
-| D4 | **Untrusted blocks buys, never sells** | Losing trust must protect new entrants without trapping existing ones. The trust flip can never freeze funds. |
-| D5 | **Fees accrue, admin pulls** | Submission + trading + recovery fees accumulate in `pending_fees`; `withdraw_fees()` is the single, capped exit. 100% to the admin, zero burn. |
-| D6 | **1 address = 1 vote per round** | The network fee is the only (honest) sybil cost on XELIS today. Votes reset when a new round opens; trust tallies otherwise accumulate for the project's whole life — early supports cushion later reports, early reports are never forgotten. |
+- The discount is acquired at graduation and is **irreversible**: a
+  project that later loses trust keeps the lower fee on sells (holders
+  exit cheap — D4 in the contract header). The milestone is what is
+  rewarded.
+- The setters cross-check the pair in BOTH directions
+  (`set_trading_fee` refuses to go below `graduated_fee_bps`;
+  `set_graduated_trading_fee` refuses to exceed `trading_fee_bps`), and
+  the helper re-clamps at read time — no parameter sequence can invert
+  the discount.
+- Both quotes (`get_buy_quote`, `get_sell_quote`) use the same helper as
+  the trades — a quote can never disagree with the trade it previews.
+
+### 2b. Graduation, the two paths (v2)
+
+| path            | trigger                                          | migration fee taken on |
+|-----------------|--------------------------------------------------|------------------------|
+| curve growth    | `R >= liquidity × graduation_multiplier` (×4)     | the grown reserves     |
+| direct listing  | `liquidity >= direct_listing_threshold` at propose | the seed liquidity     |
+
+- The threshold (default 2000 XEL = 500 × 4 — exactly what a curve
+  graduate has proven) is **snapshotted per project at propose time**:
+  the founder gets the rules they signed up with; later admin tuning
+  never reclassifies an existing proposal.
+- Both paths converge in the same `graduate()` — one set of
+  post-graduation rules, no special cases.
+- The threshold is cross-checked against `min_liquidity` in both
+  directions: the fast track can never swallow every proposal, and a
+  small float always gets its curve.
+
+**What being migrated buys a project** (the full graduation set):
+
+1. **Half the trading fee** (0.25% vs 0.50% by default) — every holder
+   and every future buyer saves on every trade.
+2. **Team unlock** — the allocation becomes claimable (§3).
+3. **The Trusted badge** — Graduated/Trusted projects are listed by
+   `get_trusted_projects` / `get_trusted_by_rank`, the frontend's
+   "serious" shelf.
+4. **Deep reserves from day one** (direct listing) or **proven demand**
+   (curve path: the community put 4× the seed into the curve).
+5. **Permanence** — the contract is the token's venue forever; liquidity
+   can never be pulled (the founder's seed is locked in the curve).
+
+What graduation does NOT buy: immunity. Trust votes continue for the
+life of the project; 80% of all accumulated votes can flip it Untrusted
+(buys blocked, sells never).
+
+### 2c. The migration fee (v2, D9)
+
+When a project graduates — by curve growth or direct listing —
+`migration_fee_bps` (default 0.5%, hard cap 5%) is taken ONCE from the
+project's reserves and accrues to `pending_fees` (admin revenue, like
+every other fee — nothing is burned). Reserves dip by exactly that fee
+and every subsequent trade prices it in; there is no further migration
+cost, ever. A direct listing pays the fee on its seed liquidity; a curve
+graduate on its ≥ 4×-larger grown reserves — the fee naturally scales
+with the value the launchpad helped create.
+
+Solvency note (invariant I2): the fee moves value from a curve's
+reserves into `pending_fees` without touching `total_curve_xel`. This is
+safe because every live project's seed liquidity sits uncommitted in the
+contract balance (it only ever leaves as a rejected refund, which is
+counted in `locked_refunds`), and the fee is capped at 5% of reserves
+while reserves at graduation are at least the seed — the margin always
+covers the fee many times over. The reference tests exercise graduation
+plus a full admin fee drain and assert I2 throughout.
+
+---
+
+## 3. The team allocation (v2, D3)
+
+The founder declares `team_bps` (≤ 20%) at propose time. The allocation
+is **reserved in the curve from day one** (the sellable supply excludes
+it), so it can never be over-sold — and it is **paid out exactly once
+across all claim paths** (invariant I4), debited against a running
+`team_paid` counter.
+
+Three unlock paths, evaluated lazily at claim time:
+
+| situation                                  | unlocked amount               |
+|--------------------------------------------|-------------------------------|
+| vesting started (`vs > 0`)                 | `team × elapsed / duration` (linear, floored, saturating) |
+| graduated, no vesting                      | the full allocation           |
+| never graduated, `≥ team_unlock_delay` of bonding | the full allocation (the late claim) |
+| anything else (validation, rejected, too early) | 0                         |
+
+- **At migration, the creator chooses**: `claim_team_allocation()` pays
+  the full remaining allocation immediately, OR `start_team_vesting(
+  duration)` locks it into a linear stream (duration within the admin
+  window, default ~1 month..~1 year) claimed incrementally. The vesting
+  is a **public commitment signal** — the frontend shows it via
+  `get_team_allocation`, and a vesting founder cannot dump.
+- **The vesting is irreversible** (one per project) — that is the point
+  of a commitment.
+- **The late claim keeps founders motivated**: a project that never
+  graduates does not hold the team hostage. After the unlock delay
+  (default ~6 months of bonding; the project may even be Untrusted or in
+  Recovery — if it is still alive, the delay keeps running) the creator
+  may claim in full (or start a vesting). Buyers are never diluted by
+  this: the allocation was reserved in the curve's supply from day one,
+  so its late release changes WHO holds those tokens, not how many
+  exist (invariant I1: `curve_supply + balances + team_remaining ==
+  total_supply`, always).
+- A **rejected** project mints nothing: the launch never happened, the
+  liquidity is refunded 100%, the team gets a lesson instead.
+
+---
 
 ## 4. Fees & parameters (all admin-settable, all range-checked)
 
-| Parameter | Default | Hard range | Storage key |
-|---|---|---|---|
-| submission_fee | 10 XEL | ≤ 100 XEL | `sub` |
-| min_liquidity | 500 XEL | [1 XEL, 100k XEL] | `mnl` |
-| trading_fee_bps | 50 (0.5%) | ≤ 1000 (10%) | `tfe` |
-| min_participants | 20 | [1, 100k] | `mnp` |
-| min_approval_ratio_bps | 8000 (80%) | (50%, 100%] | `mab` |
-| validation_duration | 51840 topos (~3d) | [~1h, ~15d] | `vdt` |
-| graduation_multiplier | 4 | [2, 100] | `gmu` |
-| recovery_fee | 250 XEL | ≤ 1000 XEL | `rfe` |
-| recovery_min_participants | 40 | [1, 100k] | `rmp` |
-| recovery_min_ratio_bps | 9000 (90%) | (50%, 100%] | `rmr` |
+| parameter                  | default     | hard bounds                     |
+|----------------------------|-------------|---------------------------------|
+| submission_fee             | 10 XEL      | ≤ 100 XEL                       |
+| min_liquidity              | 500 XEL     | [1 XEL, 100k XEL] and ≤ threshold |
+| trading_fee_bps (bonding)  | 50 (0.5%)   | ≤ 1000 and ≥ graduated fee      |
+| graduated_fee_bps          | 25 (0.25%)  | ≤ 1000 and ≤ trading fee        |
+| migration_fee_bps          | 50 (0.5%)   | ≤ 500 (5%)                      |
+| direct_listing_threshold   | 2000 XEL    | ≥ min_liquidity, ≤ 10M XEL      |
+| validation window          | 51840 topos | [~1h, ~15d]                     |
+| min_participants           | 20          | [1, 100k]                       |
+| min_approval_ratio_bps     | 8000 (80%)  | (50%, 100%]                     |
+| graduation_multiplier      | 4           | [2, 100]                        |
+| team_unlock_delay          | 3,153,600 topos (~6 mo) | [~5d, ~2y]           |
+| vesting bounds             | 518400..6307200 topos (~1..12 mo) | [~1d, ~2y], min < max |
+| recovery_fee               | 250 XEL     | ≤ 1000 XEL                      |
+| recovery thresholds        | 40 voters / 90% | stricter than validation    |
 
-Per-project caps (in `propose`): supply in [1, 100M] tokens, team ≤ 20%,
-name ≤ 64 chars, symbol ≤ 16, description ≤ 512, website/logo ≤ 256.
-Trade caps: buys in [0.01 XEL, 100k XEL] per call.
+**Cross-checked pairs** (the two invariants the setters enforce between
+each other): `graduated_fee_bps ≤ trading_fee_bps` (the graduation
+discount can never invert) and `min_liquidity ≤ direct_listing_threshold`
+(the fast track can never swallow every proposal). A compromised admin
+can hurt the fee model, never the funds.
 
-`set_paused(true)` freezes NEW proposals and NEW buys only — sells,
-votes, refunds and finalization are never pausable (exits and community
-decisions cannot be frozen).
+**Revenue model**: submission fees + trading fees (both rates) +
+migration fees + recovery fees — 100% to the admin via `withdraw_fees`,
+zero burn. The withdrawal is double-capped (accrued `pending_fees` AND
+the uncommitted balance), so curves and refunds are always covered first
+(invariant I2).
+
+Read the live configuration with the views: `get_config()` (launch
+parameters), `get_recovery_config()`, `get_team_config()`.
+
+---
 
 ## 5. Security model (honest threat documentation)
 
-- **Admin is a hot role with a cold wallet's job.** It sets fees and can
-  pause new activity, but it can NEVER move curve reserves, token
-  balances or refunds: the only XEL exit for the admin is
-  `withdraw_fees`, capped twice. Use a dedicated cold address as admin.
-- **Sybil resistance = the network fee.** Nothing else. 20 validating
-  votes or 80 trust-flip votes each cost a real transaction fee; cheap
-  griefing is possible, cheap *validation* of junk is not.
-- **Carry-over tallies cut both ways.** Validation supports cushion later
-  reports (80% of ALL votes are needed to flip); symmetrically, early
-  reports keep counting against recovery. A project's whole voting
-  history matters, which is the point of a long-term trust system.
-- **Front-running is possible** (public mempool, no batch auctions on
-  XELIS today). Quotes (`get_buy_quote`, `get_sell_quote`) are views —
-  frontends should display them and let users set expectations. Slippage
-  parameters can be added client-side by comparing quote vs expectation
-  before broadcasting.
-- **No reentrancy surface**: invokes are atomic, no external calls.
-- **Unguarded panics**: none reachable with public data — every optional
-  load uses a safe default or a guarded `.expect` (linter R4 enforces
-  this on every push).
+- The admin is a hot role: it sets every parameter and can pause NEW
+  proposals and NEW buys. It can NEVER move curve reserves, user token
+  balances, refundable rejections, or team allocations — `withdraw_fees`
+  is its only XEL exit, double-capped. Sells, votes, refunds, team
+  claims and finalization are never pausable.
+- No reentrancy surface: XELIS invokes are atomic, the contract calls no
+  other contract, and every transfer happens after all state changes
+  (checks-effects-interactions).
+- Voting sybil-resistance is the network fee, nothing more (documented,
+  not hidden). 20+ voting transactions at 80% agreement make cheap
+  attack campaigns expensive; the trust tallies accumulate for the whole
+  life of the project.
+- Front-running buys/sells is possible (no mempool privacy) — same as
+  every public DEX on XELIS today; quotes are view functions, use them.
+- Storage keys are fully namespaced (`p:`, `v:`, `b:` prefixes); no
+  user-controlled key material. Every panic message is a fixed short
+  literal.
+- Storage growth is bounded: 8192 projects max, per-project state is a
+  fixed key set, votes are one key per (project, round, address).
+
+---
 
 ## 6. Events (V6 contract events)
 
-| id | Event | Fields |
-|---|---|---|
-| 1 | ProjectCreated | id, name, symbol, liquidity |
-| 2 | ProjectSupported | id, round, voter |
-| 3 | ProjectReported | id, round, voter |
-| 4 | ValidationFinished | id, "1"/"0" |
-| 5 | BondingOpened | id |
-| 6 | TokensBought | id, xel_in, tokens_out, fee |
-| 7 | TokensSold | id, tokens_in, xel_out, fee |
-| 8 | ProjectGraduated | id, reserves, team_minted |
-| 9 | TrustLost | id, reports, supports |
-| 10 | TrustRecovered | id |
-| 11 | FeesCollected | amount |
-| 12 | ParamSet | param, value |
-| 13/14 | Paused / Unpaused | "admin" |
-| 15 | AdminSet | new_admin |
-| 16 | RefundClaimed | id, amount |
-| 17 | RecoveryRequested | id, round |
-| 18 | ProjectInfoUpdated | id |
+| id | event                 | fields                              |
+|----|-----------------------|-------------------------------------|
+| 1  | ProjectCreated        | id, name, symbol, liquidity         |
+| 2  | ProjectSupported      | id, round, voter                    |
+| 3  | ProjectReported       | id, round, voter                    |
+| 4  | ValidationFinished    | id, "1"\|"0"                        |
+| 5  | BondingOpened         | id                                  |
+| 6  | TokensBought          | id, xel_in, tokens_out, fee         |
+| 7  | TokensSold            | id, tokens_in, xel_out, fee         |
+| 8  | ProjectGraduated      | id, reserves, team_allocation       |
+| 9  | TrustLost             | id, reports, supports               |
+| 10 | TrustRecovered        | id                                  |
+| 11 | FeesCollected         | amount                              |
+| 12 | ParamSet              | param, value                        |
+| 13 | Paused                | "admin"                             |
+| 14 | Unpaused              | "admin"                             |
+| 15 | AdminSet              | new_admin                           |
+| 16 | RefundClaimed         | id, amount                          |
+| 17 | RecoveryRequested     | id, round                           |
+| 18 | ProjectInfoUpdated    | id                                  |
+| 19 | TeamVestingStarted    | id, duration                        |
+| 20 | TeamClaimed           | id, amount                          |
+| 21 | DirectListed          | id, liquidity                       |
+| 22 | MigrationFeeTaken     | id, fee                             |
+
+---
 
 ## 7. Frontend integration guide
 
-**Project data** — one card needs three view calls:
+Storage keys are plain strings (read via `get_contract_data` with a
+string key — see `sdk/xvault/xvault/launchpad.py`, which is a complete
+Python reference):
 
-```
-get_project(id)        -> (creator, status, created_topo, deadline, graduated)
-get_project_info(id)   -> (name, symbol, description, website, logo)
-get_project_tokenomics(id) -> (total_supply, team_bps, liquidity, reserves, curve)
-get_current_price(id)  -> XEL*1e8 per token   (divide by 1e8 for display)
-get_market_cap(id)     -> atomic XEL          (fmt like XEL amounts)
-```
+- global: `pc` (project count), `sub mnl tfe gfe mgf dlt mnp mab vdt
+  gmu tdy vmn vmx rfe rmp rmr` (parameters), `pfe fcl tvl tcx lrf pz`
+  (accounting), `adm` (admin), `xa` (XEL asset)
+- project fields `p:{id}:{field}`: `cr` creator, `st` status, `nm sy ds
+  ws lg` metadata, `ts tb lq rv cs` tokenomics, `ct ve` window, `sp rp
+  rd` votes, `gr` graduated, `rc` refund claimed, `vo` volume, `dl`
+  direct-listing eligible, `bt` bonding start, `tp` team paid, `vs vd`
+  vesting start/duration
+- balances `b:{id}:{addr}` (the launched token IS this ledger), votes
+  `v:{id}:{round}:{addr}`
 
-**Listings** — Silex has no array returns (verified against every ABI the
-v12 compiler emitted), so listings are count + rank accessors:
+Card layout suggestion (per project):
 
-```
-total   = get_total_projects()
-ids     = [get_latest_projects(rank) for rank in range(N)]        # newest first
-trusted = [get_trusted_by_rank(rank) for rank in range(get_trusted_projects())]
-by_status(n) = [get_project_by_rank(n, rank) for rank in range(get_projects_by_status(n))]
-```
+1. name/symbol/logo, status badge (`get_status_label`), Trusted badge if
+   Graduated/Trusted, "direct listing" tag if `dl`
+2. price (`get_current_price`), market cap (`get_market_cap`), fee badge
+   (bonding vs graduated rate — buyers see what graduation saves them)
+3. graduation progress: `reserves / graduation_target` (from
+   `get_bonding_info`) for curve projects; "graduated" for the rest
+4. votes: `sp / rp` and the current round (`get_project_trust`)
+5. team panel (`get_team_allocation`): allocation, paid, vesting stream
+   progress, claimable now — a running vesting is a trust signal
+6. trade panel: `get_buy_quote` / `get_sell_quote` (they already use the
+   project's effective fee), token balance via `get_token_balance`
 
-Sentinel: an accessor returns `project_count` (an invalid id) when the
-rank does not exist. Balances: `get_token_balance(id, address)`;
-vote state: `has_voted(id, address)`.
+Listings: `get_projects_by_status` + `get_project_by_rank` (paginated,
+count-then-rank — Silex ABIs return no arrays), `get_latest_projects`,
+`get_trusted_projects` + `get_trusted_by_rank` (the graduated shelf).
 
-**Direct storage reads** (cheaper for indexers, daemon RPC
-`get_contract_data` with string keys):
+Events (§6) drive the live feed: watch for `ProjectCreated`,
+`ValidationFinished`, `TokensBought/Sold`, `ProjectGraduated`,
+`DirectListed`, `TrustLost/Recovered`, `TeamVestingStarted/Claimed`,
+`MigrationFeeTaken`.
 
-```
-p:{id}:{field}   project fields (cr st nm sy ds ws lg ts tb lq rv cs ct ve sp rp gr rc rd vo)
-b:{id}:{addr}    token balance          v:{id}:{round}:{addr}  vote marker
-adm pc sub mnl tfe mnp mab vdt gmu rfe rmp rmr pfe fcl tvl tcx lrf pz  globals
-```
-
-**Entry points** — invoke by chunk id (see `xvault launchpad entries`):
-propose=12, support=13, report=14, finalize_validation=15, buy=16,
-sell=17, claim_refund=18, request_revalidation=19, update_project_info=20,
-admin setters 21-31, withdraw_fees=32. Buys attach XEL via the invoke
-deposit; sells take `(pid, token_amount)` and pay out to the caller.
+---
 
 ## 8. CLI
 
-```bash
-pip install ./sdk/xvault
-
-xvault launchpad status --contract <hash> --network testnet
-xvault launchpad project --contract <hash> --id 0 --owner xel:...
-xvault launchpad quote --reserves 500 --curve 90000000 --buy 100 --sell 1000000
-xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
-    --team-bps 1000 --liquidity 500 --contract <hash> --network testnet
-xvault launchpad entries
+```
+xvault launchpad status   --contract <hash>            # params, solvency, stats
+xvault launchpad project  --contract <hash> --id 0 --owner xel:...
+xvault launchpad team     --contract <hash> --id 0 [--topo N]
+xvault launchpad quote    --reserves 500 --curve 90000000 --buy 100 [--fee-bps 50]
+xvault launchpad propose  --name "Real Project" --symbol RPR \
+    --supply 1000000 --team-bps 1000 --liquidity 500 [--broadcast]
+xvault launchpad entries                                # chunk-id tables
 ```
 
-The CLI never holds keys: `--broadcast` sends through the local wallet
-RPC (xelis_wallet --rpc-server), exactly like the mixer commands.
+`propose` prints whether the liquidity qualifies for a direct listing
+(and the deposit split). `team` shows the allocation panel: paid,
+remaining, vesting progress, late-claim countdown, claimable now.
+
+---
 
 ## 9. Deployment checklist
 
-1. **Testnet first.** Deploy, propose a throwaway project, run the full
-   lifecycle (vote → finalize → buy → graduate → trust loss → recovery),
-   verify every event and storage key with `xvault launchpad project`.
-2. **Admin = cold wallet.** The deployer is the admin; move it to a
-   dedicated cold address with `set_admin` right after deployment.
-3. **Sanity params** before the first real proposal: review
-   `get_config()` against §4; the defaults are conservative.
-4. **Probe the entry ids** on testnet (`invoke` with `xvault` and
-   confirm the chunk numbering the VM expects — the ALT table exists in
-   the SDK for exactly this).
-5. **Mainnet**: deploy, `set_admin` to the cold wallet, announce the
-   contract hash, list the first serious project. The submission fee and
-   min liquidity gate spam; the vote window gates quality.
-6. **Revenue**: `withdraw_fees` at will — it can never exceed the
-   uncommitted balance, depositors and holders always come first.
+1. Deploy `VaultLaunch.slx` on **testnet**; the deployer becomes the
+   admin (use a cold wallet — `set_admin` is single-step).
+2. Sanity: `get_version` → `VaultLaunch v2.0.0`, `get_config` → the
+   documented defaults.
+3. Dry-run the two paths: propose a small float (bonding path) and a
+   ≥ 2000 XEL float (direct listing); pass both validations (20 voters,
+   80%); confirm `BondingOpened` vs `DirectListed` + `ProjectGraduated`
+   + `MigrationFeeTaken` in the events.
+4. Trade both: buy → check the fee rate matches the state (50 bps
+   bonding, 25 bps graduated); sell → check the payout and the never-
+   blocked exit.
+5. Team panel: `claim_team_allocation` on the graduated project (full),
+   `start_team_vesting` + incremental claims on the other; verify
+   `get_team_allocation` at every step.
+6. Trust drill: report a project to 80% of all votes → buys blocked,
+   sells open; `request_revalidation` (250 XEL when graduated) →
+   recovery vote → Trusted.
+7. Fees: `withdraw_fees(pending)` and verify the double cap — the
+   withdrawal can never make the contract insolvent.
+8. Tune parameters if needed (range + cross-checks enforced on-chain),
+   then announce the mainnet deployment with the config table.

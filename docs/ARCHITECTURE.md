@@ -1,4 +1,4 @@
-# Architecture — XelisVault Protocol v15
+# Architecture — XelisVault Protocol v16
 
 ## Why a rewrite of the layout
 
@@ -55,7 +55,7 @@ re-scoped as small, single-purpose contracts that pass the same bar:
 
 | Module | v12 state | v13+ plan |
 |---|---|---|
-| Launchpad | no community filter, no curve, no trust system | **done — VaultLaunch v1: validation vote, bonding curve, trust system** |
+| Launchpad | no community filter, no curve, no trust system | **done — VaultLaunch v2: validation vote, two-path graduation (curve / direct listing), trust system, team vesting** |
 | Privacy mixer | secrets leaked in withdraw params | **done — V5 dead-drop; on hold pending VM zk primitives** |
 | Vault engine | debts erased for free, collateral math broken | rewrite as one contract, XEL-only first |
 | Oracle | slash-all deviation logic, global DoS via miner list | staked-report median with bounded slash, no global iteration |
@@ -67,11 +67,13 @@ tests green, and a written threat model in docs/.
 
 ## Fee model (protocol revenue)
 
-- Launchpad: submission fee (default 10 XEL) + trading fee (default 0.5%,
-  cap 10%) + recovery fee (default 250 XEL on graduated projects) — 100%
-  to the admin, zero burn. Fees accrue in the contract and leave ONLY
-  through `withdraw_fees`, double-capped by the accrued amount and by the
-  uncommitted balance (curves and refunds are always covered first).
+- Launchpad: submission fee (default 10 XEL) + trading fee (default 0.5%
+  bonding / 0.25% graduated, cap 10%, cross-checked pair) + migration fee
+  (default 0.5% of reserves, once at graduation, cap 5%) + recovery fee
+  (default 250 XEL on graduated projects) — 100% to the admin, zero burn.
+  Fees accrue in the contract and leave ONLY through `withdraw_fees`,
+  double-capped by the accrued amount and by the uncommitted balance
+  (curves and refunds are always covered first).
 - Mixer: withdrawal fee, default 0.3%, hard cap 1%, collected into the
   contract and claimable by `fee_recipient` up to `balance − pending`
   (depositors always first). The fee recipient is set **before** the first

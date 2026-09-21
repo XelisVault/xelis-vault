@@ -1,6 +1,6 @@
 # xvault — XELIS Vault CLI & SDK
 
-Python tooling for the XelisVault protocol (v15, VaultLaunch + PrivacyMixer
+Python tooling for the XelisVault protocol (v16, VaultLaunch + PrivacyMixer
 V5). **Key-less by design**: the CLI prepares transactions and reads state;
 your local wallet (`xelis_wallet --rpc-server`, or Genesix via XSWD) signs
 and broadcasts.
@@ -22,6 +22,9 @@ xvault launchpad status --contract <hash> --network mainnet
 # one project card (status, curve, price, votes, volume, balances)
 xvault launchpad project --contract <hash> --id 0 --owner xel:...
 
+# team allocation panel: vesting stream, late-claim countdown, claimable now
+xvault launchpad team --contract <hash> --id 0
+
 # offline curve calculator (mirrors the contract math exactly)
 xvault launchpad quote --reserves 500 --curve 90000000 --buy 100 --sell 1000000
 
@@ -35,7 +38,8 @@ xvault launchpad entries
 ```
 
 Other entries (support/report/finalize/buy/sell/claim_refund/
-request_revalidation + admin setters) follow the same wallet flow: build
+request_revalidation/start_team_vesting/claim_team_allocation + admin
+setters) follow the same wallet flow: build
 params with `xvault.launchpad`, invoke with the chunk ids from
 `xvault launchpad entries`. The SDK's id table is CI-checked against the
 contract's declaration order on every push.

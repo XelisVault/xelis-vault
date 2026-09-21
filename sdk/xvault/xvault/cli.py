@@ -375,11 +375,20 @@ def cmd_launchpad_status(args) -> None:
     print("  parameters      :")
     print(f"    submission fee        : {crypto.fmt_xel(cfg['submission_fee'])}")
     print(f"    min liquidity         : {crypto.fmt_xel(cfg['min_liquidity'])}")
-    print(f"    trading fee           : {cfg['trading_fee_bps'] / 100:.2f}%")
+    print(f"    trading fee           : {cfg['trading_fee_bps'] / 100:.2f}% (bonding)")
+    print(f"    graduated fee         : {cfg['graduated_fee_bps'] / 100:.2f}% "
+          f"(post-graduation, always <= trading fee)")
+    print(f"    migration fee         : {cfg['migration_fee_bps'] / 100:.2f}% "
+          f"of reserves, once at graduation")
+    print(f"    direct listing        : >= {crypto.fmt_xel(cfg['direct_listing_threshold'])} "
+          f"liquidity skips bonding")
     print(f"    validation            : {cfg['min_participants']} voters, "
           f">= {cfg['min_approval_ratio_bps'] / 100:.0f}% support, "
           f"{cfg['validation_duration']} topos window")
     print(f"    graduation            : x{cfg['graduation_multiplier']} liquidity")
+    print(f"    team unlock           : {cfg['team_unlock_delay']} topos delay "
+          f"if never graduated; vesting "
+          f"{cfg['vesting_min']}..{cfg['vesting_max']} topos")
     print(f"    recovery (graduated)  : {crypto.fmt_xel(cfg['recovery_fee'])}, "
           f"{cfg['recovery_min_participants']} voters, "
           f">= {cfg['recovery_min_ratio_bps'] / 100:.0f}%")
@@ -402,17 +411,61 @@ def cmd_launchpad_project(args) -> None:
     print(f"  supply     : {fmt_token(p['total_supply'])} "
           f"({p['total_supply'] / 1e8:,.0f} tokens), "
           f"team {p['team_bps'] / 100:.0f}%")
-    print(f"  liquidity  : {crypto.fmt_xel(p['liquidity'])} deposited")
+    print(f"  liquidity  : {crypto.fmt_xel(p['liquidity'])} deposited"
+          + (" (direct-listing eligible)" if p['direct_listing'] else ""))
     print(f"  curve      : {crypto.fmt_xel(p['reserves'])} reserves, "
           f"{fmt_token(p['curve'])} sellable")
     print(f"  price      : {q['price'] / 1e8:.8f} XEL/token  "
           f"(mc {crypto.fmt_xel(q['market_cap'])})")
+    print(f"  fee        : {q['fee_bps'] / 100:.2f}% "
+          f"({'graduated' if q['graduated'] else 'bonding'} rate)")
     print(f"  votes      : {p['supports']} support / {p['reports']} report "
           f"(round {p['round']}, graduated: {bool(p['graduated'])})")
     print(f"  volume     : {crypto.fmt_xel(p['volume'])}")
     if args.owner:
         bal = reader.token_balance(args.id, args.owner)
         print(f"  balance    : {fmt_token(bal)} tokens ({args.owner})")
+
+
+def cmd_launchpad_team(args) -> None:
+    """Team allocation panel (D3): vesting state and claimable amount."""
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    if args.id >= reader.count():
+        sys.exit(f"error: project {args.id} does not exist "
+                 f"(total: {reader.count()})")
+    p = reader.project(args.id)
+    topo = args.topo if args.topo is not None else reader.d.topoheight()
+    t = reader.team_allocation(args.id, topo)
+    print(f"#{args.id} team allocation — {p['status_label']}")
+    print(f"  allocation  : {fmt_token(t['team_alloc'])} tokens "
+          f"({p['team_bps'] / 100:.0f}% of supply)")
+    print(f"  paid so far : {fmt_token(t['team_paid'])}")
+    print(f"  remaining   : {fmt_token(t['team_remaining'])}")
+    if t['vesting_start'] > 0:
+        done = min(max(topo - t['vesting_start'], 0), t['vesting_duration'])
+        print(f"  vesting     : started topo {t['vesting_start']}, "
+              f"{t['vesting_duration']} topos linear "
+              f"({done / t['vesting_duration'] * 100:.1f}% elapsed)")
+    else:
+        print("  vesting     : none started (immediate full claim available "
+              "once unlocked)")
+    if p['graduated']:
+        print("  unlock      : GRADUATED — full allocation unlockable")
+    elif p['bonding_start']:
+        cfg = reader.config()
+        elapsed = topo - p['bonding_start']
+        remaining = cfg['team_unlock_delay'] - elapsed
+        if remaining > 0:
+            print(f"  unlock      : late claim in {remaining} topos "
+                  f"({remaining * 5 / 86400:.1f} days at 5s/topo) "
+                  f"if never graduated")
+        else:
+            print("  unlock      : late claim AVAILABLE (delay elapsed)")
+    else:
+        print("  unlock      : none yet (project still in validation)")
+    print(f"  claimable   : {fmt_token(t['claimable_now'])} tokens now "
+          f"(chunk {LAUNCHPAD_ENTRY_IDS['claim_team_allocation']})")
 
 
 def cmd_launchpad_quote(args) -> None:
@@ -465,10 +518,17 @@ def cmd_launchpad_propose(args) -> None:
     print(f"  name/symbol : {args.name} ({args.symbol})")
     print(f"  supply      : {args.supply:,.0f} tokens, "
           f"team {args.team_bps / 100:.0f}% ({team / 1e8:,.0f} tokens, "
-          f"minted at graduation)")
+          f"claimable at graduation or via vesting)")
     print(f"  deposit     : {crypto.fmt_xel(deposit)} total = "
           f"{crypto.fmt_xel(cfg['submission_fee'])} fee + "
           f"{crypto.fmt_xel(liquidity)} seed liquidity")
+    if liquidity >= cfg["direct_listing_threshold"]:
+        print(f"  path        : DIRECT LISTING — liquidity >= threshold "
+              f"({crypto.fmt_xel(cfg['direct_listing_threshold'])}): graduates "
+              f"the moment validation passes")
+    else:
+        print(f"  path        : bonding curve (direct listing needs >= "
+              f"{crypto.fmt_xel(cfg['direct_listing_threshold'])})")
     if not args.broadcast:
         print("dry-run (pass --broadcast to send via the local wallet)")
         return
@@ -502,7 +562,7 @@ def cmd_launchpad_entries(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="xvault",
-        description="XELIS Vault protocol CLI (v15) — dead-drop mixer + "
+        description="XELIS Vault protocol CLI (v16) — dead-drop mixer + "
                     "VaultLaunch launchpad, key-less by design.")
     p.add_argument("--wallet-url", default=WALLET_URL,
                    help="local wallet RPC url (default: %(default)s)")
@@ -588,6 +648,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--id", type=int, required=True, help="project id")
     sp.add_argument("--owner", help="check this address's token balance")
     sp.set_defaults(func=cmd_launchpad_project)
+
+    sp = ls.add_parser("team"); common(sp)
+    sp.add_argument("--id", type=int, required=True, help="project id")
+    sp.add_argument("--topo", type=int,
+                    help="reference topoheight (default: daemon's current)")
+    sp.set_defaults(func=cmd_launchpad_team)
 
     sp = ls.add_parser("quote")
     sp.add_argument("--reserves", type=float, required=True,

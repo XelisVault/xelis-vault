@@ -5,28 +5,38 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v15** — audited contracts live beat
+[Silex](https://docs.xelis.io/). **v16** — audited contracts live beat
 fifty contracts on paper.
 
 ## What ships today
 
 **[VaultLaunch](contracts/launchpad/VaultLaunch.slx)** — a serious
 launchpad: community validation before every launch, constant-product
-bonding curve, graduation at 4x liquidity, long-term Trusted/Untrusted
+bonding curve, **two-path graduation**, long-term Trusted/Untrusted
 community trust system, every fee configurable and 100% of the revenue
 to the admin (no burn):
 
 - propose → 3-day community vote (≥ 20 voters, ≥ 80% support) → bonding
   curve opens; rejected projects refund 100% of the founder's liquidity
 - constant-product curve, integer-exact and solvent by construction
-  (u128 math, contract-favouring floors); trading fee 0.5% (cap 10%)
-- graduation at `liquidity × 4` mints the team allocation (≤ 20%, capped)
-  to the creator — never before; trading continues, the contract is the
-  token's permanent venue (no inter-contract calls on XELIS)
+  (u128 math, contract-favouring floors); bonding fee 0.5% (cap 10%)
+- **graduation is worth reaching (v16)**: graduated projects trade at a
+  LOWER fee (0.25% default, cross-checked to stay ≤ the bonding fee),
+  the team allocation unlocks, and a one-time migration fee (0.5% of
+  reserves, cap 5%) funds the protocol
+- **two-path graduation (v16)**: lock ≥ the direct-listing threshold
+  (default 2000 XEL, admin-tunable) and the project graduates the moment
+  validation passes — no bonding phase; smaller floats discover price on
+  the curve and graduate at `liquidity × 4`
+- team allocation (≤ 20%): claim in full at migration OR lock it in a
+  linear vesting (public commitment signal); a project that never
+  graduates releases the allocation after ~6 months of bonding —
+  founders are never hostage, holders keep their exit
 - losing trust (80% of all votes) blocks buys but NEVER sells; recovery
   for graduated projects costs a 250 XEL fee + a stricter re-vote
 - admin can pause new proposals/buys and tune every parameter
-  (range-checked); it can never touch curve reserves, balances or refunds
+  (range-checked, fee pairs cross-checked); it can never touch curve
+  reserves, balances or refunds
 
 Design, math, threat model, frontend guide: **[docs/LAUNCHPAD.md](docs/LAUNCHPAD.md)**.
 
@@ -57,9 +67,10 @@ Security policy and audit history: **[docs/SECURITY.md](docs/SECURITY.md)**.
 ```bash
 pip install ./sdk/xvault          # installs the `xvault` command
 
-# launchpad — status, one project, offline curve math, prepare a proposal
+# launchpad — status, one project, team panel, offline curve math, prepare a proposal
 xvault launchpad status --contract <hash> --network mainnet
 xvault launchpad project --contract <hash> --id 0 --owner xel:...
+xvault launchpad team --contract <hash> --id 0
 xvault launchpad quote --reserves 500 --curve 90000000 --buy 100
 xvault launchpad propose --name "Real Project" --symbol RPR --supply 1000000 \
     --team-bps 1000 --liquidity 500 --contract <hash> --network mainnet
@@ -106,9 +117,13 @@ v12 was fully audited and retired (1316 blocker/error findings across 51
 contracts — the corpus now powers the linter). PrivacyMixer V4 was
 superseded before deployment (recipient leak in deposit params +
 recipient-gas problem — see docs/SECURITY.md §V4 disclosure). v13/v14
-rebuilt the tree around the mixer; **v15 adds VaultLaunch**, the second
-production contract, built to the same bar: lint clean, chunk table
-verified, reference tests green, threat model written.
+rebuilt the tree around the mixer; v15 added VaultLaunch; **v16 makes
+graduation pay**: two-path graduation (direct listing above a
+tunable liquidity cap), a lower trading fee for graduated projects, a
+one-time migration fee funding the protocol, and a flexible team
+allocation (immediate claim or vesting, late release for never-graduated
+projects) — same bar: lint clean, chunk table verified, reference tests
+green, threat model written.
 Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## License

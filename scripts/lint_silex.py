@@ -162,9 +162,11 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
     ("VaultLaunch", "finalize_validation"): (
         "permissionless deadline executor: once a voting window has ended, "
         "anyone can trigger the outcome that the public tallies already "
-        "determine (pass -> Bonding/Trusted, fail -> Rejected/Untrusted); "
-        "it moves no funds, mints nothing, and cannot act before the "
-        "deadline — the founder and the community both have natural "
+        "determine (pass -> Bonding or direct-listing Graduated, fail -> "
+        "Rejected/Untrusted); it moves no user funds (the v2 migration fee "
+        "is taken from the project's own curve by graduate(), accounted in "
+        "pending_fees), mints nothing to the caller, and cannot act before "
+        "the deadline — the founder and the community both have natural "
         "incentives to call it"
     ),
 }
