@@ -122,11 +122,49 @@ invocations.
 
 **Accounting (D20, I1/I2/I10 + IX1..IX6).** `total_curve_xel` is now the
 EXACT sum of live curve reserves (seeds included) — the committed side
-of I2 also includes pending fees, locked refunds and earmarked asset
-budgets. Per-asset: `launchpad asset balance == curve inventory + unpaid
+of I2 also includes pending fees, locked refunds, earmarked asset
+budgets and (since v4.1) the locked vote pots (D21). Per-asset:
+`launchpad asset balance == curve inventory + unpaid
 team allocation` (I1), degenerating to the team escrow after migration
 (I10). The DEX keeps its own solvency (reserves + pending pots ==
 balances, IX1/IX2), verified by the fuzz suite after every action.
 
 See docs/LAUNCHPAD.md (§1a/§1b) and docs/DEX.md for the full
 specifications.
+
+## v18.1 — the founder risk review, closed (hardening only)
+
+Six risks were raised before communicating "it's live"; six are closed
+WITHOUT changing the architecture (no storage migration, no renumbered
+cross-call chunks — the DEX additions are append-only):
+
+1. **One-sided liquidity** — `add_liquidity` now enforces the pool's
+   CURRENT ratio (X7): only the proportional slice of a deposit joins
+   the reserves, the excess side is refunded in the same transaction.
+   New invariant IX7: the reserve product drifts by at most one floor
+   unit per add — only swaps move a pool's price.
+2. **Emergency pause too broad** — the DEX sell path now carries NO
+   gate at all (IX6, absolute): the emergency pause gates buys, pool
+   creation and liquidity adds only. A compromised admin can tax (fee
+   cap 10%) but never trap holders.
+3. **Upgrade path** — assumed operationally: the runbook deploys new
+   generations side by side (old venues serve their pools forever); the
+   new `get_launchpad()` DEX view exposes the pin for ops and the site.
+4. **Hardcoded chunk ids** — already CI-frozen in v18; the rule is now
+   written down: DEX functions append at the END only, ids 6/7 never
+   move (`tests/test_dex_reference.py` asserts both sides).
+5. **Sybil voting** — the D21 dial: an admin-settable REFUNDABLE vote
+   deposit (default 0 = free, cap 10 XEL) with `claim_vote_deposit`
+   pull-refunds; the pots are committed in I2 so fees can never touch
+   them. Documented as mitigation, not cure.
+6. **Public deposits** — the privacy model is now a doc table
+   (LAUNCHPAD.md §5a): balances private, attached amounts public — the
+   site must never promise total privacy.
+
+**Site data (D22).** The statically-hosted site persists nothing; the
+contracts now serve every listing through views: the asset→project
+reverse bridge (`get_project_by_asset`, written at asset creation) maps
+DEX pools back to launchpad pages, and the migrated index
+(`get_migrated_count`/`get_migrated_by_rank`) enumerates every project
+that ever moved to a pool — across DEX generations. The full
+stateless-site recipe is LAUNCHPAD.md §7a.

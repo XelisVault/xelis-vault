@@ -70,15 +70,74 @@ def test_launchpad_pin_freezes_at_first_pool_x4():
     assert 's.store(LAUNCHPAD_PINNED_KEY, true)' in src
 
 
-def test_sells_are_never_selectively_blocked_x5():
-    """swap_token_for_xel must not check the buys-pause flag; only the
-    global emergency pause gates it."""
+def test_sells_are_never_blocked_by_anything_x5():
+    """swap_token_for_xel must carry NO gate at all — neither the
+    per-pool buys-pause nor the global emergency pause (founder risk
+    review, point 2: a compromised admin must never trap holders)."""
     src = DEX_CONTRACT.read_text()
     m = re.search(r"entry swap_token_for_xel\(.*?\n\}", src, re.S)
     assert m, "entry not found"
     body = m.group(0)
     assert "buyspaused" not in body, "sell path must never check the pause"
-    assert '"paused"' in body, "only the emergency pause gates sells"
+    assert '"paused"' not in body, "sell path must not check the emergency pause either"
+    assert "EMERGENCY_KEY" not in body, "no emergency gate on the sell path"
+
+
+def test_emergency_pause_still_gates_buys_creations_and_adds():
+    """set_paused keeps its meaning: buys, pool creation and liquidity
+    adds check the emergency flag; ONLY the sell path is ungated."""
+    src = DEX_CONTRACT.read_text()
+    for entry in ("swap_xel_for_token", "create_pool", "add_liquidity"):
+        m = re.search(rf"entry {entry}\(.*?\n\}}", src, re.S)
+        assert m, f"{entry} not found"
+        assert '"paused"' in m.group(0), f"{entry} must check the emergency pause"
+
+
+def test_add_liquidity_enforces_the_pool_ratio_x7():
+    """Founder risk review, point 1: a one-sided donation must NEVER move
+    the price. Only the largest proportional pair that fits the deposit
+    joins the reserves; the excess is refunded (Uniswap-style)."""
+    src = DEX_CONTRACT.read_text()
+    m = re.search(r"entry add_liquidity\(.*?\n\}", src, re.S)
+    assert m, "entry not found"
+    body = m.group(0)
+    assert '"ratio"' in body, "an underfunded XEL side must be refused"
+    assert '"dust"' in body
+    # the refunds exist and go to the CALLER of the just-arrived deposit
+    assert "xel_back" in body and "tok_back" in body
+    # and the price-neutral fit itself (the u128 ratio products)
+    assert "need_tok" in body and "need_xel" in body
+    # the model: for random reserves and deposits, the effective pair
+    # keeps the reserve product within one floor unit of its old value
+    import random
+    rng = random.Random(11)
+    for _ in range(500):
+        x = rng.randrange(10 * XEL, 100000 * XEL)
+        y = rng.randrange(1000, 10**12)
+        xel_in = rng.randrange(1, 100 * XEL)
+        # token side chosen so at least one branch binds
+        tok_in = rng.randrange(1, 2 * y)
+        need_tok = y * xel_in // x
+        if tok_in >= need_tok:
+            xel_eff, tok_eff = xel_in, need_tok
+        else:
+            need_xel = x * tok_in // y
+            if xel_in < need_xel:
+                continue  # refused with "ratio" in the contract
+            xel_eff, tok_eff = need_xel, tok_in
+        if tok_eff < 1 or xel_eff < 1:
+            continue  # refused with "dust"
+        x1, y1 = x + xel_eff, y + tok_eff
+        drift = x1 * y - x * y1
+        assert abs(drift) < max(x, y), "price moved — X7 broken"
+        # the refunded sides never exceed the attached deposit
+        assert 0 <= xel_in - xel_eff <= xel_in
+        assert 0 <= tok_in - tok_eff <= tok_in
+
+
+def test_get_launchpad_view_exposes_the_pin_x4():
+    src = DEX_CONTRACT.read_text()
+    assert "pub fn get_launchpad() -> (string, bool)" in src
 
 
 def test_buys_paused_check_exists_on_the_buy_path():
@@ -122,4 +181,4 @@ def test_fees_are_extracted_not_pooled_x3():
 
 
 def test_version_string():
-    assert 'const VERSION: string = "LaunchDEX v1.0.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.1.0"' in DEX_CONTRACT.read_text()

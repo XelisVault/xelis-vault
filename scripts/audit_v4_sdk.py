@@ -90,6 +90,23 @@ check("(y as u128) * (net as u128) / ((x as u128) + (net as u128))" in DEX_SRC,
 check("token_reserve * net // (xel_reserve + net)" in dex_src,
       "SDK DEX buy formula drifted from the contract")
 
+# 9. the v4.1 surface: D21 builders/readers + the X7 fit mirror
+for piece in ("def vote_deposits", "def claim_vote_deposit_params",
+              "def set_vote_deposit_params", "def vote_config",
+              "def project_by_asset", "def migrated_by_rank",
+              "def migrated_list", "def asset_lookup_key",
+              "def migrated_index_key"):
+    check(piece in src, f"xvault.launchpad missing {piece} (v4.1)")
+check("def liquidity_fit" in dex_src, "xvault.dex missing liquidity_fit (X7)")
+check('y * xel_in // x' in dex_src and 'x * tok_in // y' in dex_src,
+      "SDK liquidity_fit formula drifted from the contract (X7)")
+# the contract's fit and the SDK's fit agree on the branch logic
+check("need_tok" in DEX_SRC and '"fiterr"' in DEX_SRC,
+      "contract add_liquidity no longer carries the X7 fit guards")
+# get_launchpad exposure on the DEX (upgrade-runbook bridge, point 3)
+check("pub fn get_launchpad() -> (string, bool)" in DEX_SRC,
+      "DEX get_launchpad view missing (v4.1)")
+
 if fails:
     print("AUDIT 4 (SDK PARITY) FAILED:")
     for f in fails:
@@ -97,5 +114,5 @@ if fails:
     sys.exit(1)
 print("AUDIT 4 (SDK PARITY): PASS — signatures (incl. whole-deposit sell), "
       "entry-ids on BOTH contracts, pinned cross-call chunks, defaults, "
-      "budget deposits, the v4 reader surface and the dex math mirror all "
-      "agree with the contracts.")
+      "budget deposits, the v4 reader surface, the dex math mirror and the "
+      "v4.1 hardening surface (D21/D22/X7) all agree with the contracts.")

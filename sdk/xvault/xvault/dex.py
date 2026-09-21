@@ -70,6 +70,31 @@ def spot_price(xel_reserve: int, token_reserve: int,
     return min(xel_reserve * scale // token_reserve, 2**64 - 1)
 
 
+def liquidity_fit(xel_reserve: int, token_reserve: int,
+                  xel_in: int, tok_in: int) -> tuple:
+    """X7 (v1.1): the price-neutral fit add_liquidity enforces — the
+    largest (xel_eff, tok_eff) pair at the pool's CURRENT ratio that fits
+    inside the attached deposit. Returns (xel_eff, tok_eff, xel_back,
+    tok_back): the effective liquidity and the refunded excess. Raises
+    ValueError ("dust"/"ratio") exactly where the entry refuses. A
+    donation can deepen a pool but NEVER move its price (founder risk
+    review, point 1)."""
+    x, y = xel_reserve, token_reserve
+    if x <= 0 or y <= 0:
+        raise ValueError("empty")
+    need_tok = y * xel_in // x
+    if tok_in >= need_tok:
+        xel_eff, tok_eff = xel_in, need_tok
+    else:
+        need_xel = x * tok_in // y
+        if xel_in < need_xel:
+            raise ValueError("ratio")
+        xel_eff, tok_eff = need_xel, tok_in
+    if xel_eff < 1 or tok_eff < 1:
+        raise ValueError("dust")
+    return xel_eff, tok_eff, xel_in - xel_eff, tok_in - tok_eff
+
+
 # ---------------------------------------------------------------------------
 # Storage keys — must match the contract's key builders exactly
 # ---------------------------------------------------------------------------
@@ -217,7 +242,15 @@ class DexReader:
             out[attr] = self._key(pool_key(asset_hex, field))
         x, y = out["xel_reserve"] or 0, out["token_reserve"] or 0
         out["price"] = spot_price(x, y)
-        out["status_label"] = ("buys-paused" if out["buys_paused"] else "live")
+        emergency = bool(self._key(GLOBAL_KEYS["emergency"], False))
+        if emergency:
+            # buys frozen, pool creation frozen, adds frozen — SELLS STAY
+            # OPEN in every state (IX6; say so on the frontend)
+            out["status_label"] = "emergency"
+        elif out["buys_paused"]:
+            out["status_label"] = "buys-paused"
+        else:
+            out["status_label"] = "live"
         return out
 
     def quotes(self, asset_hex: str, xel_amount: int = 0,

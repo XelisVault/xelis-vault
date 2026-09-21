@@ -190,12 +190,23 @@ PUBLIC_BY_DESIGN: Dict[Tuple[str, str], str] = {
         "support on purpose so voters never need the contract-call "
         "permission (D17)"
     ),
+    ("VaultLaunch", "claim_vote_deposit"): (
+        "pull-refund of the caller's OWN locked deposit (D21): the storage "
+        "key is v:{pid}:{round}:{caller} — it embeds the caller's address, "
+        "so no voter can ever touch another voter's funds; the slot's "
+        "recorded amount bounds the payout exactly, require(locked > 0) "
+        "makes double claims impossible (the slot is zeroed but kept — the "
+        "vote stays counted), and the round-closed check keeps deposits "
+        "locked while the window is still open"
+    ),
     ("LaunchDEX", "add_liquidity"): (
         "public donation entry by design: the caller attaches BOTH assets "
-        "and receives nothing back but a deeper pool — there is no "
-        "remove_liquidity in the entire contract (permanent protocol-owned "
-        "liquidity, X2), so the entry can only ever ADD value to the "
-        "market; the attached deposits bound exactly what it can take"
+        "and receives back at most its OWN excess side (X7 — the pool's "
+        "ratio is enforced, the excess is refunded, so the price can never "
+        "be moved by a donation) — there is no remove_liquidity in the "
+        "entire contract (permanent protocol-owned liquidity, X2), so the "
+        "entry can only ever ADD value to the market at the market's own "
+        "price; the attached deposits bound exactly what it can take"
     ),
 }
 

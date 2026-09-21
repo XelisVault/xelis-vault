@@ -33,9 +33,10 @@ from . import crypto
 from . import dex as dexmod
 from .dex import (DexReader, spot_price as dex_math_spot_price,
                   tokens_to_xel_out, xel_to_tokens_out)
-from .launchpad import (DEFAULTS, LaunchpadReader, buy_quote, current_price,
-                         fmt_token, market_cap, pid_params, propose_deposits,
-                         propose_params, sell_quote, team_alloc_of)
+from .launchpad import (DEFAULTS, LaunchpadReader, buy_quote, claim_vote_deposit_params,
+                         current_price, fmt_token, market_cap, pid_params,
+                         propose_deposits, propose_params, sell_quote,
+                         set_vote_deposit_params, team_alloc_of)
 from .mixer import (MixerReader, Note, deposit_deposits, deposit_params,
                     prepare_deposit, release_many_params, release_params)
 from .protocol import (DaemonClient, MIXER_ENTRY_IDS, MIXER_ENTRY_IDS_ALT,
@@ -385,6 +386,10 @@ def cmd_launchpad_status(args) -> None:
           f"(buy {crypto.fmt_xel(st['total_buy_volume'])} / "
           f"sell {crypto.fmt_xel(st['total_sell_volume'])}, "
           f"{st['total_trades']} trades — curve era; pool era on LaunchDEX)")
+    vc = reader.vote_config()
+    print(f"  vote dial       : {crypto.fmt_xel(vc['vote_deposit'])}"
+          f"{' (FREE voting — the D21 dial is off)' if vc['vote_deposit'] == 0 else ' REFUNDABLE deposit per vote (D21)'}"
+          f", {crypto.fmt_xel(vc['vote_pots'])} locked in pots")
     print("  parameters      :")
     print(f"    submission fee        : {crypto.fmt_xel(cfg['submission_fee'])}")
     print(f"    asset budget          : {crypto.fmt_xel(cfg['asset_budget'])} "
@@ -708,6 +713,54 @@ def cmd_launchpad_sync(args) -> None:
     print("confirmed — the pool mirrors the launchpad trust status")
 
 
+def cmd_launchpad_claim_deposit(args) -> None:
+    """D21: claim YOUR refundable vote deposit for a closed round."""
+    contract = _require_contract(args)
+    reader = LaunchpadReader(_daemon(args.network), contract)
+    if args.id >= reader.count():
+        sys.exit(f"error: project {args.id} does not exist")
+    print(f"claim_vote_deposit({args.id}, round {args.round}) — chunk "
+          f"{LAUNCHPAD_ENTRY_IDS['claim_vote_deposit']}")
+    print("  rules     : the round must be CLOSED (a newer round exists, or "
+          "the deadline passed)")
+    print("  refund    : exactly the amount locked at vote time (read from "
+          "YOUR vote slot v:{pid}:{round}:{addr})")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["claim_vote_deposit"],
+                  claim_vote_deposit_params(args.id, args.round), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — deposit refunded")
+
+
+def cmd_launchpad_set_vote_deposit(args) -> None:
+    """Admin: raise/lower the D21 sybil dial (0 = free voting, cap 10 XEL)."""
+    contract = _require_contract(args)
+    amount = int(round(args.amount * 1e8))
+    if amount > 1_000_000_000:
+        sys.exit("error: the dial is capped at 10 XEL (a sybil cost, "
+                 "never a participation toll)")
+    print(f"set_vote_deposit({amount}) — chunk "
+          f"{LAUNCHPAD_ENTRY_IDS['set_vote_deposit']}")
+    print(f"  effect    : every FUTURE support()/report() attaches "
+          f"{crypto.fmt_xel(amount)} (refundable via claim_vote_deposit)")
+    print("  note      : already-locked deposits refund at their own amount")
+    if not args.broadcast:
+        print("dry-run (pass --broadcast to send via the local wallet)")
+        return
+    w = _wallet(args)
+    before = w.nonce()
+    tx = w.invoke(contract, LAUNCHPAD_ENTRY_IDS["set_vote_deposit"],
+                  set_vote_deposit_params(amount), deposits={})
+    print(f"broadcast: {tx}")
+    w.wait_nonce_advance(before)
+    print("confirmed — dial updated")
+
+
 # dex status / pool / quote / swap / add-liquidity / entries
 # ---------------------------------------------------------------------------
 
@@ -717,7 +770,7 @@ def cmd_dex_status(args) -> None:
     cfg = reader.config()
     print(f"LaunchDEX — {contract[:16]}… ({args.network})")
     print(f"  pools           : {reader.pools_count()}")
-    print(f"  emergency       : {'YES — everything frozen' if cfg['emergency'] else 'no'}")
+    print(f"  emergency       : {'YES — buys frozen, SELLS STAY OPEN (IX6)' if cfg['emergency'] else 'no'}")
     print(f"  swap fee        : {cfg['swap_fee_bps'] / 100:.2f}% on inputs "
           f"(cap 10%, 100% admin)")
     print(f"  launchpad pin   : {cfg['launchpad'] or 'NOT SET'} "
@@ -728,7 +781,8 @@ def cmd_dex_status(args) -> None:
           f"{fmt_token(cfg['min_swap_tokens'])}.."
           f"{fmt_token(cfg['max_swap_tokens'])} tokens")
     print("  liquidity       : PERMANENT (no remove_liquidity exists — "
-          "the anti-rug core, X2)")
+          "the anti-rug core, X2) and PRICE-NEUTRAL to add (X7 — only "
+          "swaps move a pool's price)")
 
 
 def cmd_dex_pool(args) -> None:
@@ -932,6 +986,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--id", type=int, required=True, help="project id")
     sp.add_argument("--broadcast", action="store_true")
     sp.set_defaults(func=cmd_launchpad_sync)
+
+    sp = ls.add_parser("claim-deposit"); common(sp)
+    sp.add_argument("--id", type=int, required=True, help="project id")
+    sp.add_argument("--round", type=int, default=0,
+                    help="the voting round you locked the deposit in "
+                         "(default: 0)")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send via local wallet (default: prepare only)")
+    sp.set_defaults(func=cmd_launchpad_claim_deposit)
+
+    sp = ls.add_parser("set-vote-deposit"); common(sp)
+    sp.add_argument("--amount", type=float, required=True,
+                    help="deposit per vote in XEL (0 = free voting, "
+                         "max 10)")
+    sp.add_argument("--broadcast", action="store_true",
+                    help="send via local wallet (default: prepare only)")
+    sp.set_defaults(func=cmd_launchpad_set_vote_deposit)
 
     dx = sub.add_parser("dex", help="LaunchDEX operations")
     ds = dx.add_subparsers(dest="dex_cmd", required=True)

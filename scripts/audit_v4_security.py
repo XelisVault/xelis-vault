@@ -18,15 +18,16 @@ FILES = [ROOT / "contracts" / "launchpad" / "VaultLaunch.slx",
 # reviewed security decisions, not lint bypasses (mirrors lint_silex.py):
 PUBLIC_BY_DESIGN = {
     ("VaultLaunch", "propose"): "creates a project funded by the caller's OWN deposit",
-    ("VaultLaunch", "support"): "public voting by design — bounded by the one-vote-per-round key + network fee",
+    ("VaultLaunch", "support"): "public voting by design — bounded by the one-vote-per-round key + the D21 deposit dial",
     ("VaultLaunch", "report"): "public voting by design — same bound as support",
     ("VaultLaunch", "sell"): "exit path, never blockable — bounded by the caller's OWN token deposit (whole-deposit)",
+    ("VaultLaunch", "claim_vote_deposit"): "pull-refund of the caller's OWN locked deposit (D21) — the storage key embeds the caller's address (v:{pid}:{round}:{caller}), so no voter can ever touch another voter's funds; the slot's recorded amount bounds the payout, and require(locked > 0) makes double claims impossible",
     ("VaultLaunch", "finalize_validation"): "permissionless deadline executor — outcome fully determined by public tallies",
     ("VaultLaunch", "migrate"): "permissionless migration executor — no destination/amount/caller choice, pinned DEX only",
     ("VaultLaunch", "sync_trust_to_dex"): "permissionless keeper — mirrors the public trust status to the pool's buys-pause",
     ("LaunchDEX", "swap_xel_for_token"): "payable-style — bounded by the caller's OWN XEL deposit",
     ("LaunchDEX", "swap_token_for_xel"): "payable-style — bounded by the caller's OWN token deposit (whole-deposit)",
-    ("LaunchDEX", "add_liquidity"): "public permanent donation — bounded by BOTH attached deposits, nothing can come back",
+    ("LaunchDEX", "add_liquidity"): "public permanent donation — bounded by BOTH attached deposits; only the caller's OWN excess side can come back (X7 ratio fit)",
 }
 
 fails = []

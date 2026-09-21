@@ -25,8 +25,10 @@
 //     asset -> pool is natural; it also keeps per-asset solvency accounting
 //     trivial (one pool, one pending-fee pot, one balance to reconcile).
 //
-// X2. PERMANENT LIQUIDITY — no remove_liquidity entry exists. This is the
-//     anti-rug core: nobody — not the admin, not the launchpad, not the
+// X2. PERMANENT LIQUIDITY — no remove_liquidity entry exists. Since
+//     v1.1 it is also PRICE-NEUTRAL (X7): add_liquidity enforces the
+//     pool's current ratio. This is the anti-rug core: nobody — not the
+//     admin, not the launchpad, not the
 //     founder — can ever drain a pool. Liquidity enters at pool creation
 //     (the launchpad migration) and via add_liquidity (ANYONE may deepen a
 //     pool; a donation to the market that can never be clawed back). The
@@ -54,9 +56,11 @@
 //     launchpad's D4). set_pool_buys_paused is launchpad-only (called by
 //     the launchpad's permissionless sync entry), so the flag always
 //     mirrors the launchpad's status, never an admin whim. The global
-//     admin emergency pause (both directions) exists ONLY for genuine
-//     emergencies (a bug in the wild) — it cannot rug anything since
-//     nothing can leave the reserves anyway.
+//     admin emergency pause exists ONLY for genuine emergencies (a bug
+//     in the wild) and gates BUYS, POOL CREATION and LIQUIDITY ADDS
+//     ONLY — the sell path carries NO pause gate at all, not even the
+//     emergency one: a compromised admin can tax (fee caps) but can
+//     NEVER lock holders in (founder risk review, point 2).
 //
 // X6. OWN SCOREBOARD. Each pool tracks buy/sell volume (XEL side),
 //     trade count, last trade topoheight and the spot price implied by
@@ -64,16 +68,26 @@
 //     LaunchDEX keeps the pool era. The SDK aggregates both for the
 //     frontend; no indexer required on either side.
 //
-// X7. TRADE GUARDS mirror the launchpad: dust floors and whale caps on
+// X7. PRICE-NEUTRAL ADDS: add_liquidity enforces the pool's CURRENT
+//     ratio (Uniswap-style): only the proportional part of the deposit
+//     joins the reserves, the excess side is REFUNDED to the donor in the
+//     same transaction (founder risk review, point 1). A donation can
+//     deepen a pool; it can NEVER move its price — the reserve product
+//     drifts by at most one floor unit (|x1*y0 - x0*y1| < max(x0, y0),
+//     i.e. a relative drift below 1/min(x0, y0)) per add.
+//
+// X8. TRADE GUARDS mirror the launchpad: dust floors and whale caps on
 //     both directions, min_out slippage protection on every swap, u128
 //     intermediates with contract-favouring floors everywhere. A pool's
 //     reserves can never reach zero from swaps (floors always leave
 //     both sides non-zero), so no swap can ever divide by zero.
 //
-// X8. NO REENTRANCY SURFACE: LaunchDEX calls no other contract, ever.
+// X9. NO REENTRANCY SURFACE: LaunchDEX calls no other contract, ever.
 //     Cross-contract calls arrive INBOUND only (create_pool,
 //     set_pool_buys_paused), and those two entries touch no external
-//     contract themselves. Effects are ordered state-first, transfer-last.
+//     contract themselves. Effects are ordered state-first, transfer-last
+//     (the add_liquidity refunds are transfers to the CALLER of deposits
+//     that just arrived — they can never touch the reserves).
 //
 // ----------------------------------------------------------------------------
 // SWAP MATH (constant product, integer, contract-favouring floors)
@@ -101,15 +115,18 @@
 //     the only value the admin can ever extract, by design.
 //   * The launchpad pin (X4) is a one-way door: set before the first pool,
 //     frozen after. A frozen pin can never be repointed at a fake launchpad.
-//   * add_liquidity is a donation (X2): the caller sends both assets and
-//     receives nothing back but a deeper pool. There is no ratio
-//     enforcement — the donor chooses the mix; an imbalanced donation
-//     moves the price, but the donor paid full value for it (their loss
-//     or their gift, the market's gain either way).
-//   * No reentrancy (X8). No oracles. No pausable exits: the emergency
-//     pause blocks BOTH directions and is admin-only, documented as the
-//     last resort — sells are never selectively blocked (X5's per-pool
-//     flag blocks buys only).
+//   * add_liquidity is a donation (X2/X7): the caller sends both assets
+//     and receives nothing back but a deeper pool AT THE SAME PRICE — the
+//     effective liquidity is the largest proportional pair that fits the
+//     deposit, and the excess side is refunded in the same transaction.
+//     A malicious one-sided donation cannot skew the market: the price
+//     of a pool can ONLY move by swaps (founder risk review, point 1).
+//   * No reentrancy (X9). No oracles. NO PAUSABLE EXITS: the sell path
+//     carries no gate at all — neither the per-pool buys-pause (X5) nor
+//     the emergency pause can ever block a sell. The emergency pause
+//     gates buys, pool creation and liquidity adds only; a compromised
+//     admin can raise fees (capped) but can never lock holders in
+//     (founder risk review, point 2).
 //   * Front-running is possible (no mempool privacy) — same as every
 //     public AMM on XELIS; use the quotes (get_amount_out_*) + min_out.
 //
@@ -130,9 +147,15 @@
 //   IX5. PRICE SANITY: reserves of a live pool are always > 0 on both
 //        sides (min seeds at creation, floors on every swap), so
 //        price = x / y is always well-defined and finite.
-//   IX6. Buys-pause NEVER blocks sells: the per-pool flag is checked on
-//        the buy path only; the global emergency pause is the only other
-//        gate, and it blocks everything (X5).
+//   IX6. SELLS ARE UNGATED, ABSOLUTELY: the per-pool buys-pause is
+//        checked on the buy path only, and the emergency pause does not
+//        touch the sell path either — NO code path can ever block a sell
+//        (X5; founder risk review, point 2). A compromised admin can tax
+//        (swap fee, hard-capped at 10%) but never trap holders.
+//   IX7. PRICE-NEUTRAL LIQUIDITY (X7): add_liquidity keeps the reserve
+//        product within one floor unit: after every add,
+//        |x1*y0 - x0*y1| < max(x0, y0) — a relative drift below
+//        1/min(x0, y0). Only swaps move the price.
 //
 // ----------------------------------------------------------------------------
 // STORAGE MAP (string keys, flat KV — house style)
@@ -154,7 +177,8 @@
 //    1 PoolCreated       [asset, xel_seed, token_seed, launchpad]
 //    2 SwapXelForToken   [asset, xel_in, tokens_out, fee]
 //    3 SwapTokenForXel   [asset, tokens_in, xel_out, fee]
-//    4 LiquidityAdded    [asset, xel_added, tokens_added]
+//    4 LiquidityAdded    [asset, xel_effective, tokens_effective,
+//                        xel_refunded, tokens_refunded]
 //    5 FeesWithdrawn     [asset, xel_amount, token_amount]
 //    6 ParamSet          [param, value]
 //    7 BuysPaused        [asset]      8 BuysUnpaused [asset]
@@ -163,26 +187,27 @@
 //
 // ----------------------------------------------------------------------------
 // CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
-//    0  constructor                1  only_admin              2  require_pool
-//    3  pool_key                   4  fee_take                5  checked_add
-//    6  create_pool                7  set_pool_buys_paused    8  swap_xel_for_token
-//    9  swap_token_for_xel        10  add_liquidity          11  set_swap_fee
-//   12  set_trade_bounds          13  set_launchpad          14  set_admin
-//   15  set_paused                16  withdraw_fees          17  get_pool
-//   18  get_pool_state            19  get_amount_out_xel     20  get_amount_out_token
-//   21  get_spot_price            22  get_pool_volume        23  get_pools_count
-//   24  get_pool_by_index         25  get_config             26  get_status_label
-//   27  get_version
+//    0   constructor           1   only_admin            2   require_pool
+//    3   pool_key              4   fee_take              5   checked_add
+//    6   create_pool           7   set_pool_buys_paused  8   swap_xel_for_token
+//    9   swap_token_for_xel    10  add_liquidity         11  set_swap_fee
+//    12  set_trade_bounds      13  set_launchpad         14  set_admin
+//    15  set_paused            16  withdraw_fees         17  get_pool
+//    18  get_pool_state        19  get_amount_out_xel    20  get_amount_out_token
+//    21  get_spot_price        22  get_pool_volume       23  get_pools_count
+//    24  get_pool_by_index     25  get_config            26  get_status_label
+//    27  get_launchpad         28  get_version
 //
 //   PINNED FOR CROSS-CONTRACT CALLS (see VaultLaunch constants):
 //     chunk 6  = create_pool          (launchpad migrate)
 //     chunk 7  = set_pool_buys_paused (launchpad sync_trust_to_dex)
 //   tests/test_dex_reference.py asserts this table against the source AND
 //   asserts VaultLaunch's pinned constants against it — renumbering either
-//   side without the other fails CI.
+//   side without the other fails CI. Appending new functions at the END
+//   keeps every pinned id stable (the v1.1 additions did exactly that).
 // ============================================================================
 
-const VERSION: string = "LaunchDEX v1.0.0"
+const VERSION: string = "LaunchDEX v1.1.0"
 
 // ---------------------------------------------------------------------------
 // Global capacity (storage growth bound; also the static loop bound of the
@@ -528,11 +553,14 @@ entry swap_xel_for_token(asset: Hash, min_tokens_out: u64) -> u64 {
 }
 
 // ============================================================================
-// 9. SWAP TOKEN FOR XEL — the sell path. Never selectively blocked (IX6).
+// 9. SWAP TOKEN FOR XEL — the sell path. UNGATED, ABSOLUTELY (IX6).
 // ============================================================================
 // @caller: anyone (a wallet). Works even when the pool's buys are paused
-//          (holders always exit — X5); blocked only by the global emergency
-//          pause.
+//          (holders always exit — X5) AND under the global emergency pause:
+//          the sell path carries NO pause gate at all. This is deliberate
+//          (founder risk review, point 2): if the admin key is ever
+//          compromised, the worst it can do to sellers is raise the fee
+//          (hard-capped at 10%) — it can never lock holders in.
 // @attached: pool tokens in [min_swap_tokens, max_swap_tokens] — the WHOLE
 //            attached deposit is sold (nothing can be stranded).
 // @params:  min_xel_out — slippage protection ("slip").
@@ -540,7 +568,6 @@ entry swap_xel_for_token(asset: Hash, min_tokens_out: u64) -> u64 {
 // ============================================================================
 entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {
     let s: Storage = Storage::new()
-    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
     require_pool(asset)
 
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
@@ -596,14 +623,19 @@ entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {
 }
 
 // ============================================================================
-// 10. ADD LIQUIDITY — the permanent deepening (anyone, donation semantics).
+// 10. ADD LIQUIDITY — the permanent, PRICE-NEUTRAL deepening (anyone).
 // ============================================================================
 // @caller: ANYONE (a wallet) — the project, its community, the protocol.
-// @attached: XEL AND pool tokens (both must be > 0). No ratio enforcement:
-//            the donor chooses the mix; an imbalanced donation moves the
-//            price, but the donor paid full value for it. What arrives
-//            joins the reserves FOREVER (X2 — there is no remove entry):
-//            add_liquidity is a gift to the market.
+// @attached: XEL AND pool tokens (both must be > 0). The pool's CURRENT
+//            ratio is ENFORCED (X7, founder risk review, point 1): only the
+//            largest proportional pair that fits the deposit joins the
+//            reserves, and the excess side is REFUNDED to the donor in the
+//            same transaction. A one-sided or skewed donation therefore
+//            CANNOT move the price — the market can only be deepened, never
+//            steered; the price of a pool moves by SWAPS and by nothing
+//            else. What joins the reserves stays FOREVER (X2 — there is no
+//            remove entry): add_liquidity is a gift to the market at the
+//            market's own price.
 // ============================================================================
 entry add_liquidity(asset: Hash) -> u64 {
     let s: Storage = Storage::new()
@@ -622,13 +654,60 @@ entry add_liquidity(asset: Hash) -> u64 {
     let y: u64 = s.load(pool_key(asset, F_TOK_RESERVE)).unwrap_or(0)
     require(x > 0 && y > 0, "empty")
 
-    // Reserves only grow (IX3). No LP shares in v1 (X2, documented).
-    s.store(pool_key(asset, F_XEL_RESERVE), x + xel_in)
-    s.store(pool_key(asset, F_TOK_RESERVE), y + tok_in)
+    // X7 — price-neutral fit. The effective liquidity is the largest
+    // (xel_eff, tok_eff) pair at the pool's CURRENT ratio that fits inside
+    // the attached deposit; whichever side is in excess is refunded to the
+    // donor at the END of this entry (transfers last, X9). Products are
+    // bounded by MAX_SEED_* (<= 1e31), safe in u128. Floor rounding keeps
+    // the drift below one unit on the binding side (IX7).
+    let need_tok: u128 = (y as u128) * (xel_in as u128) / (x as u128)
+    let xel_eff: u64 = 0
+    let tok_eff: u64 = 0
+    if (tok_in as u128) >= need_tok {
+        // The XEL side binds: all of it joins, the token side is topped up
+        // to the ratio and the token excess goes back.
+        xel_eff = xel_in
+        tok_eff = need_tok as u64
+    } else {
+        // The token side binds: all of it joins, the XEL side is topped up
+        // to the ratio (a deposit too poor on XEL to cover its tokens is
+        // refused — "ratio", not silently shaved).
+        let need_xel: u128 = (x as u128) * (tok_in as u128) / (y as u128)
+        require((xel_in as u128) >= need_xel, "ratio")
+        xel_eff = need_xel as u64
+        tok_eff = tok_in
+    }
+    require(xel_eff >= 1 && tok_eff >= 1, "dust")
+
+    // Belt-and-braces (provably true by the branch logic above; kept so
+    // the fit invariant is LOCAL and machine-checkable — the refunds can
+    // never exceed the fresh deposit they come from).
+    require(xel_in >= xel_eff, "fiterr")
+    require(tok_in >= tok_eff, "fiterr")
+    let xel_back: u64 = xel_in - xel_eff
+    let tok_back: u64 = tok_in - tok_eff
+
+    // Reserves only grow, at the SAME ratio (IX3/IX7).
+    s.store(pool_key(asset, F_XEL_RESERVE), x + xel_eff)
+    s.store(pool_key(asset, F_TOK_RESERVE), y + tok_eff)
     let lp: u64 = s.load(pool_key(asset, F_LP_COUNT)).unwrap_or(0)
     s.store(pool_key(asset, F_LP_COUNT), checked_add(lp, 1))
 
-    emit_event(EV_LIQUIDITY_ADDED, [asset.to_hex(), xel_in.to_string(10u32), tok_in.to_string(10u32)])
+    // Refunds of the donor's own fresh deposit (never the reserves), and
+    // only after every state write (X9: state first, transfers last).
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+    if xel_back > 0 {
+        let ok: bool = transfer(caller, xel_back, xel)
+        require(ok, "txfail")
+    }
+    if tok_back > 0 {
+        let ok: bool = transfer(caller, tok_back, asset)
+        require(ok, "txfail")
+    }
+
+    emit_event(EV_LIQUIDITY_ADDED, [asset.to_hex(), xel_eff.to_string(10u32), tok_eff.to_string(10u32), xel_back.to_string(10u32), tok_back.to_string(10u32)])
     return 0
 }
 
@@ -692,10 +771,12 @@ entry set_admin(new_admin: Address) -> u64 {
     return 0
 }
 
-// 15. EMERGENCY pause — blocks EVERYTHING (swaps both ways, pool creation,
-//     liquidity adds). Admin-only, last resort (a bug in the wild). It can
-//     never rug anything: nothing can leave the reserves (IX3), and it is
-//     the ONLY gate that ever touches the sell path (X5).
+// 15. EMERGENCY pause — gates BUYS, POOL CREATION and LIQUIDITY ADDS
+//     only. Admin-only, last resort (a bug in the wild). It can never rug
+//     anything: nothing can leave the reserves (IX3), and the SELL path
+//     carries no gate at all — even under a full emergency pause, every
+//     holder can exit at market price (IX6; founder risk review, point 2:
+//     a compromised admin must never be able to trap holders).
 entry set_paused(flag: bool) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -890,7 +971,9 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool) {
     )
 }
 
-// 26. Human status label of a pool (frontend helper).
+// 26. Human status label of a pool (frontend helper). "emergency" means
+//     buys frozen + pool creation frozen + liquidity adds frozen — sells
+//     stay open in every state (IX6); the frontend should say so.
 pub fn get_status_label(asset: Hash) -> string {
     let s: Storage = Storage::new()
     require_pool(asset)
@@ -903,7 +986,26 @@ pub fn get_status_label(asset: Hash) -> string {
     return "live"
 }
 
-// 27. Contract version (house style).
+// 27. The pinned launchpad: (address_string, pinned). "unset" while no
+//     launchpad has been pinned. This is the ops/frontend bridge for the
+//     upgrade runbook (founder risk review, point 3): the site can verify
+//     WHICH launchpad generation owns this DEX's create_pool entry, and
+//     operations can assert the pin before the first migration. Once
+//     pinned == true the address is frozen forever (X4) — a new launchpad
+//     generation requires a NEW LaunchDEX deployment (documented runbook:
+//     both venues of a generation keep serving their pools forever).
+pub fn get_launchpad() -> (string, bool) {
+    let s: Storage = Storage::new()
+    let addr: string = "unset"
+    let lpx_opt: optional<Address> = s.load(LAUNCHPAD_KEY)
+    if lpx_opt.is_some() {
+        let lpx: Address = lpx_opt.expect("guarded")
+        addr = lpx.to_string()
+    }
+    return (addr, s.load(LAUNCHPAD_PINNED_KEY).unwrap_or(false))
+}
+
+// 28. Contract version (house style).
 pub fn get_version() -> string {
     return VERSION
 }

@@ -21,7 +21,7 @@ Units: XEL and token amounts are atomic integers with 8 decimals
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import protocol
 from .protocol import DaemonClient, val_addr, val_str, val_u64
@@ -73,6 +73,7 @@ DEFAULTS = {
     "team_unlock_delay": 3_153_600,           # ~6 months of bonding (D3)
     "vesting_min": 518_400,                   # ~1 month
     "vesting_max": 6_307_200,                 # ~1 year
+    "vote_deposit": 0,                        # D21 sybil dial (0 = free voting)
 }
 
 # ---------------------------------------------------------------------------
@@ -224,6 +225,17 @@ def ticker_key(symbol: str) -> str:
     return f"t:{symbol}"
 
 
+def asset_lookup_key(asset_hex: str) -> str:
+    """D22 reverse bridge: asset hash -> project id (written once at
+    creation — get_project_by_asset on-chain)."""
+    return f"a:{asset_hex}"
+
+
+def migrated_index_key(rank: int) -> str:
+    """D22 migrated index: rank (0-based, oldest first) -> project id."""
+    return f"m:{rank}"
+
+
 F_CREATOR, F_STATUS, F_NAME, F_SYMBOL = "cr", "st", "nm", "sy"
 F_DESC, F_WEBSITE, F_LOGO = "ds", "ws", "lg"
 F_TWITTER, F_TELEGRAM, F_DISCORD = "tw", "tg", "dc"
@@ -256,7 +268,7 @@ GLOBAL_KEYS = {
     "total_trades": "ttc",
     "total_curve_xel": "tcx", "locked_refunds": "lrf",
     "total_budgets": "tbb", "migrated_count": "mgc", "dex_address": "dxa",
-    "paused": "pz",
+    "paused": "pz", "vote_deposit": "vdp", "vote_pots": "tvp",
 }
 
 
@@ -301,6 +313,26 @@ def finalize_topup_deposits(xel_amount: int, xel_asset: str = "0" * 64) -> dict:
     creation cost rose above the earmarked budget (D13); the unused part
     of budget + top-up is refunded to the creator in the same transaction."""
     return {xel_asset: xel_amount}
+
+
+def vote_deposits(vote_deposit: int, xel_asset: str = "0" * 64) -> dict:
+    """D21: attach the configured vote deposit on support()/report().
+    Read the CURRENT dial first (LaunchpadReader.vote_config) — anything
+    attached beyond the dial is refunded in the same transaction, but
+    attaching LESS than the dial is refused ("votedep")."""
+    return {xel_asset: vote_deposit}
+
+
+def claim_vote_deposit_params(pid: int, round_no: int) -> list:
+    """D21 pull-refund: claim YOUR locked deposit for a round that has
+    closed (a newer round exists, or the round's deadline has passed)."""
+    return [val_u64(pid), val_u64(round_no)]
+
+
+def set_vote_deposit_params(amount: int) -> list:
+    """Admin: raise/lower the D21 dial (0 = free voting; hard cap 10 XEL).
+    Only affects FUTURE votes — locked deposits refund at their own amount."""
+    return [val_u64(amount)]
 
 
 def update_info_params(description: str, website: str, logo: str,
@@ -359,6 +391,30 @@ class LaunchpadReader:
     def migrated_count(self) -> int:
         return self._key(GLOBAL_KEYS["migrated_count"], 0)
 
+    def vote_config(self) -> Dict[str, int]:
+        """D21: (vote_deposit, vote_pots) — the CURRENT dial and the total
+        XEL locked as refundable voter deposits (committed side of I2)."""
+        return {"vote_deposit": self._key(GLOBAL_KEYS["vote_deposit"], 0),
+                "vote_pots": self._key(GLOBAL_KEYS["vote_pots"], 0)}
+
+    def project_by_asset(self, asset_hex: str) -> Optional[int]:
+        """D22 reverse bridge: the project id owning this asset hash, or
+        None if the asset was never launched here. THE way to map a DEX
+        pool (enumerated by asset) back to its launchpad project page."""
+        return self._key(asset_lookup_key(asset_hex))
+
+    def migrated_by_rank(self, rank: int) -> Optional[int]:
+        """D22: the pid of the rank-th (0-based, oldest first) migrated
+        project; None past the last (sentinel = migrated_count)."""
+        return self._key(migrated_index_key(rank))
+
+    def migrated_list(self) -> List[int]:
+        """D22 convenience for the frontend: every migrated pid, in order.
+        Vercel-safe: rebuilt from the chain on every call, nothing cached."""
+        return [pid for pid in (self.migrated_by_rank(r)
+                                for r in range(self.migrated_count()))
+                if pid is not None]
+
     def config(self) -> Dict[str, int]:
         return {name: self._key(key, DEFAULTS.get(name, 0))
                 for name, key in GLOBAL_KEYS.items()
@@ -371,7 +427,7 @@ class LaunchpadReader:
         names = ("count", "pending_fees", "fees_collected_lifetime",
                  "total_volume", "total_curve_xel", "locked_refunds",
                  "total_buy_volume", "total_sell_volume", "total_trades",
-                 "total_budgets", "migrated_count")
+                 "total_budgets", "migrated_count", "vote_pots")
         out: Dict[str, Any] = {n: self._key(GLOBAL_KEYS[n], 0) for n in names}
         out["paused"] = self.paused()
         out["dex_address"] = self.dex_address()

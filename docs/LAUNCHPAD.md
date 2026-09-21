@@ -1,7 +1,7 @@
 # VaultLaunch — Design Specification
 
 > contracts/launchpad/VaultLaunch.slx + contracts/dex/LaunchDEX.slx ·
-> VaultLaunch v4.0.0 / LaunchDEX v1.0.0 · mainnet-ready (testnet first)
+> VaultLaunch v4.1.0 / LaunchDEX v1.1.0 · mainnet-ready (testnet first)
 
 A serious launchpad for XEL: real projects are filtered by a community
 validation vote, priced by a constant-product bonding curve, and held to a
@@ -42,6 +42,34 @@ move ATOMICALLY into a permanent **LaunchDEX** pool (one cross-contract
 call with attached deposits; no remove_liquidity exists anywhere — the
 anti-rug guarantee). The launchpad keeps the project's home (votes,
 socials, trust, team escrow); the pool owns the market.
+
+**v4.1 — HARDENED BY THE FOUNDER RISK REVIEW (D21/D22).** Six risks were
+raised before going live; six are now closed in code and docs. (1) DEX
+`add_liquidity` is now **price-neutral** (Uniswap-style ratio fit — a
+skewed or one-sided donation only deepens the pool at its CURRENT price,
+the excess side is refunded in the same transaction; only swaps can move
+a pool's price). (2) **Sells are ungated, absolutely**: the DEX emergency
+pause now gates buys, pool creation and liquidity adds ONLY — no code
+path on either venue can ever block a sell; a compromised admin can tax
+(fees are hard-capped) but never trap holders. (3) The upgrade path is
+**documented as a runbook** (both pins freeze at first use; a new
+launchpad generation means a new LaunchDEX side-by-side — old venues
+keep serving their pools forever, the site aggregates generations via
+`get_launchpad` + `get_migrated_by_rank`). (4) The cross-called chunk
+ids stay **pinned and CI-asserted on both sides** (append-only rule:
+new DEX functions go at the end, ids 6/7 never move). (5) The **sybil
+dial (D21)**: an admin-settable, REFUNDABLE vote deposit (default 0 =
+free voting, cap 10 XEL) — raise it under attack, every vote then locks
+capital that `claim_vote_deposit` refunds once the round closes; XELIS
+confidentiality rules out balance-weighted voting, so capital lock is
+the honest lever, and it is documented as a mitigation, not a cure.
+(6) The **privacy model is documented honestly** (see §5a): deposits
+attached to contract calls are public by chain design; wallet balances
+stay confidential — nobody should promise "total privacy". And for the
+site (statically hosted, stateless): **D22** adds the asset→project
+reverse bridge (`get_project_by_asset`) and the migrated index
+(`get_migrated_count` / `get_migrated_by_rank`) — every listing, stat
+and link the frontend shows is enumerable from views alone.
 
 Two contracts, one architecture. Zero other dependencies.
 
@@ -469,10 +497,33 @@ corrupted counter is worse than a refused trade).
 | vesting bounds             | 518400..6307200 topos (~1..12 mo) | [~1d, ~2y], min < max |
 | recovery_fee               | 250 XEL     | ≤ 1000 XEL                      |
 | recovery thresholds        | 40 voters / 90% | stricter than validation    |
+| vote_deposit (D21, v4.1)   | 0 (free)    | ≤ 10 XEL — the REFUNDABLE sybil dial |
 
 LaunchDEX parameters (set on the DEX contract — see `docs/DEX.md`):
 `swap_fee_bps` 30 (≤ 1000), trade bounds, the launchpad pin (frozen at
 the first pool).
+
+**The sybil dial (D21)** deserves its own paragraph because it changes
+UX when raised. While `vote_deposit` reads 0 (the default), voting is
+free — one transaction, one vote, nothing locked. When the admin raises
+the dial with `set_vote_deposit` (say 5 XEL), every `support()` and
+`report()` must ATTACH that amount; it is locked for the round's
+duration and refunded in full by
+`claim_vote_deposit(pid, round)` once the round has closed (a newer
+round exists, or the deadline passed). Honest voters only ever lend
+capital; sybil farmers must lock N × deposit across wallets and rounds.
+A raise only affects future votes — already-locked deposits refund at
+their own recorded amount. Read the dial and the locked total with
+`get_vote_config()`; the locked pots are part of the committed side of
+the solvency invariant (I2) — the admin can NEVER withdraw them as
+fees. Default 0 means the launch experience is unchanged until an
+attack is observed; the cap (10 XEL) keeps the dial a sybil cost, never
+a participation toll. One honest nuance: the hard lock applies to
+VALIDATION and RECOVERY windows (the gates a sybil actually attacks);
+ongoing trust votes in Bonding/Graduated use a round whose deadline is
+already past, so their deposit is only flash-locked (vote transaction,
+then claim transaction) — the tallies still count each address exactly
+once per round either way.
 
 **Cross-checked pairs** (the two invariants the setters enforce between
 each other): `graduated_fee_bps ≤ trading_fee_bps` (the graduation
@@ -518,10 +569,14 @@ parameters), `get_recovery_config()`, `get_team_config()`.
 - No reentrancy surface: XELIS invokes are atomic; the two outbound
   calls happen last in their entries (state first), and LaunchDEX
   calls no contract at all.
-- Voting sybil-resistance is the network fee, nothing more (documented,
-  not hidden). 20+ voting transactions at 80% agreement make cheap
-  attack campaigns expensive; the trust tallies accumulate for the
-  whole life of the project.
+- Voting sybil-resistance is the network fee by default, plus the D21
+  dial when raised: 1 address = 1 vote per round, and while the
+  community is small, 20 wallets can decide a validation — this is a
+  KNOWN product weakness, mitigated (not cured) by `min_participants`,
+  the refundable vote deposit, and the report/trust system. XELIS
+  confidentiality makes balance- or age-weighted voting impossible
+  (nobody can read anyone's balance) — capital lock is the honest lever.
+  The trust tallies accumulate for the whole life of the project.
 - Front-running buys/sells is possible (no mempool privacy) — same as
   every public DEX on XELIS today; quotes are view functions, use them.
 - Storage keys are fully namespaced (`p:`, `v:`, `t:` prefixes); the
@@ -529,6 +584,51 @@ parameters), `get_recovery_config()`, `get_team_config()`.
   namespace. Every panic message is a fixed short literal.
 - Storage growth is bounded: 8192 projects max, per-project state is a
   fixed key set, votes are one key per (project, round, address).
+
+### 5a. The privacy model — what is public, what is private (D18, v4.1)
+
+Say it plainly on the site; never promise total privacy.
+
+| data                                        | public? | why                                     |
+|---------------------------------------------|---------|-----------------------------------------|
+| Wallet balances (XEL and launched assets)  | PRIVATE | native XELIS confidential balances      |
+| Wallet-to-wallet transfers of launched tokens | PRIVATE | native confidential transfers        |
+| Team allocation payouts (TeamClaimed)       | PRIVATE | the event carries NO amount (D18)       |
+| Asset max supply / mintability              | PUBLIC  | protocol-level asset properties         |
+| Deposits ATTACHED to contract calls         | PUBLIC  | the contract must read the amount       |
+| Curve buys (XEL in) / sells (tokens in)     | PUBLIC  | they are attached deposits              |
+| DEX swaps' input side                       | PUBLIC  | attached deposits                       |
+| Vote participation (which address voted)    | PUBLIC  | the vote event carries the voter        |
+| Everything the views return (reserves, volumes, market caps) | PUBLIC | on-chain scoreboard by design |
+
+The honest summary for users: **your balances and your wallet-to-wallet
+transfers are confidential; your participation in the launchpad's
+markets (what you attach to a buy/sell/swap/vote) is public by chain
+design** — exactly like every contract interaction on XELIS.
+
+### 5b. Upgrade runbook — the two frozen pins (D19, v4.1)
+
+Both pins are one-way doors, on purpose: `set_dex_address` freezes at
+the launchpad's first migration, and LaunchDEX's launchpad pin freezes
+at its first pool. A frozen pin can never be repointed — not even by
+the admin — which is what makes live pools un-orphanable. The
+operational consequence is assumed and documented: **a new VaultLaunch
+generation requires a NEW LaunchDEX deployment**, side by side:
+
+1. Deploy the new LaunchDEX, pin the NEW launchpad on it
+   (`set_launchpad`) BEFORE its first pool.
+2. Deploy/point the new VaultLaunch, `set_dex_address` to the new DEX
+   BEFORE its first migration.
+3. Old venues keep serving their pools and curves FOREVER (permanent
+   liquidity, no remove_liquidity) — nothing migrates, nothing breaks.
+4. The site aggregates generations: each launchpad instance enumerates
+   its own projects; each DEX instance exposes `get_launchpad()` so the
+   frontend can verify which generation owns which pools, and every
+   launchpad's `get_migrated_by_rank` lists its migrated set across
+   DEX generations.
+
+Never try to "reuse" a pinned DEX with a new launchpad: the pin refuses
+("pinned"), and that refusal is the security model working.
 
 ---
 
@@ -562,6 +662,7 @@ parameters), `get_recovery_config()`, `get_team_config()`.
 | 24 | MigratedToDex         | id, xel_sent, tokens_sent (D15)     |
 | 25 | DexTrustSynced        | id, "1"\|"0" (D17)                  |
 | 26 | DexAddressSet         | dex_hex (D19)                       |
+| 27 | VoteDepositClaimed    | id, round, amount (D21, v4.1)       |
 
 ---
 
@@ -585,9 +686,15 @@ Python reference):
   DECLARED PLAN (D10), `mc mh mg` market cap series (D12), `ah` ASSET
   HASH (D13 — query the asset itself on-chain), `ab` budget earmark,
   `mi ma mx mt` migration state (D15), `ds` dex trust synced (D17)
-- votes `v:{id}:{round}:{addr}`; ticker registry `t:{symbol}` (D11)
+- votes `v:{id}:{round}:{addr}` (D21: the slot holds the voter's LOCKED
+  deposit amount — presence IS the vote marker, a claimed deposit is
+  zeroed but kept); ticker registry `t:{symbol}` (D11); reverse bridge
+  `a:{asset_hex}` → project id (D22); migrated index `m:{rank}` →
+  project id (D22)
 - **token balances live in the WALLETS now** (v4): query the daemon for
   the asset (`ah`) like any XELIS balance — there is no `b:` ledger
+- global (v4.1 additions): `vdp` vote deposit dial (D21), `tvp` total
+  locked vote pots (D21 — part of I2's committed side)
 
 Card layout suggestion (per project):
 
@@ -633,6 +740,42 @@ launchpad's own total volume, buy/sell split and trade count).
 Listings: `get_projects_by_status` + `get_project_by_rank` (paginated,
 count-then-rank — Silex ABIs return no arrays), `get_latest_projects`,
 `get_trusted_projects` + `get_trusted_by_rank` (the graduated shelf).
+
+### 7a. The stateless-site data contract (D22, v4.1) — Vercel-proof
+
+The site is statically hosted: it persists NOTHING. Every page must be
+rebuildable from views alone, on every request. The complete recipe:
+
+**Home / discover** — the four shelves:
+1. Validating (vote now): `get_projects_by_status(0)` →
+   `get_project_by_rank(0, r)` for r in 0..count
+2. On the curve (bonding): status 2, same pattern
+3. Graduated (pre-migration, curve still trading): status 3 (+4 Trusted)
+4. Live on the DEX: `get_migrated_count()` → `get_migrated_by_rank(r)`
+   → per pid: `get_migration_info` (which DEX) + `get_asset_info`
+   (asset hash) → the pool itself on that DEX
+   (`get_pools_count`/`get_pool_by_index`/`get_pool_state`/
+   `get_spot_price`/`get_pool_volume` — or one `get_launchpad()` call to
+   identify the generation)
+
+**DEX → project page (the bridge)**: a pool enumerates as an ASSET hash;
+`get_project_by_asset(asset)` returns the launchpad pid — from there the
+full project card (name, socials, trust, vesting, curve-era scoreboard)
+is the standard per-pid view set. This works across DEX generations:
+each launchpad keeps its own reverse index, written at asset creation.
+
+**Rejections/blackholes**: status 1 (for the record), no trading.
+
+**Project page** = the 8-point card layout above + `get_vote_config()`
+when the D21 dial is raised (show "5 XEL refundable deposit to vote").
+
+**Protocol dashboard**: `get_protocol_stats` (now 12 fields — includes
+`vote_pots`) + `get_volume_stats` + the DEX's own `get_pools_count`.
+
+Every value the site shows — every listing, price, market cap, volume,
+social link, trust badge, vesting progress, pool state — comes from a
+view or a storage key documented above. No indexer, no database, no
+server state, no cache to invalidate: the chain IS the backend.
 
 Events (§6) drive the live feed: watch for `ProjectCreated`,
 `ValidationFinished`, `TokensBought/Sold`, `ProjectGraduated`,

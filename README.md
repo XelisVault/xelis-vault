@@ -5,8 +5,10 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v18** — real confidential assets,
-real migration, permanent liquidity.
+[Silex](https://docs.xelis.io/). **v18.1** — real confidential assets,
+real migration, permanent liquidity, hardened by the founder risk
+review (price-neutral DEX liquidity, ungated sells, sybil dial,
+stateless-site data bridges).
 
 ## What ships today
 
@@ -52,10 +54,22 @@ to the admin (no burn):
   trading at the graduated fee until the pool exists
 - **LaunchDEX (v18)**: the permanent AMM for graduated tokens — no
   remove_liquidity exists anywhere (the anti-rug guarantee), anyone can
-  deepen a pool forever (`add_liquidity`), fees 0.30% default extracted
+  deepen a pool forever (`add_liquidity`, PRICE-NEUTRAL since v1.1: the
+  pool's ratio is enforced and the excess is refunded — only swaps move
+  a price), fees 0.30% default extracted
   to pending pots (100% admin), per-pool scoreboard; the community trust
   system follows the tokens there (`sync_trust_to_dex` pauses pool buys,
-  never sells)
+  never sells — and the emergency pause itself can never block a sell)
+- **founder risk review, closed (v18.1)**: (1) one-sided liquidity
+  gifts can't skew markets (X7); (2) sells are ungated on BOTH venues;
+  (3) the upgrade runbook assumes the frozen pins (side-by-side
+  generations, `get_launchpad`); (4) cross-call chunk ids pinned +
+  CI-asserted on both sides; (5) the REFUNDABLE vote-deposit dial
+  (D21, default off, `claim_vote_deposit`) raises sybil cost; (6) the
+  privacy model documented in plain words (public deposits, private
+  balances). The stateless site (Vercel) reads EVERYTHING from views —
+  including the new asset→project reverse bridge and the migrated
+  index (D22)
 - team allocation (≤ 20%): claim in full at migration OR lock it in a
   linear vesting (public commitment signal); a project that never
   graduates releases the allocation after ~6 months of bonding —

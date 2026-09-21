@@ -98,11 +98,11 @@ REQS = [
     ("R28", "pinned chunk ids asserted against the real DEX table (CI)",
      "const DEX_CREATE_POOL_CHUNK: u16 = 6",
      "test_pinned_cross_call_chunks_d19"),
-    ("R29", "no locked funds: curve sells + pool sells never pausable",
-     'require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")',
-     "test_sells_are_never_selectively_blocked_x5"),
-    ("R30", "solvent by construction (exact-sum curve accounting, D20)",
-     "let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128)",
+    ("R29", "no locked funds: curve sells carry no pause gate at all — pool sells neither (point 2)",
+     'entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {',
+     "test_sells_are_never_blocked_by_anything_x5"),
+    ("R30", "solvent by construction (exact-sum curve accounting, D20/D21)",
+     "let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128) + (pots as u128)",
      "test_solvency_after_graduation_and_withdrawal_pressure"),
 ]
 

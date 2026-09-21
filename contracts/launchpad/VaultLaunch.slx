@@ -89,9 +89,9 @@
 //     is burned.
 //
 // D6. Voting is 1 address = 1 vote, per voting round. Every vote costs a
-//     network fee — that is the only (and honest) sybil cost on XELIS
-//     today. Votes reset when a new validation round opens; trust tallies
-//     otherwise accumulate for the whole life of the project.
+//     network fee — and, when the admin raises the D21 dial, a REFUNDABLE
+//     XEL deposit. Votes reset when a new validation round opens; trust
+//     tallies otherwise accumulate for the whole life of the project.
 //
 // D7. TWO-PATH GRADUATION (the liquidity cap). A founder may lock ANY
 //     liquidity >= min_liquidity; whether the project skips the bonding
@@ -240,10 +240,40 @@
 // D20. SOUND XEL ACCOUNTING (I2, tightened from v2). total_curve_xel is
 //     the exact sum of every live curve's reserves (seeds included — v2
 //     left them as slack; migration needs exactness), and
-//     locked_refunds + pending_fees + earmarked budgets complete the
-//     committed side. balance >= committed at every block; every path
-//     that moves XEL (buy, sell, fee, refund, asset creation, migration)
-//     updates both sides in the same transaction.
+//     locked_refunds + pending_fees + earmarked budgets + locked vote pots
+//     complete the committed side. balance >= committed at every block;
+//     every path that moves XEL (buy, sell, fee, refund, asset creation,
+//     migration, vote deposit/claim) updates both sides in the same
+//     transaction.
+//
+// D21. SYBIL DIAL — REFUNDABLE VOTE DEPOSITS (founder risk review, point
+//     5). 1-address-1-vote is free to farm while the community is small
+//     (20 wallets decide a validation). XELIS confidentiality rules out
+//     balance- or age-weighted voting (nobody can read anyone's balance),
+//     so the honest lever is CAPITAL: set_vote_deposit (admin, capped at
+//     10 XEL, DEFAULT 0 = voting stays free) makes every support()/report()
+//     attach that amount; it is LOCKED for the round's duration and fully
+//     REFUNDED by claim_vote_deposit(pid, round) once the round has closed
+//     (per-voter pull — no unbounded loops; the vote slot itself records
+//     the locked amount). An honest voter only ever lends gas-locked
+//     capital; a sybil farmer must lock 20x the deposit across wallets and
+//     rounds. The dial is a circuit-breaker to raise under attack, not a
+//     default tax — and it is documented as a mitigation, not a cure
+//     (small communities stay the weak link; min_participants remains the
+//     product-side defense).
+//
+// D22. FRONTEND COMPLETENESS — EVERYTHING THE SITE NEEDS IS ON-CHAIN. The
+//     site is static-hosted (Vercel): it stores NOTHING, so the contracts
+//     must serve every listing, every stat and every link through views.
+//     v4.1 adds the two missing bridges: a REVERSE INDEX asset hash ->
+//     project id (get_project_by_asset — the DEX enumerates pools by asset,
+//     this maps them back to the launchpad's project pages) and a MIGRATED
+//     INDEX (get_migrated_count / get_migrated_by_rank — every project that
+//     ever moved to a DEX pool, across DEX generations). Combined with the
+//     per-status rankings (get_projects_by_status / get_project_by_rank),
+//     the full launchpad surface — validating, bonding, graduated,
+//     migrated, trusted, untrusted, rejected — is enumerable in O(list)
+//     views, no indexer, no database, no server state.
 //
 // ----------------------------------------------------------------------------
 // LIFECYCLE (status codes)
@@ -422,13 +452,15 @@
 //       degenerates to balance == team_remaining (the pool owns the
 //       rest). Auditable by anyone: get_asset_info / get_balance_for_asset.
 //   I2. XEL SOLVENCY (D20, tightened): contract XEL balance >=
-//       total_curve_xel + pending_fees + locked_refunds + total_budgets,
-//       before and after every entry — where total_curve_xel is the exact
-//       sum of live curve reserves (seeds included, minus rejected
-//       projects' refunds-in-waiting, minus taken fees, minus migrated
-//       reserves), total_budgets the sum of earmarked asset budgets.
-//       Every XEL path updates both sides atomically. Checked in
-//       withdraw_fees (the only exit path for fees).
+//       total_curve_xel + pending_fees + locked_refunds + total_budgets
+//       + total_vote_pots, before and after every entry — where
+//       total_curve_xel is the exact sum of live curve reserves (seeds
+//       included, minus rejected projects' refunds-in-waiting, minus
+//       taken fees, minus migrated reserves), total_budgets the sum of
+//       earmarked asset budgets, and total_vote_pots the sum of every
+//       voter's refundable D21 deposit. Every XEL path updates both sides
+//       atomically. Checked in withdraw_fees (the only exit path for
+//       fees).
 //   I3. A project's reserves can only grow by buy nets and shrink by sell
 //       grosses, the one-time migration fee, and the migration itself;
 //       the founder's liquidity only leaves via claim_refund on a
@@ -436,8 +468,12 @@
 //   I4. Team tokens are paid to the creator EXACTLY once across all claim
 //       paths: every claim adds unlocked - team_paid and team_paid only
 //       ever increases, capped at team_alloc.
-//   I5. Every vote is one storage key ("v:{id}:{round}:{addr}"); an address
-//       votes at most once per round; rounds only increase.
+//   I5. Every vote is one storage key ("v:{id}:{round}:{addr}") holding
+//       the voter's LOCKED DEPOSIT AMOUNT (D21; 0 = voted for free) —
+//       is_some() IS the "has voted" marker, the amount is what
+//       claim_vote_deposit refunds (a claim zeroes it, keeping the marker
+//       — the vote stays counted, the deposit leaves exactly once). An
+//       address votes at most once per round; rounds only increase.
 //   I6. Status transitions are one-way per path (see LIFECYCLE); nobody,
 //       including the admin, can jump states arbitrarily. The migrated
 //       flag is one-way: once set, the curve is closed forever.
@@ -460,6 +496,7 @@
 // ----------------------------------------------------------------------------
 //   Global   : adm pc sub abd mnl tfe gfe mgf dlt mnp mab vdt gmu tdy vmn vmx
 //              rfe rmp rmr pfe fcl tvl tcx lrf pz xa tbv tsv ttc tbb mgc dxa
+//              vdp vote deposit (D21)   tvp total vote pots (D21)
 //              (see constants below)
 //   Project  : p:{id}:cr creator        p:{id}:st status (u64)
 //              p:{id}:nm name           p:{id}:sy symbol
@@ -486,8 +523,14 @@
 //              p:{id}:mi migrated flag  p:{id}:ma migrated at topo (D15)
 //              p:{id}:mx migrated XEL   p:{id}:mt migrated tokens (D15)
 //              p:{id}:ds dex trust synced flag (D17)
-//   Votes    : v:{id}:{round}:{addr} -> bool
+//   Votes    : v:{id}:{round}:{addr} -> locked deposit amount (D21;
+//              u64 — is_some() is the vote marker, 0 = voted free,
+//              claimed deposits are zeroed but kept)
 //   Registry : t:{symbol} -> project id (ticker reservation, D11)
+//   Reverse  : a:{asset_hex} -> project id (asset -> pid bridge, D22 —
+//              written once at asset creation)
+//   Migrated : m:{index} -> project id (migration order, D22 — written
+//              once at migrate; pair with get_migrated_count)
 //
 // ----------------------------------------------------------------------------
 // EVENTS (V6 contract events: id + array of string fields)
@@ -517,45 +560,47 @@
 //   24 MigratedToDex       [id, xel_sent, tokens_sent] (D15)
 //   25 DexTrustSynced      [id, "1"|"0"]              (D17)
 //   26 DexAddressSet       [dex_hex]                  (D19)
+//   27 VoteDepositClaimed  [id, round, amount]        (D21)
 //
 // ----------------------------------------------------------------------------
 // CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
-//     0  constructor              1  only_admin            2  require_project
-//     3  proj_key                 4  vote_key             5  fee_take
-//     6  buy_tokens_out           7  sell_xel_out         8  team_alloc_of
-//     9  checked_add             10  current_fee_bps     11  team_remaining
-//    12  team_unlocked           13  trust_guard         14  take_migration_fee
-//    15  update_market_cap       16  record_trade        17  graduate
-//    18  create_project_asset    19  migrate_to_dex      20  propose
-//    21  support                 22  report              23  finalize_validation
-//    24  buy                     25  sell                26  claim_refund
-//    27  request_revalidation    28  update_project_info 29  start_team_vesting
-//    30  claim_team_allocation   31  migrate             32  sync_trust_to_dex
-//    33  set_submission_fee      34  set_trading_fee     35  set_graduated_trading_fee
-//    36  set_migration_fee       37  set_direct_listing_threshold
-//    38  set_min_liquidity       39  set_min_participants
-//    40  set_min_approval_ratio  41  set_validation_duration
-//    42  set_graduation_multiplier 43  set_team_unlock_delay
-//    44  set_vesting_bounds      45  set_recovery_fee    46  set_recovery_params
-//    47  set_asset_budget        48  set_dex_address     49  set_admin
-//    50  set_paused              51  withdraw_fees       52  get_project
-//    53  get_project_info        54  get_project_status  55  get_project_tokenomics
-//    56  get_project_trust       57  get_bonding_info    58  get_current_price
-//    59  get_buy_quote           60  get_sell_quote      61  get_market_cap
-//    62  has_voted               63  get_total_projects  64  get_projects_by_status
-//    65  get_project_by_rank     66  get_latest_projects 67  get_trusted_projects
-//    68  get_trusted_by_rank     69  get_team_allocation 70  get_protocol_stats
-//    71  get_config              72  get_recovery_config 73  get_team_config
-//    74  get_social_links        75  get_trading_stats   76  get_market_cap_history
-//    77  get_proposal_data       78  get_volume_stats    79  get_asset_info
-//    80  get_migration_info      81  get_status_label    82  get_version
+//    0   constructor                   1   only_admin                    2   require_project
+//    3   proj_key                      4   vote_key                      5   fee_take
+//    6   buy_tokens_out                7   sell_xel_out                  8   team_alloc_of
+//    9   checked_add                   10  current_fee_bps               11  team_remaining
+//    12  team_unlocked                 13  trust_guard                   14  take_migration_fee
+//    15  update_market_cap             16  record_trade                  17  graduate
+//    18  create_project_asset          19  migrate_to_dex                20  propose
+//    21  support                       22  report                        23  finalize_validation
+//    24  buy                           25  sell                          26  claim_refund
+//    27  claim_vote_deposit            28  request_revalidation          29  update_project_info
+//    30  start_team_vesting            31  claim_team_allocation         32  migrate
+//    33  sync_trust_to_dex             34  set_submission_fee            35  set_trading_fee
+//    36  set_graduated_trading_fee     37  set_migration_fee             38  set_direct_listing_threshold
+//    39  set_min_liquidity             40  set_min_participants          41  set_min_approval_ratio
+//    42  set_validation_duration       43  set_graduation_multiplier     44  set_team_unlock_delay
+//    45  set_vesting_bounds            46  set_recovery_fee              47  set_recovery_params
+//    48  set_asset_budget              49  set_vote_deposit              50  set_dex_address
+//    51  set_admin                     52  set_paused                    53  withdraw_fees
+//    54  get_project                   55  get_project_info              56  get_project_status
+//    57  get_project_tokenomics        58  get_project_trust             59  get_bonding_info
+//    60  get_current_price             61  get_buy_quote                 62  get_sell_quote
+//    63  get_market_cap                64  has_voted                     65  get_total_projects
+//    66  get_projects_by_status        67  get_project_by_rank           68  get_latest_projects
+//    69  get_trusted_projects          70  get_trusted_by_rank           71  get_team_allocation
+//    72  get_protocol_stats            73  get_config                    74  get_vote_config
+//    75  get_recovery_config           76  get_team_config               77  get_social_links
+//    78  get_trading_stats             79  get_market_cap_history        80  get_proposal_data
+//    81  get_volume_stats              82  get_asset_info                83  get_project_by_asset
+//    84  get_migration_info            85  get_migrated_count            86  get_migrated_by_rank
+//    87  get_status_label              88  get_version
 //
 //   Auto-verified by scripts/verify_chunk_ids.py on every push: the table
 //   above MUST match the declaration order in this file. Renumbering any
 //   function invalidates the table — regenerate it, never hand-edit around.
 // ============================================================================
 
-const VERSION: string = "VaultLaunch v4.0.0"
+const VERSION: string = "VaultLaunch v4.1.0"
 
 // ---------------------------------------------------------------------------
 // Status codes (see LIFECYCLE)
@@ -606,6 +651,7 @@ const DEFAULT_RECOVERY_RATIO_BPS: u64 = 9000
 const DEFAULT_TEAM_DELAY: u64 = 3153600
 const DEFAULT_VESTING_MIN: u64 = 518400
 const DEFAULT_VESTING_MAX: u64 = 6307200
+const DEFAULT_VOTE_DEPOSIT: u64 = 0
 
 // ---------------------------------------------------------------------------
 // Hard caps for admin parameters (a compromised admin can hurt the fee
@@ -630,6 +676,7 @@ const MIN_TEAM_DELAY_TOPO: u64 = 86400
 const MAX_TEAM_DELAY_TOPO: u64 = 12614400
 const VESTING_FLOOR_TOPO: u64 = 17280
 const VESTING_CEIL_TOPO: u64 = 12614400
+const MAX_VOTE_DEPOSIT: u64 = 1000000000
 
 // ---------------------------------------------------------------------------
 // Per-project caps (checked in propose)
@@ -692,6 +739,8 @@ const TOTAL_TRADES_KEY: string = "ttc"
 const TOTAL_BUDGETS_KEY: string = "tbb"
 const MIGRATED_COUNT_KEY: string = "mgc"
 const DEX_ADDRESS_KEY: string = "dxa"
+const VOTE_DEPOSIT_KEY: string = "vdp"
+const VOTE_POTS_KEY: string = "tvp"
 
 // ---------------------------------------------------------------------------
 // Project field keys (p:{id}:{field})
@@ -743,6 +792,8 @@ const F_DEX_SYNCED: string = "ds"
 const PROJ_PREFIX: string = "p:"
 const VOTE_PREFIX: string = "v:"
 const TICKER_PREFIX: string = "t:"
+const ASSET_LOOKUP_PREFIX: string = "a:"
+const MIGRATED_INDEX_PREFIX: string = "m:"
 
 // ---------------------------------------------------------------------------
 // Event IDs
@@ -773,6 +824,7 @@ const EV_ASSET_CREATED: u64 = 23
 const EV_MIGRATED: u64 = 24
 const EV_DEX_SYNCED: u64 = 25
 const EV_DEX_ADDRESS: u64 = 26
+const EV_VOTE_DEPOSIT_CLAIMED: u64 = 27
 
 // ============================================================================
 // 0. CONSTRUCTOR
@@ -818,6 +870,8 @@ hook constructor() -> u64 {
     s.store(TOTAL_TRADES_KEY, 0u64)
     s.store(TOTAL_BUDGETS_KEY, 0u64)
     s.store(MIGRATED_COUNT_KEY, 0u64)
+    s.store(VOTE_DEPOSIT_KEY, DEFAULT_VOTE_DEPOSIT)
+    s.store(VOTE_POTS_KEY, 0u64)
     s.store(PAUSED_KEY, false)
 
     s.store(XEL_ASSET_KEY, get_xelis_asset())
@@ -1211,6 +1265,10 @@ fn create_project_asset(pid: u64) {
     }
 
     s.store(proj_key(pid, F_ASSET), hash)
+    // D22 — the reverse bridge: asset hash -> project id, written once at
+    // creation. The DEX enumerates pools by ASSET; this maps them back to
+    // the launchpad's project pages (get_project_by_asset).
+    s.store(ASSET_LOOKUP_PREFIX + hash.to_hex(), pid)
     emit_event(EV_ASSET_CREATED, [pid.to_string(10u32), hash.to_hex(), fee_paid.to_string(10u32)])
 }
 
@@ -1262,6 +1320,10 @@ fn migrate_to_dex(pid: u64) {
 
     let migrated_count: u64 = s.load(MIGRATED_COUNT_KEY).unwrap_or(0)
     s.store(MIGRATED_COUNT_KEY, checked_add(migrated_count, 1))
+    // D22 — the migrated index: m:{order} -> pid, written once per
+    // migration (enumerate with get_migrated_count / get_migrated_by_rank;
+    // works across DEX generations since it lives on the launchpad side).
+    s.store(MIGRATED_INDEX_PREFIX + migrated_count.to_string(10u32), pid)
 
     update_market_cap(pid)
 
@@ -1460,6 +1522,13 @@ entry propose(name: string, symbol: string, description: string, website: string
 // One vote per address per round (I5). During an open validation window the
 // vote counts towards the pass threshold; afterwards it keeps accumulating
 // in the project's trust tallies (trust_guard evaluates the flip).
+// 1 address = 1 vote per round (D6). With the D21 dial raised, a vote also
+// LOCKS the configured vote_deposit XEL (any excess attached is refunded
+// immediately; the deposit itself is refunded by claim_vote_deposit once
+// the round has closed). Voting stays free while the dial reads 0 (the
+// default) — and even then, any XEL mistakenly attached to a vote is
+// returned to the caller in the same transaction: a vote never keeps more
+// than the configured deposit.
 // ============================================================================
 entry support(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1478,11 +1547,30 @@ entry support(pid: u64) -> u64 {
 
     let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
     let vkey: string = vote_key(pid, round, caller)
-    require(s.load(vkey).unwrap_or(false) == false, "voted")
-    s.store(vkey, true)
+    require(s.load(vkey).is_none(), "voted")
+
+    // D21 — lock exactly the configured deposit, refund any excess now.
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let vdep: u64 = s.load(VOTE_DEPOSIT_KEY).unwrap_or(DEFAULT_VOTE_DEPOSIT)
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= vdep, "votedep")
+    let back: u64 = dep - vdep
+    // The vote slot records the LOCKED amount (I5: is_some() is the marker).
+    s.store(vkey, vdep)
+    if vdep > 0 {
+        let pots: u64 = s.load(VOTE_POTS_KEY).unwrap_or(0)
+        s.store(VOTE_POTS_KEY, checked_add(pots, vdep))
+    }
 
     let tally: u64 = s.load(proj_key(pid, F_SUPPORTS)).unwrap_or(0)
     s.store(proj_key(pid, F_SUPPORTS), tally + 1)
+
+    // State first, transfer last (the excess is the voter's own fresh
+    // deposit — it can never touch committed funds).
+    if back > 0 {
+        let ok: bool = transfer(caller, back, xel)
+        require(ok, "txfail")
+    }
 
     emit_event(EV_SUPPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
     trust_guard(pid, status)
@@ -1492,9 +1580,11 @@ entry support(pid: u64) -> u64 {
 // ============================================================================
 // 22. REPORT — vote AGAINST a project (validation round or ongoing trust).
 // ============================================================================
-// Mirror of support(). Enough reports on a trading project flip it to
-// Untrusted (buys blocked on the curve directly and — once synced — on the
-// pool; sells open everywhere — D4/D17).
+// Mirror of support() — same D21 deposit rules (a report costs the same as
+// a support: the dial cannot be dodged by voting against). Enough reports
+// on a trading project flip it to Untrusted (buys blocked on the curve
+// directly and — once synced — on the pool; sells open everywhere —
+// D4/D17).
 // ============================================================================
 entry report(pid: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -1513,11 +1603,27 @@ entry report(pid: u64) -> u64 {
 
     let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
     let vkey: string = vote_key(pid, round, caller)
-    require(s.load(vkey).unwrap_or(false) == false, "voted")
-    s.store(vkey, true)
+    require(s.load(vkey).is_none(), "voted")
+
+    // D21 — same deposit rules as support().
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let vdep: u64 = s.load(VOTE_DEPOSIT_KEY).unwrap_or(DEFAULT_VOTE_DEPOSIT)
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= vdep, "votedep")
+    let back: u64 = dep - vdep
+    s.store(vkey, vdep)
+    if vdep > 0 {
+        let pots: u64 = s.load(VOTE_POTS_KEY).unwrap_or(0)
+        s.store(VOTE_POTS_KEY, checked_add(pots, vdep))
+    }
 
     let tally: u64 = s.load(proj_key(pid, F_REPORTS)).unwrap_or(0)
     s.store(proj_key(pid, F_REPORTS), tally + 1)
+
+    if back > 0 {
+        let ok: bool = transfer(caller, back, xel)
+        require(ok, "txfail")
+    }
 
     emit_event(EV_REPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
     trust_guard(pid, status)
@@ -1840,7 +1946,58 @@ entry claim_refund(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 27. REQUEST REVALIDATION — the creator's path back from Untrusted.
+// 26b. CLAIM VOTE DEPOSIT — the voter's refund (D21, the sybil dial).
+// ============================================================================
+// Pull-pattern refund: a voter who locked a deposit (support/report with
+// the D21 dial raised) claims it back HERE once the round they voted in
+// has closed — either the project moved to a newer round (request_
+// revalidation) or the window's deadline has passed. Per-voter pull, so
+// no finalize ever loops over voters (Silex forbids unbounded loops;
+// voters who never claim simply leave their deposit claimable forever —
+// nothing is lost, nothing is confiscated). The vote slot is zeroed but
+// kept: the vote stays counted (I5), the deposit leaves exactly once.
+// Callable by the voter only, for any round they actually voted in.
+// ============================================================================
+entry claim_vote_deposit(pid: u64, round: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_project(pid)
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    // The round must be CLOSED: either a newer round exists, or this
+    // round's window has ended (F_DEADLINE always holds the CURRENT
+    // round's end — an older round is closed by definition).
+    let cur_round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
+    require(round <= cur_round, "badround")
+    if round == cur_round {
+        let deadline: u64 = s.load(proj_key(pid, F_DEADLINE)).unwrap_or(0)
+        require(get_current_topoheight() >= deadline, "open")
+    }
+
+    let vkey: string = vote_key(pid, round, caller)
+    let locked_opt: optional<u64> = s.load(vkey)
+    require(locked_opt.is_some(), "novote")
+    let locked: u64 = locked_opt.expect("guarded")
+    require(locked > 0, "nothing")
+
+    // State first (I5: zeroed but kept), transfer last.
+    s.store(vkey, 0u64)
+    let pots: u64 = s.load(VOTE_POTS_KEY).unwrap_or(0)
+    require(pots >= locked, "accerr")
+    s.store(VOTE_POTS_KEY, pots - locked)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let ok: bool = transfer(caller, locked, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_VOTE_DEPOSIT_CLAIMED, [pid.to_string(10u32), round.to_string(10u32), locked.to_string(10u32)])
+    return locked
+}
+
+// ============================================================================
+// 28. REQUEST REVALIDATION — the creator's path back from Untrusted.
 // ============================================================================
 // Opens a fresh voting window (tallies and the voted-map reset via a new
 // round number). For a project that already graduated, the recovery_fee is
@@ -1889,7 +2046,7 @@ entry request_revalidation(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 28. UPDATE PROJECT INFO — metadata maintenance (creator only).
+// 29. UPDATE PROJECT INFO — metadata maintenance (creator only).
 // ============================================================================
 // Description, website, logo AND the social links (D11) can be updated at
 // any time (except on a Rejected project) — communities move, channels get
@@ -1933,7 +2090,7 @@ entry update_project_info(pid: u64, description: string, website: string, logo: 
 }
 
 // ============================================================================
-// 29. START TEAM VESTING — the creator's voluntary long-term commitment.
+// 30. START TEAM VESTING — the creator's voluntary long-term commitment.
 // ============================================================================
 // @caller: the project creator (a wallet).
 // @params: duration — linear vesting length in topoheights, within the
@@ -1984,7 +2141,7 @@ entry start_team_vesting(pid: u64, duration: u64) -> u64 {
 }
 
 // ============================================================================
-// 30. CLAIM TEAM ALLOCATION — the creator's payout, all paths, once (I4).
+// 31. CLAIM TEAM ALLOCATION — the creator's payout, all paths, once (I4).
 // ============================================================================
 // @caller: the project creator (a wallet).
 // @rules:  pays team_unlocked(pid) - team_paid, as REAL tokens transferred
@@ -2042,7 +2199,7 @@ entry claim_team_allocation(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 31. MIGRATE — the permissionless, atomic move to LaunchDEX (D15).
+// 32. MIGRATE — the permissionless, atomic move to LaunchDEX (D15).
 // ============================================================================
 // @caller: ANYONE (a wallet). The outcome is fully determined by the
 //          project's state: the curve's whole XEL reserves and its whole
@@ -2076,7 +2233,7 @@ entry migrate(pid: u64) -> u64 {
 }
 
 // ============================================================================
-// 32. SYNC TRUST TO DEX — the community keeper for the pool's buys-pause
+// 33. SYNC TRUST TO DEX — the community keeper for the pool's buys-pause
 //     (D17).
 // ============================================================================
 // @caller: ANYONE (a wallet) — keeper bots, a frontend button, anyone.
@@ -2129,7 +2286,7 @@ entry sync_trust_to_dex(pid: u64) -> u64 {
 // withdrawal.
 // ============================================================================
 
-// 33. Submission fee (one-time, per proposal). Cap: 100 XEL.
+// 34. Submission fee (one-time, per proposal). Cap: 100 XEL.
 entry set_submission_fee(fee: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2139,7 +2296,7 @@ entry set_submission_fee(fee: u64) -> u64 {
     return 0
 }
 
-// 34. Trading fee in basis points, on buys AND sells while bonding.
+// 35. Trading fee in basis points, on buys AND sells while bonding.
 //     Hard cap: 10%. Cross-checked (D8): can never drop below the
 //     graduated fee — graduation must always be the cheaper regime.
 entry set_trading_fee(bps: u64) -> u64 {
@@ -2153,7 +2310,7 @@ entry set_trading_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 35. Graduated trading fee (D8): what a graduated project pays on every
+// 36. Graduated trading fee (D8): what a graduated project pays on every
 //     curve trade between graduation and migration. Hard cap: 10%.
 //     Cross-checked: <= trading_fee_bps, so the graduation discount can
 //     never invert.
@@ -2168,7 +2325,7 @@ entry set_graduated_trading_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 36. Migration fee (D9): taken once from a project's reserves when it
+// 37. Migration fee (D9): taken once from a project's reserves when it
 //     graduates (curve path or direct listing). Hard cap: 5%.
 entry set_migration_fee(bps: u64) -> u64 {
     only_admin()
@@ -2179,7 +2336,7 @@ entry set_migration_fee(bps: u64) -> u64 {
     return 0
 }
 
-// 37. Direct-listing threshold (D7): the liquidity that skips the bonding
+// 38. Direct-listing threshold (D7): the liquidity that skips the bonding
 //     phase. Cross-checked: >= min_liquidity, so the fast track can never
 //     swallow every proposal (a small float always gets its curve).
 //     Snapshotted per project at propose time.
@@ -2194,7 +2351,7 @@ entry set_direct_listing_threshold(amount: u64) -> u64 {
     return 0
 }
 
-// 38. Minimum founder liquidity, in [1 XEL, 100k XEL]. Cross-checked
+// 39. Minimum founder liquidity, in [1 XEL, 100k XEL]. Cross-checked
 //     (D7): can never exceed the direct-listing threshold.
 entry set_min_liquidity(amount: u64) -> u64 {
     only_admin()
@@ -2208,7 +2365,7 @@ entry set_min_liquidity(amount: u64) -> u64 {
     return 0
 }
 
-// 39. Minimum voters to validate/reject a project, in [1, 100k].
+// 40. Minimum voters to validate/reject a project, in [1, 100k].
 entry set_min_participants(count: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2219,7 +2376,7 @@ entry set_min_participants(count: u64) -> u64 {
     return 0
 }
 
-// 40. Minimum support ratio, in (50%, 100%] basis points.
+// 41. Minimum support ratio, in (50%, 100%] basis points.
 entry set_min_approval_ratio(bps: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2230,7 +2387,7 @@ entry set_min_approval_ratio(bps: u64) -> u64 {
     return 0
 }
 
-// 41. Validation window length in topoheights, [~1h, ~15d].
+// 42. Validation window length in topoheights, [~1h, ~15d].
 entry set_validation_duration(topos: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2241,7 +2398,7 @@ entry set_validation_duration(topos: u64) -> u64 {
     return 0
 }
 
-// 42. Graduation multiplier: graduate at liquidity x multiplier, [2, 100].
+// 43. Graduation multiplier: graduate at liquidity x multiplier, [2, 100].
 entry set_graduation_multiplier(multiplier: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2252,7 +2409,7 @@ entry set_graduation_multiplier(multiplier: u64) -> u64 {
     return 0
 }
 
-// 43. Team unlock delay (D3): how long a NEVER-graduated project must
+// 44. Team unlock delay (D3): how long a NEVER-graduated project must
 //     trade before its creator may claim the team allocation late.
 //     [~5 days, ~2 years].
 entry set_team_unlock_delay(topos: u64) -> u64 {
@@ -2265,7 +2422,7 @@ entry set_team_unlock_delay(topos: u64) -> u64 {
     return 0
 }
 
-// 44. Vesting bounds (D3): the window inside which a creator may choose a
+// 45. Vesting bounds (D3): the window inside which a creator may choose a
 //     linear vesting duration. Absolute caps: [~1 day, ~2 years]; the
 //     window itself must stay non-empty (min < max).
 entry set_vesting_bounds(min_topos: u64, max_topos: u64) -> u64 {
@@ -2280,7 +2437,7 @@ entry set_vesting_bounds(min_topos: u64, max_topos: u64) -> u64 {
     return 0
 }
 
-// 45. Recovery fee for GRADUATED projects requesting revalidation.
+// 46. Recovery fee for GRADUATED projects requesting revalidation.
 //     Cap: 1000 XEL. (Non-graduated projects always retry for free.)
 entry set_recovery_fee(fee: u64) -> u64 {
     only_admin()
@@ -2291,7 +2448,7 @@ entry set_recovery_fee(fee: u64) -> u64 {
     return 0
 }
 
-// 46. Stricter recovery thresholds: quorum in [1, 100k], ratio in (50%, 100%].
+// 47. Stricter recovery thresholds: quorum in [1, 100k], ratio in (50%, 100%].
 entry set_recovery_params(participants: u64, ratio_bps: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2305,7 +2462,7 @@ entry set_recovery_params(participants: u64, ratio_bps: u64) -> u64 {
     return 0
 }
 
-// 47. ASSET BUDGET (D13): what every proposal earmarks for the chain's
+// 48. ASSET BUDGET (D13): what every proposal earmarks for the chain's
 //     asset creation cost. The actual fee is measured at creation and the
 //     unused part is refunded; a raise only affects FUTURE proposals
 //     (existing ones top up at finalize if needed). Cap: 100 XEL.
@@ -2318,7 +2475,22 @@ entry set_asset_budget(amount: u64) -> u64 {
     return 0
 }
 
-// 48. DEX ADDRESS PIN (D19): the LaunchDEX contract migrations seed.
+// 47b. VOTE DEPOSIT (D21): the sybil dial. When > 0, every support()/
+//      report() must attach exactly this XEL amount (locked for the
+//      round, refunded by claim_vote_deposit). Default 0 — voting free.
+//      A raise only affects FUTURE votes (already-locked deposits are
+//      refunded at their own recorded amount). Cap: 10 XEL — a sybil
+//      cost, never a participation toll.
+entry set_vote_deposit(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount <= MAX_VOTE_DEPOSIT, "toohigh")
+    s.store(VOTE_DEPOSIT_KEY, amount)
+    emit_event(EV_PARAM_SET, ["vote_deposit", amount.to_string(10u32)])
+    return 0
+}
+
+// 50. DEX ADDRESS PIN (D19): the LaunchDEX contract migrations seed.
 //     Settable ONLY while no project has ever migrated (migrated_count
 //     must be 0) — after the first migration the pin is FROZEN FOREVER
 //     (the pools live inside that contract; repointing would orphan them).
@@ -2333,7 +2505,7 @@ entry set_dex_address(addr: Hash) -> u64 {
     return 0
 }
 
-// 49. Transfer the admin role (single-step — use a cold wallet).
+// 51. Transfer the admin role (single-step — use a cold wallet).
 entry set_admin(new_admin: Address) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
@@ -2342,7 +2514,7 @@ entry set_admin(new_admin: Address) -> u64 {
     return 0
 }
 
-// 50. Circuit breaker: pauses NEW proposals and NEW buys only (D-security).
+// 52. Circuit breaker: pauses NEW proposals and NEW buys only (D-security).
 //     Sells, votes, refunds, team claims, migration and finalization are
 //     never pausable: exits, community decisions and the move to the DEX
 //     cannot be frozen.
@@ -2358,12 +2530,12 @@ entry set_paused(flag: bool) -> u64 {
     return 0
 }
 
-// 51. WITHDRAW FEES — the protocol's entire revenue stream.
+// 53. WITHDRAW FEES — the protocol's entire revenue stream.
 // ============================================================================
 // Admin-only. Capped twice: by the accrued pending_fees AND by the
 // contract's uncommitted balance (balance - live curve reserves - locked
-// refunds - earmarked asset budgets — D20) — the admin can never make the
-// protocol insolvent (I2).
+// refunds - earmarked asset budgets - locked vote pots — D20/D21) — the
+// admin can never make the protocol insolvent (I2).
 // ============================================================================
 entry withdraw_fees(amount: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -2386,7 +2558,8 @@ entry withdraw_fees(amount: u64) -> u64 {
     let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
     let locked: u64 = s.load(LOCKED_REFUNDS_KEY).unwrap_or(0)
     let budgets: u64 = s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
-    let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128)
+    let pots: u64 = s.load(VOTE_POTS_KEY).unwrap_or(0)
+    let committed: u128 = (curve_xel as u128) + (locked as u128) + (budgets as u128) + (pots as u128)
     require((amount as u128) + committed <= (balance as u128), "notavail")
 
     s.store(PENDING_FEES_KEY, pending - amount)
@@ -2403,7 +2576,7 @@ entry withdraw_fees(amount: u64) -> u64 {
 // VIEWS (pub fn — read-only, no storage writes; the frontend's API)
 // ============================================================================
 
-// 52. Lifecycle snapshot: (creator, status, created_topo, validation_end,
+// 54. Lifecycle snapshot: (creator, status, created_topo, validation_end,
 //     graduated). creator is a display string; status is the code (see
 //     get_status_label). For the migration state use get_migration_info.
 pub fn get_project(pid: u64) -> (string, u64, u64, u64, bool) {
@@ -2426,7 +2599,7 @@ pub fn get_project(pid: u64) -> (string, u64, u64, u64, bool) {
     )
 }
 
-// 53. Display metadata: (name, symbol, description, website, logo).
+// 55. Display metadata: (name, symbol, description, website, logo).
 pub fn get_project_info(pid: u64) -> (string, string, string, string, string) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2439,14 +2612,14 @@ pub fn get_project_info(pid: u64) -> (string, string, string, string, string) {
     )
 }
 
-// 54. Status code of a project (see get_status_label for the text).
+// 56. Status code of a project (see get_status_label for the text).
 pub fn get_project_status(pid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_project(pid)
     return s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
 }
 
-// 55. Tokenomics: (total_supply, team_bps, liquidity_deposited, reserves,
+// 57. Tokenomics: (total_supply, team_bps, liquidity_deposited, reserves,
 //     curve_supply). All atomic units. total_supply is the asset's FIXED
 //     max supply (D13); reserves/curve_supply are the live curve state
 //     (both 0 once migrated — the pool owns the market then).
@@ -2462,7 +2635,7 @@ pub fn get_project_tokenomics(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 56. Trust state: (supports, reports, vote_round, graduated).
+// 58. Trust state: (supports, reports, vote_round, graduated).
 pub fn get_project_trust(pid: u64) -> (u64, u64, u64, bool) {
     let s: Storage = Storage::new()
     require_project(pid)
@@ -2474,7 +2647,7 @@ pub fn get_project_trust(pid: u64) -> (u64, u64, u64, bool) {
     )
 }
 
-// 57. Curve state: (reserves, curve_supply, volume, graduation_target,
+// 59. Curve state: (reserves, curve_supply, volume, graduation_target,
 //     bonding_start). graduation_target = liquidity_deposited *
 //     graduation_multiplier (the curve path's goal; a direct-listed project
 //     starts beyond it). bonding_start = when trading opened (0 while in
@@ -2499,7 +2672,7 @@ pub fn get_bonding_info(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 58. Spot price: XEL (scaled by 1e8) per 1 whole token — i.e.
+// 60. Spot price: XEL (scaled by 1e8) per 1 whole token — i.e.
 //     reserves * 1e8 / curve_supply. CURVE-ERA price: returns 0 once
 //     migrated (the live price is LaunchDEX's get_spot_price — the SDK
 //     composes both). Saturates at u64 max.
@@ -2518,7 +2691,7 @@ pub fn get_current_price(pid: u64) -> u64 {
     return scaled as u64
 }
 
-// 59. Buy quote: tokens out for an attached XEL amount (fee included).
+// 61. Buy quote: tokens out for an attached XEL amount (fee included).
 //     Uses the project's EFFECTIVE fee (graduated rate once graduated —
 //     D8), exactly like buy() — a quote can never disagree with the trade.
 pub fn get_buy_quote(pid: u64, xel_amount: u64) -> u64 {
@@ -2532,7 +2705,7 @@ pub fn get_buy_quote(pid: u64, xel_amount: u64) -> u64 {
     return buy_tokens_out(reserves, curve_supply, net)
 }
 
-// 60. Sell quote: XEL out (net of fee) for a token amount — same effective
+// 62. Sell quote: XEL out (net of fee) for a token amount — same effective
 //     fee rule as sell(). (sell() itself takes no amount: it sells the
 //     whole attached deposit; this quote is the preview for any amount.)
 pub fn get_sell_quote(pid: u64, token_amount: u64) -> u64 {
@@ -2546,7 +2719,7 @@ pub fn get_sell_quote(pid: u64, token_amount: u64) -> u64 {
     return gross - fee_take(gross, bps)
 }
 
-// 61. Market cap in atomic XEL: reserves * circulating / curve_supply,
+// 63. Market cap in atomic XEL: reserves * circulating / curve_supply,
 //     where circulating = total_supply - curve_supply - team_remaining
 //     (the allocation not yet paid to the creator). CURVE-ERA cap (D12):
 //     0 once migrated — the live cap is the DEX pool's price x circulating
@@ -2572,20 +2745,22 @@ pub fn get_market_cap(pid: u64) -> u64 {
     return cap as u64
 }
 
-// 62. Has this address already voted in the project's CURRENT round?
+// 64. Has this address already voted in the project's CURRENT round?
 pub fn has_voted(pid: u64, voter: Address) -> bool {
     let s: Storage = Storage::new()
     require_project(pid)
     let round: u64 = s.load(proj_key(pid, F_ROUND)).unwrap_or(0)
-    return s.load(vote_key(pid, round, voter)).unwrap_or(false)
+    // I5 (D21): the slot holds the locked deposit amount — presence IS
+    // the vote marker (a claimed deposit is zeroed but kept).
+    return s.load(vote_key(pid, round, voter)).is_some()
 }
 
-// 63. Total number of projects ever proposed.
+// 65. Total number of projects ever proposed.
 pub fn get_total_projects() -> u64 {
     return Storage::new().load(COUNT_KEY).unwrap_or(0)
 }
 
-// 64. COUNT of projects with a given status code (listing helper — pair
+// 66. COUNT of projects with a given status code (listing helper — pair
 //     with get_project_by_rank; ids themselves are never returned as an
 //     array, Silex ABI ground truth has no array returns).
 pub fn get_projects_by_status(status: u64) -> u64 {
@@ -2602,7 +2777,7 @@ pub fn get_projects_by_status(status: u64) -> u64 {
     return found
 }
 
-// 65. Id of the rank-th (0-based, oldest first) project with a given
+// 67. Id of the rank-th (0-based, oldest first) project with a given
 //     status. Returns project_count (an invalid id) when rank is out of
 //     range — the documented sentinel for "no such project".
 pub fn get_project_by_rank(status: u64, rank: u64) -> u64 {
@@ -2622,7 +2797,7 @@ pub fn get_project_by_rank(status: u64, rank: u64) -> u64 {
     return count
 }
 
-// 66. Id of the rank-th LATEST project (any status; rank 0 = newest).
+// 68. Id of the rank-th LATEST project (any status; rank 0 = newest).
 //     Sentinel: project_count when out of range.
 pub fn get_latest_projects(rank: u64) -> u64 {
     let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
@@ -2632,7 +2807,7 @@ pub fn get_latest_projects(rank: u64) -> u64 {
     return count
 }
 
-// 67. COUNT of trusted projects (Graduated or Trusted — both mean the
+// 69. COUNT of trusted projects (Graduated or Trusted — both mean the
 //     community currently backs the project).
 pub fn get_trusted_projects() -> u64 {
     let s: Storage = Storage::new()
@@ -2649,7 +2824,7 @@ pub fn get_trusted_projects() -> u64 {
     return found
 }
 
-// 68. Id of the rank-th trusted (Graduated/Trusted) project, oldest first.
+// 70. Id of the rank-th trusted (Graduated/Trusted) project, oldest first.
 //     Sentinel: project_count when out of range.
 pub fn get_trusted_by_rank(rank: u64) -> u64 {
     let s: Storage = Storage::new()
@@ -2669,7 +2844,7 @@ pub fn get_trusted_by_rank(rank: u64) -> u64 {
     return count
 }
 
-// 69. TEAM ALLOCATION STATE (D3, D10) — the frontend's commitment panel:
+// 71. TEAM ALLOCATION STATE (D3, D10) — the frontend's commitment panel:
 //     (team_alloc, team_paid, vesting_start, vesting_duration,
 //      claimable_now, vesting_plan). vesting_start == 0 means no vesting is
 //     running; vesting_plan == 0 means "claim at graduation" was declared,
@@ -2701,14 +2876,15 @@ pub fn get_team_allocation(pid: u64) -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
-// 70. Protocol stats: (total_projects, pending_fees, fees_collected_lifetime,
+// 72. Protocol stats: (total_projects, pending_fees, fees_collected_lifetime,
 //     total_volume, total_curve_xel, locked_refunds, balance, paused,
-//     trading_fee_bps, migrated_count, asset_budgets_earmarked). balance is
-//     the live contract XEL balance — the solvency invariant says it covers
-//     curve_xel + pending + locked + budgets (I2/D20). migrated_count is
-//     the number of projects whose liquidity moved to LaunchDEX; once > 0
-//     the DEX pin is frozen (D19).
-pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64, u64, u64) {
+//     trading_fee_bps, migrated_count, asset_budgets_earmarked,
+//     locked_vote_pots). balance is the live contract XEL balance — the
+//     solvency invariant says it covers curve_xel + pending + locked +
+//     budgets + vote pots (I2/D20/D21). migrated_count is the number of
+//     projects whose liquidity moved to LaunchDEX; once > 0 the DEX pin is
+//     frozen (D19).
+pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
     return (
@@ -2722,16 +2898,18 @@ pub fn get_protocol_stats() -> (u64, u64, u64, u64, u64, u64, u64, bool, u64, u6
         s.load(PAUSED_KEY).unwrap_or(false),
         s.load(TRADING_FEE_KEY).unwrap_or(DEFAULT_TRADING_FEE_BPS),
         s.load(MIGRATED_COUNT_KEY).unwrap_or(0),
-        s.load(TOTAL_BUDGETS_KEY).unwrap_or(0)
+        s.load(TOTAL_BUDGETS_KEY).unwrap_or(0),
+        s.load(VOTE_POTS_KEY).unwrap_or(0)
     )
 }
 
-// 71. Launch parameter set: (submission_fee, asset_budget, min_liquidity,
+// 73. Launch parameter set: (submission_fee, asset_budget, min_liquidity,
 //     trading_fee_bps, graduated_fee_bps, min_participants,
 //     min_approval_ratio_bps, validation_duration, graduation_multiplier,
-//     direct_listing_threshold, migration_fee_bps). Recovery and team
-//     parameters live in their own views (get_recovery_config /
-//     get_team_config); the DEX pin lives in get_migration_info.
+//     direct_listing_threshold, migration_fee_bps). Recovery, team and
+//     vote-deposit parameters live in their own views (get_recovery_config
+//     / get_team_config / get_vote_config); the DEX pin lives in
+//     get_migration_info.
 pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     let s: Storage = Storage::new()
     return (
@@ -2749,7 +2927,20 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     )
 }
 
-// 72. Recovery parameter set: (recovery_fee, recovery_min_participants,
+// 71b. Vote-deposit parameter set (D21): (vote_deposit, locked_vote_pots).
+//     vote_deposit is the CURRENT dial (0 = voting is free); pots is the
+//     total XEL currently locked as refundable voter deposits — part of
+//     the committed side of I2, shown here so the solvency dashboard and
+//     the site can display both without extra reads.
+pub fn get_vote_config() -> (u64, u64) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(VOTE_DEPOSIT_KEY).unwrap_or(DEFAULT_VOTE_DEPOSIT),
+        s.load(VOTE_POTS_KEY).unwrap_or(0)
+    )
+}
+
+// 75. Recovery parameter set: (recovery_fee, recovery_min_participants,
 //     recovery_min_ratio_bps).
 pub fn get_recovery_config() -> (u64, u64, u64) {
     let s: Storage = Storage::new()
@@ -2760,7 +2951,7 @@ pub fn get_recovery_config() -> (u64, u64, u64) {
     )
 }
 
-// 73. Team parameter set: (team_unlock_delay, vesting_min, vesting_max),
+// 76. Team parameter set: (team_unlock_delay, vesting_min, vesting_max),
 //     all in topoheights (D3).
 pub fn get_team_config() -> (u64, u64, u64) {
     let s: Storage = Storage::new()
@@ -2771,7 +2962,7 @@ pub fn get_team_config() -> (u64, u64, u64) {
     )
 }
 
-// 74. SOCIAL LINKS (D11): (twitter, telegram, discord) — empty string
+// 77. SOCIAL LINKS (D11): (twitter, telegram, discord) — empty string
 //     means "no link". Updatable by the creator at any time via
 //     update_project_info; the frontend renders, the voters judge.
 pub fn get_social_links(pid: u64) -> (string, string, string) {
@@ -2784,7 +2975,7 @@ pub fn get_social_links(pid: u64) -> (string, string, string) {
     )
 }
 
-// 75. TRADING STATS (D12): (buy_volume, sell_volume, total_volume,
+// 78. TRADING STATS (D12): (buy_volume, sell_volume, total_volume,
 //     trade_count, last_trade_topo) — the project's CURVE-ERA scoreboard,
 //     maintained by record_trade on every curve buy/sell. buy_volume sums
 //     the attached XEL of every buy (fee included); sell_volume sums the
@@ -2803,7 +2994,7 @@ pub fn get_trading_stats(pid: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-// 76. MARKET CAP HISTORY (D12): (current, all_time_high, at_graduation) —
+// 79. MARKET CAP HISTORY (D12): (current, all_time_high, at_graduation) —
 //     the stored series maintained by update_market_cap / graduate. current
 //     is rewritten after every curve trade; all_time_high only ever grows;
 //     at_graduation is snapshotted once, after the migration fee. CURVE
@@ -2819,7 +3010,7 @@ pub fn get_market_cap_history(pid: u64) -> (u64, u64, u64) {
     )
 }
 
-// 77. PROPOSAL DATA (D10, D7) — the ONE-CALL voting card: everything the
+// 80. PROPOSAL DATA (D10, D7) — the ONE-CALL voting card: everything the
 //     community needs to judge a proposal BEFORE the vote, in one view:
 //     (liquidity, total_supply, team_bps, vesting_plan, direct_listed,
 //      created_topo, validation_end, asset_budget). vesting_plan == 0 ->
@@ -2846,7 +3037,7 @@ pub fn get_proposal_data(pid: u64) -> (u64, u64, u64, u64, bool, u64, u64, u64) 
     )
 }
 
-// 78. PROTOCOL VOLUME STATS (D12): (total_volume, total_buy_volume,
+// 81. PROTOCOL VOLUME STATS (D12): (total_volume, total_buy_volume,
 //     total_sell_volume, total_trades) across every project ever launched —
 //     the launchpad's CURVE-ERA scoreboard. total == buy + sell (I9). The
 //     pool-era volumes live on LaunchDEX (per pool; the SDK composes).
@@ -2860,7 +3051,7 @@ pub fn get_volume_stats() -> (u64, u64, u64, u64) {
     )
 }
 
-// 79. ASSET INFO (D13) — the real token's on-chain identity:
+// 82. ASSET INFO (D13) — the real token's on-chain identity:
 //     (created, asset_hash, max_supply, circulating_supply, mintable).
 //     created == false while the project is still in validation (no asset
 //     yet — the hash reads as zero and the supplies as 0). Once created:
@@ -2895,7 +3086,20 @@ pub fn get_asset_info(pid: u64) -> (bool, Hash, u64, u64, bool) {
     return (true, hash, max_supply, supply, mintable)
 }
 
-// 80. MIGRATION INFO (D15, D19) — the pool-era bridge:
+// 79b. REVERSE LOOKUP (D22): the project id that owns a given asset hash.
+//     THE DEX->LAUNCHPAD BRIDGE: LaunchDEX enumerates pools by ASSET
+//     (get_pools_count / get_pool_by_index); this view maps each pool's
+//     asset back to the launchpad project (name, socials, trust, vesting,
+//     scoreboard — everything the site shows). Panics ("noasset") on an
+//     unknown hash: assets never launched here have no project page.
+pub fn get_project_by_asset(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let pid_opt: optional<u64> = s.load(ASSET_LOOKUP_PREFIX + asset.to_hex())
+    require(pid_opt.is_some(), "noasset")
+    return pid_opt.expect("guarded")
+}
+
+// 84. MIGRATION INFO (D15, D19) — the pool-era bridge:
 //     (migrated, migrated_at_topo, xel_sent, tokens_sent, dex_address_hex,
 //      dex_trust_synced). migrated == false until migrate() succeeded;
 //     then migrated_at is the topoheight of the move and xel/tokens are
@@ -2925,7 +3129,29 @@ pub fn get_migration_info(pid: u64) -> (bool, u64, u64, u64, string, bool) {
     )
 }
 
-// 81. Human-readable status label (frontend convenience). The migrated
+// 80b. MIGRATED COUNT (D22): how many projects ever moved their liquidity
+//      to a DEX pool. The listing pagination bound for get_migrated_by_rank
+//      — pair them like the status listings (migrated projects keep their
+//      status code; this index cuts across statuses AND DEX generations).
+pub fn get_migrated_count() -> u64 {
+    return Storage::new().load(MIGRATED_COUNT_KEY).unwrap_or(0)
+}
+
+// 80c. Id of the rank-th (0-based, oldest first) MIGRATED project.
+//      Sentinel: migrated_count when rank is out of range — the same
+//      convention as get_project_by_rank. Every id returned here has
+//      get_migration_info(id).migrated == true and a live LaunchDEX pool
+//      under its asset hash (get_asset_info).
+pub fn get_migrated_by_rank(rank: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(MIGRATED_COUNT_KEY).unwrap_or(0)
+    if rank >= count {
+        return count
+    }
+    return s.load(MIGRATED_INDEX_PREFIX + rank.to_string(10u32)).unwrap_or(count)
+}
+
+// 87. Human-readable status label (frontend convenience). The migrated
 //     state is a FLAG on top of the status (get_migration_info), not a
 //     status code — the launchpad remains the project's home for votes,
 //     socials and trust after the move (D15).
@@ -2954,7 +3180,7 @@ pub fn get_status_label(status: u64) -> string {
     return "unknown"
 }
 
-// 82. Contract version.
+// 88. Contract version.
 pub fn get_version() -> string {
     return VERSION
 }

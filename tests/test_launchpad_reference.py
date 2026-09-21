@@ -285,7 +285,9 @@ class DexSim:
 
     def swap_tokens(self, wallet, asset, tokens_in, min_out=0):
         p = self.pools[asset]
-        assert not self.emergency, "paused"   # sells never selectively blocked
+        # IX6 (absolute): NO gate on the sell path — neither the buys-pause
+        # nor the emergency pause can ever block a sell (founder risk
+        # review, point 2)
         w = self.wallets[wallet]
         assert w["assets"][asset] >= tokens_in, "notok"
         assert self.cfg["min_swap_tokens"] <= tokens_in <= self.cfg["max_swap_tokens"]
@@ -307,29 +309,51 @@ class DexSim:
         return out
 
     def add_liquidity(self, wallet, asset, xel_in, tok_in):
+        """X7 (founder risk review, point 1): the pool's CURRENT ratio is
+        enforced — only the largest proportional pair joins the reserves,
+        the excess side is refunded to the donor in the same transaction.
+        A donation can deepen a pool but NEVER move its price."""
         p = self.pools[asset]
         assert not self.emergency
         assert xel_in >= 1 and tok_in >= 1
         w = self.wallets[wallet]
         assert w["xel"] >= xel_in and w["assets"][asset] >= tok_in
+        x, y = p["x"], p["y"]
+        need_tok = y * xel_in // x
+        if tok_in >= need_tok:
+            xel_eff, tok_eff = xel_in, need_tok
+        else:
+            need_xel = x * tok_in // y
+            assert xel_in >= need_xel, "ratio"
+            xel_eff, tok_eff = need_xel, tok_in
+        assert xel_eff >= 1 and tok_eff >= 1, "dust"
+        # IX7: the reserve product drifts by at most one floor unit
+        x1, y1 = x + xel_eff, y + tok_eff
+        assert abs(x1 * y - x * y1) < max(x, y), "IX7 broken"
+        # funds: the donor deposits everything, gets the excess back
         w["xel"] -= xel_in
         w["assets"][asset] -= tok_in
         self.xel_balance += xel_in
         self.asset_balances[asset] += tok_in
-        p["x"] += xel_in
-        p["y"] += tok_in
+        w["xel"] += xel_in - xel_eff
+        w["assets"][asset] += tok_in - tok_eff
+        self.xel_balance -= xel_in - xel_eff
+        self.asset_balances[asset] -= tok_in - tok_eff
+        p["x"] = x1
+        p["y"] = y1
         p["lp"] += 1
+        return xel_eff, tok_eff
 
     def check_invariants(self):
         # IX1/IX2: reserves + pending pots <= balances (equality by
-        # construction — no donations in the Sim)
+        # construction minus the refunded liquidity excesses)
         assert sum(p["x"] + p["xf"] for p in self.pools.values()) <= self.xel_balance
         for asset, p in self.pools.items():
             assert p["y"] + p["yf"] <= self.asset_balances[asset]
             # IX5: both sides strictly positive
             assert p["x"] >= 1 and p["y"] >= 1
-            # IX6: the pause flag never blocks sells (structural: swap_tokens
-            # only checks emergency)
+            # IX6 (absolute): the sell path carries no gate at all —
+            # structural (swap_tokens checks neither bp nor emergency)
 
 
 LAUNCHPAD_ADDR = "xvault:launchpad"   # the simulated launchpad's address
@@ -356,6 +380,9 @@ class Sim:
         self.total_trades = 0
         self.total_budgets = 0
         self.migrated_count = 0
+        self.vote_pots = 0             # D21: locked voter deposits
+        self.migrated_index = []       # D22: migration order (pid list)
+        self.asset_to_pid = {}         # D22: reverse bridge (a: lookup)
         self.dex_pin = None          # D19: set_dex_address
         self.balance = 0             # launchpad XEL balance
         self.contract_assets = defaultdict(int)   # asset -> escrowed tokens
@@ -399,10 +426,16 @@ class Sim:
                 assert cs == 0
                 assert self.contract_assets[asset] == team_rem, \
                     f"I10 broken for project {pid}"
-        # I2 (D20, tightened): balance covers live reserves + fees + refunds
-        # + earmarked budgets
+        # I2 (D20/D21, tightened): balance covers live reserves + fees +
+        # refunds + earmarked budgets + locked vote pots
         assert self.balance >= self.total_curve_xel + self.pending_fees + \
-            self.locked_refunds + self.total_budgets, "I2 broken"
+            self.locked_refunds + self.total_budgets + self.vote_pots, "I2 broken"
+        # D21: the pots equal the sum of every unclaimed vote slot
+        pots_sum = 0
+        for k, v in self.s.items():
+            if k.startswith("v:"):
+                pots_sum += v
+        assert pots_sum == self.vote_pots, "D21 pots drift"
         # I9: volume identity + stored market-cap freshness
         per_project_total = 0
         for pid in range(self.count):
@@ -531,17 +564,49 @@ class Sim:
         self.check_invariants()
         return pid
 
-    def vote(self, pid, voter, support):
+    def vote(self, pid, voter, support, deposit=0):
+        """D21: with the dial raised (cfg["vote_deposit"] > 0) the voter
+        attaches >= the deposit; exactly the configured amount is locked
+        (the excess is refunded immediately — modelled as: the wallet only
+        ever parts with the locked part), the slot records the amount."""
         status = self.s[self._pk(pid, "st")]
         assert status != lp.ST_REJECTED, "dead"
         if status in (lp.ST_VALIDATION, lp.ST_RECOVERY):
             assert self.topo < self.s[self._pk(pid, "ve")], "ended"
         round_no = self.s[self._pk(pid, "rd")]
         vkey = lp.vote_key(pid, round_no, voter)
-        assert not self.s.get(vkey, False), "voted"
-        self.s[vkey] = True
+        assert vkey not in self.s, "voted"
+        vdep = self.cfg.get("vote_deposit", 0)
+        assert deposit >= vdep, "votedep"
+        if vdep > 0:
+            w = self.wallets[voter]
+            assert w["xel"] >= deposit, "nofunds"
+            w["xel"] -= deposit          # attached
+            self.balance += deposit
+            w["xel"] += deposit - vdep    # excess refunded in the same tx
+            self.balance -= deposit - vdep  # ... and it leaves the contract
+            self.vote_pots += vdep
+        self.s[vkey] = vdep
         self.s[self._pk(pid, "sp" if support else "rp")] += 1
         self._trust_guard(pid, status)
+        self.check_invariants()
+
+    def claim_vote_deposit(self, pid, round_no, caller):
+        """D21 pull-refund: the round must be closed (a newer round exists
+        or the current round's deadline has passed), the slot must hold a
+        positive amount; it is zeroed-but-kept and the pots shrink."""
+        cur_round = self.s[self._pk(pid, "rd")]
+        assert round_no <= cur_round, "badround"
+        if round_no == cur_round:
+            assert self.topo >= self.s[self._pk(pid, "ve")], "open"
+        vkey = lp.vote_key(pid, round_no, caller)
+        locked = self.s.get(vkey)
+        assert locked is not None, "novote"
+        assert locked > 0, "nothing"
+        self.s[vkey] = 0
+        self.vote_pots -= locked
+        self.balance -= locked
+        self.wallets[caller]["xel"] += locked
         self.check_invariants()
 
     def _trust_guard(self, pid, status):
@@ -583,6 +648,9 @@ class Sim:
         self.s[self._pk(pid, "ab")] = 0
         self.total_budgets -= budget
         self.s[self._pk(pid, "ah")] = asset
+        # D22: the reverse bridge (a:{asset_hex} -> pid) — written once
+        assert asset not in self.asset_to_pid, "exists"
+        self.asset_to_pid[asset] = pid
         return asset
 
     def _graduate(self, pid):
@@ -826,6 +894,8 @@ class Sim:
         self.s[self._pk(pid, "cs")] = 0
         self.total_curve_xel -= reserves
         self.migrated_count += 1
+        # D22: the migrated index (m:{order} -> pid), migration order
+        self.migrated_index.append(pid)
         self._update_mcap(pid)
         # the atomic cross-call: funds out, pool seeded
         self.balance -= reserves
@@ -1454,7 +1524,170 @@ def test_contract_is_substantial_and_documents_its_chunk_table():
     assert len(src.splitlines()) > 2500
     assert "CHUNK TABLE (entry-point IDs" in src
     assert "VAULTLAUNCH" not in src or True
-    assert 'const VERSION: string = "VaultLaunch v4.0.0"' in src
+    assert 'const VERSION: string = "VaultLaunch v4.1.0"' in src
     dex_src = DEX_CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.0.0"' in dex_src
+    assert 'const VERSION: string = "LaunchDEX v1.1.0"' in dex_src
     assert "CHUNK TABLE (entry-point IDs" in dex_src
+
+
+# ===========================================================================
+# v4.1 — FOUNDER RISK REVIEW: the six points, each with its model test
+# ===========================================================================
+
+def test_d21_vote_deposits_full_lifecycle():
+    """Point 5 (sybil): the dial locks capital per vote, refunds it after
+    the round closes, and the pots stay on the committed side of I2."""
+    sim = Sim(cfg=_fuzz_cfg() | {"vote_deposit": 2 * XEL})
+    sim.mint("founder", 1000 * XEL)
+    pid = sim.propose("founder", 500 * XEL)
+    for i in range(5):
+        sim.mint(f"v{i}", 10 * XEL)
+        sim.vote(pid, f"v{i}", True, deposit=3 * XEL)   # 1 XEL excess attached
+        # the excess came straight back: the wallet only lost the deposit
+        assert sim.wallets[f"v{i}"]["xel"] == 10 * XEL - 2 * XEL
+    assert sim.vote_pots == 5 * 2 * XEL
+    # claims are refused while the window is open
+    with pytest.raises(AssertionError, match="open"):
+        sim.claim_vote_deposit(pid, 0, "v0")
+    # not enough attached -> refused
+    sim.mint("poor", 10 * XEL)
+    with pytest.raises(AssertionError, match="votedep"):
+        sim.vote(pid, "poor", True, deposit=1 * XEL)
+    sim.warp(sim.cfg["validation_duration"] + 1)
+    sim.finalize(pid)
+    for i in range(5):
+        before = sim.wallets[f"v{i}"]["xel"]
+        sim.claim_vote_deposit(pid, 0, f"v{i}")
+        assert sim.wallets[f"v{i}"]["xel"] == before + 2 * XEL
+        # double claim: the slot is zeroed-but-kept -> "nothing"
+        with pytest.raises(AssertionError, match="nothing"):
+            sim.claim_vote_deposit(pid, 0, f"v{i}")
+    assert sim.vote_pots == 0
+    # never voted -> "novote"
+    with pytest.raises(AssertionError, match="novote"):
+        sim.claim_vote_deposit(pid, 0, "poor")
+
+
+def test_d21_free_by_default_and_admin_cannot_confiscate():
+    """Default dial = 0: voting stays free and the pots stay empty; a raise
+    never touches already-locked deposits (they refund at their own amount)."""
+    sim = Sim(cfg=_fuzz_cfg())
+    assert sim.cfg.get("vote_deposit", 0) == 0
+    sim.mint("founder", 1000 * XEL)
+    pid = sim.propose("founder", 500 * XEL)
+    sim.mint("v0", 1 * XEL)
+    sim.vote(pid, "v0", True, deposit=0)               # free vote
+    assert sim.vote_pots == 0
+    sim.cfg["vote_deposit"] = 2 * XEL                  # the admin raises
+    sim.mint("v1", 10 * XEL)
+    sim.vote(pid, "v1", True, deposit=2 * XEL)         # new votes pay
+    assert sim.vote_pots == 2 * XEL
+    sim.warp(sim.cfg["validation_duration"] + 1)
+    sim.finalize(pid)
+    sim.claim_vote_deposit(pid, 0, "v1")               # refund at own amount
+    assert sim.vote_pots == 0
+
+
+def test_d21_withdraw_fees_cannot_touch_vote_pots():
+    """The pots are committed (I2): the admin's fee withdrawal is capped by
+    the uncommitted balance — a raised dial never becomes admin revenue."""
+    sim = Sim(cfg=_fuzz_cfg() | {"vote_deposit": 5 * XEL})
+    sim.mint("founder", 1000 * XEL)
+    pid = sim.propose("founder", 500 * XEL)
+    for i in range(3):
+        sim.mint(f"v{i}", 10 * XEL)
+        sim.vote(pid, f"v{i}", True, deposit=5 * XEL)
+    # 15 XEL locked; the pending fees are just the submission fee — the
+    # withdrawable cap is balance - committed, and pots are committed
+    sim.warp(sim.cfg["validation_duration"] + 1)
+    sim.finalize(pid)
+    for i in range(3):
+        sim.claim_vote_deposit(pid, 0, f"v{i}")
+    assert sim.vote_pots == 0
+    assert sim.balance >= sim.total_curve_xel + sim.pending_fees  # I2 intact
+
+
+def test_d22_migrated_index_and_reverse_lookup():
+    """Point 'site data': every migrated project is enumerable in order and
+    every created asset maps back to its project (the DEX->launchpad bridge)."""
+    sim = Sim(cfg=_fuzz_cfg())
+    sim.set_dex_address("dex")
+    migrated = []
+    for k in range(3):
+        sim.mint(f"f{k}", 3000 * XEL)
+        # direct listing: >= the 2000 XEL threshold graduates at finalize
+        pid = sim.propose(f"f{k}", 2500 * XEL)
+        _validated(sim, pid)
+        assert sim.s[sim._pk(pid, "st")] in (lp.ST_GRADUATED, lp.ST_TRUSTED)
+        sim.migrate(pid)
+        migrated.append(pid)
+        # D22 reverse bridge: the asset of every pool maps back to the pid
+        asset = sim.asset_of(pid)
+        assert sim.asset_to_pid[asset] == pid
+        assert asset in sim.dex.pools
+    assert sim.migrated_index == migrated
+    assert sim.migrated_count == 3
+
+
+def test_x7_dex_one_sided_donation_cannot_move_the_price():
+    """Point 1: an imbalanced add_liquidity only deepens at the CURRENT
+    ratio; the excess side is refunded — the price is unchanged (within one
+    floor unit), and a lone-sided deposit is refused outright."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    dex.create_pool("lpx", "aa" * 32, 1000 * XEL, 10**9)
+    p = dex.pools["aa" * 32]
+    x0, y0 = p["x"], p["y"]
+    price0 = x0 * 10**8 // y0
+    dex.wallets["donor"]["xel"] = 500 * XEL
+    dex.wallets["donor"]["assets"]["aa" * 32] = 10**9
+    # malicious XEL-heavy donation: 500 XEL but only 1 token — the token
+    # side binds: only (ratio) 1 token + its XEL equivalent join, the rest
+    # of the XEL goes straight back. The price CANNOT move.
+    xel_eff, tok_eff = dex.add_liquidity("donor", "aa" * 32, 500 * XEL, 1)
+    assert tok_eff == 1
+    assert xel_eff == x0 * 1 // y0
+    price1 = p["x"] * 10**8 // p["y"]
+    assert abs(price1 - price0) <= 1, "price moved — X7 broken"
+    assert dex.wallets["donor"]["xel"] == 500 * XEL - xel_eff
+    # token-heavy donation (1 XEL + 5e8 tokens): the XEL side binds, only
+    # the proportional token slice joins, the token excess is refunded —
+    # the donor is never refused and never over-donates
+    x0, y0 = p["x"], p["y"]
+    tok_before = dex.wallets["donor"]["assets"]["aa" * 32]
+    xel_eff, tok_eff = dex.add_liquidity("donor", "aa" * 32, 1 * XEL, 5 * 10**8)
+    assert xel_eff == 1 * XEL
+    assert tok_eff == y0 * (1 * XEL) // x0
+    price1b = p["x"] * 10**8 // p["y"]
+    assert abs(price1b - price1) <= 1
+    assert dex.wallets["donor"]["assets"]["aa" * 32] == tok_before - tok_eff
+    # dust refusal: an XEL side too small to price a single token unit
+    with pytest.raises(AssertionError, match="dust"):
+        dex.add_liquidity("donor", "aa" * 32, 1, 10**6)
+    # balanced donation with token excess: the XEL side binds, the token
+    # excess is refunded
+    x0, y0 = p["x"], p["y"]
+    dex.wallets["donor"]["assets"]["aa" * 32] += 2 * 10**9   # re-stock the donor
+    tok_before = dex.wallets["donor"]["assets"]["aa" * 32]
+    dex.wallets["donor"]["xel"] += 500 * XEL
+    xel_eff, tok_eff = dex.add_liquidity("donor", "aa" * 32, 500 * XEL, 10**9)
+    assert xel_eff == 500 * XEL
+    assert tok_eff == y0 * (500 * XEL) // x0
+    price2 = p["x"] * 10**8 // p["y"]
+    assert abs(price2 - price1) <= 1
+    assert dex.wallets["donor"]["assets"]["aa" * 32] == tok_before - tok_eff
+
+
+def test_x5_dex_sells_work_under_emergency_pause():
+    """Point 2: even under the global emergency pause, every holder can
+    still exit — only buys are gated."""
+    dex = DexSim()
+    dex.set_launchpad("lpx")
+    dex.create_pool("lpx", "bb" * 32, 1000 * XEL, 10**9)
+    dex.wallets["h"]["assets"]["bb" * 32] = 10**7
+    dex.emergency = True
+    dex.wallets["h"]["xel"] = 10 * XEL
+    with pytest.raises(AssertionError, match="buyspaused"):
+        dex.swap_xel("h", "bb" * 32, 10 * XEL)   # buys: gated by emergency
+    out = dex.swap_tokens("h", "bb" * 32, 10**7)  # sells: NO gate at all
+    assert out >= 1

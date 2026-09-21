@@ -48,6 +48,8 @@ for key, const in [
     # v4 (D13/D19/D20)
     ("abd", "ASSET_BUDGET_KEY"), ("tbb", "TOTAL_BUDGETS_KEY"),
     ("mgc", "MIGRATED_COUNT_KEY"), ("dxa", "DEX_ADDRESS_KEY"),
+    # v4.1 (D21)
+    ("vdp", "VOTE_DEPOSIT_KEY"), ("tvp", "VOTE_POTS_KEY"),
 ]:
     if f'const {const}: string = "{key}"' not in CONTRACT:
         fails.append(f"contract: global key {key} ({const}) missing")
@@ -82,7 +84,11 @@ for view in ["get_current_price", "get_market_cap", "get_bonding_info",
              # v4 (D13/D15): real assets + migration. get_token_balance is
              # GONE on purpose (no internal ledger — wallets hold the asset)
              "get_asset_info", "get_migration_info",
-             "migrate", "sync_trust_to_dex"]:
+             "migrate", "sync_trust_to_dex",
+             # v4.1 (D21/D22): the sybil dial + the site-data bridges
+             "claim_vote_deposit", "get_vote_config",
+             "get_project_by_asset", "get_migrated_count",
+             "get_migrated_by_rank"]:
     if f"fn {view}(" not in CONTRACT and f"entry {view}(" not in CONTRACT:
         fails.append(f"contract: view/entry {view} named in the doc is missing")
     if view not in DOC:
@@ -102,15 +108,17 @@ for name, eid in [("EV_PROJECT_CREATED", 1), ("EV_SUPPORTED", 2),
                   ("EV_DIRECT_LISTED", 21), ("EV_MIGRATION_FEE", 22),
                   # v4
                   ("EV_ASSET_CREATED", 23), ("EV_MIGRATED", 24),
-                  ("EV_DEX_SYNCED", 25), ("EV_DEX_ADDRESS", 26)]:
+                  ("EV_DEX_SYNCED", 25), ("EV_DEX_ADDRESS", 26),
+                  # v4.1 (D21)
+                  ("EV_VOTE_DEPOSIT_CLAIMED", 27)]:
     if f"const {name}: u64 = {eid}" not in CONTRACT:
         fails.append(f"contract: event {name} = {eid} missing")
 
 # 6. version strings agree
-if 'const VERSION: string = "VaultLaunch v4.0.0"' not in CONTRACT:
-    fails.append("contract: VERSION is not v4.0.0")
-if "v4.0.0" not in DOC:
-    fails.append("doc: LAUNCHPAD.md does not say v4.0.0")
+if 'const VERSION: string = "VaultLaunch v4.1.0"' not in CONTRACT:
+    fails.append("contract: VERSION is not v4.1.0")
+if "v4.1.0" not in DOC:
+    fails.append("doc: LAUNCHPAD.md does not say v4.1.0")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
@@ -123,6 +131,12 @@ for concept in ["Asset::create", "Fixed", "asset_budget", "migrate",
                 "get_migration_info", "confidential"]:
     if concept not in DOC:
         fails.append(f"doc: v4 concept {concept} not documented")
+
+# v4.1 sanity: the risk-review hardening is documented (D21/D22, X7, IX6)
+for concept in ["vote_deposit", "claim_vote_deposit", "get_project_by_asset",
+                "get_migrated_by_rank", "price-neutral", "set_vote_deposit"]:
+    if concept not in DOC:
+        fails.append(f"doc: v4.1 concept {concept} not documented")
 
 # 7. the doc's fee schedule quotes the real default pair
 if "0.25%" not in DOC or "0.50%" not in DOC or "0.5%" not in DOC:

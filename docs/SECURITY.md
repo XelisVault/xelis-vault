@@ -178,14 +178,34 @@ identity `balance == curve inventory + team escrow` (I1) holds at every
 block. Post-migration the identity degenerates to the team escrow (I10)
 — the migration sends exactly the inventory, never the escrow.
 
-**The DEX's own threat model.** The DEX admin can set the swap fee
-(cap 10%), the trade bounds, the launchpad pin (before the first pool
-only) and trigger the global emergency pause. It can NEVER move pool
-reserves: `withdraw_fees` is capped by the pending pots AND the
-uncommitted balance (IX1/IX2). No remove_liquidity exists anywhere —
-permanent liquidity is the feature. Sells are never selectively
-blockable (IX6): the per-pool flag pauses buys only, and the emergency
-pause blocks everything (documented last resort).
+**The DEX's own threat model (v1.1, founder risk review).** The DEX
+admin can set the swap fee (cap 10%), the trade bounds, the launchpad
+pin (before the first pool only) and trigger the global emergency
+pause. It can NEVER move pool reserves: `withdraw_fees` is capped by
+the pending pots AND the uncommitted balance (IX1/IX2). No
+remove_liquidity exists anywhere — permanent liquidity is the feature.
+**Sells are ungated, absolutely (IX6)**: the per-pool flag pauses buys
+only, and since v1.1 the emergency pause gates buys, pool creation and
+liquidity adds ONLY — the sell path carries NO gate at all. A
+compromised admin can tax sellers (fee hard-capped at 10%) but can
+NEVER trap holders. And since v1.1 `add_liquidity` is price-neutral
+(X7/IX7): a malicious one-sided donation cannot skew a market — only
+swaps move a pool's price.
+
+**The founder risk review, closed (v4.1).** The six pre-launch risks
+and their resolutions: (1) one-sided liquidity → X7 ratio fit with
+same-transaction refund of the excess; (2) emergency pause trapping
+holders → sells carry no gate on either venue; (3) frozen upgrade
+pins → assumed and documented as the side-by-side runbook
+(LAUNCHPAD.md §5b, `get_launchpad()` exposes the pin); (4) hardcoded
+cross-call chunk ids → pinned constants asserted against BOTH real
+tables by CI on every push (append-only rule for the DEX); (5) sybil
+voting → the D21 refundable-deposit dial (default off, cap 10 XEL,
+`claim_vote_deposit` refunds, pots committed in I2), honest that it
+mitigates and does not cure; (6) public deposits → the privacy model
+is documented in plain words (LAUNCHPAD.md §5a) — balances are
+confidential, attached amounts are public, never promise total
+privacy.
 
 **Permissions note for integrators.** Transactions that cross-call
 (`migrate`, `sync_trust_to_dex`, and the DEX's launchpad-only entries)
