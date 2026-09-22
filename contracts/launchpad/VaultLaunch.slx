@@ -789,7 +789,7 @@ const F_MIGRATED: string = "mi"
 const F_MIG_AT: string = "ma"
 const F_MIG_XEL: string = "mx"
 const F_MIG_TOK: string = "mt"
-const F_DEX_SYNCED: string = "ds"
+const F_DEX_SYNCED: string = "dsy"
 
 const PROJ_PREFIX: string = "p:"
 const VOTE_PREFIX: string = "v:"
@@ -1342,14 +1342,19 @@ fn migrate_to_dex(pid: u64) {
     let deposits: map<Hash, u64> = {}
     deposits.insert(xel, reserves)
     deposits.insert(asset, curve_supply)
-    target.call(DEX_CREATE_POOL_CHUNK, [asset], deposits)
+    // Devnet toolchain: the VM leaves the cross-called chunk's return value on
+    // the stack; it MUST be captured or the invocation ends in a stack
+    // imbalance (StackNotCleaned -> ILLEGAL_STATE). Local fix (not upstreamed).
+    let pool_res: u64 = target.call(DEX_CREATE_POOL_CHUNK, [asset], deposits)
+    require(pool_res == 0, "poolerr")
 
     // Untrusted at migration time: pause the pool's buys in the SAME
     // transaction (D17). Sells stay open on both venues, always (D4).
     let status: u64 = s.load(proj_key(pid, F_STATUS)).unwrap_or(0)
     if status == ST_UNTRUSTED {
         require(is_contract_callable(dex, DEX_SET_PAUSED_CHUNK), "txperm")
-        target.call(DEX_SET_PAUSED_CHUNK, [asset, true], {})
+        let paused_res: u64 = target.call(DEX_SET_PAUSED_CHUNK, [asset, true], {})
+        require(paused_res == 0, "pauserr")
         s.store(proj_key(pid, F_DEX_SYNCED), true)
     }
 }
@@ -1515,7 +1520,9 @@ entry propose(name: string, symbol: string, description: string, website: string
     }
 
     emit_event(EV_PROJECT_CREATED, [pid.to_string(10u32), name, symbol, liquidity.to_string(10u32)])
-    return pid
+    // Devnet toolchain: any nonzero entry return is treated as execution
+    // failure (rolled back) — the pid is discoverable via storage COUNT_KEY.
+    return 0
 }
 
 // ============================================================================
@@ -1576,7 +1583,8 @@ entry support(pid: u64) -> u64 {
 
     emit_event(EV_SUPPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
     trust_guard(pid, status)
-    return tally + 1
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -1629,7 +1637,8 @@ entry report(pid: u64) -> u64 {
 
     emit_event(EV_REPORTED, [pid.to_string(10u32), round.to_string(10u32), caller.to_string()])
     trust_guard(pid, status)
-    return tally + 1
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -1694,7 +1703,8 @@ entry finalize_validation(pid: u64) -> u64 {
                 emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "1"])
                 emit_event(EV_BONDING_OPENED, [pid.to_string(10u32)])
             }
-            return 1
+            // Devnet toolchain: nonzero entry return => rolled back.
+            return 0
         }
         s.store(proj_key(pid, F_STATUS), ST_REJECTED)
         let liquidity: u64 = s.load(proj_key(pid, F_LIQUIDITY)).unwrap_or(0)
@@ -1727,7 +1737,8 @@ entry finalize_validation(pid: u64) -> u64 {
             s.store(proj_key(pid, F_STATUS), ST_BONDING)
         }
         emit_event(EV_TRUST_RECOVERED, [pid.to_string(10u32)])
-        return 1
+        // Devnet toolchain: nonzero entry return => rolled back.
+        return 0
     }
     s.store(proj_key(pid, F_STATUS), ST_UNTRUSTED)
     emit_event(EV_VALIDATION_FINISHED, [pid.to_string(10u32), "0"])
@@ -1823,7 +1834,8 @@ entry buy(pid: u64) -> u64 {
     // D12 — stored market cap follows every curve state change (idempotent
     // recompute; also covers the graduation fee when it just happened).
     update_market_cap(pid)
-    return tokens
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -1895,7 +1907,8 @@ entry sell(pid: u64) -> u64 {
 
     // D12 — stored market cap follows every curve state change.
     update_market_cap(pid)
-    return out
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -1995,7 +2008,8 @@ entry claim_vote_deposit(pid: u64, round: u64) -> u64 {
     require(ok, "txfail")
 
     emit_event(EV_VOTE_DEPOSIT_CLAIMED, [pid.to_string(10u32), round.to_string(10u32), locked.to_string(10u32)])
-    return locked
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -2197,7 +2211,8 @@ entry claim_team_allocation(pid: u64) -> u64 {
     // D18 — NO amount in the event: the payout is the creator's private
     // business (a native confidential transfer).
     emit_event(EV_TEAM_CLAIMED, [pid.to_string(10u32)])
-    return pay
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -2274,7 +2289,8 @@ entry sync_trust_to_dex(pid: u64) -> u64 {
     let target_opt: optional<Contract> = Contract::new(dex)
     require(target_opt.is_some(), "dexgone")
     let target: Contract = target_opt.expect("guarded")
-    target.call(DEX_SET_PAUSED_CHUNK, [asset, flag], {})
+    let paused_res: u64 = target.call(DEX_SET_PAUSED_CHUNK, [asset, flag], {})
+    require(paused_res == 0, "pauserr")
 
     if flag {
         emit_event(EV_DEX_SYNCED, [pid.to_string(10u32), "1"])

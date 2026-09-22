@@ -27,6 +27,11 @@ NETWORKS = {
         "xelis_asset": "0" * 64,
         "address_prefix": "xet",
     },
+    "devnet": {
+        "daemon": "http://127.0.0.1:8080/json_rpc",
+        "xelis_asset": "0" * 64,
+        "address_prefix": "xet",
+    },
 }
 
 # Local wallet RPC (xelis_wallet --rpc-server) — defaults from the official CLI.
@@ -166,15 +171,20 @@ LAUNCHPAD_ENTRY_IDS_ALT = {
 
 # ---------------------------------------------------------------------------
 # LaunchDEX chunk ids (same rule: every function in declaration order).
-# The two chunks VaultLaunch cross-calls are PINNED here and asserted against
-# the DEX's real chunk table by tests/test_dex_reference.py (D19):
-#   create_pool = 6, set_pool_buys_paused = 7.
+# NOTE (devnet toolchain): VaultLaunch cross-calls create_pool and
+# set_pool_buys_paused, which are declared `pub fn` — NOT `entry` — because
+# this devnet VM refuses cross-contract calls into `entry` chunks ("Chunk is
+# not public"). They keep their real chunk ids (create_pool = 6,
+# set_pool_buys_paused = 7) since chunk numbering follows declaration order
+# for every function (hook/fn/pub fn/entry alike). Being `pub fn`, they are
+# absent from this transaction-facing entry table; the D19 pin (VaultLaunch's
+# DEX_CREATE_POOL_CHUNK / DEX_SET_PAUSED_CHUNK) is asserted against the real
+# declaration order by tests/test_dex_reference.py and
+# tests/test_launchpad_reference.py.
 # ---------------------------------------------------------------------------
 DEX_CONTRACT = "LaunchDEX"
 
 LAUNCHDEX_ENTRY_IDS = {
-    "create_pool": 6,
-    "set_pool_buys_paused": 7,
     "swap_xel_for_token": 8,
     "swap_token_for_xel": 9,
     "add_liquidity": 10,
@@ -190,20 +200,18 @@ LAUNCHDEX_ENTRY_IDS = {
 }
 
 LAUNCHDEX_ENTRY_IDS_ALT = {
-    "create_pool": 0,
-    "set_pool_buys_paused": 1,
-    "swap_xel_for_token": 2,
-    "swap_token_for_xel": 3,
-    "add_liquidity": 4,
-    "set_swap_fee": 5,
-    "set_trade_bounds": 6,
-    "set_launchpad": 7,
-    "set_admin": 8,
-    "set_paused": 9,
-    "withdraw_fees": 10,
-    "set_fee_split": 11,
-    "claim_lp_fees": 12,
-    "remove_liquidity": 13,
+    "swap_xel_for_token": 0,
+    "swap_token_for_xel": 1,
+    "add_liquidity": 2,
+    "set_swap_fee": 3,
+    "set_trade_bounds": 4,
+    "set_launchpad": 5,
+    "set_admin": 6,
+    "set_paused": 7,
+    "withdraw_fees": 8,
+    "set_fee_split": 9,
+    "claim_lp_fees": 10,
+    "remove_liquidity": 11,
 }
 
 # ---------------------------------------------------------------------------

@@ -62,9 +62,13 @@
 //
 // X4. MIGRATION ENTRY IS LAUNCHPAD-ONLY. create_pool reads the deposits
 //     attached to a cross-contract call and is callable ONLY by the pinned
-//     launchpad contract address (get_caller check). The launchpad address
-//     is set once by the admin and FREEZES the moment the first pool
-//     exists — a swapped launchpad could otherwise orphan every live pool.
+//     launchpad contract address (get_caller check). It is a pub fn (NOT an
+//     entry): the Vault drives it through a cross-contract chunk call, and
+//     this devnet toolchain refuses calls into `entry` chunks ("Chunk is
+//     not public"). Same for set_pool_buys_paused (X5). The launchpad
+//     address is set once by the admin and FREEZES the moment the first
+//     pool exists — a swapped launchpad could otherwise orphan every live
+//     pool.
 //
 // X5. TRUST HOOK — per-pool buys-pause. The launchpad's community trust
 //     system (Untrusted) must keep meaning after migration: buys on the
@@ -357,8 +361,8 @@
 //
 // ----------------------------------------------------------------------------
 // CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
-//    0   constructor           1   only_admin            2   require_pool
-//    3   pool_key              4   fee_take              5   checked_add
+//    0   constructor           1   only_admin            2   pool_key
+//    3   require_pool          4   fee_take              5   checked_add
 //    6   create_pool           7   set_pool_buys_paused  8   swap_xel_for_token
 //    9   swap_token_for_xel    10  add_liquidity         11  set_swap_fee
 //    12  set_trade_bounds      13  set_launchpad         14  set_admin
@@ -547,16 +551,17 @@ fn only_admin() {
     require(caller == admin, "notauth")
 }
 
-// 2. Pool existence — every pool-scoped entry and view starts here. The
+// 2. Storage key of a pool field: "q:{asset_hex}:{field}" (declared before
+//    require_pool: the devnet toolchain resolves calls in declaration order).
+fn pool_key(asset: Hash, field: string) -> string {
+    return POOL_PREFIX + asset.to_hex() + ":" + field
+}
+
+// 3. Pool existence — every pool-scoped entry and view starts here. The
 //    xel-reserve slot is the pool's existence marker (write-once, IX4).
 fn require_pool(asset: Hash) {
     let s: Storage = Storage::new()
     require(s.load(pool_key(asset, F_XEL_RESERVE)).is_some(), "nopool")
-}
-
-// 3. Storage key of a pool field: "q:{asset_hex}:{field}".
-fn pool_key(asset: Hash, field: string) -> string {
-    return POOL_PREFIX + asset.to_hex() + ":" + field
 }
 
 // 4. Fee split — floor, in favour of the pool.
@@ -603,7 +608,7 @@ fn checked_add(a: u64, b: u64) -> u64 {
 //            tl == 0 at birth, the first 1 XEL add on a 4000 XEL pool
 //            would have captured 100% of the provider fee share).
 // ============================================================================
-entry create_pool(asset: Hash) -> u64 {
+pub fn create_pool(asset: Hash) -> u64 {
     let s: Storage = Storage::new()
 
     let lpx_opt: optional<Address> = s.load(LAUNCHPAD_KEY)
@@ -703,8 +708,11 @@ entry create_pool(asset: Hash) -> u64 {
 // @params: asset — the pool's asset; flag — true pauses BUYS only.
 // @rules:  sells are never touched (X5/IX6): a paused pool lets every
 //          holder exit at market price, it only refuses new XEL in.
+//          pub fn (NOT entry) for the same devnet reason as create_pool:
+//          the Vault's sync crosses this chunk, and entry chunks are not
+//          callable cross-contract on this toolchain.
 // ============================================================================
-entry set_pool_buys_paused(asset: Hash, flag: bool) -> u64 {
+pub fn set_pool_buys_paused(asset: Hash, flag: bool) -> u64 {
     let s: Storage = Storage::new()
 
     let lpx_opt: optional<Address> = s.load(LAUNCHPAD_KEY)
@@ -816,7 +824,8 @@ entry swap_xel_for_token(asset: Hash, min_tokens_out: u64) -> u64 {
     require(ok, "txfail")
 
     emit_event(EV_SWAP_XEL, [asset.to_hex(), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
-    return out
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -905,7 +914,8 @@ entry swap_token_for_xel(asset: Hash, min_xel_out: u64) -> u64 {
     require(ok, "txfail")
 
     emit_event(EV_SWAP_TOKEN, [asset.to_hex(), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
-    return out
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
 }
 
 // ============================================================================
@@ -1330,10 +1340,10 @@ pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool, u64) {
 pub fn get_status_label(asset: Hash) -> string {
     let s: Storage = Storage::new()
     require_pool(asset)
-    if s.load(EMERGENCY_KEY).unwrap_or(false) {
+    if s.load(EMERGENCY_KEY).unwrap_or(false) == true {
         return "emergency"
     }
-    if s.load(pool_key(asset, F_BUYS_PAUSED)).unwrap_or(false) {
+    if s.load(pool_key(asset, F_BUYS_PAUSED)).unwrap_or(false) == true {
         return "buys-paused"
     }
     return "live"

@@ -250,7 +250,7 @@ F_BUY_VOL, F_SELL_VOL, F_TRADES, F_LAST_TRADE = "bv", "sv", "tc", "lt"
 F_MCAP, F_MCAP_HIGH, F_MCAP_GRAD = "mc", "mh", "mg"
 F_ASSET, F_BUDGET = "ah", "ab"
 F_MIGRATED, F_MIG_AT, F_MIG_XEL, F_MIG_TOK = "mi", "ma", "mx", "mt"
-F_DEX_SYNCED = "ds"
+F_DEX_SYNCED = "dsy"
 
 GLOBAL_KEYS = {
     "admin": "adm", "count": "pc", "submission_fee": "sub",

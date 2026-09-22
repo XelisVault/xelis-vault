@@ -32,7 +32,7 @@ for field, const in [
     # v4 (D13/D15/D17)
     ("ah", "F_ASSET"), ("ab", "F_BUDGET"), ("mi", "F_MIGRATED"),
     ("ma", "F_MIG_AT"), ("mx", "F_MIG_XEL"), ("mt", "F_MIG_TOK"),
-    ("ds", "F_DEX_SYNCED"),
+    ("dsy", "F_DEX_SYNCED"),
 ]:
     if f'const {const}: string = "{field}"' not in CONTRACT:
         fails.append(f"contract: field key {field} ({const}) missing")

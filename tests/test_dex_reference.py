@@ -60,9 +60,10 @@ def test_pinned_cross_call_chunks_d19():
         "create_pool moved — update DEX_CREATE_POOL_CHUNK (and vice versa)"
     assert dex_order.index("set_pool_buys_paused") == int(m2.group(1)), \
         "set_pool_buys_paused moved — update DEX_SET_PAUSED_CHUNK"
-    # the SDK agrees with both
-    assert LAUNCHDEX_ENTRY_IDS["create_pool"] == int(m1.group(1))
-    assert LAUNCHDEX_ENTRY_IDS["set_pool_buys_paused"] == int(m2.group(1))
+    # create_pool / set_pool_buys_paused are pub fn (cross-call chunks on this
+    # devnet toolchain), so they live outside the transaction-facing
+    # LAUNCHDEX_ENTRY_IDS table — the pin above (REAL declaration order,
+    # chunk ids 6/7) is the authoritative D19 gate.
 
 
 def test_the_seed_is_protocol_locked_x11_x12():
@@ -86,7 +87,7 @@ def test_the_seed_is_protocol_locked_x11_x12():
     assert "buyspaused" not in body
     # create_pool mints the seed's parts to the admin WITHOUT a
     # withdrawable balance (X11) and records the locked floor
-    cp = re.search(r"entry create_pool\(.*?\n\}", src, re.S)
+    cp = re.search(r"(?:entry|pub fn) create_pool\(.*?\n\}", src, re.S)
     assert cp, "create_pool not found"
     cp_body = cp.group(0)
     assert 's.store(pool_key(asset, F_LP_TOTAL), xel_seed)' in cp_body
@@ -263,7 +264,7 @@ def test_emergency_pause_still_gates_buys_creations_and_adds():
     adds check the emergency flag; ONLY the sell path is ungated."""
     src = DEX_CONTRACT.read_text()
     for entry in ("swap_xel_for_token", "create_pool", "add_liquidity"):
-        m = re.search(rf"entry {entry}\(.*?\n\}}", src, re.S)
+        m = re.search(rf"(?:entry|pub fn) {entry}\(.*?\n\}}", src, re.S)
         assert m, f"{entry} not found"
         assert '"paused"' in m.group(0), f"{entry} must check the emergency pause"
 
