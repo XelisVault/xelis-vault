@@ -1,3 +1,5 @@
+
+
 # XelisVault Protocol
 
 [![CI](https://github.com/XelisVault/xelis-vault/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
@@ -203,7 +205,7 @@ VaultLaunch; v16 made graduation pay; v17 put everything on-chain
 migration to LaunchDEX; v18.1 closed the first founder risk review
 (X7, ungated sells, D21/D22); v18.2 closed the second (LP fee share,
 sybil dial on by default, front-running documented, the generation
-runbook).
+runbook); v18.3 closed the third (seed shares, free providers).
 Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## License
