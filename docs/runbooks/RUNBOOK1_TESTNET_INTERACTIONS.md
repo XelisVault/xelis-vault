@@ -173,7 +173,7 @@ python3 scripts/xrpc.py wait-tx c546f30418490996aafcc78e0106c36e5e9ca16e6361f684
 | **49** | `set_vote_deposit` | `u64(0)` | votes gratuits (0 = fallback 50M si non stocké) |
 | **42** | `set_validation_duration` | `u64(720)` | fenêtre de validation minimale = 720 topos |
 | **43** | `set_graduation_multiplier` | `u64(2)` | graduation quand réserves ≥ 2× liquidité |
-| **37** | `set_migration_fee` | `u64(500)` | fee de migration 5 % (prise UNE fois à la graduation) — aligné mainnet (§ runbook 2) |
+| **37** | `set_migration_fee` | `u64(50)` | fee de migration 0,5 % (défaut, prise UNE fois à la graduation) — valeurs cibles mainnet au runbook 2 |
 
 Commandes réelles :
 
@@ -194,7 +194,7 @@ python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f6842
 python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f684214f311a890e31f7 49 '[{"type":"primitive","value":{"type":"u64","value":"0"}}]'
 python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f684214f311a890e31f7 42 '[{"type":"primitive","value":{"type":"u64","value":"720"}}]'
 python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f684214f311a890e31f7 43 '[{"type":"primitive","value":{"type":"u64","value":"2"}}]'
-python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f684214f311a890e31f7 37 '[{"type":"primitive","value":{"type":"u64","value":"500"}}]'  # mgf = 5 % (TX bfb9e784…, bloc 725deb56…)
+python3 scripts/xrpc.py invoke c546f30418490996aafcc78e0106c36e5e9ca16e6361f684214f311a890e31f7 37 '[{"type":"primitive","value":{"type":"u64","value":"50"}}]'  # mgf = 0.5 % (TX c767a4f9…, bloc fef962b2…)
 ```
 
 Vérifier un paramètre stocké :
@@ -405,8 +405,8 @@ dx = DexReader(D, DEX)           # pools_count() / config() / pool(asset)
    - Deploy DEX → `97104c21…` ; Deploy Vault → `c546f304…` (TX confirmées en
      blocs réels : `79ce2e98…`, `f90a456e…`)
    - `set_dex_address(50)`, `set_launchpad(13)` vers USER
-   - Params 34/48/39/40/49/42/43 + **37 `set_migration_fee(500)`** (voir §3) —
-     `mgf=500` confirmé en bloc réel `725deb56…`
+   - Params 34/48/39/40/49/42/43 + **37 `set_migration_fee(50)`** (voir §3) —
+     `mgf=50` confirmé en bloc réel `fef962b2…`
 7. USER propose (entry 20) + support (entry 21) — en cours d'exécution via
    `run_user_test.py` (PID 20304, lancé 19:36) ; **en attente de la fenêtre**
    `ve` (720 topos ≈ ~90 min).

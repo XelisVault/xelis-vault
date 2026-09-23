@@ -112,25 +112,32 @@ python3 scripts/xrpc.py --wallet-url http://127.0.0.1:8081/json_rpc --wallet-aut
 
 ## C. Budget XEL nécessaire (mainnet)
 
-Tous les montants en **atomics** (100000000 = 1 XEL) :
+Tous les montants en **atomics** (100000000 = 1 XEL). Config cible mainnet :
+**sub 25 XEL (2,5e9) + abd 1 XEL (1e8) + mnl 500 XEL (5e10), gmu 2** →
+le dépôt minimum d'un propose est **526 XEL**, et la graduation se produit
+quand les réserves atteignent **lq × gmu = 500 × 2 = 1000 XEL** (calcul exact
+vérifié dans le code : `new_reserves >= liquidity * multiplier`).
 
-| Poste | Montant min | Notes |
-|---|---|---|
-| Fees TX + gas (deploys + ~30 invokes) | ~100-200 M | gas max 5-20 M par TX |
-| propose (sub 1e6 + budget 1e8 + liq 1e8) | 201 M (déposés, exposés) | dépôt dans le contrat |
-| buy (graduation) | 110 M (déposés) | devient réserves |
-| add_liquidity DEX | 150 M XEL + 310e9 tokens | LP |
-| swaps (tests) | 10-50 M | récupérables en partie |
-| Auto-prudence | + 200 M de marge | — |
-| **Total confortable admin** | **≥ 3 XEL (3e8-3e9) d'atomics de travail** | voir §K |
+| Poste | Montant (atomics) | Montant (XEL) | Notes |
+|---|---|---|---|
+| Fees TX + gas (deploys + ~30 invokes) | ~100-200 M | 1-2 XEL | gas max 5-20 M par TX |
+| propose (sub 25 + abd 1 + mnl 500) | 52,6e9 (déposés, exposés) | **526 XEL** | dépôt dans le contrat |
+| buy (graduation → réserves 1000 XEL) | ~50,25e9 (déposés) | **~502,5 XEL** | devient réserves de la courbe |
+| add_liquidity DEX (sur pool migré ~995 XEL) | ~5e9 + ~2,26e12 tokens | ~50 XEL + LP | proportionnel au pool |
+| swaps (tests) | 10-50 M | 0,1-0,5 XEL | récupérables en partie |
+| Auto-prudence | + 100e9 | + 1000 XEL | marge / top-up si besoin |
+| **Exposition totale minimale** | **~102,85e9** | **~1028,5 XEL** | propose 526 + buy 502,5 + tests |
 
-> Recommandation mainnet : prévoir **≥ 10 XEL (1 000 000 000 atomic)**
-> répartis admin/user pour tout le flux + marge de sécurité. Le reste des
-> fonds vit HORS de la chaîne (coffre-froid) jusqu'à la validation finale.
-> Attention : sur testnet public, les récompenses de minage étaient
-> **verrouillées temporairement** (montant « available » < solde) — sur
-> mainnet, les fonds envoyés depuis un échange sont disponibles immédiatement,
-> mais prévoyez la latence de stabilisation pour les réutiliser.
+> ⚠️ Avec mnl = 500 XEL, un propose **coûte minimum 526 XEL** (sub 25 +
+> abd 1 + seed liquidité 500). Le buy de graduation coûte ~502,5 XEL bruts
+> (net 500 XEL → réserves 1000 XEL). C'est le **coût réel d'une bonding mainnet**
+> : la quasi-totalité est de la liquidité verrouillée dans la courbe (pas
+> brûlée), récupérable via le pool DEX après migration et via les sells.
+> Le seul coût irrécupérable : sub 25 XEL + fees.
+> Le reste des fonds vit HORS de la chaîne (coffre-froid) jusqu'à la validation.
+> Sur testnet public, les récompenses de minage étaient **verrouillées
+> temporairement** (available < solde) — sur mainnet, les fonds d'un échange
+> sont disponibles immédiatement, mais prévoyez la latence de stabilisation.
 
 ---
 
@@ -179,18 +186,26 @@ python3 scripts/xrpc.py invoke <DEX_HASH> 13 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Address","value":"<USER_ADDR>"}}}]'
 python3 scripts/xrpc.py wait-tx <TX> --timeout 300
 
-# ===== E3. Paramètres Vault (une commande par paramètre) =====
-python3 scripts/xrpc.py invoke <VAULT_HASH> 34 '[{"type":"primitive","value":{"type":"u64","value":"1000000"}}]'   # sub  = 0.01 XEL
-python3 scripts/xrpc.py invoke <VAULT_HASH> 48 '[{"type":"primitive","value":{"type":"u64","value":"100000000"}}]' # abd  = 1 XEL (budget asset)
-python3 scripts/xrpc.py invoke <VAULT_HASH> 39 '[{"type":"primitive","value":{"type":"u64","value":"100000000"}}]' # mnl  = 1 XEL (liquidity)
+# ===== E3. Paramètres Vault — VALEURS CIBLES MAINNET =====
+#   NB : sub/mnl/abd sont lus au moment du propose — régler AVANT le 1er propose.
+#   GRADUATION (vérifiée dans le code, lignes 1826-1834) :
+#     new_reserves >= liquidite_deposee × gmu  →  graduate(pid)
+#   Avec mnl 500 XEL + gmu 2 : graduation quand les réserves atteignent
+#   1000 XEL (500 × 2). JAMAIS 2000 XEL ici — le « 2000 » est le seuil de
+#   DIRECT LISTING (dlt, entrée 38, défaut 200 000 000 000) : une liquidité
+#   déposée ≥ dlt au propose skip le bonding et est listée immédiatement.
+#   Notre propose standard (mnl 500) reste sous dlt → bonding normal.
+python3 scripts/xrpc.py invoke <VAULT_HASH> 34 '[{"type":"primitive","value":{"type":"u64","value":"2500000000"}}]' # sub  = 25 XEL (0→100 XEL max)
+python3 scripts/xrpc.py invoke <VAULT_HASH> 48 '[{"type":"primitive","value":{"type":"u64","value":"100000000"}}]'   # abd  = 1 XEL (budget asset; défaut 10 XEL)
+python3 scripts/xrpc.py invoke <VAULT_HASH> 39 '[{"type":"primitive","value":{"type":"u64","value":"50000000000"}}]' # mnl  = 500 XEL (défaut du contrat)
 python3 scripts/xrpc.py invoke <VAULT_HASH> 40 '[{"type":"primitive","value":{"type":"u64","value":"1"}}]'           # mnp  = 1 participant min
 python3 scripts/xrpc.py invoke <VAULT_HASH> 41 '[{"type":"primitive","value":{"type":"u64","value":"8000"}}]'      # mab  = 80 % d'approbation
 python3 scripts/xrpc.py invoke <VAULT_HASH> 42 '[{"type":"primitive","value":{"type":"u64","value":"720"}}]'      # vdt  = fenêtre 720 topos
 python3 scripts/xrpc.py invoke <VAULT_HASH> 43 '[{"type":"primitive","value":{"type":"u64","value":"2"}}]'         # gmu  = graduation x2
 python3 scripts/xrpc.py invoke <VAULT_HASH> 49 '[{"type":"primitive","value":{"type":"u64","value":"0"}}]'         # vdp  = vote gratuit 0
-python3 scripts/xrpc.py invoke <VAULT_HASH> 35 '[{"type":"primitive","value":{"type":"u64","value":"50"}}]'        # tfe  = 0.5 % trading
-python3 scripts/xrpc.py invoke <VAULT_HASH> 36 '[{"type":"primitive","value":{"type":"u64","value":"25"}}]'        # gfe  = 0.25 % gradué
-python3 scripts/xrpc.py invoke <VAULT_HASH> 37 '[{"type":"primitive","value":{"type":"u64","value":"500"}}]'       # mgf  = 5 % migration fee
+python3 scripts/xrpc.py invoke <VAULT_HASH> 35 '[{"type":"primitive","value":{"type":"u64","value":"50"}}]'        # tfe  = 0.5 % trading (défaut)
+python3 scripts/xrpc.py invoke <VAULT_HASH> 36 '[{"type":"primitive","value":{"type":"u64","value":"25"}}]'        # gfe  = 0.25 % gradué (défaut)
+python3 scripts/xrpc.py invoke <VAULT_HASH> 37 '[{"type":"primitive","value":{"type":"u64","value":"50"}}]'        # mgf  = 0.5 % migration fee (DÉFAUT — pas la borne 500 !)
 
 # ===== E4. Paramètres DEX =====
 python3 scripts/xrpc.py invoke <DEX_HASH> 11 '[{"type":"primitive","value":{"type":"u64","value":"30"}}]'  # sfe = 0.3 %
@@ -215,9 +230,12 @@ Sur mainnet, faire d'abord une **répétition complète sur le testnet public**
 
 ```bash
 # 1) Proposer un projet TEST avec strictement le minimum
-#    (le dépôt proposé == 201M, récupérable seulement si rejeté — donc
-#     utiliser un montant "poubelle" si la config le permet, sinon accepter
-#     que ce test consomme des fonds)
+#    (avec la config mainnet 25/500, le dépôt MINIMUM d'un propose est
+#    52,6e9 = 526 XEL : sub 2,5e9 + abd 1e8 + mnl 5e10 — liquide exposé,
+#    récupérable en liquidité de pool après migration, seuls 25 XEL sub
+#    sont irrécupérables. Il n'y a PAS de « petit test » possible sur
+#    mainnet avec mnl = 500 XEL : la répétition du MÉCANISME se fait sur
+#    le testnet public (runbook 1), où les valeurs sont réduites.)
 python3 scripts/xrpc.py invoke <VAULT_HASH> 20 \
   '[{"type":"primitive","value":{"type":"string","value":"Test"}},
     {"type":"primitive","value":{"type":"string","value":"TST"}},
@@ -225,7 +243,7 @@ python3 scripts/xrpc.py invoke <VAULT_HASH> 20 \
     {"type":"primitive","value":{"type":"u64","value":"1000000000000"}},
     {"type":"primitive","value":{"type":"u64","value":"1000"}},
     {"type":"primitive","value":{"type":"u64","value":"0"}}]' \
-  --deposits "{\"$XEL\": 201000000}" --max-gas 10000000
+  --deposits "{\"$XEL\": 52600000000}" --max-gas 10000000
 
 # 2) Vérifier état p:0:st == 0, pc == 1
 # 3) support(0) avec 50M
@@ -233,16 +251,20 @@ python3 scripts/xrpc.py invoke <VAULT_HASH> 20 \
 #    puis finalize_validation
 ```
 
-> En production réelle, ce projet test consomme ~350M atomic (3.5 XEL)
-> irrécupérables s'il n'est pas rejeté. À faire avec un budget dédié.
+> En production réelle, ce projet test expose **526 XEL** (seed liquidité 500
+> XEL, récupérable via le pool DEX après migration) dont **25 XEL
+> irrécupérables** (fee de submission) + 1 XEL de budget asset. Faire la
+> répétition du mécanisme sur le testnet public AVANT (runbook 1), pas sur
+> mainnet.
 
 ---
 
 ## G. Flux complet mainnet (ordres + vérifications)
 
 ```bash
-# ===== G1. propose (dépôt 201M : fee 1e6 + budget 1e8 + liq 1e8) =====
+# ===== G1. propose (dépôt 52,6e9 : sub 2,5e9 + budget 1e8 + seed liq 5e10) =====
 #   (voir F1 — mêmes params ; le pid retourné est 0 au premier projet)
+#   Réserves initiales = liquidité seed 500 XEL (5e10).
 
 # ===== G2. support (dépôt 50M) =====
 python3 scripts/xrpc.py invoke <VAULT_HASH> 21 \
@@ -255,10 +277,12 @@ python3 scripts/xrpc.py invoke <VAULT_HASH> 23 \
   '[{"type":"primitive","value":{"type":"u64","value":"0"}}]' --max-gas 10000000
 #   Vérifier : p:0:st == 2, p:0:bt != 0, asset p:0:ah présent.
 
-# ===== G4. buy (dépôt 110M) => réserves ≥ 2e8 => graduation =====
+# ===== G4. buy (dépôt 50 251 256 282 ≈ 502,5 XEL) => réserves ≥ 1e11 => graduation =====
+#   Calcul exact (formule du contrat) : seuil = lq 5e10 × gmu 2 = 1e11 (1000 XEL).
+#   réserves 5e10 + net (~500e8) = ~1e11 → gradué. Marge : arrondir à 51e9.
 python3 scripts/xrpc.py invoke <VAULT_HASH> 24 \
   '[{"type":"primitive","value":{"type":"u64","value":"0"}}]' \
-  --deposits "{\"$XEL\": 110000000}"
+  --deposits "{\"$XEL\": 51000000000}"
 #   Vérifier : p:0:st == 3, p:0:gr == true.
 
 # ===== G5. sell (du user, sur la courbe, AVANT migration) =====
@@ -275,10 +299,13 @@ python3 scripts/xrpc.py invoke <VAULT_HASH> 32 \
 python3 scripts/xrpc.py invoke <VAULT_HASH> 33 \
   '[{"type":"primitive","value":{"type":"u64","value":"0"}}]'
 
-# ===== G8. add_liquidity DEX (150M XEL + 310e9 tokens) =====
+# ===== G8. add_liquidity DEX (50 XEL + tokens proportionnels au pool migré) =====
+#   Après migration, pool ≈ 995 XEL + ~450e9 tokens (ratio ~4,52 tokens/XEL
+#   atomic) — ajouter de la liquidité PROPORTIONNELLEMENT : ex. 50 XEL
+#   (5e9) + ~22,6e9 tokens pour ne pas déformer le ratio du pool.
 python3 scripts/xrpc.py invoke <DEX_HASH> 10 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"<ASSET>"}}}]' \
-  --deposits "{\"$XEL\": 150000000, \"<ASSET>\": 310000000000}"
+  --deposits "{\"$XEL\": 5000000000, \"<ASSET>\": 22600000000}"
 
 # ===== G9. swaps =====
 python3 scripts/xrpc.py invoke <DEX_HASH> 8 \
@@ -358,8 +385,9 @@ cat > /tmp/mainnet_contracts.json <<'EOF'
   "admin": "<ADMIN_ADDR>",
   "user": "<USER_ADDR>",
   "pins": {"vault.set_dex_address": "<DEX_HASH>", "dex.set_launchpad": "<USER_ADDR>"},
-  "params": {"sub": 1000000, "abd": 100000000, "mnl": 100000000, "mnp": 1,
-             "mab": 8000, "vdt": 720, "gmu": 2, "vdp": 0}
+  "params": {"sub": 2500000000, "abd": 100000000, "mnl": 50000000000, "mnp": 1,
+             "mab": 8000, "vdt": 720, "gmu": 2, "vdp": 0,
+             "tfe": 50, "gfe": 25, "mgf": 50, "dlt": 200000000000}
 }
 EOF
 cp /tmp/mainnet_contracts.json ~/xelis-vault/backups/mainnet_contracts_$(date +%Y%m%d).json
@@ -376,13 +404,23 @@ Référence du déploiement testnet **public** (chaîne réelle) :
 - Transferts admin→user : 400M (`a16488b4…`) + 220M (`d8ef25c4…`) → user 620M
 - Miner : 4 threads CPU → 642 blocs acceptés (~1 bloc/10-30 s à difficulté 10K)
 - Fenêtre de validation : ~720 topos ≈ ~90 min (testnet public ~11 s/bloc)
-- Config Vault alignée mainnet (tous réglés en blocs réels) : sub 1e6, abd 1e8,
+- Config testnet public **test léger** (pour valider le MÉCANISME à petite
+  échelle — les VALEURS CIBLES mainnet sont au §E3) : sub 1e6, abd 1e8,
   mnl 1e8, mnp 1, mab 8000, vdt 720, gmu 2, vdp 0, tfe 50, gfe 25,
-  **mgf 500 = 5 %** (TX `bfb9e784…`, bloc `725deb56…`) ; DEX : sfe 30, fsl 5000
+  **mgf 50 = 0,5 %** (TX `c767a4f9…`, bloc `fef962b2…`) ; DEX : sfe 30, fsl 5000.
+- **Graduation** : `new_reserves >= lq × gmu` (vérifié code, lignes 1826-1834).
+  Testnet (lq 1 XEL, gmu 2) : buy 110M → réserves ~2,09e8 ≥ 2e8 ✓. Mainnet
+  (lq 500 XEL, gmu 2) : buy ~50,25e9 → réserves ≥ 1e11 = **1000 XEL** ✓.
+  Le seuil de **2000 XEL n'existe PAS** sauf si `gmu=4` ou si la *liquidité
+  déposée au propose* ≥ `dlt` (2000 XEL = graduation directe, D7) — avec
+  notre config (mnl 500, gmu 2) la graduation bonding est à 1000 XEL.
 
-> ⚠️ Le montant « ≥ 10 XEL de travail » (§C) est un minimum pour rejouer tout
-> le flux. Sur mainnet, augmentez la marge (frais réels, gas imprévus) et
-> gardez le reste des fonds hors chaîne jusqu'à la fin des tests.
+> ⚠️ L'exposition minimale (§C) est **~1028 XEL** (propose 526 + buy ~502,5
+> + tests) pour rejouer tout le flux. Sur mainnet, augmentez la marge (frais
+> réels, gas imprévus, top-up finalize) et gardez le reste des fonds hors
+> chaîne jusqu'à la fin des tests. Le seul coût irrécupérable : **sub 25 XEL
+> + fees** — le seed liquidité et le buy restent dans la courbe avant
+> migration puis dans le pool DEX (LP du fondateur).
 
 ---
 
