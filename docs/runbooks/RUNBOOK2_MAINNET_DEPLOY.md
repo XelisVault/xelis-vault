@@ -139,6 +139,20 @@ vérifié dans le code : `new_reserves >= liquidity * multiplier`).
 > temporairement** (available < solde) — sur mainnet, les fonds d'un échange
 > sont disponibles immédiatement, mais prévoyez la latence de stabilisation.
 
+> **SÉCURITÉ & PLANCHE DE GRADUATION (à lire AVANT mainnet)**
+> Le seul « risque liquidité » d'une bonding curve = un pool DEX trop petit
+> après migration (le prix peut chuter fort sur un gros sell). Mais le DEX
+> (`LaunchDEX.slx` X2/X11) verrouille **à jamais** le seed migré (« the
+> migrated seed never leaves ») : `remove_liquidity` ne peut retirer QUE la
+> liquidité ajoutée ensuite par les providers — personne (même l'admin) ne
+> peut drainer le pool sous son plancher de migration. Anti-rug structurel.
+> Le curseur à régler est donc **gmu** = preuve de demande avant listing :
+>   - gmu 2 → graduation à 1000 XEL (pool ~995 XEL) — défaut recommandé ;
+>   - gmu 4 → graduation à 2000 XEL (pool ~1990 XEL) — si le XEL monte,
+>     relever gmu pour exiger plus de demande réelle avant le listing.
+> Les vraies protections anti-scam : validation communautaire (mab 80 % +
+> mnp), seed verrouillé à vie, escrow team + vesting, sells jamais bloquables.
+
 ---
 
 ## D. Déploiement — ORDRE IMPÉRATIF (DEX d'abord, puis Vault)
