@@ -12,6 +12,29 @@ can exit pro-rata anytime), hardened by three founder risk reviews
 (price-neutral DEX liquidity, ungated sells AND provider exits, sybil
 dial ON by default, stateless-site data bridges).
 
+## 🟢 Live on mainnet (23/09/2026)
+
+Deployed, configured and **verified on-chain** on the official XELIS mainnet
+(block version V7). The community creates the coins.
+
+| Contract | Address |
+|---|---|
+| **VaultLaunch** (launchpad) | `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54` |
+| **LaunchDEX** (DEX) | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` |
+| Official wallet | `xel:sel92pcaegt0kenv3q35ycnzpd4xfl0md93usnkxq0rsjtha6cjsqe2xwch` |
+| Explorer | [`https://explorer.xelis.io`](https://explorer.xelis.io) |
+
+The two contracts are pinned to each other (`dxa` Vault → DEX, `lpx` DEX →
+wallet): beware of clones.
+
+- **For the community**: read the [Community Guide](docs/COMMUNITY.md) —
+  launch a coin (526 XEL minimum), vote for free, trade on the bonding curve
+  and on the DEX, provide liquidity and earn fees.
+- **For operators**: all interaction commands (propose → vote → buy/sell →
+  migrate, swaps, liquidity, claims, data reads) with the real deployment and
+  configuration hashes are in
+  [RUNBOOK 3 — Mainnet interactions](docs/runbooks/RUNBOOK3_MAINNET_INTERACTIONS.md).
+
 ## What ships today
 
 **[VaultLaunch](contracts/launchpad/VaultLaunch.slx)** — a serious

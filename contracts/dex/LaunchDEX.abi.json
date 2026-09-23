@@ -1,0 +1,174 @@
+{
+  "data": [
+    {
+      "entry_id": 8,
+      "name": "swap_xel_for_token",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "min_tokens_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 9,
+      "name": "swap_token_for_xel",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "min_xel_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 10,
+      "name": "add_liquidity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 11,
+      "name": "set_swap_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 12,
+      "name": "set_trade_bounds",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "min_seed_xel",
+          "type": "u64"
+        },
+        {
+          "name": "min_seed_tokens",
+          "type": "u64"
+        },
+        {
+          "name": "min_swap_xel",
+          "type": "u64"
+        },
+        {
+          "name": "max_swap_xel",
+          "type": "u64"
+        },
+        {
+          "name": "min_swap_tokens",
+          "type": "u64"
+        },
+        {
+          "name": "max_swap_tokens",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 13,
+      "name": "set_launchpad",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 14,
+      "name": "set_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 15,
+      "name": "set_paused",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "flag",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "withdraw_fees",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "xel_amount",
+          "type": "u64"
+        },
+        {
+          "name": "token_amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "set_fee_split",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "lp_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "claim_lp_fees",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}

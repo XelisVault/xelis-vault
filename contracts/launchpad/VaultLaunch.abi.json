@@ -1,0 +1,494 @@
+{
+  "data": [
+    {
+      "entry_id": 20,
+      "name": "propose",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "symbol",
+          "type": "string"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "website",
+          "type": "string"
+        },
+        {
+          "name": "logo",
+          "type": "string"
+        },
+        {
+          "name": "twitter",
+          "type": "string"
+        },
+        {
+          "name": "telegram",
+          "type": "string"
+        },
+        {
+          "name": "discord",
+          "type": "string"
+        },
+        {
+          "name": "total_supply",
+          "type": "u64"
+        },
+        {
+          "name": "team_bps",
+          "type": "u64"
+        },
+        {
+          "name": "vesting_duration",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "support",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "report",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "finalize_validation",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "buy",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "sell",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "claim_refund",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "claim_vote_deposit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        },
+        {
+          "name": "round",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "request_revalidation",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "update_project_info",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "website",
+          "type": "string"
+        },
+        {
+          "name": "logo",
+          "type": "string"
+        },
+        {
+          "name": "twitter",
+          "type": "string"
+        },
+        {
+          "name": "telegram",
+          "type": "string"
+        },
+        {
+          "name": "discord",
+          "type": "string"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "start_team_vesting",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        },
+        {
+          "name": "duration",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "claim_team_allocation",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "migrate",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 33,
+      "name": "sync_trust_to_dex",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "pid",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 34,
+      "name": "set_submission_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "fee",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 35,
+      "name": "set_trading_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 36,
+      "name": "set_graduated_trading_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 37,
+      "name": "set_migration_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 38,
+      "name": "set_direct_listing_threshold",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 39,
+      "name": "set_min_liquidity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 40,
+      "name": "set_min_participants",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "count",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 41,
+      "name": "set_min_approval_ratio",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 42,
+      "name": "set_validation_duration",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "topos",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 43,
+      "name": "set_graduation_multiplier",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "multiplier",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 44,
+      "name": "set_team_unlock_delay",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "topos",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 45,
+      "name": "set_vesting_bounds",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "min_topos",
+          "type": "u64"
+        },
+        {
+          "name": "max_topos",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 46,
+      "name": "set_recovery_fee",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "fee",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 47,
+      "name": "set_recovery_params",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "participants",
+          "type": "u64"
+        },
+        {
+          "name": "ratio_bps",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 48,
+      "name": "set_asset_budget",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 49,
+      "name": "set_vote_deposit",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 50,
+      "name": "set_dex_address",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "addr",
+          "type": "Hash"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 51,
+      "name": "set_admin",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 52,
+      "name": "set_paused",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "flag",
+          "type": "bool"
+        }
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 53,
+      "name": "withdraw_fees",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
+    }
+  ],
+  "internal_types": [],
+  "version": "1.1.1"
+}
