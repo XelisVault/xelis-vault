@@ -376,6 +376,9 @@ Référence du déploiement testnet **public** (chaîne réelle) :
 - Transferts admin→user : 400M (`a16488b4…`) + 220M (`d8ef25c4…`) → user 620M
 - Miner : 4 threads CPU → 642 blocs acceptés (~1 bloc/10-30 s à difficulté 10K)
 - Fenêtre de validation : ~720 topos ≈ ~90 min (testnet public ~11 s/bloc)
+- Config Vault alignée mainnet (tous réglés en blocs réels) : sub 1e6, abd 1e8,
+  mnl 1e8, mnp 1, mab 8000, vdt 720, gmu 2, vdp 0, tfe 50, gfe 25,
+  **mgf 500 = 5 %** (TX `bfb9e784…`, bloc `725deb56…`) ; DEX : sfe 30, fsl 5000
 
 > ⚠️ Le montant « ≥ 10 XEL de travail » (§C) est un minimum pour rejouer tout
 > le flux. Sur mainnet, augmentez la marge (frais réels, gas imprévus) et
