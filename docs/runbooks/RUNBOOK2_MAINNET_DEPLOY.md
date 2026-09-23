@@ -337,6 +337,33 @@ python3 scripts/xrpc.py invoke <VAULT_HASH> 53 '[{"type":"primitive","value":{"t
 
 ---
 
+## Gbis. Procédures d'URGENCE (vérifiées dans le code des 2 contrats)
+
+Toutes réglables **à chaud par l'admin**, sans redéploiement :
+
+| Contrat | Entrée | Commande | Effet | Exits ? |
+|---|---|---|---|---|
+| **Vault** | 52 | `set_paused(true)` | gèle tous les nouveaux `propose` + `buy` | **sells restent OUVERT** (D4/I8) |
+| **Vault** | 52 | `set_paused(false)` | ré-ouverture | — |
+| **Vault** | 51 | `set_admin(<new_addr>)` | transférer l'admin (ex. multisig) | — |
+| **DEX** | 15 | `set_paused(true)` | `EMERGENCY_KEY` global : gèle buys + create_pool + add_liquidity | **sells, claims fees, remove_liquidity restent OUVERT** (X12/IX6) |
+| **DEX** | 15 | `set_paused(false)` | retour à la normale | — |
+| **DEX** | 7 | `set_pool_buys_paused(asset, true)` | pause PAR POOL (appelée auto par `sync_trust_to_dex` en même TX que la migration, D17) | sells jamais bloqués |
+| **DEX** | 16 | `withdraw_fees` | fees admin, double-cap (pending + solde non-committé) — jamais insolvable | — |
+
+Garde-fous de fond (lignes vérifiées `LaunchDEX.slx` 222-256) :
+- **Le seed migré est verrouillé à JAMAIS (X11)** — même l'admin ne peut pas le
+  retirer (`remove_liquidity` ne touche que la liquidité ajoutée ensuite).
+- **NO PAUSABLE EXITS** : aucune pause (même l'emergency) ne bloque un holder
+  ou un provider — sells, fee claims et liquidity removes marchent sous pause.
+- **Pin launchpad→DEX à sens unique**, gelé après le premier pool (X4) —
+  jamais repointable vers un clone.
+- Tous les paramètres admin sont **bornés** (`MAX_*`) : fees plafonnées,
+  pas d'insolvabilité possible ; ~30 params ajustables en live (sub, mnl,
+  gmu, tfe, mgf, dlt…).
+
+---
+
 ## H. Checklist de sécurité ZÉRO PERTE (avant, pendant, après)
 
 **AVANT (pré-déploiement)**
