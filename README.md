@@ -21,7 +21,6 @@ Deployed, configured and **verified on-chain** on the official XELIS mainnet
 |---|---|
 | **VaultLaunch** (launchpad) | `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54` |
 | **LaunchDEX** (DEX) | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` |
-| Official wallet | `xel:sel92pcaegt0kenv3q35ycnzpd4xfl0md93usnkxq0rsjtha6cjsqe2xwch` |
 | Explorer | [`https://explorer.xelis.io`](https://explorer.xelis.io) |
 
 The two contracts are pinned to each other (`dxa` Vault → DEX, `lpx` DEX →
