@@ -5,10 +5,12 @@ Enforces the repository layout decided after the XelisVault audit (v13,
 extended in v15 when VaultLaunch joined the mixer as the second active
 contract):
 
-  1. contracts/ contains ONLY .slx files, and only inside contracts/mixer/
-     and contracts/launchpad/ (the active, self-contained contracts — one
-     per product family; anything else needs a deliberate layout decision,
-     not a stray file).
+  1. contracts/ contains ONLY .slx files, and only inside contracts/mixer/,
+     contracts/launchpad/, contracts/dex/ and contracts/community/ (the
+     active, self-contained contracts — one per product family; anything
+     else needs a deliberate layout decision, not a stray file).
+     ABI tables (.abi.json) live in abi/ at the repo root (compile
+     artifacts, documented there — they are NOT contract source).
   2. No active script imports the archived legacy/ code. Reading legacy files
      as DATA (e.g. lint_silex.py --scan-legacy, explicitly a non-CI flag) is
      allowed; importing legacy Python modules would resurrect known-broken
@@ -50,10 +52,11 @@ def check_contracts_layout(repo: Path) -> List[str]:
         if p.suffix != ".slx":
             problems.append(f"contracts/ must contain only .slx files — found {p.relative_to(repo)}")
 
-    # Active contract families, one directory each (v18: mixer + launchpad + dex).
-    # Adding a family is a deliberate layout decision: extend this tuple,
-    # the CI workflow comment and docs/ARCHITECTURE.md in the same commit.
-    active_families = ("mixer", "launchpad", "dex")
+    # Active contract families, one directory each (v18.4: mixer +
+    # launchpad + dex + community). Adding a family is a deliberate layout
+    # decision: extend this tuple, the CI workflow comment and
+    # docs/ARCHITECTURE.md in the same commit.
+    active_families = ("mixer", "launchpad", "dex", "community")
     for p in slx_files:
         parts = p.relative_to(contracts).parts
         # active contract: contracts/<family>/<Name>.slx (exactly one level)
@@ -176,7 +179,7 @@ def main(argv=None) -> int:
     print("=" * 78)
 
     sections = [
-        ("contracts/ layout (only .slx under contracts/mixer|launchpad|dex/)", check_contracts_layout),
+        ("contracts/ layout (only .slx under contracts/mixer|launchpad|dex|community/)", check_contracts_layout),
         ("no legacy/ imports in active scripts", check_no_legacy_imports),
         ("no secrets in active files", check_no_secrets),
         ("no binary blobs outside legacy/", check_no_blobs),

@@ -1,16 +1,17 @@
 # XelisVault Protocol
 
 [![CI](https://github.com/XelisVault/xelis-vault/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
-![Silex](https://img.shields.io/badge/contracts-PrivacyMixer%20V5%20%2B%20VaultLaunch%20v4%20%2B%20LaunchDEX-8b5cf6)
+![Silex](https://img.shields.io/badge/contracts-PrivacyMixer%20V5%20%2B%20VaultLaunch%20v4%20%2B%20LaunchDEX%20v1.4%20%2B%20CommunityLaunch-8b5cf6)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Privacy-first DeFi primitives for [XELIS](https://xelis.io), built in
-[Silex](https://docs.xelis.io/). **v18.3** — real confidential assets,
-real migration, two-tier liquidity with a PERMANENT SEED FLOOR (the
-migration is protocol-locked forever; providers earn their pro-rata and
-can exit pro-rata anytime), hardened by three founder risk reviews
-(price-neutral DEX liquidity, ungated sells AND provider exits, sybil
-dial ON by default, stateless-site data bridges).
+[Silex](https://docs.xelis.io/). **v18.4** — TWO tracks, one DEX
+lineage: the serious launchpad (community validation, real confidential
+assets, real migration, two-tier liquidity with a PERMANENT SEED
+FLOOR) and the permissionless community-coin factory (launch a REAL
+token for ~2 XEL on a virtual-reserve bonding curve, graduate on
+demand, migrate to the same DEX through the OPEN seeding endpoint),
+hardened by three founder risk reviews and the second-migration fix.
 
 ## 🟢 Live on mainnet (23/09/2026)
 
@@ -151,6 +152,36 @@ features — see the status note at the top of docs/MIXER.md):
 
 Design, threat model and guarantees: **[docs/MIXER.md](docs/MIXER.md)**.
 Security policy and audit history: **[docs/SECURITY.md](docs/SECURITY.md)**.
+
+**[CommunityLaunch](contracts/community/CommunityLaunch.slx)** — the
+permissionless community-coin factory (the "pump.fun track"), v18.4:
+
+- launch a REAL XELIS confidential asset in ONE transaction for ~2 XEL
+  (1 XEL fee + the chain's asset cost, measured and refunded if
+  unused) — no vote, no founder liquidity, Fixed supply capped by the
+  protocol itself
+- **virtual-reserve bonding curve**: a constant virtual XEL reserve
+  (default 100 XEL) gives the coin a sensible price and ~1% slippage
+  on a 1 XEL buy from the FIRST trade, with zero founder capital —
+  solvency PROVED (the curve product never decreases; the real
+  reserves cover the worst-case sell exactly)
+- **graduation = demand proof**: real depth (default 50 XEL) AND price
+  continuity (the pool opens at or above the curve's spot — no
+  graduation dump by construction); the curve keeps trading at the
+  graduated fee until the migration
+- **permissionless migration on BOTH sides**: anyone migrates; the DEX
+  endpoint (`create_pool_open`, LaunchDEX v1.4 X13) is open — no
+  pinned signer can become a graduation bottleneck; the buyers' own
+  money becomes the protocol-locked pool floor
+- creator allocation <= 5%, reserved off-curve, claimable ONLY after
+  migration; sells never blockable; the pause gates launches and buys
+  only
+- LaunchDEX v1.4 also fixes the second-migration bug (gen-1
+  `create_pool` returned its pool index — only the FIRST project
+  migration would ever have succeeded); see UPGRADES.md §6 for the
+  one-DEX-both-tracks cut plan
+
+Design, math and guarantees: **[docs/COMMUNITY_LAUNCH.md](docs/COMMUNITY_LAUNCH.md)**.
 
 ## Quickstart (CLI)
 

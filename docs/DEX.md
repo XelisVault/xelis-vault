@@ -1,7 +1,7 @@
 # LaunchDEX — Design Specification
 
-> contracts/dex/LaunchDEX.slx · v1.3.0 · the AMM for VaultLaunch-graduated
-> tokens, with a PERMANENT FLOOR
+> contracts/dex/LaunchDEX.slx · v1.4.0 · the AMM for VaultLaunch-graduated
+> tokens AND CommunityLaunch-graduated coins, with a PERMANENT FLOOR
 
 LaunchDEX is the migration target of VaultLaunch: one XEL-quote pool per
 asset, constant-product pricing, and a **two-tier liquidity model**:
@@ -25,6 +25,29 @@ no LP parts either, so the FIRST 1 XEL add on a 4000 XEL pool captured
 **100% of the provider fee share** — the economics bug of the founder's
 third risk review, fixed by X11 (the same add now mints 1/4001 of the
 depth).
+
+**v1.4 — the community track + the second-migration fix (X13).** Two
+additions, both append-only (chunk 33). (1) `create_pool_open`: the
+SAME pool creation and the SAME X11 seed economics as create_pool,
+minus the launchpad gate — callable by anyone carrying the seed as
+attached deposits. This is the endpoint CommunityLaunch (the
+permissionless community-coin factory, docs/COMMUNITY_LAUNCH.md)
+migrates its graduated coins to. On this VM get_caller() reports the
+original transaction signer even inside a cross-contract call, so a
+"factory-only" caller check is impossible to express — the entry is
+honestly permissionless instead, and the deposits are the
+authorisation (X13). Spam has a price: every pool permanently locks
+≥ 1 XEL of seed into the protocol floor, and the site only lists
+pools it can map back to a project or a coin (the asset→id reverse
+bridges) — unindexed pools are invisible, not harmful. (2) THE
+SECOND-MIGRATION FIX: create_pool used to return the pool's INDEX (0
+for the first pool, 1 for the second, ...), while the pinned
+launchpad's migrate_to_dex treats a non-zero cross-call result as
+failure ("poolerr") — every migration after the FIRST would have
+reverted. Cross-called chunks return 0 on success (the same
+convention entries follow on this daemon). Gen-1 deployments already
+live carry the old behaviour — cut a v1.4 generation and repin the
+launchpad BEFORE its second migration (UPGRADES.md §6).
 
 **v1.3 — seed shares + free providers (X11/X12, founder risk review
 point 1).** `create_pool` mints LP parts equal to the XEL seed to the
@@ -92,6 +115,7 @@ minimal design: no oracle, no PSM, no external calls of any kind.
 | X10 | **LP fee share** (v1.2, D23) | providers earn their pro-rata share of every fee (default 50/50, dial hard-bounded [25%, 75%]); pull claims; only fees ever flow out of the pots |
 | X11 | **seed shares — the protocol LP position** (v1.3) | the seed mints LP parts to the admin at creation: the first external add mints its marginal depth (1 XEL on 4000 XEL = 1/4001, not 100%), and the protocol earns the provider share pro-rata on its position — fees-only, forever (no withdrawable balance is ever minted for the seed) |
 | X12 | **remove_liquidity — providers are free** (v1.3) | burn withdrawable parts for the exact floored pro-rata of BOTH reserves at the current ratio; min_out on both sides; fees crystallised before the burn; NO gate (works under any pause); the seed floor is unreachable ("locked" + "seederr" belt-and-braces) |
+| X13 | **open seeding for the community track** (v1.4) | create_pool_open is create_pool minus the launchpad gate: anyone may seed a pool by attaching both sides of the seed; identical economics (X11 seed shares, IX5 floors, one pool per asset, pause-gated like every creation); the lpx pin still gates the moderation hook (chunk 7) and still freezes at the first pool, whichever path created it |
 
 ## 2. The math (constant product, integer-exact)
 
@@ -214,11 +238,12 @@ owned them at creation (UPGRADES.md, the runbook's Phase 0 checklist).
 | `set_swap_fee(bps)` | admin | ≤ 10% |
 | `set_trade_bounds(...)` | admin | seed floors/caps + swap floors/caps, cross-checked (`min < max`) |
 | `set_fee_split(lp_bps)` (v1.2) | admin | the admin/providers revenue dial, **hard-bounded [2500, 7500]**; affects FUTURE fees only |
-| `set_launchpad(addr)` | admin, **before the first pool only** | the one-way pin (X4) |
+| `set_launchpad(addr)` | admin, **before the first pool only** | the one-way pin (X4) — gates `set_pool_buys_paused` (the moderation hook) and `create_pool`; freezes at the first pool whichever path (launchpad migrate or open seeding) created it |
 | `set_admin(new_admin)` | admin | single-step — use a cold wallet; **claim the seed position before rotating** (X11: the parts stay with their owner) |
 | `set_paused(flag)` | admin | global EMERGENCY — gates buys, pool creation and liquidity adds ONLY; every exit (sells, claims, removes) stays open (IX6/X12); can never rug anything |
 | `withdraw_fees(asset, xel_amount, token_amount)` | admin | pays the ADMIN pots; double-capped (pending AND uncommitted balance — IX1/IX2); the provider pots are untouchable here |
 | `claim_lp_fees(asset)` (v1.2) | anyone (a provider) | pays the CALLER's own accrued fees on both sides, out of the provider pots only; belt-and-braces bounded (`"lperr"`); works under the emergency pause; **the admin uses it too — the seed position's earnings** |
+| `create_pool_open(asset)` (v1.4, chunk 33) | **ANYONE** (cross-call or direct) | the open seeding endpoint (X13): identical economics to create_pool minus the lpx gate — what the caller attached IS the seed; the deposits are the authorisation; emergency-pause gated like every creation; mints the X11 seed shares; freezes the lpx pin at the first pool; returns 0 (the v1.4 cross-call convention — the second-migration fix) |
 
 ## 4. Views (the pool-era API)
 
@@ -274,7 +299,10 @@ on XELIS (LAUNCHPAD.md §5a's public/private table).
 `7/8 BuysPaused/Unpaused [asset]` · `9/10 EmergencyPaused/Unpaused` ·
 `11 AdminSet` · `12 LaunchpadSet` · `13 LpFeesClaimed [asset, xel, tokens]`
 (v1.2) · **`14 LiquidityRemoved [asset, parts_burned, xel_out,
-tokens_out]` (v1.3)**.
+tokens_out]` (v1.3)**. Since v1.4 the `PoolCreated` event's 4th field is
+the SEEDER — the pinned launchpad address on the `create_pool` path,
+the signing wallet on the `create_pool_open` path (who drove the
+seeding).
 
 ## 7. Invariants
 
@@ -326,14 +354,17 @@ tokens_out]` (v1.3)**.
   the seed at any time (a market risk, not a rug — the floor itself is
   immutable). Frontends should show the floor next to the depth.
 
-## 8. Cross-contract protocol with VaultLaunch (D19)
+## 8. Cross-contract protocol with VaultLaunch (D19) and CommunityLaunch (X13)
 
 VaultLaunch pins `DEX_CREATE_POOL_CHUNK = 6` and
-`DEX_SET_PAUSED_CHUNK = 7` — asserted against this contract's real chunk
-table by `tests/test_dex_reference.py` on every CI run. Renumbering
-either contract without the other fails the build. The calling wallet's
+`DEX_SET_PAUSED_CHUNK = 7`; CommunityLaunch (the community factory)
+pins `DEX_CREATE_POOL_OPEN_CHUNK = 33` — all asserted against this
+contract's real chunk table by `tests/test_dex_reference.py` and
+`tests/test_community_reference.py` on every CI run. Renumbering any
+contract without the others fails the build. The calling wallet's
 transaction must carry the contract-call permission (`is_contract_callable`
-precheck — the clear `"txperm"` refusal). The v1.3 changes change
-NOTHING on this interface: `create_pool` keeps its signature (the seed
-mint and the floor are internal effects), so VaultLaunch v4.2 calls it
-unchanged.
+precheck — the clear `"txperm"` refusal). The v1.3/v1.4 changes change
+NOTHING on the v1 interface: `create_pool` keeps its signature (the seed
+mint, the floor and the return-value fix are internal effects), so
+VaultLaunch v4.2 calls it unchanged — and now works for EVERY
+migration, not just the first.

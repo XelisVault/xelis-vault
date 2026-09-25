@@ -215,6 +215,56 @@ LAUNCHDEX_ENTRY_IDS_ALT = {
 }
 
 # ---------------------------------------------------------------------------
+# CommunityLaunch chunk ids (same rule: every function in declaration
+# order — the factory of the permissionless community track, v1.0).
+# The cross-called DEX chunk (create_pool_open, LaunchDEX v1.4 chunk 33)
+# is pinned as CommunityLaunch's DEX_CREATE_POOL_OPEN_CHUNK constant and
+# asserted against the DEX's real declaration order by
+# tests/test_community_reference.py.
+# ---------------------------------------------------------------------------
+COMMUNITY_CONTRACT = "CommunityLaunch"
+
+COMMUNITY_ENTRY_IDS = {
+    "launch_coin": 15,
+    "buy": 16,
+    "sell": 17,
+    "migrate": 18,
+    "claim_creator_allocation": 19,
+    "update_coin_info": 20,
+    "set_submission_fee": 21,
+    "set_asset_budget": 22,
+    "set_curve_fee": 23,
+    "set_graduated_fee": 24,
+    "set_migration_fee": 25,
+    "set_graduation_depth": 26,
+    "set_virtual_xel": 27,
+    "set_dex_address": 28,
+    "set_admin": 29,
+    "set_paused": 30,
+    "withdraw_fees": 31,
+}
+
+COMMUNITY_ENTRY_IDS_ALT = {
+    "launch_coin": 0,
+    "buy": 1,
+    "sell": 2,
+    "migrate": 3,
+    "claim_creator_allocation": 4,
+    "update_coin_info": 5,
+    "set_submission_fee": 6,
+    "set_asset_budget": 7,
+    "set_curve_fee": 8,
+    "set_graduated_fee": 9,
+    "set_migration_fee": 10,
+    "set_graduation_depth": 11,
+    "set_virtual_xel": 12,
+    "set_dex_address": 13,
+    "set_admin": 14,
+    "set_paused": 15,
+    "withdraw_fees": 16,
+}
+
+# ---------------------------------------------------------------------------
 # ValueCell builders (adjacently tagged JSON, mirrors the official CLI)
 # ---------------------------------------------------------------------------
 

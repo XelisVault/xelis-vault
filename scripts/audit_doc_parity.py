@@ -121,10 +121,10 @@ if 'const VERSION: string = "VaultLaunch v4.2.0"' not in CONTRACT:
     fails.append("contract: VERSION is not v4.2.0")
 if "v4.2.0" not in DOC:
     fails.append("doc: LAUNCHPAD.md does not say v4.2.0")
-if 'const VERSION: string = "LaunchDEX v1.3.0"' not in DEX_CONTRACT:
-    fails.append("dex contract: VERSION is not v1.3.0")
-if "v1.3.0" not in DEX_DOC:
-    fails.append("doc: DEX.md does not say v1.3.0")
+if 'const VERSION: string = "LaunchDEX v1.4.0"' not in DEX_CONTRACT:
+    fails.append("dex contract: VERSION is not v1.4.0")
+if "v1.4.0" not in DEX_DOC:
+    fails.append("doc: DEX.md does not say v1.4.0")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
@@ -195,6 +195,82 @@ for guard in ('require(parts <= w, "locked")', '"seederr"', '"parterr"',
 for concept in ("seed is protocol-locked", "remove_liquidity"):
     if concept not in DOC:
         fails.append(f"doc: LAUNCHPAD.md v1.3 concept {concept} missing")
+
+# v1.4 DEX sanity: the open seeding endpoint + the second-migration fix
+# are documented in DEX.md and present in the contract
+for concept in ["X13", "create_pool_open", "second-migration",
+                "permissionless", "CommunityLaunch"]:
+    if concept not in DEX_DOC:
+        fails.append(f"doc: DEX.md v1.4 concept {concept} not documented")
+if "pub fn create_pool_open(asset: Hash) -> u64" not in DEX_CONTRACT:
+    fails.append("dex contract: create_pool_open missing")
+if "33  create_pool_open" not in DEX_CONTRACT:
+    fails.append("dex contract: chunk table does not list create_pool_open at 33")
+# THE FIX: create_pool must return 0 (a non-zero cross-call result is
+# treated as failure by the pinned launchpad's migrate_to_dex) — check
+# the ACTUAL return statements (the fix's comment mentions the old one)
+import re as _re
+_cp = _re.search(r"pub fn create_pool\(.*?\n\}", DEX_CONTRACT, _re.S)
+if not _cp:
+    fails.append("dex contract: create_pool body not found")
+elif _re.findall(r"^\s*return (\w+)", _cp.group(0), _re.M) != ["0"]:
+    fails.append("dex contract: create_pool must return 0 — it still "
+                 "returns the pool index (the second-migration bug)")
+_cpo = _re.search(r"pub fn create_pool_open\(.*?\n\}", DEX_CONTRACT, _re.S)
+if not _cp or not _cpo:
+    fails.append("dex contract: create_pool/create_pool_open bodies not found")
+else:
+    if "return 0" not in _cpo.group(0):
+        fails.append("dex contract: create_pool_open must return 0")
+    if 'require(caller == lpx' in _cpo.group(0):
+        fails.append("dex contract: create_pool_open must NOT gate on lpx (X13)")
+    if '"paused"' not in _cpo.group(0):
+        fails.append("dex contract: create_pool_open must check the emergency pause")
+    if 's.store(LAUNCHPAD_PINNED_KEY, true)' not in _cpo.group(0):
+        fails.append("dex contract: create_pool_open must freeze the lpx pin "
+                     "at the first pool (X4)")
+
+# CommunityLaunch sanity: the community track's contract, doc, keys,
+# entries and pinned cross-call chunk agree
+try:
+    COMMUNITY_CONTRACT_SRC = (REPO / "contracts" / "community"
+                              / "CommunityLaunch.slx").read_text()
+    COMMUNITY_DOC_SRC = (REPO / "docs" / "COMMUNITY_LAUNCH.md").read_text()
+except FileNotFoundError as e:
+    fails.append(f"community track file missing: {e.filename}")
+    COMMUNITY_CONTRACT_SRC = ""
+    COMMUNITY_DOC_SRC = ""
+if COMMUNITY_CONTRACT_SRC:
+    if 'const VERSION: string = "CommunityLaunch v1.0.0"' not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: VERSION is not v1.0.0")
+    if "v1.0.0" not in COMMUNITY_DOC_SRC:
+        fails.append("doc: COMMUNITY_LAUNCH.md does not say v1.0.0")
+    for concept in ["C1", "C2", "C4", "virtual", "graduation", "migrate",
+                    "create_pool_open", "IC3", "IC4", "permissionless",
+                    "Asset::create", "Fixed", "min_tokens_out", "LaunchDEX"]:
+        if concept not in COMMUNITY_DOC_SRC:
+            fails.append(f"doc: COMMUNITY_LAUNCH.md concept {concept} not documented")
+    for fn in ("entry launch_coin", "entry buy", "entry sell", "entry migrate",
+               "entry claim_creator_allocation", "entry update_coin_info",
+               "entry set_dex_address", "entry withdraw_fees",
+               "pub fn get_curve_info", "pub fn get_coin_by_asset",
+               "pub fn get_buy_quote", "pub fn get_sell_quote",
+               "pub fn get_market_cap", "pub fn get_status_label"):
+        if fn not in COMMUNITY_CONTRACT_SRC:
+            fails.append(f"community contract: {fn} missing")
+    for guard in ('require(tokens <= yr, "curverr")',
+                  'require(gross <= xr, "curverr")',
+                  'require(dep >= committed, "budget")'):
+        if guard not in COMMUNITY_CONTRACT_SRC:
+            fails.append(f"community contract: guard {guard} missing")
+    if "const DEX_CREATE_POOL_OPEN_CHUNK: u16 = 33" not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: the pinned cross-call chunk 33 is missing")
+    if "const DEFAULT_VIRTUAL_XEL: u64 = 10000000000" not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: DEFAULT_VIRTUAL_XEL is not 100 XEL")
+    if "const DEFAULT_GRADUATION_DEPTH: u64 = 5000000000" not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: DEFAULT_GRADUATION_DEPTH is not 50 XEL")
+    if "const MAX_CREATOR_BPS: u64 = 500" not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: MAX_CREATOR_BPS is not 5%")
 
 # the upgrade runbook exists and the honest audit status is written
 for path, needle in (("docs/UPGRADES.md", "generation"),

@@ -17,15 +17,18 @@ v13 takes the opposite bet:
 
 ```
 contracts/
-  launchpad/VaultLaunch.slx  the launchpad (active product, self-contained)
-  mixer/PrivacyMixerV5.slx   the privacy pool (on hold pending VM features)
-  mixer/superseded/          archived V4 (the R11 regression corpus)
-sdk/xvault/                  Python CLI + SDK (key-less by design)
-scripts/                     CI tooling: linter, chunk-id verifier, structure check
-tests/                       reference tests (Python ↔ contract parity)
-docs/                        LAUNCHPAD / MIXER / SECURITY / ARCHITECTURE
-legacy/                      the 51 v12 contracts, archived read-only
-.github/workflows/ci.yml     strict CI: lint + chunks + tests + structure
+  launchpad/VaultLaunch.slx    the launchpad (active product, self-contained)
+  dex/LaunchDEX.slx            the AMM (v1.4: launchpad-pinned + open seeding)
+  community/CommunityLaunch.slx  the permissionless community-coin factory
+  mixer/PrivacyMixerV5.slx     the privacy pool (on hold pending VM features)
+  mixer/superseded/            archived V4 (the R11 regression corpus)
+abi/                           transaction-facing entry tables (compile artifacts)
+sdk/xvault/                    Python CLI + SDK (key-less by design)
+scripts/                       CI tooling: linter, chunk-id verifier, structure check
+tests/                         reference tests (Python ↔ contract parity)
+docs/                          LAUNCHPAD / DEX / COMMUNITY_LAUNCH / MIXER / SECURITY / ARCHITECTURE
+legacy/                        the 51 v12 contracts, archived read-only
+.github/workflows/ci.yml       strict CI: lint + chunks + tests + structure
 ```
 
 Each active contract lives in its own family directory
@@ -82,8 +85,6 @@ tests green, and a written threat model in docs/.
 - Future modules follow the same pattern: capped, transparent, claim-only,
   never able to touch principal.
 
-
----
 
 ## v18 — VaultLaunch v4 + LaunchDEX (real assets, real migration)
 
@@ -235,3 +236,46 @@ Two points; both closed by LaunchDEX v1.3 (append-only, chunk 32, pins
    the seed floor (9th field), `get_lp_info` the withdrawable balance
    (4th field) — the frontend shows "depth X, of which the migration's
    Y is permanent" and the live exit quote.
+
+---
+
+## v18.4 — the two tracks: projects AND community coins (CommunityLaunch v1.0 + LaunchDEX v1.4)
+
+**The launchpad grows a second shelf.** CommunityLaunch
+(contracts/community/) is the permissionless community-coin factory —
+the pump.fun track: anyone launches a REAL XELIS confidential asset in
+one transaction for ~2 XEL, no vote, no founder liquidity. Pricing
+starts on a VIRTUAL-RESERVE bonding curve (C1): a constant virtual XEL
+reserve (default 100 XEL) and a mirrored virtual token reserve give
+the coin a sensible price and single-digit slippage from the FIRST
+buy, while only the buyers' real XEL accumulates — solvency is proved,
+not hoped for (IC3/IC4: the curve product k never decreases through
+trades, so the real reserves are non-negative by construction and the
+worst-case sell is exactly covered). Graduation is a demand proof in
+TWO conditions (C2): real depth (default 50 XEL, snapshotted per coin)
+AND price continuity (xr·y0 ≥ yr·vx — the pool opens at or above the
+curve's spot, no graduation dump by construction). The migration is
+permissionless on BOTH sides (C6): anyone calls migrate(), and the DEX
+endpoint it drives — create_pool_open, LaunchDEX v1.4 chunk 33 (X13) —
+has no gate at all (on this VM get_caller() is the transaction signer
+even cross-contract, so a factory-only gate cannot be expressed; the
+deposits are the authorisation). The one-time migration fee is carved
+from the POOL SEED, never the live curve (C4 — the k-invariance the
+solvency proof needs). The creator allocation is small (≤ 5%), held
+off-curve, and claimable ONLY post-migration (C5): a creator's payoff
+is conditional on the coin graduating.
+
+**LaunchDEX v1.4 also fixes the second-migration bug**: create_pool
+used to return the pool's INDEX, and the launchpad's migrate_to_dex
+treats a non-zero cross-call result as failure — only the FIRST
+project migration would ever have succeeded on a gen-1 pair. v1.4
+chunks return 0 on success; the fix is invisible to the v1 interface
+(VaultLaunch v4.2 calls it unchanged) but needs a NEW generation to
+reach mainnet — and since the gen-1 pins froze at nothing yet (no pool
+exists), the recommended cut is: deploy ONE v1.4 DEX, repin the gen-1
+launchpad to it (still possible), and pin the new factory to it too —
+both tracks share the same DEX lineage, its launchpad pin serving only
+as the moderation hook (per-pool buys-pause). See
+COMMUNITY_LAUNCH.md §10 and UPGRADES.md §6.
+
+---

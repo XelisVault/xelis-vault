@@ -30,7 +30,48 @@
 // clean-room minimal design with exactly one job: price migrated tokens
 // against XEL, forever, solvently.
 //
+// **v1.4 — the community track + the second-migration fix (X13).**
+// Two additions, both append-only. (1) `create_pool_open` (chunk 33):
+// the SAME pool creation and the SAME X11 seed economics as create_pool,
+// minus the launchpad gate — callable by anyone carrying the seed as
+// attached deposits. This is the endpoint CommunityLaunch (the
+// permissionless community-coin factory) migrates its graduated coins
+// to; see docs/COMMUNITY_LAUNCH.md. On this VM get_caller() reports the
+// ORIGINAL TRANSACTION SIGNER even inside a cross-contract call, so a
+// "factory-only" caller check is impossible to express — the entry is
+// honestly permissionless instead, and the deposits are the
+// authorisation (X13). Spam has a price: every pool permanently locks
+// >= 1 XEL of seed into the protocol floor, and the site only lists
+// pools it can map back to a coin (the asset->coin reverse bridges).
+// (2) THE SECOND-MIGRATION FIX: create_pool used to return the pool's
+// INDEX (0 for the first pool, 1 for the second, ...), while the pinned
+// launchpad's migrate_to_dex treats a non-zero cross-call result as
+// failure ("poolerr") — every migration after the FIRST would have
+// reverted. Cross-called chunks return 0 on success, the same
+// convention as entries on this daemon; the pool's index stays
+// discoverable through get_pools_count / get_pool_by_index. Gen-1
+// deployments (already on mainnet) carry the old behaviour — cut a
+// v1.4 generation and repin the launchpad BEFORE its second migration
+// (docs/UPGRADES.md §6).
+//
 // ZERO external dependencies (no oracle, no PSM). ONE file.
+//
+// **v1.4 — the community track + the second-migration fix (X13).** Two
+// additions, both append-only. (1) `create_pool_open` (chunk 33): the
+// SAME pool creation and the SAME X11 seed economics as create_pool,
+// minus the launchpad gate — callable by anyone carrying the seed as
+// attached deposits. This is the endpoint CommunityLaunch (the
+// permissionless community-coin factory) migrates its graduated coins
+// to; see docs/COMMUNITY_LAUNCH.md. (2) THE SECOND-MIGRATION FIX:
+// create_pool used to return the pool's INDEX (0 for the first pool, 1
+// for the second, ...), while the pinned launchpad's migrate_to_dex
+// treats a non-zero cross-call result as failure ("poolerr") — every
+// migration after the FIRST would have reverted. Cross-called chunks
+// return 0 on success, the same convention entries follow on this
+// daemon; the pool's index stays discoverable through get_pools_count /
+// get_pool_by_index. Gen-1 deployments already live carry the old
+// behaviour — cut a v1.4 generation and repin the launchpad BEFORE its
+// second migration (docs/UPGRADES.md §6).
 //
 // ----------------------------------------------------------------------------
 // DESIGN DECISIONS (and why — read before changing anything)
@@ -196,6 +237,23 @@
 //     back to the seed floor at any time (a market risk, not a rug: the
 //     floor itself is immutable). Frontends should show the seed floor
 //     next to the total depth (get_pool_state's pl field).
+//
+// X13. OPEN SEEDING FOR THE COMMUNITY TRACK (v1.4). create_pool_open is
+//     create_pool minus the launchpad gate: anyone may seed a pool by
+//     attaching both sides of the seed, and the deposits ARE the
+//     authorisation. The economics are IDENTICAL (X11 seed shares, IX5
+//     floors, one pool per asset, pause-gated like every creation, MAX
+//     pools). On this VM get_caller() reports the ORIGINAL TRANSACTION
+//     SIGNER even inside a cross-contract call, so a "factory-only"
+//     caller check is impossible to express — the entry is honestly
+//     permissionless instead. Spam has a price: every pool permanently
+//     locks >= 1 XEL of XEL seed into the protocol floor, and the site
+//     only lists pools it can map back to a launchpad project or a
+//     factory coin (the asset -> id reverse bridges) — unindexed pools
+//     are invisible, not harmful. The lpx pin keeps its meaning on this
+//     path too: it still gates set_pool_buys_paused (the moderation
+//     hook — pause a scam pool's BUYS there; sells never) and still
+//     freezes at the first pool, whichever path created it (X4).
 //
 // ----------------------------------------------------------------------------
 // SWAP MATH (constant product, integer, contract-favouring floors)
@@ -372,18 +430,21 @@
 //    24  get_pool_by_index     25  get_config            26  get_status_label
 //    27  get_launchpad         28  get_version           29  set_fee_split
 //    30  claim_lp_fees         31  get_lp_info           32  remove_liquidity
+//    33  create_pool_open
 //
 //   PINNED FOR CROSS-CONTRACT CALLS (see VaultLaunch constants):
 //     chunk 6  = create_pool          (launchpad migrate)
 //     chunk 7  = set_pool_buys_paused (launchpad sync_trust_to_dex)
+//   PINNED FOR CROSS-CONTRACT CALLS (see CommunityLaunch constants):
+//     chunk 33 = create_pool_open     (community factory migrate)
 //   tests/test_dex_reference.py asserts this table against the source AND
-//   asserts VaultLaunch's pinned constants against it — renumbering either
+//   asserts BOTH callers' pinned constants against it — renumbering any
 //   side without the other fails CI. Appending new functions at the END
-//   keeps every pinned id stable (the v1.1, v1.2 and v1.3 additions did
-//   exactly that).
+//   keeps every pinned id stable (the v1.1, v1.2, v1.3 and v1.4 additions
+//   did exactly that).
 // ============================================================================
 
-const VERSION: string = "LaunchDEX v1.3.0"
+const VERSION: string = "LaunchDEX v1.4.0"
 
 // ---------------------------------------------------------------------------
 // Global capacity (storage growth bound; also the static loop bound of the
@@ -697,7 +758,15 @@ pub fn create_pool(asset: Hash) -> u64 {
     }
 
     emit_event(EV_POOL_CREATED, [asset.to_hex(), xel_seed.to_string(10u32), tok_seed.to_string(10u32), lpx.to_string()])
-    return count
+    // v1.4 — THE SECOND-MIGRATION FIX: this chunk used to `return count`
+    // (0 for the first pool, 1 for the second, ...). The pinned
+    // launchpad's migrate_to_dex treats a non-zero cross-call result as
+    // failure ("poolerr"), so EVERY migration after the first would have
+    // reverted on the gen-1 pair. Cross-called chunks return 0 on
+    // success — the same convention entries follow on this daemon. The
+    // pool's index stays discoverable via get_pools_count /
+    // get_pool_by_index.
+    return 0
 }
 
 // ============================================================================
@@ -1630,5 +1699,135 @@ entry remove_liquidity(asset: Hash, parts: u64, min_xel_out: u64, min_tokens_out
     require(ok_y, "txfail")
 
     emit_event(EV_LIQUIDITY_REMOVED, [asset.to_hex(), parts.to_string(10u32), out_xel.to_string(10u32), out_tok.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 33. CREATE POOL OPEN — the community track's permissionless seeding
+//     (v1.4, X13). Appended at the END so every existing chunk id and both
+//     cross-contract pins (6, 7) stay stable — the house rule since v1.1.
+// ============================================================================
+// @caller: ANYONE — the wallet driving CommunityLaunch.migrate, a keeper
+//          bot, a frontend button, or any wallet holding both sides of a
+//          seed. On this VM get_caller() reports the ORIGINAL TRANSACTION
+//          SIGNER even inside a cross-contract call, so a "factory-only"
+//          caller check is impossible to express; the entry is honestly
+//          permissionless instead and the DEPOSITS are the authorisation
+//          (X13): what seeds the pool is exactly what the caller
+//          attached, and no state of this contract is touched beyond the
+//          new pool itself.
+// @params: asset — the token being listed (one pool per asset, IX4).
+// @attached: XEL >= min_seed_xel AND asset tokens >= min_seed_tokens —
+//            the SAME floors as create_pool, including the 1 XEL LP
+//            floor ("seedlp": the seed becomes the pool's permanent
+//            floor, X11/IX9 — the precision guarantee holds for the
+//            pool's whole life).
+// @rules:  IDENTICAL economics to create_pool (X11 seed shares: the
+//          seed mints the protocol's fees-only LP position, tl = pl =
+//          xel_seed from birth, no withdrawable balance; IX5 both
+//          reserves strictly positive from birth) minus the launchpad
+//          gate. The lpx pin still FREEZES at the first pool (X4):
+//          whichever path creates pool #0, the moderation key
+//          (set_pool_buys_paused, chunk 7) stays with the address pinned
+//          before that moment — pause a malicious pool's BUYS there;
+//          sells are never pausable anywhere (IX6).
+// @security: emergency pause blocks pool creation (the IX6 family:
+//            gates buys, creations and adds ONLY); one pool per asset
+//            (write-once); capacity MAX_POOLS; seed caps ("toobig");
+//            spam has a price — each pool permanently locks >= 1 XEL of
+//            XEL seed into the protocol floor, and the site only lists
+//            pools it can map back to a launchpad project or a factory
+//            coin (the asset -> id reverse bridges), so unindexed pools
+//            are invisible, not harmful.
+// ============================================================================
+pub fn create_pool_open(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+
+    // ANY caller — X13. The signer is only read for the event (who
+    // seeded this pool); there is no gate to check.
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "nocal")
+    let caller: Address = caller_opt.expect("guarded")
+
+    require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
+
+    // One pool per asset, forever (IX4).
+    let xr_key: string = pool_key(asset, F_XEL_RESERVE)
+    require(s.load(xr_key).is_none(), "exists")
+
+    // Capacity.
+    let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
+    require(count < MAX_POOLS, "full")
+
+    // The seed arrives as deposits of this invocation.
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let xel_seed: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    let tok_seed: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+
+    let min_x: u64 = s.load(MIN_SEED_XEL_KEY).unwrap_or(DEFAULT_MIN_SEED_XEL)
+    let min_t: u64 = s.load(MIN_SEED_TOKENS_KEY).unwrap_or(DEFAULT_MIN_SEED_TOKENS)
+    require(xel_seed >= min_x, "seedx")
+    require(tok_seed >= min_t, "seedt")
+    require(xel_seed <= MAX_SEED_XEL, "toobig")
+    require(tok_seed <= MAX_SEED_TOKENS, "toobig")
+    // X11: the seed IS the pool's permanent LP floor — it must clear the
+    // same 1 XEL floor as every provider add (IX9's half of the IX8
+    // precision proof).
+    require(xel_seed >= MIN_LP_ADD_XEL, "seedlp")
+
+    // The protocol LP position (X11): the admin holds the seed's parts,
+    // fees-only forever (no withdrawable balance is ever minted here —
+    // X12; claim before rotating the admin role, UPGRADES.md).
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let admin: Address = admin_opt.expect("guarded")
+    let seed_lkey: string = LP_PREFIX + asset.to_hex() + ":" + admin.to_string() + ":"
+
+    // Pool state (IX5: both reserves strictly positive from birth).
+    s.store(xr_key, xel_seed)
+    s.store(pool_key(asset, F_TOK_RESERVE), tok_seed)
+    s.store(pool_key(asset, F_XEL_FEES), 0u64)
+    s.store(pool_key(asset, F_TOK_FEES), 0u64)
+    s.store(pool_key(asset, F_LP_POT_XEL), 0u64)
+    s.store(pool_key(asset, F_LP_POT_TOK), 0u64)
+    // X11: the seed mints the protocol LP position — tl = pl = xel_seed
+    // from birth; the first external add mints its marginal depth.
+    s.store(pool_key(asset, F_LP_TOTAL), xel_seed)
+    s.store(pool_key(asset, F_LP_LOCKED), xel_seed)
+    s.store(pool_key(asset, F_LP_ACC_XEL), 0u64)
+    s.store(pool_key(asset, F_LP_ACC_TOK), 0u64)
+    // The admin's parts + snapshots (posited at the zero counters — the
+    // same mint rule as add_liquidity). NO LPF_W store: the seed parts
+    // are never withdrawable (X12/IX9).
+    s.store(seed_lkey + LPF_XEL, xel_seed)
+    s.store(seed_lkey + LPF_SNAP_XEL, 0u64)
+    s.store(seed_lkey + LPF_SNAP_TOK, 0u64)
+    s.store(seed_lkey + LPF_CLAIM_XEL, 0u64)
+    s.store(seed_lkey + LPF_CLAIM_TOK, 0u64)
+    s.store(pool_key(asset, F_BUYS_PAUSED), false)
+    s.store(pool_key(asset, F_CREATED), get_current_topoheight())
+    s.store(pool_key(asset, F_BUY_VOL), 0u64)
+    s.store(pool_key(asset, F_SELL_VOL), 0u64)
+    s.store(pool_key(asset, F_TRADES), 0u64)
+    s.store(pool_key(asset, F_LAST_TRADE), 0u64)
+    s.store(pool_key(asset, F_LIFETIME_FEES), 0u64)
+    s.store(pool_key(asset, F_LP_COUNT), 0u64)
+    s.store(pool_key(asset, F_ASSET), asset)
+
+    // Listing index: i:{index} -> asset hash (for the listing views).
+    s.store(ASSET_INDEX_PREFIX + count.to_string(10u32), asset)
+    s.store(POOLS_COUNT_KEY, count + 1)
+
+    // X4: the first pool freezes the launchpad pin FOREVER — whichever
+    // path (launchpad migrate or open seeding) created it. The
+    // moderation key (chunk 7) is thereby locked to the address pinned
+    // before this moment.
+    if count == 0 {
+        s.store(LAUNCHPAD_PINNED_KEY, true)
+    }
+
+    emit_event(EV_POOL_CREATED, [asset.to_hex(), xel_seed.to_string(10u32), tok_seed.to_string(10u32), caller.to_string()])
+    // Cross-called chunks return 0 on success (the v1.4 convention —
+    // the second-migration fix documented at create_pool).
     return 0
 }

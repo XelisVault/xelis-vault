@@ -1,0 +1,152 @@
+{
+  "data": [
+    {
+      "entry_id": 15,
+      "name": "launch_coin",
+      "outputs": "u64",
+      "params": [
+        {"name": "name", "type": "String"},
+        {"name": "symbol", "type": "String"},
+        {"name": "description", "type": "String"},
+        {"name": "website", "type": "String"},
+        {"name": "logo", "type": "String"},
+        {"name": "twitter", "type": "String"},
+        {"name": "telegram", "type": "String"},
+        {"name": "discord", "type": "String"},
+        {"name": "total_supply", "type": "u64"},
+        {"name": "team_bps", "type": "u64"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 16,
+      "name": "buy",
+      "outputs": "u64",
+      "params": [
+        {"name": "cid", "type": "u64"},
+        {"name": "min_tokens_out", "type": "u64"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 17,
+      "name": "sell",
+      "outputs": "u64",
+      "params": [
+        {"name": "cid", "type": "u64"},
+        {"name": "min_xel_out", "type": "u64"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 18,
+      "name": "migrate",
+      "outputs": "u64",
+      "params": [
+        {"name": "cid", "type": "u64"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 19,
+      "name": "claim_creator_allocation",
+      "outputs": "u64",
+      "params": [
+        {"name": "cid", "type": "u64"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 20,
+      "name": "update_coin_info",
+      "outputs": "u64",
+      "params": [
+        {"name": "cid", "type": "u64"},
+        {"name": "description", "type": "String"},
+        {"name": "website", "type": "String"},
+        {"name": "logo", "type": "String"},
+        {"name": "twitter", "type": "String"},
+        {"name": "telegram", "type": "String"},
+        {"name": "discord", "type": "String"}
+      ],
+      "type": "entry"
+    },
+    {
+      "entry_id": 21,
+      "name": "set_submission_fee",
+      "outputs": "u64",
+      "params": [{"name": "fee", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 22,
+      "name": "set_asset_budget",
+      "outputs": "u64",
+      "params": [{"name": "amount", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 23,
+      "name": "set_curve_fee",
+      "outputs": "u64",
+      "params": [{"name": "bps", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 24,
+      "name": "set_graduated_fee",
+      "outputs": "u64",
+      "params": [{"name": "bps", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 25,
+      "name": "set_migration_fee",
+      "outputs": "u64",
+      "params": [{"name": "bps", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 26,
+      "name": "set_graduation_depth",
+      "outputs": "u64",
+      "params": [{"name": "amount", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 27,
+      "name": "set_virtual_xel",
+      "outputs": "u64",
+      "params": [{"name": "amount", "type": "u64"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 28,
+      "name": "set_dex_address",
+      "outputs": "u64",
+      "params": [{"name": "addr", "type": "Hash"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 29,
+      "name": "set_admin",
+      "outputs": "u64",
+      "params": [{"name": "new_admin", "type": "Address"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 30,
+      "name": "set_paused",
+      "outputs": "u64",
+      "params": [{"name": "flag", "type": "Bool"}],
+      "type": "entry"
+    },
+    {
+      "entry_id": 31,
+      "name": "withdraw_fees",
+      "outputs": "u64",
+      "params": [{"name": "amount", "type": "u64"}],
+      "type": "entry"
+    }
+  ]
+}

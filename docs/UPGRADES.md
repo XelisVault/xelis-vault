@@ -131,7 +131,7 @@ or a silent retarget of live value (pins are one-way doors).
 
 ```
 [ ] all CI gates green on the commit being deployed
-[ ] pinned chunks (6/7) unchanged OR both sides updated + tests green
+[ ] pinned chunks (6/7/33) unchanged OR all sides updated + tests green
 [ ] before ANY admin rotation: claim_lp_fees on the seed position of
     every live pool (the parts stay with their owner at creation, X11)
 [ ] testnet lifecycle: full pass, provider fees claimed, pins frozen
@@ -140,3 +140,40 @@ or a silent retarget of live value (pins are one-way doors).
 [ ] mainnet addresses recorded, pins verified frozen after cross-pin
 [ ] site generation registry updated
 ```
+
+## 6. The v18.4 cut — one new DEX generation for BOTH tracks, and the gen-1 repin
+
+The v1.4 generation (LaunchDEX v1.4 + CommunityLaunch v1.0) is cut per
+§3 above, with ONE addition made possible by the fact that the gen-1
+mainnet pair has created **no pool yet** (its pins froze at nothing):
+
+1. **Deploy LaunchDEX v1.4** (testnet rehearsal first, always). This
+   generation fixes the SECOND-MIGRATION BUG: gen-1's `create_pool`
+   returns the pool's INDEX, and VaultLaunch's `migrate_to_dex` treats
+   a non-zero cross-call result as failure ("poolerr") — only the
+   FIRST project migration would ever have succeeded against a gen-1
+   DEX. v1.4 chunks return 0 on success; the interface is unchanged
+   (VaultLaunch v4.2 calls it byte-identically).
+2. **Repin the gen-1 launchpad** (still possible while `dxa` is
+   unfrozen — i.e. while IT has never migrated anything): invoke
+   `set_dex_address` (entry 50) on the gen-1 VaultLaunch with the v1.4
+   DEX's hash. The project track now migrates into the fixed DEX —
+   every migration works, not just the first.
+3. **Set the v1.4 DEX's launchpad pin** to the official wallet: it
+   gates ONLY the moderation hook (`set_pool_buys_paused`, chunk 7 —
+   pause a malicious pool's BUYS; sells never) and `create_pool`. It
+   freezes at the first pool, whichever path created it.
+4. **Deploy CommunityLaunch** and pin its `set_dex_address` to the
+   same v1.4 DEX. The community track migrates through
+   `create_pool_open` (chunk 33, permissionless — X13): no pinned
+   signer can become a graduation bottleneck.
+5. **The orphaned gen-1 DEX** (`bce37bde…`) simply never serves a
+   pool. It keeps existing forever (honest cost of the fix); the
+   golden-rule addresses in COMMUNITY.md must be updated to the new
+   generation pair before the community interacts with either track.
+
+The result: ONE DEX lineage serves both tracks — launchpad-pinned
+`create_pool` for the projects, open `create_pool_open` for the
+community coins — and the site's generation registry lists the new
+pair alongside gen-1 (the stateless views enumerate everything;
+LAUNCHPAD.md §7a).

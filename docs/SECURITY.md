@@ -1,4 +1,4 @@
-# Security Policy — XelisVault Protocol v18.3
+# Security Policy — XelisVault Protocol v18.4
 
 ## Reporting
 
@@ -282,6 +282,60 @@ providers mint WITHDRAWABLE parts they may burn pro-rata at any time
   no fee is ever stranded in a beneficiary-less pot; the pre-v1.3
   no-provider redirect to the admin pot remains as defense-in-depth.
 
+## v18.4 — the community track's honest threat model (CommunityLaunch v1.0)
+
+CommunityLaunch is a casino and says so: **there is no quality filter**.
+Anyone can launch a coin for ~2 XEL, and scams WILL. The design bounds
+what a scam can DO, not what a coin can BE — read this section before
+touching the track:
+
+**What a malicious creator CANNOT do (structural):**
+- **Mint past the supply** — XELIS enforces the `Fixed` max-supply cap
+  at the base layer; the whole supply exists at launch, nothing more
+  can ever be created.
+- **Pull the launch liquidity** — there is none of THEIRS. The pool is
+  seeded with the BUYERS' own money and protocol-locked forever (X11);
+  the founder provided nothing, so the founder can rug nothing but the
+  price.
+- **Trap holders** — sells carry NO gate on either venue (not the
+  factory pause, not the DEX emergency pause, not anything); the curve
+  pays out of real reserves that are provably sufficient (IC3/IC4: the
+  virtual pair can never be asked to pay a seller), and the DEX sell
+  path is ungated absolutely (IX6).
+- **Honeypot** — the bonding curve IS the counterparty: the
+  constant-product formula executes identically for every wallet, and
+  buys/sells are the same two entries for everyone.
+- **Reclaim their allocation early** — the creator's <= 5% is reserved
+  OFF the curve from birth (the formula can never sell it) and
+  claimable ONLY after migration (IC5, paid exactly once). A
+  never-graduating coin pays the creator NOTHING, forever.
+
+**What a malicious actor CAN do (accepted, documented):**
+- **Dump 5% post-migration** — the creator's declared cut, public from
+  launch, cap enforced. The market prices it.
+- **Rug the price with a monster sell** — their choice; the pool floor
+  survives (the seed never leaves), sells stay open for everyone.
+- **Launch a hundred scam coins** — each costs the submission fee plus
+  the chain's asset cost; the site must label community coins loudly
+  ("community coin — no validation") and keep the two tracks visually
+  separate; the moderation key (the DEX's launchpad pin,
+  `set_pool_buys_paused`, chunk 7) can pause any pool's BUYS on either
+  track — sells never.
+- **Front-run** — same assumed ceiling as everywhere on this chain
+  (see below); `min_tokens_out` / `min_xel_out` are on both trades.
+
+**The degenerate edge, documented**: a single monster buy CAN drain a
+coin's whole curve inventory (`out == yr` exactly). Such a coin
+graduates and simply cannot migrate until a sell re-fills the
+inventory (`"empty"`) — no funds are at risk, the curve stays open,
+the state is honest.
+
+**Admin powers on this track** (same philosophy as the launchpad's):
+every fee/parameter is settable and hard-capped; the pause gates NEW
+launches and NEW buys only; `withdraw_fees` is double-capped (accrued
+AND uncommitted balance — the factory can never be made insolvent,
+IC1). No admin entry writes a coin's status, reserves or inventory.
+
 ## Front-running — an assumed ceiling, documented (not a bug)
 
 The XELIS mempool is public, like every blockchain mempool: a pending
@@ -304,7 +358,8 @@ the design does about it, honestly:
 ## Permissions note for integrators
 
 Transactions that cross-call
-(`migrate`, `sync_trust_to_dex`, and the DEX's launchpad-only entries)
+(`migrate` on either track, `sync_trust_to_dex`, and the DEX's
+launchpad-only entries)
 must carry the wallet's contract-call permission (XSWD "all" or an
 allowlist). The contracts refuse early with `"txperm"` instead of
 failing opaquely. Voters and traders NEVER need the permission:

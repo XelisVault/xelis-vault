@@ -1,0 +1,1729 @@
+// ============================================================================
+// CommunityLaunch — XelisVault Protocol
+// ============================================================================
+// The permissionless community-coin factory (the "pump.fun track") for
+// XELIS. Where VaultLaunch is the SERIOUS shelf — a community validation
+// vote before anything trades, 526 XEL of founder skin in the game, a
+// trust system and team vesting — CommunityLaunch is the casino next
+// door, and it says so honestly:
+//
+//   * ANYONE launches a coin, instantly, for ~2 XEL out of pocket
+//     (submission fee + the chain's asset-creation cost). No vote, no
+//     validation, no founder liquidity required.
+//   * The coin is born as a REAL XELIS confidential asset: Asset::create
+//     with MaxSupplyMode::Fixed — the WHOLE supply is minted to this
+//     contract at launch and can never be increased (the cap is enforced
+//     by the XELIS protocol itself, not by our code). Buyers hold real
+//     tokens in their own wallets from the first second.
+//   * Pricing starts on a VIRTUAL-RESERVE bonding curve (C1): the
+//     contract adds a constant virtual XEL reserve (default 100 XEL) and
+//     a virtual token reserve equal to the curve's initial inventory to
+//     the REAL reserves in every formula. The coin therefore has a
+//     sensible price and single-digit-percent slippage from the FIRST
+//     buy, with ZERO founder capital — the depth of the book is
+//     simulated; only the buyers' real XEL accumulates.
+//   * Graduation (C2) fires inside the buy() that crosses it: the REAL
+//     reserves must clear the depth floor (default 50 XEL, admin-set,
+//     snapshotted per coin) AND the price-continuity condition
+//     (xr * y0 >= yr * vx — the real ratio has overtaken the virtual
+//     ratio, so the pool the coin migrates into will open at a price at
+//     or above the curve's spot: no graduation dump by construction).
+//   * The curve keeps trading at the graduated fee until the
+//     permissionless migrate() (anyone, any time) moves the curve's
+//     whole REAL reserves and REAL inventory into a LaunchDEX pool via
+//     the OPEN seeding endpoint (create_pool_open, chunk 33, v1.4) —
+//     permissionless on BOTH sides: no pinned signer can become a
+//     graduation bottleneck. The pool's seed is protocol-locked FOREVER
+//     (LaunchDEX X11) — the community's own money is the anti-rug floor.
+//
+// The two tracks are SEPARATE BY DESIGN (C3): different contracts,
+// different filters, different budgets, different fees — but the same
+// DEX lineage (a LaunchDEX generation serves both), the same SDK and
+// the same site. The site must never blur them: project tokens earn
+// their listing through a community vote; community coins buy their
+// launch for 2 XEL. Frontends should label community coins loudly
+// ("community coin — no validation") — scams WILL launch here; the
+// structural guarantees (fixed supply, no founder liquidity to pull,
+// locked pool seed, never-blockable sells) bound what a scam can DO,
+// not what a coin can BE.
+//
+// ANTI-RUG, THE HONEST LIST (what a malicious creator CANNOT do here):
+//   * mint past the supply (XELIS enforces the Fixed cap),
+//   * pull the launch liquidity (there is none of THEIRS — the pool is
+//     seeded with the BUYERS' money, protocol-locked forever, X11),
+//   * trap holders (sells carry NO gate — not the pause, not anything;
+//     the curve pays out of real reserves that are provably sufficient,
+//     IC3/IC4, and the DEX sell path is ungated absolutely, IX6),
+//   * honeypot (the curve is the counterparty; the constant-product
+//     formula executes the same for every wallet),
+//   * reclaim their creator allocation early (it is held OFF the curve
+//     and claimable only AFTER migration — a creator's payoff is
+//     conditional on the coin graduating).
+// What a malicious creator CAN do: dump their 5% creator allocation
+// post-migration (public from launch, cap enforced), rug the price with
+// a monster sell (their own choice — the pool floor survives), and
+// launch a hundred scam coins (each costs the submission fee + an asset
+// budget; the site labels them; the moderation key can pause their
+// pools' BUYS on the DEX).
+//
+// ----------------------------------------------------------------------------
+// DESIGN DECISIONS (and why — read before changing anything)
+// ----------------------------------------------------------------------------
+// C1. VIRTUAL RESERVES, REAL SOLVENCY. State per coin: xr = real XEL in
+//     the curve (starts 0 — the founder provides NOTHING), yr = real
+//     curve inventory (starts total_supply - creator allocation), plus
+//     two constants snapshotted at launch: vx (virtual XEL, default
+//     100 XEL) and y0 (= the initial inventory — so the virtual token
+//     reserve always mirrors the real one). Every formula uses the
+//     TOTALS: x_total = xr + vx, y_total = yr + y0.
+//       buy:  out  = y_total * net / (x_total + net)     (floored)
+//       sell: gross = x_total * T / (y_total + T)        (floored)
+//     Solvency is not hoped for, it is PROVED (see IC3/IC4): through
+//     trades the product k = x_total * y_total never decreases (fees
+//     are EXTRACTED to pending_fees, never parked in the reserves;
+//     every floor favours the curve), so k >= k0 = vx * 2*y0 forever,
+//     and since y_total <= 2*y0 (nothing circulates that was not
+//     bought from the curve), x_total >= vx — the real reserves xr are
+//     non-negative by construction, and the worst-case sell (the whole
+//     circulating supply in one transaction) extracts EXACTLY xr, to
+//     the floor rounding. The virtual side is mathematics, never a
+//     liability.
+// C2. GRADUATION = DEMAND PROOF, IN TWO CONDITIONS. A coin graduates in
+//     the buy() that makes BOTH true:
+//       depth:        xr >= gdx            (default 50 XEL, snapshotted)
+//       continuity:  xr * y0 >= yr * vx   (structural, hard-coded)
+//     The continuity condition means the pool will open at xr/yr >=
+//     spot price — along the constant-k trajectory it reduces to
+//     xr >= (sqrt(2)-1) * vx (~41.4 XEL at the default vx), so with the
+//     defaults the depth floor binds and graduation lands around
+//     2/3 of the supply sold, ~3x the launch FDV. Both conditions are
+//     evaluated on the state AFTER the triggering buy (the buyer's
+//     trade always completes first — VaultLaunch's exact pattern).
+//     Graduation itself moves NO funds and takes NO fee: the curve
+//     keeps trading at the graduated fee (the never-trap rule — if the
+//     DEX is paused, holders still have the curve) until migrate().
+// C3. TWO TRACKS, ONE DEX LINEAGE. VaultLaunch (projects) migrates via
+//     create_pool (chunk 6, pinned to one signer — the launchpad's
+//     migration driver); CommunityLaunch migrates via create_pool_open
+//     (chunk 33, permissionless). A single LaunchDEX v1.4 deployment
+//     can serve both (set its launchpad pin to the moderation wallet —
+//     it gates set_pool_buys_paused only). The factory keeps its own
+//     listing indexes (latest, by-status, migrated) and the asset ->
+//     coin reverse bridge; the site never needs an indexer.
+// C4. THE MIGRATION FEE IS CARVED FROM THE SEED, NOT THE CURVE. VaultLaunch
+//     takes its migration fee from the reserves at graduation; here the
+//     fee is taken inside migrate(), after the curve is done forever —
+//     because IC3/IC4's solvency proof requires k to stay EXACTLY
+//     invariant while the curve trades. (Taking it from the live curve
+//     would shrink k by up to mgf and make the last sliver of a full
+//     sell-back unpayable — a trap this design refuses.) The fee
+//     therefore only reduces the POOL SEED, and the pool opens at the
+//     real ratio the market actually paid for.
+// C5. CREATOR ALLOCATION: SMALL, OFF-CURVE, POST-MIGRATION ONLY. The
+//     creator declares up to 5% at launch (cap enforced, 4x tighter
+//     than the project track). The allocation is EXCLUDED from the
+//     curve inventory (y0 is net of it — the formula can never sell
+//     it), held by the contract, and claimable ONLY once the coin has
+//     migrated. A creator's payoff is conditional on graduation — the
+//     alignment pump.fun made culture, written into the state machine.
+//     No vesting on this track (the serious track has it); the claim
+//     pays the creator's own reserve via a confidential transfer and
+//     the event carries NO amount (D18 privacy, same rule).
+// C6. PERMISSIONLESS MIGRATION, BOTH SIDES. migrate(cid) is callable by
+//     ANYONE (the outcome is fully determined by the coin's state — no
+//     destination, no amount, no caller choice anywhere), and the DEX
+//     endpoint it drives (create_pool_open) is permissionless too. A
+//     frontend button, a keeper bot, or the last buyer executes it in
+//     the same block as graduation — no pinned wallet can become a
+//     bottleneck, and an emergency-paused DEX only DELAYS the move (the
+//     curve keeps trading; nothing is ever stuck).
+// C7. SELLS ARE NEVER BLOCKABLE. The pause gates launch_coin and buy
+//     (new XEL in) ONLY. Sells, creator claims and migration carry NO
+//     pause check — exactly the launchpad's D4 and the DEX's IX6, for
+//     the same reason: a pause must never become a trap.
+// C8. SNAPSHOT THE RULES AT LAUNCH (the launchpad's D7, applied here):
+//     the virtual reserve (vx) and the graduation depth (gdx) a coin
+//     launches with are the ones it graduates by — later admin tuning
+//     never reclassifies an existing coin. The fee schedule (cfe/gfe)
+//     stays global, like the launchpad's.
+// C9. HONEST CAPACITY: MAX_COINS (8192) bounds storage growth and the
+//     static loop bounds of the listing views (R8-clean, same rule as
+//     every active contract).
+//
+// ----------------------------------------------------------------------------
+// LIFECYCLE
+// ----------------------------------------------------------------------------
+//   launch_coin() [fee + asset budget attached]
+//        |
+//        v  Asset::create — the REAL confidential asset is born:
+//        |    Fixed supply, whole balance held by the contract, cap forever.
+//        |    The chain's creation cost is measured by balance-delta and
+//        |    the unused part of the deposit is refunded on the spot.
+//        |
+//   0 LIVE (bonding with virtual reserves; buys/sells open, fee cfe)
+//        |
+//        |  the buy() that crosses: xr >= gdx  AND  xr*y0 >= yr*vx
+//        v
+//   1 GRADUATED (curve keeps trading at the graduated fee gfe; creator
+//        |         allocation unlocks AT MIGRATION; no fee taken here — C4)
+//        |  migrate() — permissionless, atomic (C6): mgf carved from the
+//        |  seed, then ONE cross-contract call to LaunchDEX
+//        |  create_pool_open (chunk 33) carrying xr + yr as deposits
+//        v
+//   2 MIGRATED (curve closed forever; the pool owns the market; the
+//               factory keeps the coin's home — metadata, creator claim)
+//
+// Status codes (get_status_label): 0 live, 1 graduated, 2 migrated.
+// Who triggers what: XELIS has no timers — graduation fires inside the
+// buy() that crosses the conditions; migration is executed by anyone
+// (frontend, keeper, buyer); everything else is a direct call.
+//
+// ----------------------------------------------------------------------------
+// CURVE MATH (virtual reserves, integer-exact)
+// ----------------------------------------------------------------------------
+//   buy with D XEL attached:  fee = D * cfe / 10000        (extracted)
+//                            net = D - fee                 (joins xr)
+//                            out  = (yr+y0) * net / ((xr+vx) + net)  (floored)
+//                            require(out <= yr)            — the whale guard
+//   sell of T tokens:        gross = (xr+vx) * T / ((yr+y0) + T)     (floored)
+//                            require(gross <= xr)          — provably true,
+//                            fee = gross * fee / 10000      kept as belt
+//                            out  = gross - fee             (to the seller)
+//
+//   Both floors favour the curve; all intermediates in u128 (products
+//   up to ~2e31). The implied k = (xr+vx)*(yr+y0) NEVER DECREASES
+//   through trades, and the migration fee never touches it (C4) — the
+//   full solvency chain is IC3/IC4 below.
+//
+// ----------------------------------------------------------------------------
+// SECURITY MODEL (honest threat documentation)
+// ----------------------------------------------------------------------------
+//   * The admin is a hot role: it sets every fee/parameter (all
+//     hard-capped), pins the DEX (before the first migration only) and
+//     can pause NEW launches and NEW buys. It can NEVER: touch a
+//     curve's reserves, block a sell, block a creator claim, block a
+//     migration, or change a coin's state by hand (no admin entry
+//     writes a c:{id}:st slot).
+//   * Fees accrue to pending_fees and leave ONLY through withdraw_fees,
+//     double-capped by the accrued amount and by the uncommitted
+//     balance (live curve reserves are always covered first).
+//   * Front-running is an assumed ceiling, like everywhere on this
+//     chain: public mempool, min_out slippage protection on both
+//     trade entries, no MEV protection claimed.
+//   * A degenerate monster buy CAN drain a coin's whole curve inventory
+//     (out == yr exactly) — such a coin graduates and simply cannot
+//     migrate until a sell re-fills the inventory ("empty"): no funds
+//     are at risk, the curve stays open, the state is honest.
+//
+// ----------------------------------------------------------------------------
+// INVARIANTS (machine-checked by tests/test_community_reference.py)
+// ----------------------------------------------------------------------------
+// IC1. XEL SOLVENCY, EXACT-SUM MODEL. The contract's XEL balance equals
+//      the sum of every live coin's curve reserves (tcx) plus
+//      pending_fees, at every block: deposits arrive whole, buys add
+//      their net to xr/tcx, sells subtract their gross, migration moves
+//      xr out in one atomic step (fee included), and withdraw_fees is
+//      double-capped (accrued AND balance - tcx). The admin can never
+//      make the factory insolvent.
+// IC2. ASSET SOLVENCY, PER COIN. For every coin: the factory's balance
+//      of the coin's asset equals its curve inventory (yr) plus the
+//      unclaimed creator allocation — degenerating to the reserve alone
+//      after migration (yr = 0). The creator allocation can never be
+//      oversold (y0 is net of it at birth) and is paid exactly once.
+// IC3. THE VIRTUAL PAIR NEVER LEAKS. Through trades, the product
+//      k = (xr+vx)*(yr+y0) never decreases: buy floors (out floored)
+//      and sell floors (gross floored) both favour the curve, and fees
+//      are EXTRACTED to pending_fees, never parked in the reserves.
+//      With nothing sold back, y_total <= 2*y0 forever (nothing
+//      circulates that was not bought from the curve), so
+//      x_total = k/y_total >= k0/(2*y0) = vx — the REAL reserves
+//      xr = x_total - vx are non-negative BY CONSTRUCTION. The virtual
+//      XEL can never be asked to pay a seller.
+// IC4. THE WORST-CASE SELL IS EXACTLY COVERED. Selling the ENTIRE
+//      circulating supply in one transaction extracts
+//      vx*(y0-yr)/(y0+yr) <= xr = vx*(y0-yr)/y0 — floored to strict
+//      inequality by integer rounding. The require(gross <= xr) guard
+//      in sell is therefore structurally unreachable (kept so the
+//      invariant is LOCAL and machine-checkable — the "fiterr" house
+//      style). The whale guard on buys (out <= yr) is the same argument
+//      on the token side: the virtual token reserve is mathematics,
+//      never tokens.
+// IC5. THE CREATOR ALLOCATION IS PAID EXACTLY ONCE. creator_remaining =
+//      alloc - paid is debited atomically by claim_creator_allocation
+//      (paid only ever grows, bounded by alloc); claims are
+//      creator-only and gated on MIGRATED. A rejected nothing (there is
+//      no rejection on this track) — but a never-graduating coin pays
+//      the creator NOTHING, forever.
+// IC6. STATES ONLY MOVE FORWARD, BY THE RULES. LIVE -> GRADUATED fires
+//      only inside buy() when BOTH graduation conditions hold on the
+//      post-trade state; GRADUATED -> MIGRATED fires only inside
+//      migrate() (permissionless, deterministic). No admin entry writes
+//      a coin's status, reserves or inventory. The curve never trades
+//      after MIGRATED ("migrated" refusal); sells are never blocked in
+//      any state that trades (C7).
+//
+// ----------------------------------------------------------------------------
+// STORAGE MAP (string keys, flat KV — house style)
+// ----------------------------------------------------------------------------
+//   Global  : adm pc sub abd cfe gfe mgf gdx vxs dxa pfe pz xa
+//             tbv tsv ttc tvl mgc tcx (see constants below)
+//   Coin    : c:{id}:cr creator          c:{id}:st status (0/1/2)
+//             c:{id}:nm name             c:{id}:sy symbol
+//             c:{id}:ds description      c:{id}:ws website
+//             c:{id}:lg logo             c:{id}:tw twitter
+//             c:{id}:tg telegram         c:{id}:dc discord
+//             c:{id}:ts total supply     c:{id}:cb creator bps
+//             c:{id}:xr real XEL res.    c:{id}:yr real tok inventory
+//             c:{id}:y0 initial inventory (virtual tok reserve)
+//             c:{id}:vx virtual XEL (snapshot)  c:{id}:gx grad depth (snap)
+//             c:{id}:ct created topo     c:{id}:gr graduated flag
+//             c:{id}:gt graduated topo   c:{id}:mi migrated flag
+//             c:{id}:ma migrated topo    c:{id}:mx migrated XEL
+//             c:{id}:mt migrated tokens  c:{id}:cp creator paid
+//             c:{id}:ah asset hash       c:{id}:bv buy volume (XEL)
+//             c:{id}:sv sell volume (XEL) c:{id}:tc trade count
+//             c:{id}:lt last trade topo  c:{id}:vo total volume
+//   Index   : t:{symbol} -> cid (ticker registry, one per symbol forever)
+//             a:{asset_hex} -> cid (the reverse bridge, written at launch)
+//             m:{order} -> cid (the migrated index, written once per move)
+//
+// ----------------------------------------------------------------------------
+// EVENTS (V6 contract events: id + array of string fields)
+// ----------------------------------------------------------------------------
+//    1 CoinLaunched      [cid, name, symbol, total_supply]
+//    2 CoinBought        [cid, xel_in, tokens_out, fee]
+//    3 CoinSold          [cid, tokens_in, xel_out, fee]
+//    4 CoinGraduated     [cid, depth_xel, curve_tokens]
+//    5 CoinMigrated      [cid, xel_seed, token_seed]
+//    6 CreatorClaimed    [cid]                      (NO amount — D18)
+//    7 ParamSet          [param, value]
+//    8 Paused            ["admin"]    9 Unpaused    ["admin"]
+//   10 AdminSet          [new_admin] 11 DexSet      [dex]
+//   12 CoinInfoUpdated   [cid]
+//   13 MigrationFee      [cid, fee]
+//   14 AssetCreated      [cid, asset_hex, fee_paid]
+//   15 FeesWithdrawn     [amount]
+//
+// ----------------------------------------------------------------------------
+// CHUNK TABLE (entry-point IDs, 0-based, declaration order — CI-checked)
+//     0   constructor          1   only_admin           2   require_coin
+//     3   coin_key             4   fee_take            5   checked_add
+//     6   creator_alloc_of     7   buy_tokens_out      8   sell_xel_out
+//     9   current_fee_bps     10   creator_remaining  11   record_trade
+//    12   graduate_coin       13   create_coin_asset   14   migrate_coin_to_dex
+//    15   launch_coin         16   buy                17   sell
+//    18   migrate             19   claim_creator_allocation
+//    20   update_coin_info    21   set_submission_fee  22   set_asset_budget
+//    23   set_curve_fee       24   set_graduated_fee   25   set_migration_fee
+//    26   set_graduation_depth 27 set_virtual_xel     28   set_dex_address
+//    29   set_admin           30   set_paused         31   withdraw_fees
+//    32   get_coin            33   get_coin_meta       34   get_coin_tokenomics
+//    35   get_curve_info      36   get_current_price   37   get_buy_quote
+//    38   get_sell_quote      39   get_market_cap      40   get_total_coins
+//    41   get_coins_by_status 42   get_coin_by_rank    43   get_latest_coin
+//    44   get_coin_by_asset   45   get_migrated_count  46   get_migrated_by_rank
+//    47   get_trading_stats   48   get_config          49   get_status_label
+//    50   get_version
+//
+//   PINNED FOR CROSS-CONTRACT CALLS (see LaunchDEX constants):
+//     chunk 33 = create_pool_open (this factory's migrate — the OPEN
+//                seeding endpoint, permissionless by design X13)
+//   tests/test_community_reference.py asserts this table against the
+//   source AND asserts the pinned constant against LaunchDEX's real
+//   declaration order — renumbering either side without the other fails
+//   CI. New functions append at the END only.
+// ============================================================================
+
+const VERSION: string = "CommunityLaunch v1.0.0"
+
+// ---------------------------------------------------------------------------
+// Status codes (see LIFECYCLE)
+// ---------------------------------------------------------------------------
+const ST_LIVE: u64 = 0
+const ST_GRADUATED: u64 = 1
+const ST_MIGRATED: u64 = 2
+
+// ---------------------------------------------------------------------------
+// Global capacity (storage growth bound; also the static loop bound of the
+// listing views — R8-clean)
+// ---------------------------------------------------------------------------
+const MAX_COINS: u64 = 8192
+
+// ---------------------------------------------------------------------------
+// Asset parameters (real confidential assets, D13 lineage)
+// ---------------------------------------------------------------------------
+const TOKEN_DECIMALS: u8 = 8
+
+// ---------------------------------------------------------------------------
+// LaunchDEX cross-call pin — asserted against the DEX's real chunk table
+// by tests/test_community_reference.py. DO NOT renumber one side alone.
+// ---------------------------------------------------------------------------
+const DEX_CREATE_POOL_OPEN_CHUNK: u16 = 33
+
+// ---------------------------------------------------------------------------
+// Defaults (atomic units, 8 decimals — 1 XEL = 100000000)
+// ---------------------------------------------------------------------------
+const DEFAULT_SUBMISSION_FEE: u64 = 100000000
+const DEFAULT_ASSET_BUDGET: u64 = 100000000
+const DEFAULT_CURVE_FEE_BPS: u64 = 100
+const DEFAULT_GRADUATED_FEE_BPS: u64 = 50
+const DEFAULT_MIGRATION_FEE_BPS: u64 = 50
+const DEFAULT_GRADUATION_DEPTH: u64 = 5000000000
+const DEFAULT_VIRTUAL_XEL: u64 = 10000000000
+
+// ---------------------------------------------------------------------------
+// Hard caps for admin parameters (a compromised admin can hurt the fee
+// model, never the funds)
+// ---------------------------------------------------------------------------
+const MAX_SUBMISSION_FEE: u64 = 10000000000
+const MAX_ASSET_BUDGET: u64 = 10000000000
+const MAX_FEE_BPS: u64 = 1000
+const MAX_MIGRATION_FEE_BPS: u64 = 500
+const MIN_GRADUATION_DEPTH: u64 = 100000000
+const MAX_GRADUATION_DEPTH: u64 = 10000000000000
+const MIN_VIRTUAL_XEL: u64 = 100000000
+const MAX_VIRTUAL_XEL: u64 = 1000000000000
+
+// ---------------------------------------------------------------------------
+// Per-coin caps (checked at launch)
+// ---------------------------------------------------------------------------
+const MIN_COIN_SUPPLY: u64 = 10000000000000
+const MAX_COIN_SUPPLY: u64 = 1000000000000000000
+const MAX_CREATOR_BPS: u64 = 500
+const MAX_NAME_LEN: u32 = 64
+const MAX_SYMBOL_LEN: u32 = 16
+const MAX_DESC_LEN: u32 = 512
+const MAX_URL_LEN: u32 = 256
+
+// ---------------------------------------------------------------------------
+// Trade guards (dust & overflow containment)
+// ---------------------------------------------------------------------------
+const MIN_BUY_XEL: u64 = 1000000
+const MAX_TRADE_XEL: u64 = 10000000000000
+
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+const BPS_DENOM: u64 = 10000
+const PRICE_SCALE: u64 = 100000000
+const U64_MAX: u64 = 18446744073709551615
+const U64_MAX_128: u128 = 18446744073709551615u128
+
+// ---------------------------------------------------------------------------
+// Global storage keys
+// ---------------------------------------------------------------------------
+const ADMIN_KEY: string = "adm"
+const COUNT_KEY: string = "pc"
+const SUBMISSION_FEE_KEY: string = "sub"
+const ASSET_BUDGET_KEY: string = "abd"
+const CURVE_FEE_KEY: string = "cfe"
+const GRADUATED_FEE_KEY: string = "gfe"
+const MIGRATION_FEE_KEY: string = "mgf"
+const GRADUATION_DEPTH_KEY: string = "gdx"
+const VIRTUAL_XEL_KEY: string = "vxs"
+const DEX_ADDRESS_KEY: string = "dxa"
+const PENDING_FEES_KEY: string = "pfe"
+const FEES_LIFETIME_KEY: string = "fcl"
+const PAUSED_KEY: string = "pz"
+const XEL_ASSET_KEY: string = "xa"
+const TOTAL_BUY_VOL_KEY: string = "tbv"
+const TOTAL_SELL_VOL_KEY: string = "tsv"
+const TOTAL_TRADES_KEY: string = "ttc"
+const TOTAL_VOLUME_KEY: string = "tvl"
+const MIGRATED_COUNT_KEY: string = "mgc"
+const TOTAL_CURVE_XEL_KEY: string = "tcx"
+
+// ---------------------------------------------------------------------------
+// Coin field keys (c:{id}:{field})
+// ---------------------------------------------------------------------------
+const F_CREATOR: string = "cr"
+const F_STATUS: string = "st"
+const F_NAME: string = "nm"
+const F_SYMBOL: string = "sy"
+const F_DESC: string = "ds"
+const F_WEBSITE: string = "ws"
+const F_LOGO: string = "lg"
+const F_SUPPLY: string = "ts"
+const F_CREATOR_BPS: string = "cb"
+const F_XR: string = "xr"
+const F_YR: string = "yr"
+const F_Y0: string = "y0"
+const F_VX: string = "vx"
+const F_GX: string = "gx"
+const F_CREATED: string = "ct"
+const F_GRADUATED: string = "gr"
+const F_GRAD_AT: string = "gt"
+const F_MIGRATED: string = "mi"
+const F_MIG_AT: string = "ma"
+const F_MIG_XEL: string = "mx"
+const F_MIG_TOK: string = "mt"
+const F_CREATOR_PAID: string = "cp"
+const F_ASSET: string = "ah"
+const F_BUY_VOL: string = "bv"
+const F_SELL_VOL: string = "sv"
+const F_TRADES: string = "tc"
+const F_LAST_TRADE: string = "lt"
+const F_VOLUME: string = "vo"
+
+const COIN_PREFIX: string = "c:"
+const TICKER_PREFIX: string = "t:"
+const ASSET_LOOKUP_PREFIX: string = "a:"
+const MIGRATED_INDEX_PREFIX: string = "m:"
+
+// ---------------------------------------------------------------------------
+// Event IDs
+// ---------------------------------------------------------------------------
+const EV_COIN_LAUNCHED: u64 = 1
+const EV_COIN_BOUGHT: u64 = 2
+const EV_COIN_SOLD: u64 = 3
+const EV_COIN_GRADUATED: u64 = 4
+const EV_COIN_MIGRATED: u64 = 5
+const EV_CREATOR_CLAIMED: u64 = 6
+const EV_PARAM_SET: u64 = 7
+const EV_PAUSED: u64 = 8
+const EV_UNPAUSED: u64 = 9
+const EV_ADMIN_SET: u64 = 10
+const EV_DEX_ADDRESS: u64 = 11
+const EV_COIN_INFO_UPDATED: u64 = 12
+const EV_MIGRATION_FEE: u64 = 13
+const EV_ASSET_CREATED: u64 = 14
+const EV_FEES_WITHDRAWN: u64 = 15
+
+// ============================================================================
+// 0. CONSTRUCTOR
+// ============================================================================
+// Admin = deployer (signer of the deployment transaction). All parameters
+// start at their documented defaults; the admin adjusts them with the
+// set_* entries (range-checked against the hard caps, the fee pair
+// cross-checked) and pins the LaunchDEX address (set_dex_address) before
+// the first migration. The pin freezes at the first migration (D19
+// lineage): after that, THIS factory migrates into THAT DEX forever.
+// ============================================================================
+hook constructor() -> u64 {
+    let s: Storage = Storage::new()
+
+    let deployer: Address = Transaction::current().unwrap().source()
+    s.store(ADMIN_KEY, deployer)
+
+    s.store(COUNT_KEY, 0u64)
+    s.store(SUBMISSION_FEE_KEY, DEFAULT_SUBMISSION_FEE)
+    s.store(ASSET_BUDGET_KEY, DEFAULT_ASSET_BUDGET)
+    s.store(CURVE_FEE_KEY, DEFAULT_CURVE_FEE_BPS)
+    s.store(GRADUATED_FEE_KEY, DEFAULT_GRADUATED_FEE_BPS)
+    s.store(MIGRATION_FEE_KEY, DEFAULT_MIGRATION_FEE_BPS)
+    s.store(GRADUATION_DEPTH_KEY, DEFAULT_GRADUATION_DEPTH)
+    s.store(VIRTUAL_XEL_KEY, DEFAULT_VIRTUAL_XEL)
+
+    s.store(PENDING_FEES_KEY, 0u64)
+    s.store(FEES_LIFETIME_KEY, 0u64)
+    s.store(TOTAL_BUY_VOL_KEY, 0u64)
+    s.store(TOTAL_SELL_VOL_KEY, 0u64)
+    s.store(TOTAL_TRADES_KEY, 0u64)
+    s.store(TOTAL_VOLUME_KEY, 0u64)
+    s.store(MIGRATED_COUNT_KEY, 0u64)
+    s.store(TOTAL_CURVE_XEL_KEY, 0u64)
+    s.store(PAUSED_KEY, false)
+
+    s.store(XEL_ASSET_KEY, get_xelis_asset())
+
+    return 0
+}
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+// 1. Access control — every admin entry funnels through this.
+fn only_admin() {
+    let s: Storage = Storage::new()
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let admin: Address = admin_opt.expect("guarded")
+    let caller: Address = caller_opt.expect("guarded")
+    require(caller == admin, "notauth")
+}
+
+// 2. Coin existence — every coin-scoped entry and view starts here.
+fn require_coin(cid: u64) {
+    let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
+    require(cid < count, "nocoin")
+}
+
+// 3. Storage key of a coin field: "c:{id}:{field}".
+fn coin_key(cid: u64, field: string) -> string {
+    return COIN_PREFIX + cid.to_string(10u32) + ":" + field
+}
+
+// 4. Fee split — floor, in favour of the contract.
+fn fee_take(amount: u64, bps: u64) -> u64 {
+    let wide: u128 = (amount as u128) * (bps as u128) / (BPS_DENOM as u128)
+    return wide as u64
+}
+
+// 5. CHECKED ADD — u64 + u64 with an explicit overflow refusal (the
+//    accumulators are the only counters that grow without bound by
+//    design, so every addition on them goes through this).
+fn checked_add(a: u64, b: u64) -> u64 {
+    let wide: u128 = (a as u128) + (b as u128)
+    require(wide <= U64_MAX_128, "ovf")
+    return wide as u64
+}
+
+// 6. Creator allocation of a coin (atomic token units), reserved OFF the
+//    curve from birth (y0 is net of it), paid out via
+//    claim_creator_allocation after migration (C5, IC5).
+fn creator_alloc_of(total_supply: u64, creator_bps: u64) -> u64 {
+    let wide: u128 = (total_supply as u128) * (creator_bps as u128) / (BPS_DENOM as u128)
+    return wide as u64
+}
+
+// 7. Curve buy math on the VIRTUAL pair: tokens out for a NET xel amount
+//    (fee already extracted). out = (yr+y0) * net / ((xr+vx) + net),
+//    floored. The caller enforces out <= yr (the whale guard — the
+//    contract can only pay its REAL inventory; C1).
+fn buy_tokens_out(xr: u64, yr: u64, y0: u64, vx: u64, net_xel: u64) -> u64 {
+    let x_total: u128 = (xr as u128) + (vx as u128)
+    let y_total: u128 = (yr as u128) + (y0 as u128)
+    let wide: u128 = y_total * (net_xel as u128) / (x_total + (net_xel as u128))
+    return wide as u64
+}
+
+// 8. Curve sell math on the VIRTUAL pair: XEL out (gross, before fee) for
+//    T tokens. gross = (xr+vx) * T / ((yr+y0) + T), floored. The caller
+//    enforces gross <= xr — provably true by IC3/IC4 (kept as a
+//    belt-and-braces require, the "fiterr" house style).
+fn sell_xel_out(xr: u64, yr: u64, y0: u64, vx: u64, tokens: u64) -> u64 {
+    let x_total: u128 = (xr as u128) + (vx as u128)
+    let y_total: u128 = (yr as u128) + (y0 as u128)
+    let wide: u128 = x_total * (tokens as u128) / (y_total + (tokens as u128))
+    return wide as u64
+}
+
+// 9. EFFECTIVE TRADING FEE — graduated coins trade at graduated_fee_bps;
+//    live coins at curve_fee_bps. The clamp guarantees graduated_fee <=
+//    curve_fee even if storage were somehow inconsistent (defence in
+//    depth on top of the cross-checked setters). Used by buy, sell AND
+//    both quotes — a quote can never disagree with the trade it previews.
+fn current_fee_bps(graduated: bool) -> u64 {
+    let s: Storage = Storage::new()
+    let live_fee: u64 = s.load(CURVE_FEE_KEY).unwrap_or(DEFAULT_CURVE_FEE_BPS)
+    if !graduated {
+        return live_fee
+    }
+    let graduated_fee: u64 = s.load(GRADUATED_FEE_KEY).unwrap_or(DEFAULT_GRADUATED_FEE_BPS)
+    if graduated_fee > live_fee {
+        return live_fee
+    }
+    return graduated_fee
+}
+
+// 10. Creator allocation still owed: alloc - paid (never negative — IC5).
+fn creator_remaining(cid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let total_supply: u64 = s.load(coin_key(cid, F_SUPPLY)).unwrap_or(0)
+    let creator_bps: u64 = s.load(coin_key(cid, F_CREATOR_BPS)).unwrap_or(0)
+    let alloc: u64 = creator_alloc_of(total_supply, creator_bps)
+    let paid: u64 = s.load(coin_key(cid, F_CREATOR_PAID)).unwrap_or(0)
+    if paid >= alloc {
+        return 0
+    }
+    return alloc - paid
+}
+
+// 11. RECORD TRADE — the single funnel through which every curve
+//     buy/sell updates the scoreboard, per coin and protocol-wide, all
+//     overflow-guarded. Buy side records the ATTACHED amount (fee
+//     included); sell side records the PRE-FEE gross out (the same
+//     conventions as the launchpad's D12 and the DEX's X6).
+fn record_trade(cid: u64, buy_side: bool, xel_amount: u64) {
+    let s: Storage = Storage::new()
+    if buy_side {
+        let bv: u64 = s.load(coin_key(cid, F_BUY_VOL)).unwrap_or(0)
+        s.store(coin_key(cid, F_BUY_VOL), checked_add(bv, xel_amount))
+        let tbv: u64 = s.load(TOTAL_BUY_VOL_KEY).unwrap_or(0)
+        s.store(TOTAL_BUY_VOL_KEY, checked_add(tbv, xel_amount))
+    } else {
+        let sv: u64 = s.load(coin_key(cid, F_SELL_VOL)).unwrap_or(0)
+        s.store(coin_key(cid, F_SELL_VOL), checked_add(sv, xel_amount))
+        let tsv: u64 = s.load(TOTAL_SELL_VOL_KEY).unwrap_or(0)
+        s.store(TOTAL_SELL_VOL_KEY, checked_add(tsv, xel_amount))
+    }
+    let vo: u64 = s.load(coin_key(cid, F_VOLUME)).unwrap_or(0)
+    s.store(coin_key(cid, F_VOLUME), checked_add(vo, xel_amount))
+    let tvl: u64 = s.load(TOTAL_VOLUME_KEY).unwrap_or(0)
+    s.store(TOTAL_VOLUME_KEY, checked_add(tvl, xel_amount))
+    let tc: u64 = s.load(coin_key(cid, F_TRADES)).unwrap_or(0)
+    s.store(coin_key(cid, F_TRADES), checked_add(tc, 1))
+    let ttc: u64 = s.load(TOTAL_TRADES_KEY).unwrap_or(0)
+    s.store(TOTAL_TRADES_KEY, checked_add(ttc, 1))
+    s.store(coin_key(cid, F_LAST_TRADE), get_current_topoheight())
+}
+
+// 12. GRADUATE COIN — flips a LIVE coin to GRADUATED (the milestone).
+//     Takes NO fee and moves NO funds (C4: the migration fee is carved
+//     from the pool seed at migrate time, so the curve's k stays exactly
+//     invariant while it trades — the IC3/IC4 solvency chain). The curve
+//     keeps trading at the graduated fee until the permissionless
+//     migrate() moves everything to the DEX pool. Called from buy()
+//     after the triggering trade completed.
+fn graduate_coin(cid: u64) {
+    let s: Storage = Storage::new()
+    s.store(coin_key(cid, F_STATUS), ST_GRADUATED)
+    s.store(coin_key(cid, F_GRADUATED), true)
+    s.store(coin_key(cid, F_GRAD_AT), get_current_topoheight())
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    emit_event(EV_COIN_GRADUATED, [cid.to_string(10u32), xr.to_string(10u32), yr.to_string(10u32)])
+}
+
+// 13. CREATE COIN ASSET — the real token is born, called by launch_coin
+//     in the SAME transaction as the launch. Asset::create with
+//     MaxSupplyMode::Fixed: the ENTIRE supply is minted to this contract
+//     and can never be increased (the cap is enforced by the XELIS
+//     protocol itself). The chain's creation cost is measured by
+//     balance-delta (robust to any fee change), paid from the attached
+//     deposit, and everything the launch did not consume (deposit -
+//     submission fee - creation cost) is refunded to the creator on the
+//     spot. A failed creation reverts the whole launch.
+fn create_coin_asset(cid: u64) {
+    let s: Storage = Storage::new()
+
+    // The asset is created exactly once per coin (the slot is write-once).
+    require(s.load(coin_key(cid, F_ASSET)).is_none(), "exists")
+
+    let name: string = s.load(coin_key(cid, F_NAME)).unwrap_or("")
+    let symbol: string = s.load(coin_key(cid, F_SYMBOL)).unwrap_or("")
+    let total_supply: u64 = s.load(coin_key(cid, F_SUPPLY)).unwrap_or(0)
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    let sub_fee: u64 = s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE)
+
+    // Measure the protocol's creation fee by balance-delta. The deposit
+    // is already credited, so the delta isolates exactly what
+    // Asset::create charged.
+    let bal_before: u64 = get_balance_for_asset(xel).unwrap_or(0)
+
+    let asset_opt: optional<Asset> = Asset::create(
+        cid,
+        name,
+        symbol,
+        TOKEN_DECIMALS,
+        MaxSupplyMode::Fixed { max_supply: total_supply }
+    )
+    require(asset_opt.is_some(), "assetcr")
+    let asset: Asset = asset_opt.expect("guarded")
+    let hash: Hash = asset.get_hash()
+
+    let bal_after: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    require(bal_before >= bal_after, "accerr")
+    let fee_paid: u64 = bal_before - bal_after
+
+    // The safety check (D13 lineage): Fixed mode must have delivered the
+    // WHOLE supply to this contract. Anything less reverts the launch.
+    let tok_bal: u64 = get_balance_for_asset(hash).unwrap_or(0)
+    require(tok_bal == total_supply, "assetbal")
+
+    // Budget accounting: the deposit must cover the submission fee AND
+    // the creation cost; the rest goes back to the creator immediately.
+    // (If the chain's asset fee rose past what the creator attached,
+    // the launch reverts with "budget" — retry with a bigger deposit;
+    // the admin can also raise the documented asset_budget floor.)
+    let committed: u64 = checked_add(sub_fee, fee_paid)
+    require(dep >= committed, "budget")
+    let refund: u64 = dep - committed
+
+    let creator_opt: optional<Address> = s.load(coin_key(cid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+
+    s.store(coin_key(cid, F_ASSET), hash)
+    // The reverse bridge: asset hash -> coin id, written once at creation
+    // (the DEX enumerates pools by ASSET; this maps them back to the
+    // factory's coin pages — get_coin_by_asset).
+    s.store(ASSET_LOOKUP_PREFIX + hash.to_hex(), cid)
+
+    if refund > 0 {
+        let ok: bool = transfer(creator, refund, xel)
+        require(ok, "txfail")
+    }
+
+    emit_event(EV_ASSET_CREATED, [cid.to_string(10u32), hash.to_hex(), fee_paid.to_string(10u32)])
+}
+
+// 14. MIGRATE COIN TO DEX (internal) — the atomic move. Carves the
+//     one-time migration fee out of the seed (C4 — NEVER out of the live
+//     curve), then takes the curve's whole REAL XEL reserves and whole
+//     REAL inventory and seeds a permanent LaunchDEX pool with them via
+//     ONE cross-contract call (create_pool_open, chunk 33) carrying both
+//     amounts as attached deposits. Everything (state flips, the fee,
+//     the deposits, the pool creation) is one transaction: a failure
+//     anywhere reverts it all.
+fn migrate_coin_to_dex(cid: u64) {
+    let s: Storage = Storage::new()
+
+    let dex_opt: optional<Hash> = s.load(DEX_ADDRESS_KEY)
+    require(dex_opt.is_some(), "nodex")
+    let dex: Hash = dex_opt.expect("guarded")
+
+    let asset_opt: optional<Hash> = s.load(coin_key(cid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    require(xr >= 1 && yr >= 1, "empty")
+
+    // Belt-and-braces solvency (IC1/IC2 guarantee these; refuse loudly if
+    // accounting ever disagrees — a broken migration is better than a
+    // short one). The creator reserve stays here until claimed (IC2).
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let xel_bal: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    require(xr <= xel_bal, "accerr")
+    let tok_bal: u64 = get_balance_for_asset(asset).unwrap_or(0)
+    let creator_rem: u64 = creator_remaining(cid)
+    require((yr as u128) + (creator_rem as u128) <= (tok_bal as u128), "accerr")
+
+    // C4 — the migration fee, taken ONCE, out of the SEED (the curve is
+    // done forever after this; k was never touched while it traded).
+    let bps: u64 = s.load(MIGRATION_FEE_KEY).unwrap_or(DEFAULT_MIGRATION_FEE_BPS)
+    let fee: u64 = fee_take(xr, bps)
+    require(xr >= fee, "curverr")
+    let seed_xel: u64 = xr - fee
+    if fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+        let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+        s.store(FEES_LIFETIME_KEY, checked_add(lifetime, fee))
+        emit_event(EV_MIGRATION_FEE, [cid.to_string(10u32), fee.to_string(10u32)])
+    }
+
+    // STATE FIRST (atomic with the call below): close the curve,
+    // snapshot what is being sent, update the global accounting.
+    s.store(coin_key(cid, F_MIGRATED), true)
+    s.store(coin_key(cid, F_MIG_AT), get_current_topoheight())
+    s.store(coin_key(cid, F_MIG_XEL), seed_xel)
+    s.store(coin_key(cid, F_MIG_TOK), yr)
+    s.store(coin_key(cid, F_XR), 0u64)
+    s.store(coin_key(cid, F_YR), 0u64)
+
+    let migrated_count: u64 = s.load(MIGRATED_COUNT_KEY).unwrap_or(0)
+    s.store(MIGRATED_COUNT_KEY, checked_add(migrated_count, 1))
+    // The migrated index: m:{order} -> cid, written once per migration
+    // (enumerate with get_migrated_count / get_migrated_by_rank).
+    s.store(MIGRATED_INDEX_PREFIX + migrated_count.to_string(10u32), cid)
+
+    // IC1: the whole curve XEL (fee + seed) leaves the exact-sum model.
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    require(curve_xel >= xr, "accerr")
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel - xr)
+
+    // Permission precheck (clear refusal for wallets that did not grant
+    // the contract-call permission on this transaction).
+    require(is_contract_callable(dex, DEX_CREATE_POOL_OPEN_CHUNK), "txperm")
+
+    let target_opt: optional<Contract> = Contract::new(dex)
+    require(target_opt.is_some(), "dexgone")
+    let target: Contract = target_opt.expect("guarded")
+
+    // The deposits carry BOTH sides of the seed; the DEX reads exactly
+    // what arrived (single source of truth).
+    let deposits: map<Hash, u64> = {}
+    deposits.insert(xel, seed_xel)
+    deposits.insert(asset, yr)
+    // Devnet toolchain: the VM leaves the cross-called chunk's return
+    // value on the stack; it MUST be captured or the invocation ends in
+    // a stack imbalance (StackNotCleaned -> ILLEGAL_STATE). v1.4 DEX
+    // convention: cross-called chunks return 0 on success.
+    let pool_res: u64 = target.call(DEX_CREATE_POOL_OPEN_CHUNK, [asset], deposits)
+    require(pool_res == 0, "poolerr")
+}
+
+// ============================================================================
+// 15. LAUNCH COIN — the permissionless launch (anyone, ~2 XEL).
+// ============================================================================
+// @caller: ANYONE (a wallet) — the coin's creator. No vote, no filter,
+//          no founder liquidity: the ONLY costs are the submission fee
+//          (to the protocol's pending_fees, non-refundable) and the
+//          chain's asset-creation cost (measured, refunded if unused).
+// @params: name, symbol, description, website, logo, twitter, telegram,
+//             discord — display metadata (length-capped; socials may be
+//             empty; the creator can update description, website, logo
+//             AND socials at any time via update_coin_info — D11
+//             lineage);
+//          total_supply — the coin's FIXED supply in atomic units
+//             (8 decimals), bounded to [MIN_COIN_SUPPLY, MAX_COIN_SUPPLY]
+//             (1M .. 10B whole tokens). This is the asset's max_supply:
+//             the WHOLE supply is minted to the contract at launch and
+//             NOTHING can ever be minted past it;
+//          team_bps — the CREATOR allocation in basis points, <= 5%,
+//             reserved OFF the curve and claimable only after migration
+//             (C5).
+// @attached: >= submission_fee + asset_budget. The fee joins
+//             pending_fees immediately; the budget is the DOCUMENTED
+//             floor that covers the chain's asset-creation cost (the
+//             actual cost is measured by balance-delta inside
+//             create_coin_asset; everything unused — including any
+//             excess attached — is refunded to the creator in the same
+//             transaction).
+// @ticker registry: the symbol is reserved factory-wide at launch time —
+//             first coin wins it, forever (XELIS tickers are
+//             self-declared; this registry keeps OUR listings
+//             unambiguous within the community track).
+// @returns: nothing (devnet convention: nonzero entry returns roll
+//           back; the coin id is discoverable via get_total_coins - 1).
+// ============================================================================
+entry launch_coin(name: string, symbol: string, description: string, website: string, logo: string, twitter: string, telegram: string, discord: string, total_supply: u64, team_bps: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require(s.load(PAUSED_KEY).unwrap_or(false) == false, "paused")
+
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    require(count < MAX_COINS, "full")
+
+    // Metadata caps (socials are display metadata, same rules — D11).
+    require(name.len() >= 1u32 && name.len() <= MAX_NAME_LEN, "badname")
+    require(symbol.len() >= 1u32 && symbol.len() <= MAX_SYMBOL_LEN, "badsym")
+    require(description.len() <= MAX_DESC_LEN, "baddesc")
+    require(website.len() <= MAX_URL_LEN, "badurl")
+    require(logo.len() <= MAX_URL_LEN, "badlogo")
+    require(twitter.len() <= MAX_URL_LEN, "badtw")
+    require(telegram.len() <= MAX_URL_LEN, "badtg")
+    require(discord.len() <= MAX_URL_LEN, "baddc")
+
+    // Ticker reservation: one community coin per symbol, forever.
+    let ticker_key: string = TICKER_PREFIX + symbol
+    require(s.load(ticker_key).is_none(), "tick")
+
+    // Tokenomics caps.
+    require(total_supply >= MIN_COIN_SUPPLY && total_supply <= MAX_COIN_SUPPLY, "badsupply")
+    require(team_bps <= MAX_CREATOR_BPS, "badteam")
+
+    // Funds: submission fee (protocol revenue) + asset budget (the
+    // documented floor covering the chain's creation cost). Anything
+    // above comes back with the creation refund.
+    let sub_fee: u64 = s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE)
+    let budget: u64 = s.load(ASSET_BUDGET_KEY).unwrap_or(DEFAULT_ASSET_BUDGET)
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= sub_fee + budget, "needfee")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let cid: u64 = count
+    s.store(coin_key(cid, F_CREATOR), caller)
+    s.store(coin_key(cid, F_STATUS), ST_LIVE)
+    s.store(coin_key(cid, F_NAME), name)
+    s.store(coin_key(cid, F_SYMBOL), symbol)
+    s.store(coin_key(cid, F_DESC), description)
+    s.store(coin_key(cid, F_WEBSITE), website)
+    s.store(coin_key(cid, F_LOGO), logo)
+    s.store(coin_key(cid, F_TWITTER), twitter)
+    s.store(coin_key(cid, F_TELEGRAM), telegram)
+    s.store(coin_key(cid, F_DISCORD), discord)
+    s.store(coin_key(cid, F_SUPPLY), total_supply)
+    s.store(coin_key(cid, F_CREATOR_BPS), team_bps)
+
+    // Curve opening state (C1): real reserves start at ZERO (the founder
+    // provides nothing); the sellable inventory EXCLUDES the creator
+    // allocation (reserved off the curve until migration — C5).
+    let y0: u64 = total_supply - creator_alloc_of(total_supply, team_bps)
+    s.store(coin_key(cid, F_XR), 0u64)
+    s.store(coin_key(cid, F_YR), y0)
+    s.store(coin_key(cid, F_Y0), y0)
+
+    // C8 — snapshot the rules the coin launches by: the virtual XEL
+    // reserve and the graduation depth (later admin tuning never
+    // reclassifies an existing coin; the launchpad's D7, applied here).
+    let vx: u64 = s.load(VIRTUAL_XEL_KEY).unwrap_or(DEFAULT_VIRTUAL_XEL)
+    let gdx: u64 = s.load(GRADUATION_DEPTH_KEY).unwrap_or(DEFAULT_GRADUATION_DEPTH)
+    s.store(coin_key(cid, F_VX), vx)
+    s.store(coin_key(cid, F_GX), gdx)
+
+    // Milestone bookkeeping.
+    s.store(coin_key(cid, F_CREATED), get_current_topoheight())
+    s.store(coin_key(cid, F_GRADUATED), false)
+    s.store(coin_key(cid, F_GRAD_AT), 0u64)
+    s.store(coin_key(cid, F_MIGRATED), false)
+    s.store(coin_key(cid, F_MIG_AT), 0u64)
+    s.store(coin_key(cid, F_MIG_XEL), 0u64)
+    s.store(coin_key(cid, F_MIG_TOK), 0u64)
+    s.store(coin_key(cid, F_CREATOR_PAID), 0u64)
+
+    // Trading-data scoreboard: starts empty, filled by every trade.
+    s.store(coin_key(cid, F_BUY_VOL), 0u64)
+    s.store(coin_key(cid, F_SELL_VOL), 0u64)
+    s.store(coin_key(cid, F_TRADES), 0u64)
+    s.store(coin_key(cid, F_LAST_TRADE), 0u64)
+    s.store(coin_key(cid, F_VOLUME), 0u64)
+
+    // The submission fee joins the protocol revenue (non-refundable —
+    // there is no validation to fail; the coin exists from here on).
+    if sub_fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, checked_add(pending, sub_fee))
+    }
+
+    // The REAL token is born HERE — before the coin becomes enumerable
+    // (a failed creation reverts the whole launch, retryable).
+    create_coin_asset(cid)
+
+    s.store(COUNT_KEY, cid + 1)
+    s.store(ticker_key, cid)
+
+    emit_event(EV_COIN_LAUNCHED, [cid.to_string(10u32), name, symbol, total_supply.to_string(10u32)])
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
+}
+
+// ============================================================================
+// 16. BUY — trade XEL for REAL tokens on the virtual-reserve curve.
+// ============================================================================
+// @caller: anyone (a wallet). Gated by the emergency pause (new XEL in —
+//          C7) and refused once the coin migrated (the pool owns the
+//          market then).
+// @attached: XEL in [MIN_BUY_XEL, MAX_TRADE_XEL] — the WHOLE deposit
+//            trades (fee extracted, net joins the REAL reserves xr).
+// @params:  min_tokens_out — slippage protection; the trade reverts
+//           ("slip") if the curve would return fewer tokens.
+// @graduation (C2): after the trade completes, a LIVE coin whose REAL
+//           reserves now clear BOTH conditions — depth (xr >= gx) and
+//           continuity (xr*y0 >= yr*vx) — graduates in the same
+//           transaction. The buyer's trade always completes first.
+// ============================================================================
+entry buy(cid: u64, min_tokens_out: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    require(s.load(PAUSED_KEY).unwrap_or(false) == false, "paused")
+
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    require(status == ST_LIVE || status == ST_GRADUATED, "migrated")
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let dep: u64 = get_deposit_for_asset(xel).unwrap_or(0)
+    require(dep >= MIN_BUY_XEL, "tiny")
+    require(dep <= MAX_TRADE_XEL, "toobig")
+
+    let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
+    let bps: u64 = current_fee_bps(graduated)
+    let fee: u64 = fee_take(dep, bps)
+    let net: u64 = dep - fee
+
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
+    let vx: u64 = s.load(coin_key(cid, F_VX)).unwrap_or(0)
+    require(yr >= 1, "empty")
+
+    let tokens: u64 = buy_tokens_out(xr, yr, y0, vx, net)
+    require(tokens >= 1, "tinyout")
+    // The whale guard (C1): the contract can only pay its REAL
+    // inventory — the virtual token reserve is mathematics, not tokens.
+    // A single buy larger than the inventory can serve reverts whole.
+    require(tokens <= yr, "curverr")
+    require(tokens >= min_tokens_out, "slip")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    // Curve state (net joins the REAL reserves, tokens leave the REAL
+    // inventory — the virtual sides never move).
+    let new_xr: u64 = xr + net
+    let new_yr: u64 = yr - tokens
+    s.store(coin_key(cid, F_XR), new_xr)
+    s.store(coin_key(cid, F_YR), new_yr)
+    // IC1's exact-sum model: tcx is the EXACT sum of live curve reserves.
+    s.store(TOTAL_CURVE_XEL_KEY, checked_add(s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0), net))
+
+    record_trade(cid, true, dep)
+    if fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+    }
+
+    // The REAL tokens go to the buyer's wallet (IC2: balance follows the
+    // inventory).
+    let asset_opt: optional<Hash> = s.load(coin_key(cid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let ok: bool = transfer(caller, tokens, asset)
+    require(ok, "txfail")
+
+    emit_event(EV_COIN_BOUGHT, [cid.to_string(10u32), dep.to_string(10u32), tokens.to_string(10u32), fee.to_string(10u32)])
+
+    // Graduation check (C2): only from LIVE, only once — evaluated on
+    // the POST-trade state, both conditions, u128 products.
+    if status == ST_LIVE {
+        let gdx: u64 = s.load(coin_key(cid, F_GX)).unwrap_or(0)
+        if (new_xr as u128) >= (gdx as u128) {
+            if (new_xr as u128) * (y0 as u128) >= (new_yr as u128) * (vx as u128) {
+                graduate_coin(cid)
+            }
+        }
+    }
+
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
+}
+
+// ============================================================================
+// 17. SELL — trade REAL tokens back for XEL. NEVER blockable (C7).
+// ============================================================================
+// Works LIVE and GRADUATED; carries NO pause check (a pause must never
+// become a trap). The WHOLE attached token deposit is sold (symmetric
+// with buy — nothing can be stranded); the tokens return to the curve's
+// inventory, the gross XEL leaves the REAL reserves (the virtual side
+// never moves), the trading fee goes to pending_fees, the rest is
+// transferred to the caller. After migration the curve is closed —
+// holders sell on the DEX pool instead (sells there are never pausable
+// either, IX6).
+// ============================================================================
+entry sell(cid: u64, min_xel_out: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    require(status == ST_LIVE || status == ST_GRADUATED, "migrated")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    // The sale amount IS the attached token deposit (whole-deposit
+    // semantics; a partial sale would strand the rest).
+    let asset_opt: optional<Hash> = s.load(coin_key(cid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let dep: u64 = get_deposit_for_asset(asset).unwrap_or(0)
+    require(dep >= 1, "nosell")
+
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
+    let vx: u64 = s.load(coin_key(cid, F_VX)).unwrap_or(0)
+    require(xr >= 1, "empty")
+
+    let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
+    let bps: u64 = current_fee_bps(graduated)
+    let gross: u64 = sell_xel_out(xr, yr, y0, vx, dep)
+    require(gross >= 1, "tiny")
+    // IC3/IC4's machine-checkable face: the worst-case sell extracts at
+    // most the REAL reserves — provably true (see C1's proof), kept as
+    // a belt-and-braces require so the invariant is LOCAL.
+    require(gross <= xr, "curverr")
+    let fee: u64 = fee_take(gross, bps)
+    let out: u64 = gross - fee
+    require(out >= 1, "tinyout")
+    require(out >= min_xel_out, "slip")
+
+    // Curve state (tokens return to the inventory, gross XEL leaves the
+    // REAL reserves — the virtual sides never move).
+    s.store(coin_key(cid, F_XR), xr - gross)
+    s.store(coin_key(cid, F_YR), yr + dep)
+    let curve_xel: u64 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0)
+    require(curve_xel >= gross, "accerr")
+    s.store(TOTAL_CURVE_XEL_KEY, curve_xel - gross)
+
+    record_trade(cid, false, gross)
+    if fee > 0 {
+        let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+        s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+    }
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let ok: bool = transfer(caller, out, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_COIN_SOLD, [cid.to_string(10u32), dep.to_string(10u32), out.to_string(10u32), fee.to_string(10u32)])
+    // Devnet toolchain: nonzero entry return => rolled back.
+    return 0
+}
+
+// ============================================================================
+// 18. MIGRATE — the permissionless move to the LaunchDEX pool (C6).
+// ============================================================================
+// @caller: ANYONE (a wallet) — the frontend's button, a keeper bot, the
+//          last buyer: the outcome is fully determined by the coin's
+//          state (no destination, no amount, no caller choice anywhere).
+//          Requires the contract-call permission on the transaction
+//          ("txperm" refusal otherwise).
+// @rules:  only a GRADUATED, not-yet-migrated coin; the curve's whole
+//          REAL reserves (migration fee carved out first, C4) and whole
+//          REAL inventory seed a permanent LaunchDEX pool via ONE atomic
+//          cross-contract call (create_pool_open). The curve closes
+//          forever; the pool owns the market; the factory keeps the
+//          coin's home (metadata, creator claim).
+// ============================================================================
+entry migrate(cid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    require(status == ST_GRADUATED, "notgrad")
+    require(s.load(coin_key(cid, F_MIGRATED)).unwrap_or(false) == false, "done")
+
+    migrate_coin_to_dex(cid)
+
+    let xel: u64 = s.load(coin_key(cid, F_MIG_XEL)).unwrap_or(0)
+    let tok: u64 = s.load(coin_key(cid, F_MIG_TOK)).unwrap_or(0)
+    emit_event(EV_COIN_MIGRATED, [cid.to_string(10u32), xel.to_string(10u32), tok.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 19. CLAIM CREATOR ALLOCATION — the creator's payoff, post-migration
+//     only (C5).
+// ============================================================================
+// Creator-only, exactly once across all claim paths (IC5: the paid
+// counter debits the reserve). The allocation was reserved OFF the
+// curve from birth (y0 is net of it) and held by the contract; it
+// unlocks ONLY when the coin has migrated — a creator's payoff is
+// conditional on the coin graduating. The payout is a confidential
+// transfer and the event carries NO amount (D18 privacy, same rule as
+// the launchpad's team claims).
+// ============================================================================
+entry claim_creator_allocation(cid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    require(status == ST_MIGRATED, "notmig")
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let creator_opt: optional<Address> = s.load(coin_key(cid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+    require(caller == creator, "notauth")
+
+    let rem: u64 = creator_remaining(cid)
+    require(rem >= 1, "none")
+
+    let paid: u64 = s.load(coin_key(cid, F_CREATOR_PAID)).unwrap_or(0)
+    s.store(coin_key(cid, F_CREATOR_PAID), checked_add(paid, rem))
+
+    let asset_opt: optional<Hash> = s.load(coin_key(cid, F_ASSET))
+    require(asset_opt.is_some(), "noasset")
+    let asset: Hash = asset_opt.expect("guarded")
+    let ok: bool = transfer(caller, rem, asset)
+    require(ok, "txfail")
+
+    emit_event(EV_CREATOR_CLAIMED, [cid.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// 20. UPDATE COIN INFO — the creator's editable card (D11 lineage).
+// ============================================================================
+// Description, website, logo and socials may change at any time; name
+// and symbol are immutable (they are the asset's on-chain identity).
+// Creator-only.
+// ============================================================================
+entry update_coin_info(cid: u64, description: string, website: string, logo: string, twitter: string, telegram: string, discord: string) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let creator_opt: optional<Address> = s.load(coin_key(cid, F_CREATOR))
+    require(creator_opt.is_some(), "nocr")
+    let creator: Address = creator_opt.expect("guarded")
+    require(caller == creator, "notauth")
+
+    require(description.len() <= MAX_DESC_LEN, "baddesc")
+    require(website.len() <= MAX_URL_LEN, "badurl")
+    require(logo.len() <= MAX_URL_LEN, "badlogo")
+    require(twitter.len() <= MAX_URL_LEN, "badtw")
+    require(telegram.len() <= MAX_URL_LEN, "badtg")
+    require(discord.len() <= MAX_URL_LEN, "baddc")
+
+    s.store(coin_key(cid, F_DESC), description)
+    s.store(coin_key(cid, F_WEBSITE), website)
+    s.store(coin_key(cid, F_LOGO), logo)
+    s.store(coin_key(cid, F_TWITTER), twitter)
+    s.store(coin_key(cid, F_TELEGRAM), telegram)
+    s.store(coin_key(cid, F_DISCORD), discord)
+
+    emit_event(EV_COIN_INFO_UPDATED, [cid.to_string(10u32)])
+    return 0
+}
+
+// ============================================================================
+// ADMIN — parameter setters (all range-checked, the fee pair
+// cross-checked) + fee withdrawal.
+// ============================================================================
+
+// 21. Submission fee (one-time, per launch). Cap: 100 XEL.
+entry set_submission_fee(fee: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(fee <= MAX_SUBMISSION_FEE, "toohigh")
+    s.store(SUBMISSION_FEE_KEY, fee)
+    emit_event(EV_PARAM_SET, ["submission_fee", fee.to_string(10u32)])
+    return 0
+}
+
+// 22. Asset budget (the documented floor covering the chain's
+//     asset-creation cost). Cap: 100 XEL.
+entry set_asset_budget(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount <= MAX_ASSET_BUDGET, "toohigh")
+    s.store(ASSET_BUDGET_KEY, amount)
+    emit_event(EV_PARAM_SET, ["asset_budget", amount.to_string(10u32)])
+    return 0
+}
+
+// 23. Curve fee in basis points, on buys AND sells while LIVE. Hard cap:
+//     10%. Cross-checked: can never drop below the graduated fee —
+//     graduation must always be the cheaper regime.
+entry set_curve_fee(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps <= MAX_FEE_BPS, "toohigh")
+    let graduated_fee: u64 = s.load(GRADUATED_FEE_KEY).unwrap_or(DEFAULT_GRADUATED_FEE_BPS)
+    require(bps >= graduated_fee, "croserr")
+    s.store(CURVE_FEE_KEY, bps)
+    emit_event(EV_PARAM_SET, ["curve_fee_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 24. Graduated fee: what a GRADUATED coin pays on every curve trade
+//     between graduation and migration. Hard cap: 10%. Cross-checked:
+//     <= curve_fee_bps, so the graduation discount can never invert.
+entry set_graduated_fee(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps <= MAX_FEE_BPS, "toohigh")
+    let curve_fee: u64 = s.load(CURVE_FEE_KEY).unwrap_or(DEFAULT_CURVE_FEE_BPS)
+    require(bps <= curve_fee, "croserr")
+    s.store(GRADUATED_FEE_KEY, bps)
+    emit_event(EV_PARAM_SET, ["graduated_fee_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 25. Migration fee: taken ONCE per coin, carved out of the POOL SEED at
+//     migrate time (C4 — never out of the live curve). Hard cap: 5%.
+entry set_migration_fee(bps: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(bps <= MAX_MIGRATION_FEE_BPS, "toohigh")
+    s.store(MIGRATION_FEE_KEY, bps)
+    emit_event(EV_PARAM_SET, ["migration_fee_bps", bps.to_string(10u32)])
+    return 0
+}
+
+// 26. Graduation depth floor (gdx): the REAL reserves a coin must show
+//     before it can graduate. Bounds: [1 XEL, 100 000 XEL]. Snapshotted
+//     per coin at launch (C8) — a change affects future launches only.
+entry set_graduation_depth(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount >= MIN_GRADUATION_DEPTH, "toolow")
+    require(amount <= MAX_GRADUATION_DEPTH, "toohigh")
+    s.store(GRADUATION_DEPTH_KEY, amount)
+    emit_event(EV_PARAM_SET, ["graduation_depth", amount.to_string(10u32)])
+    return 0
+}
+
+// 27. Virtual XEL reserve (vxs): the simulated depth that prices a coin
+//     from its first buy (C1). Bounds: [1 XEL, 10 000 XEL]. Snapshotted
+//     per coin at launch (C8).
+entry set_virtual_xel(amount: u64) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(amount >= MIN_VIRTUAL_XEL, "toolow")
+    require(amount <= MAX_VIRTUAL_XEL, "toohigh")
+    s.store(VIRTUAL_XEL_KEY, amount)
+    emit_event(EV_PARAM_SET, ["virtual_xel", amount.to_string(10u32)])
+    return 0
+}
+
+// 28. Pin the LaunchDEX this factory migrates into. Possible only while
+//     no coin has ever migrated; after the first migration the pin is
+//     FROZEN forever (the pools live inside that DEX — D19 lineage).
+entry set_dex_address(addr: Hash) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    require(s.load(MIGRATED_COUNT_KEY).unwrap_or(0) == 0, "frozen")
+    s.store(DEX_ADDRESS_KEY, addr)
+    emit_event(EV_DEX_ADDRESS, [addr.to_hex()])
+    return 0
+}
+
+// 29. Transfer the admin role (single-step — use a cold wallet).
+entry set_admin(new_admin: Address) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(ADMIN_KEY, new_admin)
+    emit_event(EV_ADMIN_SET, [new_admin.to_string()])
+    return 0
+}
+
+// 30. Circuit breaker: pauses NEW launches and NEW buys only (C7).
+//     Sells, creator claims and migration are never pausable — exits
+//     and the move to the DEX cannot be frozen.
+entry set_paused(flag: bool) -> u64 {
+    only_admin()
+    let s: Storage = Storage::new()
+    s.store(PAUSED_KEY, flag)
+    if flag {
+        emit_event(EV_PAUSED, ["admin"])
+    } else {
+        emit_event(EV_UNPAUSED, ["admin"])
+    }
+    return 0
+}
+
+// 31. WITHDRAW FEES — the protocol's entire revenue stream.
+// ============================================================================
+// Admin-only. Capped twice: by the accrued pending_fees AND by the
+// contract's uncommitted balance (balance - live curve reserves — IC1):
+// the admin can never make the factory insolvent.
+// ============================================================================
+entry withdraw_fees(amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+
+    let caller_opt: optional<Address> = get_caller()
+    require(caller_opt.is_some(), "walletonly")
+    let caller: Address = caller_opt.expect("guarded")
+
+    let admin_opt: optional<Address> = s.load(ADMIN_KEY)
+    require(admin_opt.is_some(), "noadmin")
+    let admin: Address = admin_opt.expect("guarded")
+    require(caller == admin, "notauth")
+
+    require(amount > 0, "badamt")
+    let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
+    require(amount <= pending, "badamt")
+
+    let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    let balance: u64 = get_balance_for_asset(xel).unwrap_or(0)
+    // IC1's exact-sum model: every live coin's xr sums to tcx — the
+    // committed side of the solvency check, no loop needed (the same
+    // discipline as the launchpad's I2).
+    let committed: u128 = s.load(TOTAL_CURVE_XEL_KEY).unwrap_or(0) as u128
+    require((amount as u128) + committed <= (balance as u128), "notavail")
+
+    s.store(PENDING_FEES_KEY, pending - amount)
+    let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+    s.store(FEES_LIFETIME_KEY, checked_add(lifetime, amount))
+
+    let ok: bool = transfer(caller, amount, xel)
+    require(ok, "txfail")
+
+    emit_event(EV_FEES_WITHDRAWN, [amount.to_string(10u32)])
+    return 0
+}
+// ============================================================================
+// VIEWS (pub fn — read-only, no storage writes; the frontend's API)
+// ============================================================================
+
+// 32. Lifecycle snapshot: (creator_string, status, created_topo,
+//     total_supply, migrated). status is the code (see get_status_label);
+//     the graduated flag rides get_coin_tokenomics' 5th field.
+pub fn get_coin(cid: u64) -> (string, u64, u64, u64, bool) {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+
+    let creator: string = "unknown"
+    let creator_opt: optional<Address> = s.load(coin_key(cid, F_CREATOR))
+    if creator_opt.is_some() {
+        let c: Address = creator_opt.expect("guarded")
+        creator = c.to_string()
+    }
+
+    return (
+        creator,
+        s.load(coin_key(cid, F_STATUS)).unwrap_or(0),
+        s.load(coin_key(cid, F_CREATED)).unwrap_or(0),
+        s.load(coin_key(cid, F_SUPPLY)).unwrap_or(0),
+        s.load(coin_key(cid, F_MIGRATED)).unwrap_or(false)
+    )
+}
+
+// 33. The whole display card in one call: (name, symbol, description,
+//     website, logo, twitter, telegram, discord).
+pub fn get_coin_meta(cid: u64) -> (string, string, string, string, string, string, string, string) {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    return (
+        s.load(coin_key(cid, F_NAME)).unwrap_or(""),
+        s.load(coin_key(cid, F_SYMBOL)).unwrap_or(""),
+        s.load(coin_key(cid, F_DESC)).unwrap_or(""),
+        s.load(coin_key(cid, F_WEBSITE)).unwrap_or(""),
+        s.load(coin_key(cid, F_LOGO)).unwrap_or(""),
+        s.load(coin_key(cid, F_TWITTER)).unwrap_or(""),
+        s.load(coin_key(cid, F_TELEGRAM)).unwrap_or(""),
+        s.load(coin_key(cid, F_DISCORD)).unwrap_or("")
+    )
+}
+
+// 34. Tokenomics: (total_supply, creator_bps, creator_alloc,
+//     creator_paid, creator_remaining). All atomic units. total_supply
+//     is the asset's FIXED max supply (the on-chain proof of the cap);
+//     the creator allocation is reserved OFF the curve and claimable
+//     only after migration (C5).
+pub fn get_coin_tokenomics(cid: u64) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let total_supply: u64 = s.load(coin_key(cid, F_SUPPLY)).unwrap_or(0)
+    let creator_bps: u64 = s.load(coin_key(cid, F_CREATOR_BPS)).unwrap_or(0)
+    return (
+        total_supply,
+        creator_bps,
+        creator_alloc_of(total_supply, creator_bps),
+        s.load(coin_key(cid, F_CREATOR_PAID)).unwrap_or(0),
+        creator_remaining(cid)
+    )
+}
+
+// 35. The curve's live state: (real_xel, real_inventory, y0, vx, gdx).
+//     All five are the inputs of every formula — the frontend computes
+//     spot price, market cap, graduation progress and slippage quotes
+//     from this view alone (the SDK mirrors the math).
+pub fn get_curve_info(cid: u64) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    return (
+        s.load(coin_key(cid, F_XR)).unwrap_or(0),
+        s.load(coin_key(cid, F_YR)).unwrap_or(0),
+        s.load(coin_key(cid, F_Y0)).unwrap_or(0),
+        s.load(coin_key(cid, F_VX)).unwrap_or(0),
+        s.load(coin_key(cid, F_GX)).unwrap_or(0)
+    )
+}
+
+// 36. Spot price on the virtual curve: XEL per 1 whole token, scaled by
+//     1e8 — (xr+vx) * 1e8 / (yr+y0), saturating at u64 max. Zero when
+//     the curve is closed (migrated — the price lives on the DEX then).
+pub fn get_current_price(cid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
+    let vx: u64 = s.load(coin_key(cid, F_VX)).unwrap_or(0)
+    if yr == 0 && y0 == 0 {
+        return 0
+    }
+    let x_total: u128 = (xr as u128) + (vx as u128)
+    let y_total: u128 = (yr as u128) + (y0 as u128)
+    let wide: u128 = x_total * (PRICE_SCALE as u128) / y_total
+    if wide > U64_MAX_128 {
+        return U64_MAX
+    }
+    return wide as u64
+}
+
+// 37. Buy quote: tokens out for an attached XEL amount (the SAME helper
+//     the trade uses — a quote can never disagree with its trade).
+//     Ignores the whale guard; the trade enforces it ("curverr").
+pub fn get_buy_quote(cid: u64, xel_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
+    let bps: u64 = current_fee_bps(graduated)
+    let fee: u64 = fee_take(xel_amount, bps)
+    let net: u64 = xel_amount - fee
+    return buy_tokens_out(
+        s.load(coin_key(cid, F_XR)).unwrap_or(0),
+        s.load(coin_key(cid, F_YR)).unwrap_or(0),
+        s.load(coin_key(cid, F_Y0)).unwrap_or(0),
+        s.load(coin_key(cid, F_VX)).unwrap_or(0),
+        net
+    )
+}
+
+// 38. Sell quote: XEL out (post-fee) for a token amount (the SAME
+//     helpers the trade uses).
+pub fn get_sell_quote(cid: u64, token_amount: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
+    let bps: u64 = current_fee_bps(graduated)
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
+    let vx: u64 = s.load(coin_key(cid, F_VX)).unwrap_or(0)
+    let gross: u64 = sell_xel_out(xr, yr, y0, vx, token_amount)
+    let fee: u64 = fee_take(gross, bps)
+    return gross - fee
+}
+
+// 39. Market cap (FDV convention, the pump.fun standard): spot price x
+//     total supply — (xr+vx) * ts / (yr+y0), saturating at u64 max.
+//     Zero when the curve is closed (the cap lives on the DEX then).
+pub fn get_market_cap(cid: u64) -> u64 {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
+    let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
+    let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
+    let vx: u64 = s.load(coin_key(cid, F_VX)).unwrap_or(0)
+    let ts: u64 = s.load(coin_key(cid, F_SUPPLY)).unwrap_or(0)
+    if yr == 0 && y0 == 0 {
+        return 0
+    }
+    let x_total: u128 = (xr as u128) + (vx as u128)
+    let y_total: u128 = (yr as u128) + (y0 as u128)
+    let wide: u128 = x_total * (ts as u128) / y_total
+    if wide > U64_MAX_128 {
+        return U64_MAX
+    }
+    return wide as u64
+}
+
+// 40. Total number of coins ever launched.
+pub fn get_total_coins() -> u64 {
+    return Storage::new().load(COUNT_KEY).unwrap_or(0)
+}
+
+// 41. COUNT of coins with a given status code (listing helper — pair
+//     with get_coin_by_rank; static loop bound, R8-clean).
+pub fn get_coins_by_status(status: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let found: u64 = 0
+    for i: u64 = 0; i < MAX_COINS; i += 1 {
+        if i < count {
+            if s.load(coin_key(i, F_STATUS)).unwrap_or(0) == status {
+                found += 1
+            }
+        }
+    }
+    return found
+}
+
+// 42. Id of the rank-th (0-based, oldest first) coin with a given
+//     status. Returns coin_count (an invalid id) when rank is out of
+//     range — the documented sentinel for "no such coin".
+pub fn get_coin_by_rank(status: u64, rank: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let seen: u64 = 0
+    for i: u64 = 0; i < MAX_COINS; i += 1 {
+        if i < count {
+            if s.load(coin_key(i, F_STATUS)).unwrap_or(0) == status {
+                if seen == rank {
+                    return i
+                }
+                seen += 1
+            }
+        }
+    }
+    return count
+}
+
+// 43. Id of the rank-th LATEST coin (any status; rank 0 = newest).
+//     Sentinel: coin_count when out of range.
+pub fn get_latest_coin(rank: u64) -> u64 {
+    let count: u64 = Storage::new().load(COUNT_KEY).unwrap_or(0)
+    if rank < count {
+        return count - 1 - rank
+    }
+    return count
+}
+
+// 44. The reverse bridge: coin id of an asset hash (the DEX enumerates
+//     pools by ASSET; this maps them back to the factory's coin pages —
+//     written once at launch). Sentinel: coin_count when unknown.
+pub fn get_coin_by_asset(asset: Hash) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let cid_opt: optional<u64> = s.load(ASSET_LOOKUP_PREFIX + asset.to_hex())
+    if cid_opt.is_some() {
+        let cid: u64 = cid_opt.expect("guarded")
+        if cid < count {
+            return cid
+        }
+    }
+    return count
+}
+
+// 45. Total number of coins ever migrated (the "graduated shelf" bound).
+pub fn get_migrated_count() -> u64 {
+    return Storage::new().load(MIGRATED_COUNT_KEY).unwrap_or(0)
+}
+
+// 46. Id of the rank-th migrated coin (migration order). Sentinel:
+//     coin_count when out of range.
+pub fn get_migrated_by_rank(rank: u64) -> u64 {
+    let s: Storage = Storage::new()
+    let count: u64 = s.load(COUNT_KEY).unwrap_or(0)
+    let migrated: u64 = s.load(MIGRATED_COUNT_KEY).unwrap_or(0)
+    if rank < migrated {
+        let cid_opt: optional<u64> = s.load(MIGRATED_INDEX_PREFIX + rank.to_string(10u32))
+        if cid_opt.is_some() {
+            let cid: u64 = cid_opt.expect("guarded")
+            if cid < count {
+                return cid
+            }
+        }
+    }
+    return count
+}
+
+// 47. Trading scoreboard: (buy_volume, sell_volume, trades,
+//     last_trade_topo, total_volume). XEL side, fee-included on buys,
+//     pre-fee gross on sells (the D12/X6 conventions).
+pub fn get_trading_stats(cid: u64) -> (u64, u64, u64, u64, u64) {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    return (
+        s.load(coin_key(cid, F_BUY_VOL)).unwrap_or(0),
+        s.load(coin_key(cid, F_SELL_VOL)).unwrap_or(0),
+        s.load(coin_key(cid, F_TRADES)).unwrap_or(0),
+        s.load(coin_key(cid, F_LAST_TRADE)).unwrap_or(0),
+        s.load(coin_key(cid, F_VOLUME)).unwrap_or(0)
+    )
+}
+
+// 48. Config snapshot: (submission_fee, asset_budget, curve_fee_bps,
+//     graduated_fee_bps, migration_fee_bps, graduation_depth,
+//     virtual_xel, paused, dex_pinned). The last two: the circuit
+//     breaker's state and whether the DEX pin is frozen (a coin has
+//     migrated — set_dex_address refuses forever after).
+pub fn get_config() -> (u64, u64, u64, u64, u64, u64, u64, bool, bool) {
+    let s: Storage = Storage::new()
+    return (
+        s.load(SUBMISSION_FEE_KEY).unwrap_or(DEFAULT_SUBMISSION_FEE),
+        s.load(ASSET_BUDGET_KEY).unwrap_or(DEFAULT_ASSET_BUDGET),
+        s.load(CURVE_FEE_KEY).unwrap_or(DEFAULT_CURVE_FEE_BPS),
+        s.load(GRADUATED_FEE_KEY).unwrap_or(DEFAULT_GRADUATED_FEE_BPS),
+        s.load(MIGRATION_FEE_KEY).unwrap_or(DEFAULT_MIGRATION_FEE_BPS),
+        s.load(GRADUATION_DEPTH_KEY).unwrap_or(DEFAULT_GRADUATION_DEPTH),
+        s.load(VIRTUAL_XEL_KEY).unwrap_or(DEFAULT_VIRTUAL_XEL),
+        s.load(PAUSED_KEY).unwrap_or(false),
+        s.load(MIGRATED_COUNT_KEY).unwrap_or(0) > 0
+    )
+}
+
+// 49. Human status label of a coin (frontend helper): "live",
+//     "graduated" (awaiting the permissionless migrate) or "migrated"
+//     (the pool owns the market; the factory keeps the coin's home).
+pub fn get_status_label(cid: u64) -> string {
+    let s: Storage = Storage::new()
+    require_coin(cid)
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    if status == ST_GRADUATED {
+        return "graduated"
+    }
+    if status == ST_MIGRATED {
+        return "migrated"
+    }
+    return "live"
+}
+
+// 50. Contract version (house style).
+pub fn get_version() -> string {
+    return VERSION
+}

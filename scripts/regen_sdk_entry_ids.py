@@ -32,6 +32,11 @@ TARGETS = [
         "dict": "LAUNCHDEX_ENTRY_IDS",
         "alt": "LAUNCHDEX_ENTRY_IDS_ALT",
     },
+    {
+        "src": REPO / "contracts" / "community" / "CommunityLaunch.slx",
+        "dict": "COMMUNITY_ENTRY_IDS",
+        "alt": "COMMUNITY_ENTRY_IDS_ALT",
+    },
 ]
 
 DECL_RE = re.compile(r"^(?:entry|pub fn|fn|hook) (\w+)", re.M)

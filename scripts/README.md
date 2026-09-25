@@ -73,3 +73,27 @@ about what a function (and therefore a chunk ID) is.
 `tests/test_ci_sanity.py` is the permanent placeholder that keeps the pytest
 job meaningful while the functional suite grows: it asserts the active
 contract exists, is more than 500 lines, and documents its CHUNK TABLE.
+
+## verify_pass3_math.py — the v18.4 independent math re-derivation (one-shot)
+
+Re-derives CommunityLaunch's virtual-reserve curve math from the SPEC
+(docs/COMMUNITY_LAUNCH.md §3) WITHOUT importing the SDK or the test
+helpers, then checks it against the contract source text and
+brute-forces it: 200 random (vx, y0, gdx) regimes x 250 random trades
+asserting k never decreases, real reserves stay non-negative, the
+whale guard bounds buys and the worst-case sell is exactly covered
+(IC3/IC4); plus the graduation economics at the defaults (launch FDV
+50 XEL, graduation at ~2/3 sold / ~3x FDV, pool opens >= spot) and the
+2-XEL unit economics. Run: `python3 scripts/verify_pass3_math.py`.
+
+## verify_pass4_parity.py — the v18.4 cross-contract parity check (one-shot)
+
+Machine-checks the cross-contract protocol end to end: the pinned
+chunks (create_pool=6, set_pool_buys_paused=7, create_pool_open=33)
+against the DEX's real declaration order on BOTH callers, the call
+signature and deposit protocol (what the factory sends IS the seed,
+fee carved before the deposits are built), the v1.4 return-value
+convention (both endpoints return 0, both callers require 0), and the
+three-way ABI agreement (contract chunk tables <-> SDK dicts <->
+abi/*.json, param names included). Run:
+`python3 scripts/verify_pass4_parity.py`.

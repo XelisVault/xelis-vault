@@ -359,7 +359,81 @@ def test_fees_are_extracted_not_pooled_x3():
 
 
 def test_version_string():
-    assert 'const VERSION: string = "LaunchDEX v1.3.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.4.0"' in DEX_CONTRACT.read_text()
+
+
+# ===========================================================================
+# v1.4 — THE COMMUNITY TRACK + THE SECOND-MIGRATION FIX (X13)
+# ===========================================================================
+
+def test_v14_the_second_migration_fix():
+    """THE FIX: create_pool used to return the pool's INDEX (0 for the
+    first pool, 1 for the second, ...) while the pinned launchpad's
+    migrate_to_dex requires a zero cross-call result ("poolerr") — every
+    migration after the FIRST would have reverted on the gen-1 pair.
+    v1.4: cross-called chunks return 0 on success."""
+    src = DEX_CONTRACT.read_text()
+    cp = re.search(r"pub fn create_pool\(.*?\n\}", src, re.S).group(0)
+    returns = re.findall(r"^\s*return (\w+)", cp, re.M)
+    assert returns == ["0"], f"create_pool must return 0, got {returns}"
+    # and the launchpad's require still treats non-zero as failure
+    lp_src = LAUNCHPAD_CONTRACT.read_text()
+    assert 'require(pool_res == 0, "poolerr")' in lp_src
+
+
+def test_v14_create_pool_open_is_permissionless_x13():
+    """X13: the open seeding endpoint — identical economics to
+    create_pool (X11 seed shares, IX5 floors, IX4 one pool per asset)
+    minus the launchpad gate; ANY caller carrying the seed as deposits;
+    emergency-paused like every creation; freezes the lpx pin at the
+    first pool (the moderation key); returns 0."""
+    src = DEX_CONTRACT.read_text()
+    m = re.search(r"pub fn create_pool_open\(.*?\n\}", src, re.S)
+    assert m, "create_pool_open not found"
+    body = m.group(0)
+    assert "require(caller == lpx" not in body    # NO gate — X13
+    assert '"paused"' in body                     # emergency blocks it
+    assert '"exists"' in body                     # one pool per asset (IX4)
+    assert '"full"' in body                       # MAX_POOLS capacity
+    assert '"seedx"' in body and '"seedt"' in body   # seed floors
+    assert 'require(xel_seed >= MIN_LP_ADD_XEL, "seedlp")' in body  # X11/IX9
+    # X11 seed shares: tl = pl = xel_seed at birth, fees-only (no w)
+    assert 's.store(pool_key(asset, F_LP_TOTAL), xel_seed)' in body
+    assert 's.store(pool_key(asset, F_LP_LOCKED), xel_seed)' in body
+    assert 's.store(seed_lkey + LPF_XEL, xel_seed)' in body
+    assert 's.store(seed_lkey + LPF_W' not in body
+    # X4: the first pool freezes the lpx pin — whichever path created it
+    assert 's.store(LAUNCHPAD_PINNED_KEY, true)' in body
+    # the v1.4 cross-call convention
+    returns = re.findall(r"^\s*return (\w+)", body, re.M)
+    assert returns == ["0"]
+    # documented as chunk 33 in the header table, and CommunityLaunch
+    # pins it (asserted against the real order by the community tests)
+    assert "33  create_pool_open" in src
+
+
+def test_v14_open_seeding_simulation():
+    """The DexSim open endpoint: anyone seeds, the X11 floor is born
+    with the pool, and the first pool freezes the pin."""
+    dex = DexSim()
+    a = "cd" * 32
+    # no set_launchpad at all — the open path needs NO pin
+    dex.create_pool_open("stranger", a, 100 * XEL, 10**9)
+    p = dex.pools[a]
+    assert p["x"] == 100 * XEL and p["pl"] == 100 * XEL
+    assert dex.lp[(a, dex.admin)]["x"] == 100 * XEL   # the protocol position
+    assert dex.lp[(a, dex.admin)]["w"] == 0            # fees-only, forever
+    assert dex.pinned                                    # X4 froze at #0
+    dex.check_invariants()
+    # one pool per asset, whichever path tried first
+    with pytest.raises(AssertionError, match="exists"):
+        dex.create_pool_open("stranger", a, 50 * XEL, 10**9)
+    # emergency pause blocks creations — but exits never (IX6 family)
+    dex.emergency = True
+    with pytest.raises(AssertionError):
+        dex.create_pool_open("stranger", "ef" * 32, 50 * XEL, 10**9)
+    dex.emergency = False
+    dex.check_invariants()
 
 
 # ===========================================================================

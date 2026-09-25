@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """AUDIT 2 (v4) — mechanical security pass over VaultLaunch v4 +
-LaunchDEX v1: guarded subtractions, overflow-guarded accumulators,
-access control on every entry, transfers as last interactions, and the
-cross-call ordering (state first, external call last).
-
-Heuristic by design — a finding is either fixed or explicitly justified
-below; the machine-checked guarantees live in the fuzz/invariant suite
-(tests/test_launchpad_reference.py)."""
+LaunchDEX v1 + CommunityLaunch v1: guarded subtractions, overflow-guarded
+accumulators, access control on every entry, transfers as last
+interactions, and the cross-call ordering (state first, external call
+last)."""
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FILES = [ROOT / "contracts" / "launchpad" / "VaultLaunch.slx",
-         ROOT / "contracts" / "dex" / "LaunchDEX.slx"]
+         ROOT / "contracts" / "dex" / "LaunchDEX.slx",
+         ROOT / "contracts" / "community" / "CommunityLaunch.slx"]
 
 # reviewed security decisions, not lint bypasses (mirrors lint_silex.py):
 PUBLIC_BY_DESIGN = {
@@ -35,6 +33,17 @@ PUBLIC_BY_DESIGN = {
     ),
     ("VaultLaunch", "finalize_validation"): "permissionless deadline executor — outcome fully determined by public tallies",
     ("VaultLaunch", "migrate"): "permissionless migration executor — no destination/amount/caller choice, pinned DEX only",
+    ("CommunityLaunch", "migrate"): (
+        "permissionless community migration executor (C6): the outcome is "
+        "fully determined by the coin's public state — the seed amounts "
+        "are the coin's OWN curve reserves (the migration fee is carved "
+        "from them, accounted in pending_fees), the destination is the "
+        "PINNED dex (set_dex_address, frozen at the first migration), the "
+        "amounts are the whole reserves/inventory (no caller choice "
+        "anywhere) and the pool is created by the DEX's OPEN seeding "
+        "endpoint, which mints the seed's LP parts to the DEX's admin "
+        "with NO withdrawable balance (X11/IX9 — the anti-rug floor)"
+    ),
     ("VaultLaunch", "sync_trust_to_dex"): "permissionless keeper — mirrors the public trust status to the pool's buys-pause",
     ("LaunchDEX", "swap_xel_for_token"): "payable-style — bounded by the caller's OWN XEL deposit",
     ("LaunchDEX", "swap_token_for_xel"): "payable-style — bounded by the caller's OWN token deposit (whole-deposit)",
@@ -130,6 +139,9 @@ for path in FILES:
                  # team allocation: team_bps <= 2000 (required in propose)
                  # => team_alloc_of(ts, tb) <= ts/5 < ts
                  (b == "team_alloc_of" and "require(team_bps <= MAX_TEAM_BPS" in ctx) or
+                 # creator allocation: team_bps <= 500 (required in launch_coin)
+                 # => creator_alloc_of(ts, tb) <= ts/20 < ts
+                 (b == "creator_alloc_of" and "require(team_bps <= MAX_CREATOR_BPS" in ctx) or
                  # DEX swap floors: require(wide < (y as u128)) with
                  # out = wide as u64, checked right above the store
                  (b == "out" and re.search(r"require\(wide < \(" + a + r" as u128\)", ctx)) or

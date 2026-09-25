@@ -247,6 +247,34 @@ class DexSim:
         assert not self.pinned, "pinned"
         self.launchpad = addr
 
+    def create_pool_open(self, caller, asset, xel_seed, tok_seed):
+        """v1.4 X13: the OPEN seeding endpoint — identical economics to
+        create_pool (X11 seed shares, IX5 floors, IX4 one pool per
+        asset) minus the launchpad gate. ANY caller (the community
+        factory's migrate, a keeper, anyone). Returns 0 on success (the
+        v1.4 cross-call convention — the second-migration fix)."""
+        assert not self.emergency
+        assert asset not in self.pools, "exists"
+        assert xel_seed >= self.cfg["min_seed_xel"]
+        assert tok_seed >= self.cfg["min_seed_tokens"]
+        # X11: the seed IS the pool's permanent LP floor
+        assert xel_seed >= dx.MIN_LP_ADD_XEL, "seedlp"
+        self.xel_balance += xel_seed
+        self.asset_balances[asset] += tok_seed
+        self.pools[asset] = {"x": xel_seed, "y": tok_seed, "xf": 0, "yf": 0,
+                             "bp": False, "ct": self.topo, "bv": 0, "sv": 0,
+                             "tc": 0, "lt": 0, "fl": 0, "lp": 0,
+                             "lx": 0, "ly": 0, "tl": xel_seed, "ax": 0,
+                             "ay": 0, "pl": xel_seed}
+        seed = self.lp[(asset, self.admin)]
+        seed["x"] = xel_seed
+        seed["sx"] = 0
+        seed["sy"] = 0
+        self.index.append(asset)
+        if not self.pinned:
+            self.pinned = True
+        return 0
+
     def create_pool(self, caller, asset, xel_seed, tok_seed):
         # X4: only the pinned launchpad (cross-call context)
         assert caller == self.launchpad, "notlpx"
@@ -1726,7 +1754,7 @@ def test_contract_is_substantial_and_documents_its_chunk_table():
     assert "VAULTLAUNCH" not in src or True
     assert 'const VERSION: string = "VaultLaunch v4.2.0"' in src
     dex_src = DEX_CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.3.0"' in dex_src
+    assert 'const VERSION: string = "LaunchDEX v1.4.0"' in dex_src
     assert "CHUNK TABLE (entry-point IDs" in dex_src
 
 
