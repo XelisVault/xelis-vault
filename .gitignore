@@ -27,6 +27,9 @@ note*.json
 notes/
 *.note.json
 
+# Generated compile artifacts / audit scratch (not source, not ABI)
+out/
+
 # Editors / OS
 .idea/
 .vscode/

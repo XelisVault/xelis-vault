@@ -47,6 +47,11 @@ MIN_LP_SHARE_BPS = 2_500
 MAX_LP_SHARE_BPS = 7_500
 MIN_LP_ADD_XEL = 100_000_000                  # hard LP-entry floor (1 XEL)
 ACC_SCALE = 100_000_000                       # accrual scale == floor
+# Hard seed caps. CommunityLaunch permits up to 10B whole tokens, so the
+# migration seed cap must cover the full factory supply range. The swap
+# cap is intentionally separate and remains the anti-whale bound.
+MAX_SEED_XEL = 1_000_000_000_000_000
+MAX_SEED_TOKENS = 1_000_000_000_000_000_000
 
 # ---------------------------------------------------------------------------
 # Swap math — the contract's exact integer formulas (u128-safe)

@@ -1,7 +1,7 @@
 # CommunityLaunch — Design Specification
 
 > contracts/community/CommunityLaunch.slx + contracts/dex/LaunchDEX.slx
-> (v1.4) · CommunityLaunch v1.0.0 · the permissionless community-coin
+> (v1.4.1) · CommunityLaunch v1.0.1 · the permissionless community-coin
 > factory — the "pump.fun track" of XelisVault
 
 CommunityLaunch is the casino next to VaultLaunch's serious shelf — and
@@ -119,8 +119,8 @@ contract header, machine-checked by `tests/test_community_reference.py`.
 **What the defaults buy** (vx = 100 XEL, y0 = 1B tokens): launch FDV =
 50 XEL; a 1 XEL buy moves the price ~1% (the virtual book absorbs it);
 graduation at 50 XEL real depth lands with ~2/3 of the supply sold at
-~3× the launch FDV; the pool opens at `xr/yr` ≥ the curve's spot
-price (see §4).
+~3× the launch FDV; the pool opens at `xr/yr` within one migration fee
+of the curve's spot price (see §4 — the honest, fee-aware reading).
 
 **The degenerate monster buy**: a single buy can legally drain the
 whole real inventory (`out == yr` exactly, ~100 XEL at launch). Such a
@@ -139,7 +139,18 @@ first — VaultLaunch's exact pattern):
 | condition | formula | meaning |
 |---|---|---|
 | depth | `xr >= gdx` (default 50 XEL, snapshotted per coin) | the community put REAL money in |
-| continuity | `xr * y0 >= yr * vx` (structural, hard-coded) | the pool will open at `xr/yr >= spot` — **no graduation dump by construction** |
+| continuity | `xr * y0 >= yr * vx` (structural, hard-coded) | the pool opens at `xr/yr` ≥ the curve's virtual ratio — **no graduation dump by construction** |
+
+The honest, fee-aware reading of the continuity claim: the migration
+fee (mgf, default 0.5%) is carved from the XEL side of the seed (C4),
+so the pool actually opens at `(xr − mgf·xr)/yr` — one fee haircut
+below `xr/yr`. Since `xr/yr` is bounded ABOVE the curve's spot (see
+below), the open is at worst `spot × (1 − mgf)` ≈ 99.5% of the spot at
+the default — a rounding-level dip, not a dump, and it is *left of* the
+full fee because the continuity invariant pushes `xr/yr` above spot:
+with `xr/yr ≥ vx/y0` and `spot` the weighted mean of `xr/yr` and
+`vx/y0`, `xr/yr ≥ spot ≥ vx/y0`. The pool can never open materially
+below the price the market just paid for the coin.
 
 Along the constant-k trajectory the continuity condition reduces to
 `xr >= (√2−1)·vx ≈ 41.4 XEL` at the default vx — independent of how
@@ -177,6 +188,27 @@ would shrink k by up to mgf and make the last sliver of a full
 sell-back unpayable — a trap this design refuses. The fee therefore
 only reduces the pool seed, and the pool opens at the real ratio the
 market actually paid for.
+
+Migration writes the terminal state **inside the same atomic move**:
+`st = ST_MIGRATED (2)` and `migrated = true` are stored BEFORE the
+cross-contract call (state first, call last — no store can be lost to
+a revert). This matters for the views (§8): a migrated coin's
+`get_status_label` reads `migrated`, and the creator claim gates on it
+(C5). The pre-v1.0.1 build forgot the status write (the E2E showed `st`
+stuck at 1 after migration) — v1.0.1 fixes it, and `get_current_price`,
+`get_buy_quote`, `get_sell_quote` and `get_market_cap` all return **0**
+once migrated (the curve is closed; the price lives on the pool).
+
+The DEX pin (`set_dex_address`, admin, one-way, freezes at the first
+migration) also gained a v1.0.1 sanity check: the address must be a
+contract that is callable at the pinned chunk (`"baddex"` otherwise),
+so an empty hash or an EOA cannot be pinned by mistake. This is an
+operational guard, **not provenance**: the generation-1 signer
+semantics of this VM mean the factory's trust boundary — the admin
+choosing the DEX before any migration — is explicit in the deployment
+runbook, and the DEX side must be configured in the right order too
+(DEX.md v1.4.1: its `lpx` moderation pin must exist before the first
+open pool).
 
 After the migration: the curve is closed forever ("migrated"), the
 pool owns the market (its seed is protocol-locked forever — DEX.md
@@ -236,6 +268,17 @@ bridge** — maps DEX pools back to coin pages) · `get_migrated_count` +
 `get_config` · `get_status_label` (`live` / `graduated` / `migrated`)
 · `get_version`.
 
+**Migrated coins report zero on the curve views** (v1.0.1): when `st ==
+ST_MIGRATED`, `get_current_price`, `get_buy_quote`, `get_sell_quote`
+and `get_market_cap` return 0 — the curve is closed and those numbers
+would be stale at best, misleading at worst. Frontends must check
+`get_status_label` (or `get_coin`'s status field) first and switch to
+the pool's price (`get_pool_state` / `get_amount_out_*` on LaunchDEX).
+The SDK mirrors this: `CommunityReader.price()`, `buy_quote()`,
+`sell_quote()`, `market_cap()` return what the contract returns (0
+once migrated); the pure math helpers (`spot_price`, `market_cap`, …)
+take reserves only and are the LIVE-curve formulas by design.
+
 The SDK mirror is `sdk/xvault/xvault/community.py` (math + a
 `CommunityReader`); the ABI table is `abi/CommunityLaunch.abi.json`.
 
@@ -248,11 +291,27 @@ The SDK mirror is `sdk/xvault/xvault/community.py` (math + a
 | curve fee (`cfe`) | 1% | ≤ 10%, ≥ gfe |
 | graduated fee (`gfe`) | 0.5% | ≤ 10%, ≤ cfe |
 | migration fee (`mgf`) | 0.5% | ≤ 5%, carved from the seed |
-| graduation depth (`gdx`) | 50 XEL | [1 XEL, 100 000 XEL], snapshotted per coin |
-| virtual XEL (`vxs`) | 100 XEL | [1 XEL, 10 000 XEL], snapshotted per coin |
+| graduation depth (`gdx`) | 50 XEL | [1 XEL, 100 000 XEL], snapshotted per coin; **gdx ≤ vx/2 (cross-invariant)** |
+| virtual XEL (`vxs`) | 100 XEL | [1 XEL, 10 000 XEL], snapshotted per coin; **the same gdx ≤ vx/2** |
 | creator allocation | — | ≤ 5% (hard) |
-| total supply | — | [1M, 10B] whole tokens |
+| total supply | — | [1M, 10B] whole tokens (both ends enforced at launch) |
 | trade guards | 0.01 XEL dust | ≤ 100 000 XEL per buy |
+
+**The gdx ≤ vx/2 cross-invariant** (v1.0.1): `vx` is the curve's
+effective real-reserve ceiling as the real inventory drains, so a
+graduation floor above half the virtual reserve would let a coin
+graduate with no inventory left to migrate (a dead coin). The invariant
+is enforced at launch AND in both admin setters (`set_graduation_depth`,
+`set_virtual_xel`) — a parameter pair that violates it is unsettable.
+
+**Fee accounting** (v1.0.1): every collected fee — the 1 XEL
+submission, live/graduated curve cuts, and the migration fee — is
+added to BOTH the withdrawable `pfe` (pending) pot and the lifetime
+`fcl` counter at collection time. A withdrawal pays out of `pfe` only
+and never touches `fcl`: lifetime revenue is a monotonically growing
+scoreboard, not an accounting trick that inflates with payouts
+(`get_config` exposes both; the pre-v1.0.1 build incremented `fcl`
+at withdrawal instead — fixed).
 
 **The unit economics** (defaults): a launch costs the creator exactly
 `sub + asset_fee` ≈ 2 XEL out of pocket; the protocol nets ~1 XEL per
@@ -267,10 +326,14 @@ revenue stream; the track is designed to run at volume.
 Following UPGRADES.md's generation model — **contracts are never
 upgraded in place; a new version is a NEW deployment**:
 
-1. **Testnet rehearsal** (Phase 1, always): deploy CommunityLaunch +
-   a LaunchDEX v1.4 generation, cross-pin them, run the FULL lifecycle
-   (launch → buy → graduate → migrate → pool swaps → creator claim),
-   verify both pins froze.
+1. **Testnet rehearsal** (Phase 1, always): deploy CommunityLaunch
+   v1.0.1 + a LaunchDEX v1.4.1 generation, **configure the DEX's
+   `set_launchpad` first** (v1.4.1 `nolpx`: the moderation pin must
+   exist before any pool — see DEX.md), then pin the factory's
+   `set_dex_address` to the DEX, and run the FULL lifecycle (launch →
+   buy → graduate → migrate → pool swaps → creator claim), verifying
+   the migrated status flips to 2, the curve views close, and both
+   pins froze.
 2. **Mainnet cut** (Phase 2): deploy both, pin the factory's
    `set_dex_address` to the new DEX. The gen-1 pair (VaultLaunch
    `45baf014…` + LaunchDEX `bce37bde…`) keeps serving the project

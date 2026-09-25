@@ -1,6 +1,6 @@
 # LaunchDEX — Design Specification
 
-> contracts/dex/LaunchDEX.slx · v1.4.0 · the AMM for VaultLaunch-graduated
+> contracts/dex/LaunchDEX.slx · v1.4.1 · the AMM for VaultLaunch-graduated
 > tokens AND CommunityLaunch-graduated coins, with a PERMANENT FLOOR
 
 LaunchDEX is the migration target of VaultLaunch: one XEL-quote pool per
@@ -48,6 +48,24 @@ reverted. Cross-called chunks return 0 on success (the same
 convention entries follow on this daemon). Gen-1 deployments already
 live carry the old behaviour — cut a v1.4 generation and repin the
 launchpad BEFORE its second migration (UPGRADES.md §6).
+
+**v1.4.1 — the open-seeding read guards (audit fix).** Three
+append-only-in-contract-strength fixes to the open path:
+(1) **`nolpx`** — an open pool can no longer be the FIRST pool on a
+DEX whose `lpx` pin is still unset. The pin is one-way (X4) and
+freezes at the first pool, whichever path created it; a squatter
+seeding a pool before deployment finished would have frozen an empty
+pin and stranded the moderator for that generation. The deployment
+ordering is now enforced on-chain: **configure `set_launchpad` before
+any pool exists**, then the open path works for anyone (the caller gate
+is still genuinely absent — X13's permissionless design is unchanged).
+(2) **`sameass`** — both creation paths reject the native asset (the
+zero hash) as the token side, so an XEL-quote pool cannot be born with
+XEL as both reserves (a deposit-measurement trap). (3) **seed-cap
+coverage** — `MAX_SEED_TOKENS` was raised from 100M to 10B whole
+tokens so a CommunityLaunch coin at the top of its documented supply
+range (10B) can still migrate its full real inventory; the separate
+swap-token cap is unchanged and remains the anti-whale bound.
 
 **v1.3 — seed shares + free providers (X11/X12, founder risk review
 point 1).** `create_pool` mints LP parts equal to the XEL seed to the
@@ -115,7 +133,7 @@ minimal design: no oracle, no PSM, no external calls of any kind.
 | X10 | **LP fee share** (v1.2, D23) | providers earn their pro-rata share of every fee (default 50/50, dial hard-bounded [25%, 75%]); pull claims; only fees ever flow out of the pots |
 | X11 | **seed shares — the protocol LP position** (v1.3) | the seed mints LP parts to the admin at creation: the first external add mints its marginal depth (1 XEL on 4000 XEL = 1/4001, not 100%), and the protocol earns the provider share pro-rata on its position — fees-only, forever (no withdrawable balance is ever minted for the seed) |
 | X12 | **remove_liquidity — providers are free** (v1.3) | burn withdrawable parts for the exact floored pro-rata of BOTH reserves at the current ratio; min_out on both sides; fees crystallised before the burn; NO gate (works under any pause); the seed floor is unreachable ("locked" + "seederr" belt-and-braces) |
-| X13 | **open seeding for the community track** (v1.4) | create_pool_open is create_pool minus the launchpad gate: anyone may seed a pool by attaching both sides of the seed; identical economics (X11 seed shares, IX5 floors, one pool per asset, pause-gated like every creation); the lpx pin still gates the moderation hook (chunk 7) and still freezes at the first pool, whichever path created it |
+| X13 | **open seeding for the community track** (v1.4, hardened v1.4.1) | create_pool_open is create_pool minus the launchpad CALLER gate: anyone may seed a pool by attaching both sides of the seed; identical economics (X11 seed shares, IX5 floors, one pool per asset, pause-gated like every creation); v1.4.1 adds `nolpx` (the moderation pin must exist before the FIRST pool freezes it), `sameass` (the native asset can never be the token side) and full seed-cap coverage for the community supply range; the lpx pin still gates the moderation hook (chunk 7) and still freezes at the first pool, whichever path created it |
 
 ## 2. The math (constant product, integer-exact)
 
@@ -243,7 +261,7 @@ owned them at creation (UPGRADES.md, the runbook's Phase 0 checklist).
 | `set_paused(flag)` | admin | global EMERGENCY — gates buys, pool creation and liquidity adds ONLY; every exit (sells, claims, removes) stays open (IX6/X12); can never rug anything |
 | `withdraw_fees(asset, xel_amount, token_amount)` | admin | pays the ADMIN pots; double-capped (pending AND uncommitted balance — IX1/IX2); the provider pots are untouchable here |
 | `claim_lp_fees(asset)` (v1.2) | anyone (a provider) | pays the CALLER's own accrued fees on both sides, out of the provider pots only; belt-and-braces bounded (`"lperr"`); works under the emergency pause; **the admin uses it too — the seed position's earnings** |
-| `create_pool_open(asset)` (v1.4, chunk 33) | **ANYONE** (cross-call or direct) | the open seeding endpoint (X13): identical economics to create_pool minus the lpx gate — what the caller attached IS the seed; the deposits are the authorisation; emergency-pause gated like every creation; mints the X11 seed shares; freezes the lpx pin at the first pool; returns 0 (the v1.4 cross-call convention — the second-migration fix) |
+| `create_pool_open(asset)` (v1.4, chunk 33; hardened v1.4.1) | **ANYONE** (cross-call or direct) | the open seeding endpoint (X13): identical economics to create_pool minus the lpx CALLER gate — what the caller attached IS the seed; the deposits are the authorisation; v1.4.1 guards: `nolpx` (the moderation pin must be configured before any pool exists), `sameass` (XEL can never be the token side), seed caps covering the full community supply range; emergency-pause gated like every creation; mints the X11 seed shares; freezes the lpx pin at the first pool; returns 0 (the v1.4 cross-call convention — the second-migration fix) |
 
 ## 4. Views (the pool-era API)
 

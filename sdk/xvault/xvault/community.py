@@ -39,7 +39,7 @@ DEFAULTS = {
 
 # Bounds (must match the contract constants exactly)
 MAX_CREATOR_BPS = 500                       # 5% creator allocation cap
-MIN_COIN_SUPPLY = 10_000_000_000_000        # 1M whole tokens
+MIN_COIN_SUPPLY = 100_000_000_000_000       # 1M whole tokens
 MAX_COIN_SUPPLY = 1_000_000_000_000_000_000  # 10B whole tokens
 MIN_BUY_XEL = 1_000_000                     # 0.01 XEL dust floor
 MAX_TRADE_XEL = 10_000_000_000_000          # 100 000 XEL whale cap

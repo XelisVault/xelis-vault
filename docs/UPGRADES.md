@@ -69,15 +69,23 @@ generations still exist forever.
 **Phase 1 — testnet rehearsal (always, no exception)**
 
 5. Deploy the NEW LaunchDEX to testnet. Record its address.
-6. Deploy the NEW VaultLaunch to testnet. Record its address.
-7. Cross-pin them: `set_launchpad(<new launchpad>)` on the new DEX,
-   `set_dex_address(<new dex>)` on the new launchpad.
+6. **Set its launchpad pin FIRST** (`set_launchpad(<official moderation
+   wallet>)` before any pool exists — the v1.4.1 `nolpx` guard enforces
+   this ordering on-chain; see §6 step 3).
+7. Deploy the NEW VaultLaunch to testnet, then CommunityLaunch v1.0.1.
+   Record both addresses. Cross-pin them: `set_dex_address(<new dex>)`
+   on the new launchpad and `set_dex_address(<new dex>)` on the
+   factory (the `baddex` guard confirms the target is a callable
+   contract).
 8. Run the FULL lifecycle on testnet with the CLI: propose → validate
    (with the vote deposit paid and refunded) → bond → graduate → migrate
    → trade on the pool → add liquidity → **claim provider fees** → trust
-   flip → recovery. Every step checked against the views (`status`,
-   `project`, `dex pool`, `dex lp`).
-9. Verify both pins FROZE (a second `set_launchpad` / `set_dex_address`
+   flip → recovery. Then the community track: launch → buy to graduation
+   → migrate → creator claim → verify `get_status_label` reads
+   `migrated` and the curve views read 0 → trade on the community pool.
+   Every step checked against the views (`status`, `project`, `dex
+   pool`, `dex lp`, `coin`, `curve_info`).
+9. Verify all pins FROZE (a second `set_launchpad` / `set_dex_address`
    must refuse with `"pinned"` / `"frozen"`).
 10. Let it soak. Duration is a founder call; days, not minutes.
 
@@ -143,31 +151,46 @@ or a silent retarget of live value (pins are one-way doors).
 
 ## 6. The v18.4 cut — one new DEX generation for BOTH tracks, and the gen-1 repin
 
-The v1.4 generation (LaunchDEX v1.4 + CommunityLaunch v1.0) is cut per
-§3 above, with ONE addition made possible by the fact that the gen-1
-mainnet pair has created **no pool yet** (its pins froze at nothing):
+The v1.4.1 generation (LaunchDEX v1.4.1 + CommunityLaunch v1.0.1) is
+cut per §3 above, with ONE addition made possible by the fact that the
+gen-1 mainnet pair has created **no pool yet** (its pins froze at
+nothing):
 
-1. **Deploy LaunchDEX v1.4** (testnet rehearsal first, always). This
+1. **Deploy LaunchDEX v1.4.1** (testnet rehearsal first, always). This
    generation fixes the SECOND-MIGRATION BUG: gen-1's `create_pool`
    returns the pool's INDEX, and VaultLaunch's `migrate_to_dex` treats
    a non-zero cross-call result as failure ("poolerr") — only the
    FIRST project migration would ever have succeeded against a gen-1
    DEX. v1.4 chunks return 0 on success; the interface is unchanged
-   (VaultLaunch v4.2 calls it byte-identically).
-2. **Repin the gen-1 launchpad** (still possible while `dxa` is
+   (VaultLaunch v4.2 calls it byte-identically). v1.4.1 hardens the
+   open path: `nolpx` (the launchpad pin must exist BEFORE the first
+   pool — configure it in step 3 before ANY seeding), `sameass` (the
+   native asset can never be the token side), and the seed-token cap
+   now covers CommunityLaunch's full 10B-token supply range.
+2. **Deploy CommunityLaunch v1.0.1.** Same declaration order as v1.0;
+   the fixes are in the bodies: the migration now writes
+   `st = ST_MIGRATED`, the price/mcap/quote views close (return 0)
+   once a coin is migrated, `gdx ≤ vx/2` is a hard cross-invariant,
+   `set_dex_address` requires a callable contract (`baddex`), and the
+   lifetime-fee counter counts collections, not withdrawals.
+3. **Set the v1.4.1 DEX's launchpad pin FIRST** (v1.4.1 `nolpx`
+   requires the ordering): invoke `set_launchpad` with the official
+   moderation wallet BEFORE any pool exists on the new DEX. It gates
+   ONLY the moderation hook (`set_pool_buys_paused`, chunk 7 — pause a
+   malicious pool's BUYS; sells never) and `create_pool`. It freezes at
+   the first pool, whichever path created it.
+4. **Repin the gen-1 launchpad** (still possible while `dxa` is
    unfrozen — i.e. while IT has never migrated anything): invoke
-   `set_dex_address` (entry 50) on the gen-1 VaultLaunch with the v1.4
-   DEX's hash. The project track now migrates into the fixed DEX —
-   every migration works, not just the first.
-3. **Set the v1.4 DEX's launchpad pin** to the official wallet: it
-   gates ONLY the moderation hook (`set_pool_buys_paused`, chunk 7 —
-   pause a malicious pool's BUYS; sells never) and `create_pool`. It
-   freezes at the first pool, whichever path created it.
-4. **Deploy CommunityLaunch** and pin its `set_dex_address` to the
-   same v1.4 DEX. The community track migrates through
-   `create_pool_open` (chunk 33, permissionless — X13): no pinned
-   signer can become a graduation bottleneck.
-5. **The orphaned gen-1 DEX** (`bce37bde…`) simply never serves a
+   `set_dex_address` (entry 50) on the gen-1 VaultLaunch with the
+   v1.4.1 DEX's hash. The project track now migrates into the fixed
+   DEX — every migration works, not just the first.
+5. **Pin the factory to the same DEX**: CommunityLaunch
+   `set_dex_address(<v1.4.1 dex>)` — the `baddex` guard proves the
+   target is a callable contract (provenance is this runbook, not the
+   contract). The community track migrates through `create_pool_open`
+   (chunk 33, permissionless — X13): no pinned signer can become a
+   graduation bottleneck.
+6. **The orphaned gen-1 DEX** (`bce37bde…`) simply never serves a
    pool. It keeps existing forever (honest cost of the fix); the
    golden-rule addresses in COMMUNITY.md must be updated to the new
    generation pair before the community interacts with either track.
@@ -177,3 +200,10 @@ The result: ONE DEX lineage serves both tracks — launchpad-pinned
 community coins — and the site's generation registry lists the new
 pair alongside gen-1 (the stateless views enumerate everything;
 LAUNCHPAD.md §7a).
+
+**Mainnet is BLOCKED until** (a) both testnet E2Es pass on the new
+pair — project track AND community track, including the migrated
+status flip and the closed views — (b) the generation-1 limitations in
+SECURITY.md (signer-not-caller, pool squatting, DEX-pin provenance)
+are formally accepted by the community, and (c) every CI gate
+including the new compile/ABI gate is green on the deployed commit.

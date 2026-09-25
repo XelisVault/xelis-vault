@@ -444,7 +444,7 @@
 //   did exactly that).
 // ============================================================================
 
-const VERSION: string = "LaunchDEX v1.4.0"
+const VERSION: string = "LaunchDEX v1.4.1"
 
 // ---------------------------------------------------------------------------
 // Global capacity (storage growth bound; also the static loop bound of the
@@ -483,7 +483,11 @@ const MAX_SWAP_FEE_BPS: u64 = 1000
 const MIN_SEED_FLOOR_XEL: u64 = 1000000
 const MAX_SEED_XEL: u64 = 1000000000000000
 const MIN_SEED_FLOOR_TOKENS: u64 = 1
-const MAX_SEED_TOKENS: u64 = 10000000000000000
+// The community factory permits supplies up to 10B whole tokens. A
+// migration seed is bounded by the coin's real inventory, so this cap
+// must cover the full CommunityLaunch supply range; the separate swap
+// cap below remains the anti-whale bound.
+const MAX_SEED_TOKENS: u64 = 1000000000000000000
 const MIN_SWAP_FLOOR_XEL: u64 = 1
 const MAX_SWAP_CAP_XEL: u64 = 100000000000000
 const MIN_SWAP_FLOOR_TOKENS: u64 = 1
@@ -690,8 +694,10 @@ pub fn create_pool(asset: Hash) -> u64 {
     let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
     require(count < MAX_POOLS, "full")
 
-    // The seed arrives as deposits of this invocation.
+    // The seed arrives as deposits of this invocation. The native asset
+    // is represented by the zero hash and cannot also be the token side.
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    require(asset != xel, "sameass")
     let xel_seed: u64 = get_deposit_for_asset(xel).unwrap_or(0)
     let tok_seed: u64 = get_deposit_for_asset(asset).unwrap_or(0)
 
@@ -1749,6 +1755,11 @@ pub fn create_pool_open(asset: Hash) -> u64 {
     require(caller_opt.is_some(), "nocal")
     let caller: Address = caller_opt.expect("guarded")
 
+    // A first open pool must not freeze an unset moderation pin. The
+    // deployment ordering is part of the invariant: configure lpx before
+    // any pool exists, then the pin can be frozen safely.
+    require(s.load(LAUNCHPAD_KEY).is_some(), "nolpx")
+
     require(s.load(EMERGENCY_KEY).unwrap_or(false) == false, "paused")
 
     // One pool per asset, forever (IX4).
@@ -1759,8 +1770,10 @@ pub fn create_pool_open(asset: Hash) -> u64 {
     let count: u64 = s.load(POOLS_COUNT_KEY).unwrap_or(0)
     require(count < MAX_POOLS, "full")
 
-    // The seed arrives as deposits of this invocation.
+    // The seed arrives as deposits of this invocation. The native asset
+    // is represented by the zero hash and cannot also be the token side.
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
+    require(asset != xel, "sameass")
     let xel_seed: u64 = get_deposit_for_asset(xel).unwrap_or(0)
     let tok_seed: u64 = get_deposit_for_asset(asset).unwrap_or(0)
 

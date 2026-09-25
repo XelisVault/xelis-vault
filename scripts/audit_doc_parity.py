@@ -121,10 +121,10 @@ if 'const VERSION: string = "VaultLaunch v4.2.0"' not in CONTRACT:
     fails.append("contract: VERSION is not v4.2.0")
 if "v4.2.0" not in DOC:
     fails.append("doc: LAUNCHPAD.md does not say v4.2.0")
-if 'const VERSION: string = "LaunchDEX v1.4.0"' not in DEX_CONTRACT:
-    fails.append("dex contract: VERSION is not v1.4.0")
-if "v1.4.0" not in DEX_DOC:
-    fails.append("doc: DEX.md does not say v1.4.0")
+if 'const VERSION: string = "LaunchDEX v1.4.1"' not in DEX_CONTRACT:
+    fails.append("dex contract: VERSION is not v1.4.1")
+if "v1.4.1" not in DEX_DOC:
+    fails.append("doc: DEX.md does not say v1.4.1")
 # v3 sanity: the D10/D11/D12 views are documented in the frontend guide
 for concept in ["vesting_plan", "get_social_links", "get_volume_stats",
                 "get_market_cap_history", "get_trading_stats"]:
@@ -241,10 +241,10 @@ except FileNotFoundError as e:
     COMMUNITY_CONTRACT_SRC = ""
     COMMUNITY_DOC_SRC = ""
 if COMMUNITY_CONTRACT_SRC:
-    if 'const VERSION: string = "CommunityLaunch v1.0.0"' not in COMMUNITY_CONTRACT_SRC:
-        fails.append("community contract: VERSION is not v1.0.0")
-    if "v1.0.0" not in COMMUNITY_DOC_SRC:
-        fails.append("doc: COMMUNITY_LAUNCH.md does not say v1.0.0")
+    if 'const VERSION: string = "CommunityLaunch v1.0.1"' not in COMMUNITY_CONTRACT_SRC:
+        fails.append("community contract: VERSION is not v1.0.1")
+    if "v1.0.1" not in COMMUNITY_DOC_SRC:
+        fails.append("doc: COMMUNITY_LAUNCH.md does not say v1.0.1")
     for concept in ["C1", "C2", "C4", "virtual", "graduation", "migrate",
                     "create_pool_open", "IC3", "IC4", "permissionless",
                     "Asset::create", "Fixed", "min_tokens_out", "LaunchDEX"]:

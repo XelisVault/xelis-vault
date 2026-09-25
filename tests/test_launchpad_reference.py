@@ -30,6 +30,7 @@ from xvault.protocol import LAUNCHDEX_ENTRY_IDS, LAUNCHDEX_ENTRY_IDS_ALT, \
     LAUNCHPAD_ENTRY_IDS, LAUNCHPAD_ENTRY_IDS_ALT  # noqa: E402
 
 XEL = 100_000_000  # 1 XEL, atomic
+XEL_ASSET = "0" * 64  # native XEL is represented by the zero hash
 CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "launchpad" / "VaultLaunch.slx"
 DEX_CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "dex" / "LaunchDEX.slx"
 
@@ -254,9 +255,13 @@ class DexSim:
         factory's migrate, a keeper, anyone). Returns 0 on success (the
         v1.4 cross-call convention — the second-migration fix)."""
         assert not self.emergency
+        assert self.launchpad is not None, "nolpx"
+        assert asset != XEL_ASSET, "sameass"
         assert asset not in self.pools, "exists"
         assert xel_seed >= self.cfg["min_seed_xel"]
         assert tok_seed >= self.cfg["min_seed_tokens"]
+        assert xel_seed <= dx.MAX_SEED_XEL, "toobig"
+        assert tok_seed <= dx.MAX_SEED_TOKENS, "toobig"
         # X11: the seed IS the pool's permanent LP floor
         assert xel_seed >= dx.MIN_LP_ADD_XEL, "seedlp"
         self.xel_balance += xel_seed
@@ -277,11 +282,15 @@ class DexSim:
 
     def create_pool(self, caller, asset, xel_seed, tok_seed):
         # X4: only the pinned launchpad (cross-call context)
+        assert self.launchpad is not None, "nolpx"
         assert caller == self.launchpad, "notlpx"
         assert not self.emergency
+        assert asset != XEL_ASSET, "sameass"
         assert asset not in self.pools, "exists"
         assert xel_seed >= self.cfg["min_seed_xel"]
         assert tok_seed >= self.cfg["min_seed_tokens"]
+        assert xel_seed <= dx.MAX_SEED_XEL, "toobig"
+        assert tok_seed <= dx.MAX_SEED_TOKENS, "toobig"
         # X11: the seed IS the pool's permanent LP floor (IX9's half of
         # the IX8 bound: pl >= ACC_SCALE, removes can never cross pl)
         assert xel_seed >= dx.MIN_LP_ADD_XEL, "seedlp"
@@ -300,7 +309,7 @@ class DexSim:
         self.index.append(asset)
         if not self.pinned:
             self.pinned = True
-        return len(self.index) - 1
+        return 0
 
     def set_pool_buys_paused(self, caller, asset, flag):
         assert caller == self.launchpad, "notlpx"
@@ -828,9 +837,11 @@ class Sim:
         # the chain charged the creation fee from the contract balance
         self.balance -= fee_paid
         self.burned += fee_paid
+        # Fixed mode: the WHOLE supply lands in the contract's escrow.
+        # The asset ID is NEVER the zero hash (XEL) — the DEX's "sameass"
+        # guard rejects that case, and real XELIS asset IDs are hashes.
         ts = self.s[self._pk(pid, "ts")]
-        asset = f"{pid:064x}"
-        # Fixed mode: the WHOLE supply lands in the contract's escrow
+        asset = f"{pid + 1:064x}"
         self.contract_assets[asset] = ts
         refund = budget + topup - fee_paid
         self.balance -= refund
@@ -1754,7 +1765,7 @@ def test_contract_is_substantial_and_documents_its_chunk_table():
     assert "VAULTLAUNCH" not in src or True
     assert 'const VERSION: string = "VaultLaunch v4.2.0"' in src
     dex_src = DEX_CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.4.0"' in dex_src
+    assert 'const VERSION: string = "LaunchDEX v1.4.1"' in dex_src
     assert "CHUNK TABLE (entry-point IDs" in dex_src
 
 

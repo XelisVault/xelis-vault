@@ -28,6 +28,7 @@ from xvault.protocol import LAUNCHDEX_ENTRY_IDS, LAUNCHDEX_ENTRY_IDS_ALT  # noqa
 from test_launchpad_reference import DexSim  # noqa: E402
 
 XEL = 100_000_000
+XEL_ASSET = "0" * 64  # native XEL is represented by the zero hash
 DEX_CONTRACT = Path(__file__).resolve().parents[1] / "contracts" / "dex" / "LaunchDEX.slx"
 LAUNCHPAD_CONTRACT = (Path(__file__).resolve().parents[1] / "contracts"
                       / "launchpad" / "VaultLaunch.slx")
@@ -359,7 +360,7 @@ def test_fees_are_extracted_not_pooled_x3():
 
 
 def test_version_string():
-    assert 'const VERSION: string = "LaunchDEX v1.4.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.4.1"' in DEX_CONTRACT.read_text()
 
 
 # ===========================================================================
@@ -376,6 +377,11 @@ def test_v14_the_second_migration_fix():
     cp = re.search(r"pub fn create_pool\(.*?\n\}", src, re.S).group(0)
     returns = re.findall(r"^\s*return (\w+)", cp, re.M)
     assert returns == ["0"], f"create_pool must return 0, got {returns}"
+    # v1.4.1: the native asset cannot also be the token side on EITHER
+    # creation path (an XEL-quote pool of XEL would be nonsense and a
+    # deposit-measurement trap)
+    assert 'require(asset != xel, "sameass")' in cp
+    assert '"nolpx"' in cp                      # pin must exist (X4 order)
     # and the launchpad's require still treats non-zero as failure
     lp_src = LAUNCHPAD_CONTRACT.read_text()
     assert 'require(pool_res == 0, "poolerr")' in lp_src
@@ -384,14 +390,18 @@ def test_v14_the_second_migration_fix():
 def test_v14_create_pool_open_is_permissionless_x13():
     """X13: the open seeding endpoint — identical economics to
     create_pool (X11 seed shares, IX5 floors, IX4 one pool per asset)
-    minus the launchpad gate; ANY caller carrying the seed as deposits;
-    emergency-paused like every creation; freezes the lpx pin at the
-    first pool (the moderation key); returns 0."""
+    minus the launchpad CALLER gate; ANY caller carrying the seed as
+    deposits; emergency-paused like every creation; freezes the lpx pin
+    at the first pool (the moderation key); returns 0. v1.4.1: the pin
+    must exist BEFORE any open pool can freeze it (deployment ordering
+    enforced on-chain — see test_v14_open_seeding_simulation)."""
     src = DEX_CONTRACT.read_text()
     m = re.search(r"pub fn create_pool_open\(.*?\n\}", src, re.S)
     assert m, "create_pool_open not found"
     body = m.group(0)
-    assert "require(caller == lpx" not in body    # NO gate — X13
+    assert "require(caller == lpx" not in body    # NO caller gate — X13
+    assert '"nolpx"' in body                      # v1.4.1: pin must exist
+    assert '"sameass"' in body                    # v1.4.1: XEL cannot be the token side
     assert '"paused"' in body                     # emergency blocks it
     assert '"exists"' in body                     # one pool per asset (IX4)
     assert '"full"' in body                       # MAX_POOLS capacity
@@ -413,11 +423,20 @@ def test_v14_create_pool_open_is_permissionless_x13():
 
 
 def test_v14_open_seeding_simulation():
-    """The DexSim open endpoint: anyone seeds, the X11 floor is born
-    with the pool, and the first pool freezes the pin."""
+    """The DexSim open endpoint: the moderation pin MUST be configured
+    before any open pool (v1.4.1 "nolpx" — a first pool would otherwise
+    freeze an unset pin and strand the moderator). Once pinned, anyone
+    seeds, the X11 floor is born with the pool, and the first pool
+    freezes the pin."""
     dex = DexSim()
     a = "cd" * 32
-    # no set_launchpad at all — the open path needs NO pin
+    # v1.4.1: an unset pin refuses the open path BEFORE it can freeze
+    with pytest.raises(AssertionError, match="nolpx"):
+        dex.create_pool_open("stranger", a, 100 * XEL, 10**9)
+    # first configure the moderation pin — the deployment ordering the
+    # source enforces on-chain
+    dex.set_launchpad("vault")
+    assert not dex.pinned
     dex.create_pool_open("stranger", a, 100 * XEL, 10**9)
     p = dex.pools[a]
     assert p["x"] == 100 * XEL and p["pl"] == 100 * XEL
@@ -425,6 +444,9 @@ def test_v14_open_seeding_simulation():
     assert dex.lp[(a, dex.admin)]["w"] == 0            # fees-only, forever
     assert dex.pinned                                    # X4 froze at #0
     dex.check_invariants()
+    # the native asset cannot be the token side (v1.4.1 "sameass")
+    with pytest.raises(AssertionError, match="sameass"):
+        dex.create_pool_open("stranger", XEL_ASSET, 50 * XEL, 10**9)
     # one pool per asset, whichever path tried first
     with pytest.raises(AssertionError, match="exists"):
         dex.create_pool_open("stranger", a, 50 * XEL, 10**9)

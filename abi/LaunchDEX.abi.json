@@ -167,6 +167,30 @@
         }
       ],
       "type": "entry"
+    },
+    {
+      "entry_id": 32,
+      "name": "remove_liquidity",
+      "outputs": "u64",
+      "params": [
+        {
+          "name": "asset",
+          "type": "Hash"
+        },
+        {
+          "name": "parts",
+          "type": "u64"
+        },
+        {
+          "name": "min_xel_out",
+          "type": "u64"
+        },
+        {
+          "name": "min_tokens_out",
+          "type": "u64"
+        }
+      ],
+      "type": "entry"
     }
   ],
   "internal_types": [],

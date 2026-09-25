@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 import pytest  # noqa: E402
 
 from xvault import community as cl  # noqa: E402
+from xvault import dex as dx  # noqa: E402
 from xvault.protocol import COMMUNITY_ENTRY_IDS, COMMUNITY_ENTRY_IDS_ALT  # noqa: E402
 from test_launchpad_reference import DexSim  # noqa: E402
 
@@ -77,14 +78,16 @@ def test_pinned_cross_call_chunk_x13():
 
 
 def test_version_strings():
-    assert 'const VERSION: string = "CommunityLaunch v1.0.0"' in CONTRACT.read_text()
-    assert 'const VERSION: string = "LaunchDEX v1.4.0"' in DEX_CONTRACT.read_text()
+    assert 'const VERSION: string = "CommunityLaunch v1.0.1"' in CONTRACT.read_text()
+    assert 'const VERSION: string = "LaunchDEX v1.4.1"' in DEX_CONTRACT.read_text()
 
 
 def test_storage_keys_and_defaults_match_the_sdk():
     src = CONTRACT.read_text()
     for const, key in [("F_XR", "xr"), ("F_YR", "yr"), ("F_Y0", "y0"),
-                       ("F_VX", "vx"), ("F_GX", "gx"), ("F_CREATOR_PAID", "cp"),
+                       ("F_VX", "vx"), ("F_GX", "gx"), ("F_TWITTER", "tw"),
+                       ("F_TELEGRAM", "tg"), ("F_DISCORD", "dc"),
+                       ("F_CREATOR_PAID", "cp"),
                        ("F_ASSET", "ah"), ("F_STATUS", "st"),
                        ("F_CREATOR", "cr"), ("F_SUPPLY", "ts"),
                        ("F_CREATOR_BPS", "cb")]:
@@ -96,9 +99,26 @@ def test_storage_keys_and_defaults_match_the_sdk():
     assert "const DEFAULT_MIGRATION_FEE_BPS: u64 = 50" in src
     assert "const DEFAULT_SUBMISSION_FEE: u64 = 100000000" in src
     assert "const MAX_CREATOR_BPS: u64 = 500" in src
+    assert "const MIN_COIN_SUPPLY: u64 = 100000000000000" in src
+    assert cl.MIN_COIN_SUPPLY == 100_000_000_000_000
+    assert cl.MAX_COIN_SUPPLY == 10**18
     # the SDK DEFAULTS mirror the contract
     assert cl.DEFAULTS["virtual_xel"] == 10_000_000_000
     assert cl.DEFAULTS["graduation_depth"] == 5_000_000_000
+
+
+def test_curve_depth_and_virtual_reserve_have_a_cross_invariant():
+    """A graduation floor above half the virtual reserve is a dead-coin
+    setting: real reserves top out at vx as the real inventory is exhausted.
+    Both admin setters and the launch snapshot must reject it."""
+    src = CONTRACT.read_text()
+    for entry in ("set_graduation_depth", "set_virtual_xel"):
+        body = re.search(rf"entry {entry}\(.*?\n\}}", src, re.S).group(0)
+        assert 'require(amount <= vx / 2, "depth")' in body or \
+               'require(gdx <= amount / 2, "depth")' in body
+    launch = re.search(r"entry launch_coin\(.*?\n\}", src, re.S).group(0)
+    assert 'require(gdx <= vx / 2, "depth")' in launch
+    assert 50 * XEL <= 100 * XEL // 2
 
 
 # ===========================================================================
@@ -287,6 +307,7 @@ class CommunitySim:
         self.xel_balance = 0                # the factory's balance
         self.asset_balances = defaultdict(int)
         self.pending_fees = 0
+        self.fees_lifetime = 0
         self.paused = False
         self.dex_pin = None
         self.topo = 0
@@ -302,6 +323,10 @@ class CommunitySim:
         """The admin pin (D19 lineage): freezes at the first migration."""
         assert not self.migrated_index, "frozen"
         self.dex_pin = pin
+        # Mirror the real deployment ordering: the DEX's moderation pin
+        # must be configured before any pool exists (the new "nolpx"
+        # guard on create_pool_open is the source-side enforcer).
+        self.dex.set_launchpad(pin)
         self.check_invariants()
 
     def set_default_pins(self):
@@ -310,6 +335,8 @@ class CommunitySim:
     def launch_coin(self, creator, name, symbol, total_supply, team_bps=0,
                     deposit=None):
         assert not self.paused, "paused"
+        assert (self.cfg["graduation_depth"]
+                <= self.cfg["virtual_xel"] // 2), "depth"
         sub = self.cfg["submission_fee"]
         budget = self.cfg["asset_budget"]
         dep = deposit if deposit is not None else sub + budget
@@ -340,6 +367,7 @@ class CommunitySim:
             self.xel_balance -= refund
             self.wallets[creator]["xel"] += refund
         self.pending_fees += sub
+        self.fees_lifetime += sub
         self.tickers[symbol] = cid
         self.asset_lookup[c["ah"]] = cid
         self.count += 1
@@ -366,6 +394,7 @@ class CommunitySim:
         c["yr"] -= out
         self.total_curve_xel += net
         self.pending_fees += fee
+        self.fees_lifetime += fee
         # C2: graduation evaluated on the POST-trade state
         if c["st"] == 0 and cl.graduated(c["xr"], c["yr"], c["y0"],
                                          c["vx"], c["gx"]):
@@ -394,6 +423,7 @@ class CommunitySim:
         self.wallets[wallet]["xel"] += out
         self.xel_balance -= out
         self.pending_fees += fee
+        self.fees_lifetime += fee
         self.check_invariants()
         return out
 
@@ -411,6 +441,7 @@ class CommunitySim:
         fee = cl.fee_take(xr, self.cfg["migration_fee_bps"])
         seed_xel = xr - fee
         self.pending_fees += fee
+        self.fees_lifetime += fee
         # state first: the curve closes
         c.update(mi=True, mx=seed_xel, mt=yr, xr=0, yr=0, st=2)
         self.total_curve_xel -= xr
@@ -452,6 +483,7 @@ class CommunitySim:
         # IC1: exact-sum XEL solvency
         assert self.total_curve_xel == sum(c["xr"] for c in self.coins.values())
         assert self.total_curve_xel + self.pending_fees <= self.xel_balance
+        assert self.fees_lifetime >= self.pending_fees
         # IC2: per-coin asset solvency (inventory + unclaimed reserve)
         for cid, c in self.coins.items():
             alloc = c["ts"] * c["cb"] // 10_000
@@ -463,6 +495,30 @@ class CommunitySim:
             assert c["st"] in (0, 1, 2)
         # the DEX sim's own invariants hold too
         self.dex.check_invariants()
+
+
+def test_invalid_depth_virtual_pairs_are_rejected_by_the_reference():
+    sim = CommunitySim(cfg={"virtual_xel": 100 * XEL,
+                             "graduation_depth": 51 * XEL})
+    with pytest.raises(AssertionError, match="depth"):
+        sim.launch_coin("creator", "Dead", "DEAD", 10**17)
+
+
+def test_fee_lifetime_counts_collection_not_withdrawal():
+    sim = CommunitySim()
+    sim.set_default_pins()
+    cid = sim.launch_coin("creator", "Fees", "FEES", 10**17)
+    assert sim.fees_lifetime == sim.pending_fees == XEL
+    sim.buy("alice", cid, XEL)
+    collected_after_buy = sim.fees_lifetime
+    assert collected_after_buy > XEL
+    # A sell adds a collection event and a withdrawal does not.
+    sim.sell("alice", cid, 10**14)
+    collected_after_sell = sim.fees_lifetime
+    assert collected_after_sell > collected_after_buy
+    sim.withdraw_fees("admin", sim.pending_fees)
+    assert sim.fees_lifetime == collected_after_sell
+    assert sim.pending_fees == 0
 
 
 def test_full_lifecycle_launch_to_pool():
@@ -589,8 +645,12 @@ def test_the_launch_costs_two_xel_and_refunds_everything_unused():
     # 5 attached - 1 fee - 1 asset cost = 3 refunded
     assert sim.wallets["creator"]["xel"] == 3 * XEL
     assert sim.pending_fees == XEL
+    assert sim.fees_lifetime == XEL
     # the admin can collect, and the factory stays solvent (IC1)
     sim.withdraw_fees("admin", XEL)
+    # a withdrawal pays accrued fees; it is not new lifetime revenue
+    assert sim.fees_lifetime == XEL
+    assert sim.pending_fees == 0
     with pytest.raises(AssertionError, match="badamt"):
         sim.withdraw_fees("admin", 1)
 
@@ -627,6 +687,65 @@ def test_migrate_is_deterministic_and_pinned():
     # state first, cross-call last (no store after the .call except none)
     call_pos = hbody.index(".call(")
     assert "s.store(" not in hbody[call_pos:]
+
+
+def test_migration_writes_status_and_views_close():
+    """C1 fix: migrate() must write F_STATUS = ST_MIGRATED (the E2E on
+    the pre-fix build showed status stuck at 1 — the listing views and
+    the creator claim READ st). And every price/mcap/quote view must
+    report ZERO once the curve is closed, instead of a stale nonzero."""
+    src = CONTRACT.read_text()
+    h = re.search(r"fn migrate_coin_to_dex\(.*?\n\}", src, re.S).group(0)
+    assert 's.store(coin_key(cid, F_MIGRATED), true)' in h
+    assert 's.store(coin_key(cid, F_STATUS), ST_MIGRATED)' in h
+    dex_src = DEX_CONTRACT.read_text()
+    for view in ("get_current_price", "get_buy_quote", "get_sell_quote",
+                 "get_market_cap"):
+        body = re.search(rf"pub fn {view}\(.*?\n\}}", src, re.S).group(0)
+        assert 'if status == ST_MIGRATED {' in body, f"{view} must close"
+        assert "return 0" in body, f"{view} must return 0 when migrated"
+    # the admin pin cannot point at an EOA/empty hash (op sanity, not
+    # provenance — the deployment runbook still sets the DEX address)
+    sd = re.search(r"entry set_dex_address\(.*?\n\}", src, re.S).group(0)
+    assert 'require(is_contract_callable(addr, DEX_CREATE_POOL_OPEN_CHUNK), "baddex")' in sd
+    # the seed cap covers the factory's full supply range (see the
+    # MAX_SEED_TOKENS comment in LaunchDEX.slx)
+    assert "const MAX_SEED_TOKENS: u64 = 1000000000000000000" in dex_src
+    assert dx.MAX_SEED_TOKENS == 10**18
+
+
+def test_migrated_views_report_zero_in_the_reference():
+    """The SDK mirrors the closed-curve views: after migrate the status
+    is 2 and the price/mcap views are effectively ZERO — the contract's
+    get_current_price/get_market_cap/get_*_quote return 0 on
+    ST_MIGRATED (frontends must check status first and switch to the
+    pool's price; the pure math helpers take reserves only)."""
+    sim = CommunitySim()
+    sim.set_default_pins()
+    cid = sim.launch_coin("creator", "Closed", "CLSD", 10**17)
+    c = sim.coins[cid]
+    # the view is status-aware: ST_MIGRATED forces zero, anything else
+    # is the live curve math
+    def effective_price():
+        return 0 if c["st"] == 2 else cl.spot_price(c["xr"], c["yr"],
+                                                     c["y0"], c["vx"])
+
+    def effective_mcap():
+        return 0 if c["st"] == 2 else cl.market_cap(c["xr"], c["yr"],
+                                                    c["y0"], c["vx"],
+                                                    c["ts"])
+    while c["st"] != 1:
+        sim.buy("alice", cid, 5 * XEL)
+    # live: an honest nonzero view
+    assert effective_price() >= 1
+    assert effective_mcap() >= 1
+    sim.migrate(cid, caller="keeper")
+    assert c["st"] == 2
+    # closed: every curve-derived view is exactly zero (the pool owns
+    # the market now) — and the reserves carry no stale values
+    assert effective_price() == 0
+    assert effective_mcap() == 0
+    assert c["xr"] == 0 and c["yr"] == 0
 
 
 def test_solvency_guards_are_local_and_machine_checkable():

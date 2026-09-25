@@ -18,8 +18,8 @@ v13 takes the opposite bet:
 ```
 contracts/
   launchpad/VaultLaunch.slx    the launchpad (active product, self-contained)
-  dex/LaunchDEX.slx            the AMM (v1.4: launchpad-pinned + open seeding)
-  community/CommunityLaunch.slx  the permissionless community-coin factory
+  dex/LaunchDEX.slx            the AMM (v1.4.1: launchpad-pinned + open seeding)
+  community/CommunityLaunch.slx  the permissionless community-coin factory (v1.0.1)
   mixer/PrivacyMixerV5.slx     the privacy pool (on hold pending VM features)
   mixer/superseded/            archived V4 (the R11 regression corpus)
 abi/                           transaction-facing entry tables (compile artifacts)
@@ -239,7 +239,7 @@ Two points; both closed by LaunchDEX v1.3 (append-only, chunk 32, pins
 
 ---
 
-## v18.4 — the two tracks: projects AND community coins (CommunityLaunch v1.0 + LaunchDEX v1.4)
+## v18.4 — the two tracks: projects AND community coins (CommunityLaunch v1.0 → v1.0.1 + LaunchDEX v1.4 → v1.4.1)
 
 **The launchpad grows a second shelf.** CommunityLaunch
 (contracts/community/) is the permissionless community-coin factory —
@@ -253,17 +253,34 @@ not hoped for (IC3/IC4: the curve product k never decreases through
 trades, so the real reserves are non-negative by construction and the
 worst-case sell is exactly covered). Graduation is a demand proof in
 TWO conditions (C2): real depth (default 50 XEL, snapshotted per coin)
-AND price continuity (xr·y0 ≥ yr·vx — the pool opens at or above the
-curve's spot, no graduation dump by construction). The migration is
-permissionless on BOTH sides (C6): anyone calls migrate(), and the DEX
-endpoint it drives — create_pool_open, LaunchDEX v1.4 chunk 33 (X13) —
-has no gate at all (on this VM get_caller() is the transaction signer
-even cross-contract, so a factory-only gate cannot be expressed; the
-deposits are the authorisation). The one-time migration fee is carved
-from the POOL SEED, never the live curve (C4 — the k-invariance the
-solvency proof needs). The creator allocation is small (≤ 5%), held
-off-curve, and claimable ONLY post-migration (C5): a creator's payoff
-is conditional on the coin graduating.
+AND price continuity (xr·y0 ≥ yr·vx — the pool opens at the curve's
+spot within one migration fee, no graduation dump by construction; §4
+of COMMUNITY_LAUNCH.md gives the honest, fee-aware reading). The
+migration is permissionless on BOTH sides (C6): anyone calls
+migrate(), and the DEX endpoint it drives — create_pool_open, LaunchDEX
+v1.4.1 chunk 33 (X13) — has no CALLER gate (on this VM get_caller() is
+the transaction signer even cross-contract, so a factory-only gate
+cannot be expressed; the deposits are the authorisation). The one-time
+migration fee is carved from the POOL SEED, never the live curve (C4 —
+the k-invariance the solvency proof needs). The creator allocation is
+small (≤ 5%), held off-curve, and claimable ONLY post-migration (C5):
+a creator's payoff is conditional on the coin graduating.
+
+**CommunityLaunch v1.0.1 (audit fixes, same declaration order):**
+migration now writes `st = ST_MIGRATED` inside the atomic move (the
+pre-fix build left status stuck at 1 after migration), every
+price/mcap/quote view returns **0** once a coin is migrated (the curve
+is closed — the price lives on the pool), `gdx ≤ vx/2` is enforced at
+launch and in both admin setters (a graduation floor above half the
+virtual reserve would let a coin graduate with no inventory to
+migrate), `set_dex_address` rejects non-contract addresses (`"baddex"`
+— the DEX must be callable at the pinned chunk), and the lifetime-fee
+counter counts COLLECTION, not withdrawal (payouts never inflate
+lifetime revenue). The DEX track hardened in step: LaunchDEX v1.4.1
+adds `"nolpx"` (the moderation pin must exist before the first open
+pool can freeze it), `"sameass"` (the native asset can never be the
+token side on either creation path), and lifts `MAX_SEED_TOKENS` to the
+factory's full 10B-token supply range.
 
 **LaunchDEX v1.4 also fixes the second-migration bug**: create_pool
 used to return the pool's INDEX, and the launchpad's migrate_to_dex
@@ -272,10 +289,11 @@ project migration would ever have succeeded on a gen-1 pair. v1.4
 chunks return 0 on success; the fix is invisible to the v1 interface
 (VaultLaunch v4.2 calls it unchanged) but needs a NEW generation to
 reach mainnet — and since the gen-1 pins froze at nothing yet (no pool
-exists), the recommended cut is: deploy ONE v1.4 DEX, repin the gen-1
-launchpad to it (still possible), and pin the new factory to it too —
-both tracks share the same DEX lineage, its launchpad pin serving only
-as the moderation hook (per-pool buys-pause). See
-COMMUNITY_LAUNCH.md §10 and UPGRADES.md §6.
+exists), the recommended cut is: deploy ONE v1.4.1 DEX, configure its
+`set_launchpad` (moderation pin) FIRST (v1.4.1 `nolpx` — see DEX.md),
+repin the gen-1 launchpad to it (still possible), and pin the new
+factory to it too — both tracks share the same DEX lineage, its
+launchpad pin serving only as the moderation hook (per-pool
+buys-pause). See COMMUNITY_LAUNCH.md §10 and UPGRADES.md §6.
 
 ---

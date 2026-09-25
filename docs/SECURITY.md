@@ -282,7 +282,7 @@ providers mint WITHDRAWABLE parts they may burn pro-rata at any time
   no fee is ever stranded in a beneficiary-less pot; the pre-v1.3
   no-provider redirect to the admin pot remains as defense-in-depth.
 
-## v18.4 — the community track's honest threat model (CommunityLaunch v1.0)
+## v18.4 — the community track's honest threat model (CommunityLaunch v1.0 → v1.0.1)
 
 CommunityLaunch is a casino and says so: **there is no quality filter**.
 Anyone can launch a coin for ~2 XEL, and scams WILL. The design bounds
@@ -320,7 +320,9 @@ touching the track:
   ("community coin — no validation") and keep the two tracks visually
   separate; the moderation key (the DEX's launchpad pin,
   `set_pool_buys_paused`, chunk 7) can pause any pool's BUYS on either
-  track — sells never.
+  track — sells never. The 1M-token minimum supply (v1.0.1, enforced
+  at launch) and the gdx ≤ vx/2 cross-invariant keep the spam and
+  dead-coin settings out of the parameter space.
 - **Front-run** — same assumed ceiling as everywhere on this chain
   (see below); `min_tokens_out` / `min_xel_out` are on both trades.
 
@@ -329,6 +331,37 @@ coin's whole curve inventory (`out == yr` exactly). Such a coin
 graduates and simply cannot migrate until a sell re-fills the
 inventory (`"empty"`) — no funds are at risk, the curve stays open,
 the state is honest.
+
+**Generation-1 limitations, explicitly accepted (the audit's honest
+bottom line)** — none of these are fixed by v1.0.1/v1.4.1; they are the
+trade-off of the current VM's caller model and the permissionless
+open-seeding design, and they BLOCK a mainnet cut until formally
+accepted or addressed by a DEX v2:
+
+- **Signer, not caller.** `get_caller()` returns the original
+  transaction signer even inside a cross-contract call. The moderation
+  hook therefore authenticates the pinned LAUNCHPAD WALLET, not the
+  launchpad CONTRACT: anyone who can sign for that wallet can pause a
+  pool's buys, and a factory-only gate is unexpressible. Practically,
+  the moderation key is a dedicated wallet in the deployment runbook;
+  the authorization gap is documented, not fixed.
+- **Permissionless pool squatting.** `create_pool_open` lets ANYONE
+  seed the one pool an asset will ever get (IX4). An attacker can
+  observe a graduated coin and front-run its migration, planting their
+  OWN pool for the asset — the factory's migrate then hits `"exists"`
+  and the coin is stuck GRADUATED (its curve stays open; no funds
+  are lost, but the intended migration is DoS'd per-asset, cheaply).
+  v1.4.1's `nolpx`/`sameass` guards narrow the setup, not this risk.
+  A DEX v2 with a launcher registry + `get_contract_caller()` is the
+  real fix (the multi-year `out/` roadmap).
+- **Hostile DEX pinning.** `set_dex_address` (factory admin, one-way)
+  chooses the migration target. v1.0.1's `"baddex"` check proves the
+  address is *callable at the pinned chunk* — a contract, not an EOA —
+  but a malicious contract passing that check would still be accepted.
+  Provenance is the deployment process (COMMUNITY_LAUNCH.md §10 + the
+  runbook), not the contract.
+- **Stale post-migration views (fixed).** v1.0.1 closes them:
+  price/mcap/quotes return 0 once the curve is migrated.
 
 **Admin powers on this track** (same philosophy as the launchpad's):
 every fee/parameter is settable and hard-capped; the pause gates NEW

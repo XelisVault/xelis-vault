@@ -265,7 +265,7 @@
 // ----------------------------------------------------------------------------
 // STORAGE MAP (string keys, flat KV — house style)
 // ----------------------------------------------------------------------------
-//   Global  : adm pc sub abd cfe gfe mgf gdx vxs dxa pfe pz xa
+//   Global  : adm pc sub abd cfe gfe mgf gdx vxs dxa pfe fcl pz xa
 //             tbv tsv ttc tvl mgc tcx (see constants below)
 //   Coin    : c:{id}:cr creator          c:{id}:st status (0/1/2)
 //             c:{id}:nm name             c:{id}:sy symbol
@@ -334,7 +334,7 @@
 //   CI. New functions append at the END only.
 // ============================================================================
 
-const VERSION: string = "CommunityLaunch v1.0.0"
+const VERSION: string = "CommunityLaunch v1.0.1"
 
 // ---------------------------------------------------------------------------
 // Status codes (see LIFECYCLE)
@@ -387,7 +387,7 @@ const MAX_VIRTUAL_XEL: u64 = 1000000000000
 // ---------------------------------------------------------------------------
 // Per-coin caps (checked at launch)
 // ---------------------------------------------------------------------------
-const MIN_COIN_SUPPLY: u64 = 10000000000000
+const MIN_COIN_SUPPLY: u64 = 100000000000000
 const MAX_COIN_SUPPLY: u64 = 1000000000000000000
 const MAX_CREATOR_BPS: u64 = 500
 const MAX_NAME_LEN: u32 = 64
@@ -423,6 +423,7 @@ const GRADUATION_DEPTH_KEY: string = "gdx"
 const VIRTUAL_XEL_KEY: string = "vxs"
 const DEX_ADDRESS_KEY: string = "dxa"
 const PENDING_FEES_KEY: string = "pfe"
+// Lifetime fees COLLECTED (never incremented by a withdrawal payout).
 const FEES_LIFETIME_KEY: string = "fcl"
 const PAUSED_KEY: string = "pz"
 const XEL_ASSET_KEY: string = "xa"
@@ -441,6 +442,9 @@ const F_STATUS: string = "st"
 const F_NAME: string = "nm"
 const F_SYMBOL: string = "sy"
 const F_DESC: string = "ds"
+const F_TWITTER: string = "tw"
+const F_TELEGRAM: string = "tg"
+const F_DISCORD: string = "dc"
 const F_WEBSITE: string = "ws"
 const F_LOGO: string = "lg"
 const F_SUPPLY: string = "ts"
@@ -803,6 +807,7 @@ fn migrate_coin_to_dex(cid: u64) {
     // STATE FIRST (atomic with the call below): close the curve,
     // snapshot what is being sent, update the global accounting.
     s.store(coin_key(cid, F_MIGRATED), true)
+    s.store(coin_key(cid, F_STATUS), ST_MIGRATED)
     s.store(coin_key(cid, F_MIG_AT), get_current_topoheight())
     s.store(coin_key(cid, F_MIG_XEL), seed_xel)
     s.store(coin_key(cid, F_MIG_TOK), yr)
@@ -940,6 +945,10 @@ entry launch_coin(name: string, symbol: string, description: string, website: st
     // reclassifies an existing coin; the launchpad's D7, applied here).
     let vx: u64 = s.load(VIRTUAL_XEL_KEY).unwrap_or(DEFAULT_VIRTUAL_XEL)
     let gdx: u64 = s.load(GRADUATION_DEPTH_KEY).unwrap_or(DEFAULT_GRADUATION_DEPTH)
+    // Keep every newly launched coin migratable: the curve's real-reserve
+    // ceiling is vx, and this leaves at least half the initial inventory
+    // available at the depth floor.
+    require(gdx <= vx / 2, "depth")
     s.store(coin_key(cid, F_VX), vx)
     s.store(coin_key(cid, F_GX), gdx)
 
@@ -965,6 +974,8 @@ entry launch_coin(name: string, symbol: string, description: string, website: st
     if sub_fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
         s.store(PENDING_FEES_KEY, checked_add(pending, sub_fee))
+        let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+        s.store(FEES_LIFETIME_KEY, checked_add(lifetime, sub_fee))
     }
 
     // The REAL token is born HERE — before the coin becomes enumerable
@@ -1043,6 +1054,8 @@ entry buy(cid: u64, min_tokens_out: u64) -> u64 {
     if fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
         s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+        let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+        s.store(FEES_LIFETIME_KEY, checked_add(lifetime, fee))
     }
 
     // The REAL tokens go to the buyer's wallet (IC2: balance follows the
@@ -1132,6 +1145,8 @@ entry sell(cid: u64, min_xel_out: u64) -> u64 {
     if fee > 0 {
         let pending: u64 = s.load(PENDING_FEES_KEY).unwrap_or(0)
         s.store(PENDING_FEES_KEY, checked_add(pending, fee))
+        let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
+        s.store(FEES_LIFETIME_KEY, checked_add(lifetime, fee))
     }
 
     let xel: Hash = s.load(XEL_ASSET_KEY).unwrap_or(get_xelis_asset())
@@ -1324,11 +1339,16 @@ entry set_migration_fee(bps: u64) -> u64 {
 // 26. Graduation depth floor (gdx): the REAL reserves a coin must show
 //     before it can graduate. Bounds: [1 XEL, 100 000 XEL]. Snapshotted
 //     per coin at launch (C8) — a change affects future launches only.
+//     The cross-invariant gdx <= vx/2 is mandatory: vx is also the curve's
+//     effective real-reserve ceiling, so a larger floor could strand a coin
+//     with no inventory to migrate.
 entry set_graduation_depth(amount: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
     require(amount >= MIN_GRADUATION_DEPTH, "toolow")
     require(amount <= MAX_GRADUATION_DEPTH, "toohigh")
+    let vx: u64 = s.load(VIRTUAL_XEL_KEY).unwrap_or(DEFAULT_VIRTUAL_XEL)
+    require(amount <= vx / 2, "depth")
     s.store(GRADUATION_DEPTH_KEY, amount)
     emit_event(EV_PARAM_SET, ["graduation_depth", amount.to_string(10u32)])
     return 0
@@ -1336,12 +1356,16 @@ entry set_graduation_depth(amount: u64) -> u64 {
 
 // 27. Virtual XEL reserve (vxs): the simulated depth that prices a coin
 //     from its first buy (C1). Bounds: [1 XEL, 10 000 XEL]. Snapshotted
-//     per coin at launch (C8).
+//     per coin at launch (C8). The same gdx <= vx/2 cross-invariant is
+//     checked so a later virtual-reserve change cannot invalidate the
+//     graduation floor for new coins.
 entry set_virtual_xel(amount: u64) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
     require(amount >= MIN_VIRTUAL_XEL, "toolow")
     require(amount <= MAX_VIRTUAL_XEL, "toohigh")
+    let gdx: u64 = s.load(GRADUATION_DEPTH_KEY).unwrap_or(DEFAULT_GRADUATION_DEPTH)
+    require(gdx <= amount / 2, "depth")
     s.store(VIRTUAL_XEL_KEY, amount)
     emit_event(EV_PARAM_SET, ["virtual_xel", amount.to_string(10u32)])
     return 0
@@ -1354,6 +1378,11 @@ entry set_dex_address(addr: Hash) -> u64 {
     only_admin()
     let s: Storage = Storage::new()
     require(s.load(MIGRATED_COUNT_KEY).unwrap_or(0) == 0, "frozen")
+    // Reject an EOA/empty hash or a contract that cannot expose the
+    // pinned cross-call. This is an operational sanity check, not DEX
+    // provenance: the generation-1 signer semantics still make the
+    // factory's trust boundary explicit in the deployment runbook.
+    require(is_contract_callable(addr, DEX_CREATE_POOL_OPEN_CHUNK), "baddex")
     s.store(DEX_ADDRESS_KEY, addr)
     emit_event(EV_DEX_ADDRESS, [addr.to_hex()])
     return 0
@@ -1414,9 +1443,9 @@ entry withdraw_fees(amount: u64) -> u64 {
     require((amount as u128) + committed <= (balance as u128), "notavail")
 
     s.store(PENDING_FEES_KEY, pending - amount)
-    let lifetime: u64 = s.load(FEES_LIFETIME_KEY).unwrap_or(0)
-    s.store(FEES_LIFETIME_KEY, checked_add(lifetime, amount))
 
+    // FEES_LIFETIME_KEY is incremented when fees are collected, not when
+    // they leave the contract. Withdrawal is a payout, not new revenue.
     let ok: bool = transfer(caller, amount, xel)
     require(ok, "txfail")
 
@@ -1508,6 +1537,10 @@ pub fn get_curve_info(cid: u64) -> (u64, u64, u64, u64, u64) {
 pub fn get_current_price(cid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_coin(cid)
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    if status == ST_MIGRATED {
+        return 0
+    }
     let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
     let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
     let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
@@ -1530,6 +1563,10 @@ pub fn get_current_price(cid: u64) -> u64 {
 pub fn get_buy_quote(cid: u64, xel_amount: u64) -> u64 {
     let s: Storage = Storage::new()
     require_coin(cid)
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    if status == ST_MIGRATED {
+        return 0
+    }
     let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
     let bps: u64 = current_fee_bps(graduated)
     let fee: u64 = fee_take(xel_amount, bps)
@@ -1548,6 +1585,10 @@ pub fn get_buy_quote(cid: u64, xel_amount: u64) -> u64 {
 pub fn get_sell_quote(cid: u64, token_amount: u64) -> u64 {
     let s: Storage = Storage::new()
     require_coin(cid)
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    if status == ST_MIGRATED {
+        return 0
+    }
     let graduated: bool = s.load(coin_key(cid, F_GRADUATED)).unwrap_or(false)
     let bps: u64 = current_fee_bps(graduated)
     let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
@@ -1565,6 +1606,10 @@ pub fn get_sell_quote(cid: u64, token_amount: u64) -> u64 {
 pub fn get_market_cap(cid: u64) -> u64 {
     let s: Storage = Storage::new()
     require_coin(cid)
+    let status: u64 = s.load(coin_key(cid, F_STATUS)).unwrap_or(0)
+    if status == ST_MIGRATED {
+        return 0
+    }
     let xr: u64 = s.load(coin_key(cid, F_XR)).unwrap_or(0)
     let yr: u64 = s.load(coin_key(cid, F_YR)).unwrap_or(0)
     let y0: u64 = s.load(coin_key(cid, F_Y0)).unwrap_or(0)
