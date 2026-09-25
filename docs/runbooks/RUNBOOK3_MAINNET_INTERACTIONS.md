@@ -1,12 +1,14 @@
 # RUNBOOK 3 — Mainnet contract interactions (XELIS mainnet LIVE)
 
 > Network: **official XELIS mainnet** (explorer `https://explorer.xelis.io`),
-> height ~7 793 000, block version **V7**, Smart Contracts active since
-> height 3 282 150. Deployment **executed and verified on-chain on 23/09/2026**.
+> block version **V7**, Smart Contracts active since height 3 282 150.
+> Gen-1 pair deployed 23/09/2026; **v1.4.1 cut executed and verified
+> on-chain on 25/09/2026** (§1A — current generation).
 >
 > This file lists **every command** to interact with `VaultLaunch` (the
-> launchpad) and `LaunchDEX` (the DEX) on mainnet: the contract addresses,
-> the deployment/config record (real TX hashes), the full creator flow
+> launchpad), `LaunchDEX v1.4.1` (the DEX) and `CommunityLaunch v1.0.1`
+> (the factory) on mainnet: the contract addresses, the deployment/config
+> record (real TX hashes), the full creator flow
 > (propose → vote → buy/sell → migrate), DEX swaps, and all data reads.
 >
 > ⚠️ On mainnet this wallet (**admin = user**) is the only signer. There are
@@ -25,7 +27,9 @@
 | Daemon (TLS relay, broken DNS) | `http://127.0.0.1:8085/json_rpc` → `fr-node.xelis.io:443` |
 | **Wallet address** | `xel:sel92pcaegt0kenv3q35ycnzpd4xfl0md93usnkxq0rsjtha6cjsqe2xwch` |
 | **VaultLaunch (Vault)** | `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54` |
-| **LaunchDEX (DEX)** | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` |
+| **LaunchDEX v1.4.1 (DEX)** | `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef` |
+| **CommunityLaunch v1.0.1 (factory)** | `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9` |
+| _gen-1 LaunchDEX (orphaned)_ | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` — never served a pool (v1.4.1 cut, §1A) |
 | XEL asset | `0000000000000000000000000000000000000000000000000000000000000000` |
 
 Helper: `python3 scripts/xrpc.py`, pointed at mainnet via environment
@@ -55,10 +59,12 @@ Deposit attached to an invoke:
 
 ---
 
-## 1. Mainnet deployment & configuration (DONE — real hashes)
+## 1. Gen-1 deployment & configuration (23/09/2026 — historical)
 
-Sequence executed and **confirmed on-chain** (each TX verified with
-`wait-tx` before the next one; every invoke then read back from storage).
+Superseded by the v1.4.1 cut (§1A): the gen-1 DEX was **orphaned** —
+it never served a pool and never will. Sequence executed and **confirmed
+on-chain** (each TX verified with `wait-tx` before the next one; every
+invoke then read back from storage).
 
 | Step | Action | TX hash (full) | topo |
 |---|---|---|---|
@@ -79,7 +85,74 @@ Measured fees: VaultLaunch 225 000 atomic, LaunchDEX 125 000 atomic
 
 ---
 
-## 2. On-chain parameters (verified by storage reads, 23/09/2026)
+## 1A. v18.4 cut — v1.4.1 generation (25/09/2026, CURRENT)
+
+The **second-migration bug** is gone: gen-1's `create_pool` returned the
+pool's INDEX, and VaultLaunch's `migrate_to_dex` treats a non-zero
+cross-call result as failure (`poolerr`) — only the FIRST project
+migration would ever have succeeded against the gen-1 DEX. v1.4 chunks
+return 0 on success with an unchanged interface, so the archive is
+interface-compatible and **the gen-1 Vault is repinnable** while its
+`dxa` is unfrozen. One DEX lineage now serves BOTH tracks
+(UPGRADES.md §6): launchpad-pinned `create_pool` for the projects,
+open `create_pool_open` (chunk 33) for the community coins.
+
+Sequence executed and **confirmed on-chain** (each TX verified with
+`wait-tx` before the next; every storage key read back afterwards):
+
+| Step | Action | TX hash (full) | fee | topo |
+|---|---|---|---|---|
+| C1 | Deploy **LaunchDEX v1.4.1** (= address D141) | `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef` | 135 000 | 9073523 |
+| C2 | Deploy **CommunityLaunch v1.0.1** (= address C101) | `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9` | 135 000 | 9073563 |
+| C3 | D141 **13** `set_launchpad(address wallet)` — **before ANY pool** (`nolpx`) | `299dbcaf7e1750e10ac0cb1daa8528b67c677758a7bca9945b73af5d902067ff` | 25 000 | 9073612 |
+| C4 | Vault **50** `set_dex_address(hash D141)` — gen-1 repin | `d1fc28376d21fcccdf481ef4d598ac946523b4b7d779aa1db4583ff32528ed14` | 25 000 | 9073629 |
+| C5 | C101 **28** `set_dex_address(hash D141)` — factory pin (`baddex` guard) | `02dba8ff0662c87a987691570b2f61135ef0159113e13fb84984a4d21b0b0d19` | 25 000 | 9073642 |
+
+The exact commands (wallet `build_transaction` + `broadcast: true`, same
+typed-parameter format as §0):
+
+```bash
+# C1/C2 — deploy (modules validated by the compile/ABI CI gate,
+#          byte-identical to the testnet E2E-validated version)
+python3 scripts/xrpc.py deploy --max-gas 20000000 /tmp/DEX-new.hex   # -> D141
+python3 scripts/xrpc.py deploy --max-gas 20000000 /tmp/CL-new.hex    # -> C101
+
+# C3 — launchpad pin FIRST (v1.4.1 `nolpx`: must exist before any pool)
+python3 scripts/xrpc.py invoke f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef 13 \
+  '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Address","value":"xel:sel92pcaegt0kenv3q35ycnzpd4xfl0md93usnkxq0rsjtha6cjsqe2xwch"}}}]' \
+  --max-gas 20000000
+
+# C4 — repin the gen-1 Vault to the v1.4.1 DEX (possible while pc=0/dxa unfrozen)
+python3 scripts/xrpc.py invoke 45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54 50 \
+  '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef"}}}]' \
+  --max-gas 20000000
+
+# C5 — pin the community factory to the same DEX
+python3 scripts/xrpc.py invoke 8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9 28 \
+  '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef"}}}]' \
+  --max-gas 20000000
+```
+
+Verified storage (fresh `get_contract_data` reads after the cut):
+
+- **D141** — `sfe=30`, `fsl=5000`, `mnx=100000000` (1 XEL),
+  `lnt=1000000`, `mnt=1000000`, `tsw=10000000000000`, `mst=1`,
+  `mxs=10000000000000000`, `xpa=false`, `lpx=xel:sel92…`,
+  `pc=0`, `adm=xel:sel92…`.
+- **C101** (contract defaults = target — nothing to set): `sub=100000000`
+  (1 XEL), `abd=100000000` (1 XEL), `cfe=100` (1 %), `gfe=50` (0.5 %),
+  `mgf=50` (0.5 %), `gdx=5000000000` (50 XEL), `vxs=10000000000` (100 XEL),
+  `dxa=f3c461af…`, `mgc=0`, `pc=0`.
+- **Vault gen-1** — `dxa=f3c461af…` (was `bce37bde…`), `pc=0`.
+
+Sanity: **no pool exists on any contract** (`pc=0` everywhere) — no pin
+is frozen; the whole cut was reversible up to the first pool. The gen-1
+DEX keeps existing forever but never serves a pool (honest cost of the
+fix, UPGRADES.md §6 step 6).
+
+---
+
+## 2. On-chain parameters (verified by storage reads, 23/09 + re-verified 25/09/2026)
 
 ### VaultLaunch — `45baf014…`
 
@@ -95,7 +168,7 @@ Measured fees: VaultLaunch 225 000 atomic, LaunchDEX 125 000 atomic
 | `vdp` | `0` | no vote deposit required |
 | `tfe` / `gfe` / `mgf` | `50` / `25` / `50` | bonding / graduated / migration fees (defaults) |
 | `dlt` | `200000000000` (2000 XEL) | direct-listing threshold (default) |
-| `dxa` | DEX hash | **pin**: only DEX `bce37bde…` can receive `migrate` |
+| `dxa` | DEX hash | **pin**: only DEX `f3c461af…` can receive `migrate` (repinned 25/09/2026, §1A C4) |
 | `pc` | 0 | project counter |
 
 > Graduation: a small-float project is listed when
@@ -104,14 +177,40 @@ Measured fees: VaultLaunch 225 000 atomic, LaunchDEX 125 000 atomic
 > (2 000 XEL deposited at propose) → **direct listing** right after
 > validation, no bonding phase.
 
-### LaunchDEX — `bce37bde…`
+### LaunchDEX v1.4.1 — `f3c461af…`
 
 | Key | On-chain value | Meaning |
 |---|---|---|
 | `sfe` | `30` (0.30 %) | swap fee (default) |
-| `fsl` | `5000` (50 %) | LP share of the fee (`set_fee_split`) |
-| `lpx` | `xel:sel92…` | **pin**: only this wallet can `create_pool` |
+| `fsl` | `5000` (50 %) | LP share of the fee |
+| `mnx` | `100000000` (1 XEL) | min seed XEL (`set_trade_bounds`) |
+| `lnt` | `1000000` | min seed tokens |
+| `mnt` | `1000000` (0.01 XEL) | min swap XEL |
+| `tsw` | `10000000000000` | max swap XEL |
+| `mst` | `1` | min swap tokens |
+| `mxs` | `10000000000000000` | max swap tokens |
+| `xpa` | `false` | emergency pause (`set_paused`) |
+| `lpx` | `xel:sel92…` | **pin**: only this wallet can `create_pool` / pause buys (§1A C3) |
 | `pc` | 0 | pool counter |
+| `adm` | `xel:sel92…` | admin (deployer) |
+
+The gen-1 `sub/abd/mnl/mnp/mab/vdt/gmu/vdp/tfe/gfe/mgf/dlt` storage keys
+belonged to the OLD gen-1 DEX global defaults; v1.4.1 took them out of
+the DEX (pool params travel with the community contract C101 and the
+launchpad's per-project config, not as DEX-wide globals).
+
+### CommunityLaunch v1.0.1 — `8252cf7b…`
+
+| Key | On-chain value | Meaning |
+|---|---|---|
+| `sub` | `100000000` (1 XEL) | submission fee (default) |
+| `abd` | `100000000` (1 XEL) | asset budget (default) |
+| `cfe` / `gfe` / `mgf` | `100` / `50` / `50` | curve 1 % / graduated 0.5 % / migration 0.5 % (defaults) |
+| `gdx` | `5000000000` (50 XEL) | graduation depth (default; hard bound `gdx ≤ vxs/2`) |
+| `vxs` | `10000000000` (100 XEL) | virtual XEL reserves (default) |
+| `dxa` | `f3c461af…` | **pin**: the DEX the community coins migrate to (§1A C5) |
+| `mgc` | 0 | migration counter (increments per collected fee collection) |
+| `pc` | 0 | coins launched |
 
 ---
 
@@ -207,7 +306,8 @@ python3 scripts/xrpc.py invoke <VAULT> 32 '[{"type":"primitive","value":{"type":
 python3 scripts/xrpc.py wait-tx <TX_HASH>
 ```
 Cross-calls `LaunchDEX.create_pool` — accepted because `dxa` is pinned to
-`bce37bde…`. After migration, all trading continues on the DEX pool.
+`f3c461af…` (the v1.4.1 DEX, repinned 25/09/2026). After migration, all
+trading continues on the DEX pool.
 
 ### 3.7 Other user entries
 
@@ -261,7 +361,7 @@ python3 scripts/xrpc.py state 45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438
 
 ## 5. LaunchDEX — swaps, liquidity, fees (entry IDs)
 
-DEX = `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d`
+DEX = `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef`
 
 | ID | Function | Params | Notes |
 |---|---|---|---|
@@ -276,27 +376,34 @@ DEX = `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d`
 | 16 | `withdraw_fees` | `hash, u64, u64` | pools `xf`/`yf` |
 | **29** | `set_fee_split` | `u64(lp_bps)` | 2500 ≤ lp ≤ 7500; `fsl` |
 | **30** | `claim_lp_fees` | `hash(asset)` | crystallized LP share |
+| **32** | `remove_liquidity` | `hash(asset), u64(parts), u64(min_xel), u64(min_tokens)` | pro-rata exit; the seed (mnl floor) is locked forever |
+| **33** | `create_pool_open` | `hash(asset)` | **permissionless** pool creation (community track; deposits ARE the seed) |
+
+Pool creation paths: `create_pool` (chunk 6) is called **only** by the
+pinned launchpad (Vault migration — project track); `create_pool_open`
+(chunk 33) is open to anyone attaching both sides of the seed
+(community track).
 
 Trading examples (after a `migrate`, a pool exists for `<ASSET>`):
 
 ```bash
 # Buy tokens on the DEX (XEL deposit, min_tokens_out = 1)
-python3 scripts/xrpc.py invoke bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d 8 \
+python3 scripts/xrpc.py invoke f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef 8 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"<ASSET_HEX>"}}},{"type":"primitive","value":{"type":"u64","value":"1"}}]' \
   --deposits '{"0000000000000000000000000000000000000000000000000000000000000000":10000000}'
 
 # Sell tokens for XEL (min_xel_out = 1)
-python3 scripts/xrpc.py invoke bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d 9 \
+python3 scripts/xrpc.py invoke f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef 9 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"<ASSET_HEX>"}}},{"type":"primitive","value":{"type":"u64","value":"1"}}]' \
   --deposits '{"<ASSET_HEX>":10000000}'
 
 # Add liquidity (XEL + tokens deposit; skip if the pool already exists)
-python3 scripts/xrpc.py invoke bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d 10 \
+python3 scripts/xrpc.py invoke f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef 10 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"<ASSET_HEX>"}}}]' \
   --deposits '{"0000000000000000000000000000000000000000000000000000000000000000":100000000,"<ASSET_HEX>":100000000}'
 
 # Claim your LP fees on the pool
-python3 scripts/xrpc.py invoke bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d 30 \
+python3 scripts/xrpc.py invoke f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef 30 \
   '[{"type":"primitive","value":{"type":"opaque","value":{"type":"Hash","value":"<ASSET_HEX>"}}}]'
 ```
 
@@ -309,8 +416,11 @@ python3 scripts/xrpc.py invoke bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041
 ```bash
 python3 scripts/xrpc.py state 45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54 sub
 python3 scripts/xrpc.py state 45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54 dxa
-python3 scripts/xrpc.py state bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d lpx
-python3 scripts/xrpc.py state bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d sfe
+python3 scripts/xrpc.py state f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef lpx
+python3 scripts/xrpc.py state f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef sfe
+python3 scripts/xrpc.py state 8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9 dxa
+python3 scripts/xrpc.py state 8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9 vxs
+```
 ```
 
 Project keys (Vault, project pid `p`): `p:<pid>:nm` (name), `p:<pid>:sy`
@@ -345,13 +455,22 @@ python3 scripts/xrpc.py address
 Every TX and every contract can be verified on `https://explorer.xelis.io`
 (transaction / contract tab):
 
+**Current generation (v1.4.1, 25/09/2026):**
+- LaunchDEX v1.4.1 deployment: `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef` (topo 9073523)
+- CommunityLaunch v1.0.1 deployment: `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9` (topo 9073563)
+- DEX pin: `lpx` = `xel:sel92…` (set_launchpad, topo 9073612)
+- Vault pin: `dxa` = `f3c461af…` (repin, topo 9073629); factory pin: C101 `dxa` = `f3c461af…` (topo 9073642)
+- gen-1 DEX `bce37bde…` — orphaned, never served a pool
+
+**Gen-1 deployment (23/09/2026, historical):**
 - LaunchDEX deployment: `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d`
 - VaultLaunch deployment: `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54`
-- DEX pin → Vault: `dxa` = `bce37bde…`; launchpad pin → DEX: `lpx` =
-  `xel:sel92…` (verified: `dxa` at topo 9041922, `lpx` at topo 9041927).
+- Original pins (since superseded): `dxa` at topo 9041922, `lpx` at topo 9041927.
 
 SHA-256/checksums of the deployed modules (cross-check with the ABI/SDK):
-`out/VaultLaunch.hex` `b6e9cb47…`; `out/LaunchDEX.hex` `34067589…`.
+`out/VaultLaunch.hex` `b6e9cb47…`; gen-1 `out/LaunchDEX.hex` `34067589…`;
+v1.4.1 DEX `/tmp/DEX-new.hex` `9cf3489e…`; v1.0.1 CL `/tmp/CL-new.hex`
+`09abba6e…`.
 
 ---
 
@@ -366,3 +485,8 @@ SHA-256/checksums of the deployed modules (cross-check with the ABI/SDK):
 5. Final storage verification: **16/16 keys read** (0.4 s via the persistent
    relay) — every parameter in §2 table confirmed on-chain.
 6. Total cost < 0.01 XEL; unspent balance intact (~156.3 XEL).
+7. **25/09/2026 — v18.4 cut (§1A)**: deployed v1.4.1 DEX `f3c461af…` +
+   CommunityLaunch `8252cf7b…`; set the launchpad pin BEFORE any pool,
+   repinned the gen-1 Vault to the new DEX and pinned the factory. All
+   five TXs confirmed in blocks (9 073 523 → 9 073 642), every storage
+   key read back. No pool exists anywhere (`pc=0`) — nothing frozen.

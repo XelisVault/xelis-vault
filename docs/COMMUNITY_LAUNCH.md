@@ -334,18 +334,18 @@ upgraded in place; a new version is a NEW deployment**:
    buy → graduate → migrate → pool swaps → creator claim), verifying
    the migrated status flips to 2, the curve views close, and both
    pins froze.
-2. **Mainnet cut** (Phase 2): deploy both, pin the factory's
-   `set_dex_address` to the new DEX. The gen-1 pair (VaultLaunch
-   `45baf014…` + LaunchDEX `bce37bde…`) keeps serving the project
-   track untouched — with ONE recommended adjustment while its pins
-   are still unfrozen (no pool exists yet): **re-pin gen-1 VaultLaunch
-   to the v1.4 DEX** (entry 50 `set_dex_address`) so the project track
-   benefits from the second-migration fix (DEX.md v1.4: gen-1's
-   `create_pool` returns its pool index, which the launchpad's
-   `migrate_to_dex` treats as failure — only the FIRST project
-   migration would ever succeed on the gen-1 DEX). Set the new DEX's
-   `set_launchpad` to the official wallet: it keeps the moderation
-   hook (per-pool buys-pause, chunk 7) for BOTH tracks.
+2. **Mainnet cut** (Phase 2) — **DONE 25/09/2026**: deployed both, pinned
+   the factory's `set_dex_address` to the new DEX, re-pinned gen-1
+   VaultLaunch to the v1.4 DEX (entry 50 `set_dex_address`) so the project
+   track benefits from the second-migration fix, set the new DEX's
+   `set_launchpad` to the official wallet — first, before any pool
+   (v1.4.1 `nolpx`). The gen-1 pair (VaultLaunch `45baf014…` + LaunchDEX
+   `bce37bde…`) keeps existing; the gen-1 DEX is **orphaned** (never
+   served a pool). Real mainnet hashes: DEX v1.4.1
+   `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef`,
+   factory v1.0.1
+   `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9`,
+   cut TXs in RUNBOOK 3 §1A (topos 9073523 → 9073642).
 3. **Site** (Phase 3): add the generation pair to the site's static
    registry; the stateless views enumerate everything (D22 recipe).
 

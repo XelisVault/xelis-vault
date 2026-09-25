@@ -12,23 +12,30 @@
 | Contract | Address (deployment hash) | Role |
 |---|---|---|
 | **VaultLaunch** (the launchpad) | `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54` | propose → vote → bonding curve → graduation → migration |
-| **LaunchDEX** (the DEX) | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` | XEL/token pools, swaps, liquidity, LP fees |
+| **LaunchDEX v1.4.1** (the DEX) | `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef` | XEL/token pools, swaps, liquidity, LP fees |
+| **CommunityLaunch v1.0.1** (the factory) | `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9` | permissionless community coins → same DEX |
 | Explorer | [`https://explorer.xelis.io`](https://explorer.xelis.io) | verify TXs, contracts, storage |
 
 > ⚠️ **Golden rule**: never interact with any other address presented as
-> "the launchpad" or "the DEX". These two hashes are the only ones deployed
-> by the official wallet
+> "the launchpad", "the DEX" or "the factory". These three hashes are the
+> only ones deployed by the official wallet
 > `xel:sel92pcaegt0kenv3q35ycnzpd4xfl0md93usnkxq0rsjtha6cjsqe2xwch`.
 > Always check the full hash in the explorer before sending funds.
 
-**Independent verification** — the two contracts are **pinned to each other**
+**Independent verification** — the contracts are **pinned to each other**
 at the protocol level:
-- Storage `dxa` of the Vault = `bce37bde…` (the DEX): only that DEX can
+- Storage `dxa` of the Vault = `f3c461af…` (the DEX): only that DEX can
   receive a project's migration.
+- Storage `dxa` of CommunityLaunch = `f3c461af…` (the same DEX): that is
+  where community coins migrate.
 - Storage `lpx` of the DEX = `xel:sel92…` (the official wallet): only that
   wallet can create a pool via `create_pool`.
 
-Any "clone" that does not honor both pins is a fake.
+> The previous gen-1 DEX (`bce37bde…`) is **orphaned** — it exists on
+> chain but never served a pool and never will (the v1.4.1 cut fixed the
+> second-migration bug; UPGRADES.md §6). Never use it for trading.
+
+Any "clone" that does not honor all three pins is a fake.
 
 ---
 
@@ -132,7 +139,8 @@ from xvault.dex import DexReader
 
 D = DaemonClient("http://127.0.0.1:8085/json_rpc")  # or your own mainnet node
 VAULT = "45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54"
-DEX   = "bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d"
+DEX   = "f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef"
+COM   = "8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9"
 
 lp = LaunchpadReader(D, VAULT)   # lp.count(), lp.project(0), ...
 dx = DexReader(D, DEX)           # dx.pools_count(), dx.pool(asset), ...
@@ -140,16 +148,17 @@ dx = DexReader(D, DEX)           # dx.pools_count(), dx.pool(asset), ...
 
 ---
 
-## 5. Protocol status (23/09/2026)
+## 5. Protocol status (25/09/2026)
 
 | Done | Detail |
 |---|---|
-| Deployment | Vault `45baf014…`, DEX `bce37bde…` — TX confirmed in blocks 9 041 909 / 9 041 917 |
-| Pins | `dxa` Vault → DEX ✓ , `lpx` DEX → wallet ✓ |
-| Config | sub 25, abd 1, mnl 500, mnp 1, mab 80 %, vdt 720, gmu ×2, vdp 0, tfe/gfe/mgf 0.5/0.25/0.5 %, dlt 2 000, sfe 0.30 %, fsl 50 % — **16/16 storage keys verified on-chain** |
+| Deployment (gen-1, 23/09) | VaultLaunch `45baf014…` — TX at topo 9041917 |
+| **v18.4 cut (25/09)** | **DEX v1.4.1 `f3c461af…`** (topo 9073523) + **CommunityLaunch `8252cf7b…`** (topo 9073563) deployed; launchpad pin set before any pool (topo 9073612); gen-1 Vault repinned + factory pinned to the new DEX (topos 9073629/9073642) |
+| Pins | `dxa` Vault → DEX ✓ , `dxa` CL → DEX ✓ , `lpx` DEX → wallet ✓ |
+| Config | Vault: sub 25, abd 1, mnl 500, mnp 1, mab 80 %, vdt 720, gmu ×2, vdp 0, tfe/gfe/mgf 0.5/0.25/0.5 %, dlt 2 000 — **16/16 storage keys verified on-chain**; DEX: sfe 0.30 %, fsl 50 %, trade bounds at v1.4.1 defaults; CL: defaults = target (sub 1, abd 1, cfe/gfe/mgf 1/0.5/0.5 %, gdx 50, vxs 100) |
 | Projects | `pc = 0` — nothing launched yet: **the community creates the coins** |
-| Pools | `pc = 0` — no DEX pool created yet |
-| Module verification | .hex checksums identical to the testnet-validated version |
+| Pools | `pc = 0` — no DEX pool created yet (both DEXes) |
+| Module verification | .hex checksums identical to the testnet-validated / CI-gated version |
 
 ---
 
@@ -176,5 +185,6 @@ In the [mainnet RUNBOOK 3](runbooks/RUNBOOK3_MAINNET_INTERACTIONS.md)
 
 ---
 
-*XelisVault v18.3 — Privacy-first DeFi on XELIS. Deployed on mainnet,
-configured and verified. The rest of the protocol belongs to the community.*
+*XelisVault v18.4 — Privacy-first DeFi on XELIS. Deployed on mainnet,
+configured and verified (v1.4.1 cut on 25/09/2026: one DEX lineage for
+both tracks). The rest of the protocol belongs to the community.*

@@ -13,7 +13,7 @@ token for ~2 XEL on a virtual-reserve bonding curve, graduate on
 demand, migrate to the same DEX through the OPEN seeding endpoint),
 hardened by three founder risk reviews and the second-migration fix.
 
-## 🟢 Live on mainnet (23/09/2026)
+## 🟢 Live on mainnet (v1.4.1 cut, 25/09/2026)
 
 Deployed, configured and **verified on-chain** on the official XELIS mainnet
 (block version V7). The community creates the coins.
@@ -21,11 +21,13 @@ Deployed, configured and **verified on-chain** on the official XELIS mainnet
 | Contract | Address |
 |---|---|
 | **VaultLaunch** (launchpad) | `45baf014edd09f1f93a7746aa7d7c45f1dea01daa07b0bc438f2a0e80664cc54` |
-| **LaunchDEX** (DEX) | `bce37bde7ac8e0410656d5b67c398b172cbb6047f6b390041c9dbb3dbdeae11d` |
+| **LaunchDEX v1.4.1** (DEX) | `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef` |
+| **CommunityLaunch v1.0.1** (factory) | `8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9` |
 | Explorer | [`https://explorer.xelis.io`](https://explorer.xelis.io) |
 
-The two contracts are pinned to each other (`dxa` Vault → DEX, `lpx` DEX →
-wallet): beware of clones.
+The contracts are pinned to each other (`dxa` Vault → DEX, `dxa` factory →
+DEX, `lpx` DEX → wallet): beware of clones. The gen-1 DEX `bce37bde…` is
+orphaned (never served a pool).
 
 - **For the community**: read the [Community Guide](docs/COMMUNITY.md) —
   launch a coin (526 XEL minimum), vote for free, trade on the bonding curve

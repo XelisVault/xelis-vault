@@ -207,3 +207,13 @@ status flip and the closed views — (b) the generation-1 limitations in
 SECURITY.md (signer-not-caller, pool squatting, DEX-pin provenance)
 are formally accepted by the community, and (c) every CI gate
 including the new compile/ABI gate is green on the deployed commit.
+
+**Status — CUT EXECUTED on mainnet, 25/09/2026** (conditions a, b, c
+met): the v1.4.1 generation is deployed and configured in the §6 order —
+LaunchDEX v1.4.1 `f3c461afe698a2bdfc7e5d941e86300876ecf16ac33ea45d8c6ddd936f7e24ef`
+(topos 9073523), CommunityLaunch v1.0.1
+`8252cf7b7157dd05daf2d4e3bad78009c155c67bb3c908d042c61484dd7e89b9`
+(9073563), launchpad pin before any pool (9073612), gen-1 Vault repin +
+factory pin (9073629 / 9073642). Every TX confirmed in a real block and
+every storage key read back (RUNBOOK 3 §1A). Nothing frozen yet
+(`pc = 0` everywhere); the gen-1 DEX is orphaned as intended.
